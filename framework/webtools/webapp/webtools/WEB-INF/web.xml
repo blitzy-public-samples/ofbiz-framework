@@ -41,15 +41,52 @@ under the License.
         <param-value>component://webtools/widget/CommonScreens.xml</param-value>
     </context-param>
 
+    <!-- Load-balancer health probes. HealthCheckServlet is mapped BOTH as this filter and as the
+         servlet declared further down, and the two mappings deliberately carry the same two exact
+         paths.
+
+         The filter is what makes the anonymous probe surface safe, and its <filter-mapping> is
+         therefore declared FIRST below: the servlet specification builds the chain in the order the
+         url-pattern mappings appear in this descriptor, so this filter runs before ControlFilter,
+         CacheFilter, ContextFilter and SameSiteFilter. It answers the probe and does not call
+         chain.doFilter, so none of those filters is entered for a probe request. That matters for two
+         concrete reasons:
+           - ControlFilter and ContextFilter both call getSession() unconditionally, so every probe
+             would otherwise mint an HttpSession and a JSESSIONID that a target group never returns,
+             together with the session listeners, the expiry bookkeeping and the log churn behind them;
+           - ContextFilter calls WebAppUtil.setAttributesFromRequestBody, which reads an
+             application/json body of ANY size into a String and then into a Map before a servlet
+             method is dispatched. Terminating the chain first means an anonymous caller can no longer
+             reach that parser through these paths at all, and the servlet itself refuses any request
+             that merely announces a body, from Content-Length and Transfer-Encoding, without reading
+             it. What is then left of an unread body is bounded by the connector, whose Tomcat default
+             maxSwallowSize discards at most 2MB before closing the connection.
+         A request whose path is not exactly one of the two probe paths is passed through untouched,
+         so this filter cannot affect anything else in the webapp.
+
+         The servlet mapping is kept as well: it is what makes the container resolve these two paths
+         to this component rather than to the default servlet, and it keeps the probes off /control/*
+         and therefore outside the OFBTOOLS/WEBTOOLS base permission. No <load-on-startup>, so the
+         servlet initialises lazily and cannot affect boot ordering.
+
+         NOTE - the probe paths are deliberately NOT in the ControlFilter allowedPaths list below.
+         ControlFilter matches that list with startsWith, so a bare /health entry would grant
+         anonymous passage to every /health* spelling and not only to the two probes; and because the
+         filter above short-circuits the chain, ControlFilter never sees a probe request in the first
+         place, so no allow-list entry is needed. Liveness always returns 200; readiness returns 200
+         when the delegator/database is reachable and 503 when it is not. See DOCKER.adoc. -->
+    <filter>
+        <display-name>HealthCheckFilter</display-name>
+        <filter-name>HealthCheckFilter</filter-name>
+        <filter-class>org.apache.ofbiz.webapp.control.HealthCheckServlet</filter-class>
+    </filter>
     <filter>
         <display-name>ControlFilter</display-name>
         <filter-name>ControlFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.ControlFilter</filter-class>
         <init-param>
             <param-name>allowedPaths</param-name>
-            <!-- /health is the unauthenticated load-balancer probe prefix served by HealthCheckServlet
-                 (see the servlet registration below); it covers both /health/live and /health/ready. -->
-            <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp:/health</param-value>
+            <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp</param-value>
         </init-param>
         <init-param>
             <param-name>redirectPath</param-name>
@@ -71,6 +108,13 @@ under the License.
         <filter-name>SameSiteFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.SameSiteFilter</filter-class>
     </filter>
+    <!-- Declared first on purpose: the chain is built in this order, and the probes must be answered
+         before any filter that creates a session or parses the request body is reached. -->
+    <filter-mapping>
+        <filter-name>HealthCheckFilter</filter-name>
+        <url-pattern>/health/live</url-pattern>
+        <url-pattern>/health/ready</url-pattern>
+    </filter-mapping>
     <filter-mapping>
         <filter-name>ControlFilter</filter-name>
         <url-pattern>/*</url-pattern>
@@ -109,15 +153,9 @@ under the License.
         <url-pattern>/control/*</url-pattern>
     </servlet-mapping>
 
-    <!-- Health and readiness endpoints for load-balancer target-group probes (see DOCKER.adoc).
-         Deliberately unauthenticated and outside /control/* so it is not subject to the
-         OFBTOOLS/WEBTOOLS base permission; /health is added to the ControlFilter allowedPaths above
-         so the probes are not redirected. Liveness always returns 200; readiness returns 200 when
-         the delegator/database is reachable and 503 when it is not. No <load-on-startup> so the
-         servlet initialises lazily and cannot affect boot ordering. NOTE (pre-existing, out of
-         scope): ControlFilter and ContextFilter both call req.getSession() unconditionally for
-         every request, so an HttpSession is created upstream for these probes exactly as it
-         already is for the existing allow-listed /ping.txt. -->
+    <!-- Health and readiness endpoints for load-balancer target-group probes. The full rationale,
+         including why the same class is also registered as the first filter, is documented with the
+         HealthCheckFilter declaration above. -->
     <servlet>
         <description>Health and readiness check servlet for load balancer probes</description>
         <display-name>HealthCheckServlet</display-name>

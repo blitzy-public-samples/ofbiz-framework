@@ -26,58 +26,29 @@ import org.apache.ofbiz.base.util.GeneralException;
 /**
  * Content storage strategy contract for the Content component.
  *
- * <p>This service provider interface abstracts where the bytes behind a file-backed
- * {@code DataResource}, and behind user uploads, physically live, so that no caller has to
- * know the backing store. It exists purely so that an OFBiz instance can be run as a
- * stateless, horizontally scalable service: once an object store is configured, an instance
- * holds no durable local state that a sibling instance behind the same load balancer
- * cannot also read.
+ * <p>Abstracts where the bytes behind a file-backed {@code DataResource}, and behind user
+ * uploads, physically live, so that callers need not know the backing store and content need
+ * not sit on instance-local disk.
  *
- * <p><strong>Provider selection.</strong> Implementations are never instantiated by
- * callers. {@code ContentStoreFactory} resolves the active provider at runtime from the
- * {@code content.store.provider} property of the {@code content} resource (the bare OFBiz
- * resource name is {@code content}). Exactly three values are recognised:
- * <ul>
- * <li>{@code database} - the <strong>default</strong>, and the value committed to the
- *     repository. In this mode <em>no implementation of this interface is used at all</em>:
- *     the pre-existing {@code DataResource} database-storage path runs completely
- *     unchanged, and the object-storage code, including its client library, stays inert.</li>
- * <li>{@code filesystem} - the historical local-disk behaviour, rooted at the directory
- *     named by {@code content.upload.path.prefix} ({@code runtime/uploads} by default,
- *     relative to {@code ofbiz.home}).</li>
- * <li>{@code s3} - an S3-compatible object store, configured through the
- *     {@code content.store.s3.bucket}, {@code content.store.s3.region},
- *     {@code content.store.s3.endpoint}, {@code content.store.s3.access.key.id},
- *     {@code content.store.s3.secret.access.key} and {@code content.store.s3.path.style}
- *     properties. Those values are injected from the deployment environment; no
- *     credential, bucket or endpoint literal is committed to the source tree or baked into
- *     a container image.</li>
- * </ul>
+ * <p><strong>Provider selection.</strong> The intended provider is named by the
+ * {@code content.store.provider} property of the {@code content} resource, whose recognised
+ * values are {@code database}, {@code filesystem} and {@code s3}. {@code database} is the
+ * default and the committed value; in that mode no implementation of this interface takes part
+ * and the pre-existing {@code DataResource} database-storage path is used unchanged.
+ * {@code filesystem} is rooted at {@code content.upload.path.prefix}, and {@code s3} is
+ * configured through the {@code content.store.s3.*} properties, whose committed values are
+ * blank.
  *
- * <p><strong>Keys.</strong> Every operation addresses content through a single
- * {@code String} key. The key is deliberately opaque and provider-relative: the filesystem
- * provider interprets it as a path relative to its configured upload prefix, while the S3
- * provider interprets it as an object key inside its configured bucket. The whole contract
- * is expressed with nothing but {@code String} keys, {@code byte} arrays, a {@code boolean}
- * and {@link InputStream}: no local-file handle, no object-store client type and no
- * framework, entity or service type appears in it anywhere. That keeps this contract below
- * the service layer and stops callers from becoming coupled to one backing store.
- *
- * <p><strong>An absent key never yields {@code null}.</strong> Both {@link #get(String)}
- * and {@link #openStream(String)} throw {@link java.io.FileNotFoundException} when the key
- * does not resolve to stored content, instead of returning {@code null}. That mirrors the
- * existing file-resolution behaviour of {@code DataResourceWorker}, whose callers
- * dereference the returned handle with no null check, so routing them through a provider
- * cannot introduce a new null into those paths. Use {@link #exists(String)} whenever
- * absence is an expected, non-exceptional outcome.
- *
- * <p><strong>Exceptions.</strong> The declared checked exceptions are deliberately limited
- * to {@link GeneralException} and {@link IOException}, because the existing call sites
- * already catch {@code FileNotFoundException} and {@code GeneralException} and have to keep
- * compiling and behaving identically. No new exception type is introduced.
- *
- * <p>Implementations are expected to keep no per-request state and to be safe for
- * concurrent use by many request threads.
+ * <p><strong>Requirements on implementations.</strong> Every operation addresses content
+ * through a single {@code String} key that is opaque and provider-relative: a filesystem
+ * implementation reads it as a path under its configured root, an S3 implementation as an
+ * object key inside its configured bucket. An implementation must reject a null or empty key
+ * and any key that would escape its configured root; must throw
+ * {@link java.io.FileNotFoundException} from {@link #get(String)} and
+ * {@link #openStream(String)} rather than return {@code null} for a key that resolves to no
+ * stored content, leaving {@link #exists(String)} as the non-exceptional probe; must return a
+ * fresh {@link InputStream} from {@link #openStream(String)} that the caller owns and closes;
+ * and must hold no per-request state, so that many request threads can share one instance.
  */
 public interface ContentStore {
 
@@ -85,9 +56,8 @@ public interface ContentStore {
      * Stores the supplied content under the supplied key, creating the entry when it is
      * absent and replacing it in full when it already exists.
      *
-     * <p>Any intermediate structure the provider needs is created on demand, so callers do
-     * not have to prepare the store first. After a successful return the key resolves to
-     * exactly the supplied bytes.
+     * <p>Implementations must create any intermediate structure they need on demand, so that
+     * callers do not have to prepare the store first.
      *
      * @param key the opaque, provider-relative storage key to write to; must be neither
      *     null nor empty
@@ -103,9 +73,7 @@ public interface ContentStore {
     /**
      * Reads the whole content stored under the supplied key into memory.
      *
-     * <p>This is the convenience form of {@link #openStream(String)}, intended for the
-     * modestly sized payloads that the Content component already buffers in memory. Prefer
-     * {@link #openStream(String)} for large content.
+     * <p>Prefer {@link #openStream(String)} for large content.
      *
      * @param key the opaque, provider-relative storage key to read; must be neither null
      *     nor empty

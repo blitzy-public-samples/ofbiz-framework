@@ -92,7 +92,7 @@ dependencies {
       exclude group: 'pull-parser', module: 'pull-parser'
       exclude group: 'xpp3', module: 'xpp3'
     }
-    implementation 'software.amazon.awssdk:s3:2.49.1' // AWS SDK v2 s3 module only; S3-compatible object storage, used only by S3ContentStore
+    implementation 'software.amazon.awssdk:s3:2.49.1' // S3 client for the content-store provider
 
     testImplementation 'org.junit.jupiter:junit-jupiter-api:6.1.0'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:6.1.0'
@@ -108,7 +108,14 @@ dependencies {
     runtimeOnly 'org.apache.axis2:axis2-transport-http:1.8.2'
     runtimeOnly 'org.apache.axis2:axis2-transport-local:1.8.2'
     runtimeOnly 'com.h2database:h2:2.4.240'
-    runtimeOnly 'org.postgresql:postgresql:42.7.13' // JDBC driver for the localpostgres* datasources; bundled so no runtime download is needed
+    // JDBC driver for the localpostgres* datasources. Bundling it here replaces the start up download
+    // that docker/docker-entrypoint.sh used to perform, so the deployed driver version is pinned by
+    // this file and is auditable from the image alone. Note that the generated start script places
+    // lib-extra ahead of lib on the class path (see the CLASSPATH rewrite in build.gradle), so a copy
+    // of this artefact left in the /ofbiz/lib-extra volume would silently shadow the version declared
+    // here and could reintroduce an already fixed vulnerability. docker/docker-entrypoint.sh therefore
+    // refuses to start when it finds one. Keep this on the current 42.7.x line.
+    runtimeOnly 'org.postgresql:postgresql:42.7.13'
     runtimeOnly 'org.apache.geronimo.specs:geronimo-jaxrpc_1.1_spec:2.1'
     runtimeOnly 'org.apache.logging.log4j:log4j-1.2-api:2.25.4' // for external jars using the old log4j1.2: routes logging to log4j 2
     runtimeOnly 'org.apache.logging.log4j:log4j-jul:2.25.4' // for external jars using the java.util.logging: routes logging to log4j 2

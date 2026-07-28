@@ -49,10 +49,22 @@ COPY plugin[s]/ plugins/
 COPY themes/ themes/
 COPY APACHE2_HEADER build.gradle common.gradle gradle.properties NOTICE settings.gradle dependencies.gradle .
 
-# Build OFBiz while mounting a gradle cache
+# Build OFBiz while mounting a gradle cache.
+# Only "distTar" is run here, deliberately WITHOUT "generateSecretKeys". That task writes freshly
+# generated login.secret_key_string / security.token.key values into
+# framework/security/config/security.properties, which distTar then packages, so running it here would
+# bake live secret material into a layer where it can never be removed - and would additionally give
+# every built image a different key, breaking a multi-instance fleet that has to share one.
+# Both keys are supplied at run time instead: docker-entrypoint.sh renders them into
+# /ofbiz/config/security.properties (mode 0600) from OFBIZ_LOGIN_SECRET_KEY and
+# OFBIZ_JWT_TOKEN_KEY, generating a per-container value when OFBIZ_PROFILE=dev and
+# failing fast when OFBIZ_PROFILE=prod and a key is absent. /ofbiz/config precedes
+# ofbiz.jar on the classpath, so the rendered values win over the blank anchors the image ships.
+# See DOCKER.adoc, framework/security/config/security.properties and docker/docker-entrypoint.sh.
+# Run ./gradlew generateSecretKeys only for a local (non container) development checkout.
 RUN --mount=type=cache,id=gradle-cache,sharing=locked,target=/root/.gradle \
     --mount=type=tmpfs,target=runtime/tmp \
-    ["./gradlew", "--console", "plain", "generateSecretKeys", "distTar"]
+    ["./gradlew", "--console", "plain", "distTar"]
 
 ###################################################################################
 

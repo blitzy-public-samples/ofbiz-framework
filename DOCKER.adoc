@@ -80,8 +80,26 @@ configuration options for the OFBiz container.
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default value |Description
+|OFBIZ_PROFILE |dev |Selects the deployment profile, either _dev_ or
+_prod_. Any other value aborts the start up. The profile only controls
+how a missing or unusable secret is handled, as described in the
+_Secrets_ section below. It never changes which components, webapps or
+services are loaded, so a container behaves identically in both
+profiles once the secrets are in place.
+
 |OFBIZ_SKIP_INIT |_empty_ |Any non-empty value will cause the
-docker-entrypoint.sh script to skip any initialisation steps.
+docker-entrypoint.sh script to skip any initialisation steps. This also
+skips rendering the secret configuration described in the _Secrets_
+section, so the instance falls back to the unconfigured defaults
+shipped in the distribution.
+
+|OFBIZ_TRACE |_empty_ |Any non-empty value turns on verbose shell
+tracing (`+set -x+`) of `+docker-entrypoint.sh+` for troubleshooting.
+Tracing is off by default because the script handles secrets and a trace
+writes every expanded command to the container log. Even with tracing on
+it is force-disabled around every region that handles a secret, so a
+trace never publishes the admin password, the admin key, the signing
+keys or a database password.
 
 |OFBIZ_ADMIN_USER |admin |Sets the username of the OFBIZ admin user.
 
@@ -103,14 +121,354 @@ and content.url.prefix.standard properties in
 port to allow communication with OFBiz via a reverse proxy. Enabled when
 this environment variable contains a non-empty value.
 
-|OFBIZ_SKIP_DB_DRIVER_DOWNLOAD |_empty_ |Any non-empty value will cause
-the docker-entrypoint.sh script to skip downloading of any database
-drivers.
+|OFBIZ_SKIP_DB_DRIVER_DOWNLOAD |_empty_ |Obsolete and has no effect. It
+is still accepted so existing deployment manifests keep working. The
+PostgreSQL JDBC driver is bundled with the distribution, declared in
+`+dependencies.gradle+`, so `+docker-entrypoint.sh+` never downloads a
+database driver at container start and there is nothing to skip.
+
+|OFBIZ_JVM_ROUTE |_empty_ |Per-instance sticky-session route id written
+to the `+jvm-route+` property of the serving catalina container. Behind
+a load balancer that uses sticky sessions, give every instance a
+distinct value. Tomcat appends it to the session id, so only letters,
+digits, `+.+`, `+_+` and `+-+` are accepted. Left empty, the committed
+default `+jvm1+` is kept.
+
+|OFBIZ_SSL_ACCELERATOR_PORT |_empty_ |The *local* port on which this
+instance receives plain HTTP forwarded by a TLS-terminating proxy - not
+the load balancer's public HTTPS port. See _Load balancers and
+TLS-terminating proxies_ below before setting it.
+
+|OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS |_empty_ |Shares the session
+cookie across sub-domains by installing `+CrossSubdomainSessionValve+`.
+Normalised to the literal `+true+` or `+false+`; a value that is not
+clearly a boolean aborts the start up. That valve calls
+`+request.getSession(true)+`, so it forces a session to exist for every
+request. Left empty, the committed default `+false+` is kept.
+
+|OFBIZ_DISTRIBUTED_CACHE_CLEAR |false |Enables cross-instance entity
+cache invalidation on the `+default+` and `+default-no-eca+` delegators.
+Normalised to the literal `+true+` or `+false+`; a value that is not
+clearly a boolean aborts the start up. Leave it at the default for a
+single instance. See _Running more than one instance_ below.
 
 |OFBIZ_DISABLE_COMPONENTS |plugins/birt/ofbiz-component.xml |Commas
 seperated list of paths to ofbiz-component.xml files of the components
 that should not be loaded.
 |===
+
+===== Load balancers and TLS-terminating proxies
+
+Setting `+OFBIZ_SSL_ACCELERATOR_PORT+` installs
+`+SslAcceleratorValve+`, which marks every request arriving on that
+local port as secure so OFBiz rebuilds absolute URLs as `+https+`. The
+valve grants those TLS semantics on the strength of the local port
+alone: it verifies no source address, no `+X-Forwarded-Proto+` and no
+`+Forwarded+` header. *The port number is not the trust decision - the
+network is.*
+
+Enable it only when the forwarded-traffic connector is unreachable
+except through the proxy. Bind it to a private interface - uncomment and
+set the `+http-connector+` `+address+` property in
+`+framework/catalina/ofbiz-component.xml+`, or publish only the
+balancer-facing address - and restrict it in the network layer with a
+security group, firewall rule or private subnet that admits the proxy
+alone. Do not enable it on a connector bound to `+0.0.0.0+` on a
+routable interface: any client that reaches the instance directly would
+then get a request that OFBiz treats as HTTPS, so cookies marked secure
+are accepted over clear text and `+https+`-only request maps become
+reachable over an unencrypted hop.
+
+The proxy owns the other half of the boundary. It must strip client
+supplied `+X-Forwarded-*+` and `+Forwarded+` headers and set them
+itself, so a client cannot forge the forwarded protocol or address.
+Where those forwarded values have to be honoured inside Tomcat, the
+`+RemoteIpValve+` contract is what does it safely -
+`+internalProxies+`/`+trustedProxies+` pinned to the proxy's own
+addresses plus an explicit `+protocolHeader+`. That valve is not
+installed by `+CatalinaContainer+`, so with this configuration surface
+the equivalent guarantee has to come from the network restriction and
+header hygiene above.
+
+The value is validated before it is written: it must be a plain integer
+between 1 and 65535 *and* match a connector port declared in
+`+framework/catalina/ofbiz-component.xml+` (8080 for the http
+connector, 8009 for ajp). Supplying the balancer's public HTTPS port,
+say 443, is refused rather than silently installing a valve that marks
+nothing secure, and an unparseable value is refused here instead of
+aborting container loading with a `+NumberFormatException+`.
+
+===== Health and readiness endpoints
+
+Point the load balancer's target-group health check at one of the two
+endpoints the webtools webapp serves. They are registered in
+`+framework/webtools/webapp/webtools/WEB-INF/web.xml+` and need no
+configuration:
+
+[cols="1,1,4",options=header]
+|===
+|Path |Method |Meaning
+
+|`+/webtools/health/live+`
+|`+GET+`, `+HEAD+`
+|Liveness. Always `+200+` once the servlet container is up. It performs
+no database access at all, so it keeps answering while the datasource is
+unavailable. Use it to decide whether an instance has to be restarted or
+replaced.
+
+|`+/webtools/health/ready+`
+|`+GET+`, `+HEAD+`
+|Readiness. `+200+` when the entity engine can count
+`+SequenceValueItem+` and the count is non-zero, `+503+` otherwise. Use
+it to decide whether to route traffic to an instance. This is the one to
+attach to the target group, so an instance is drained rather than
+restarted when its database connection is lost.
+|===
+
+Both answer with a small fixed JSON document
+(`+{"status":"UP"}+`, `+{"status":"UP","database":"UP"}+`,
+`+{"status":"DOWN","database":"DOWN"}+`) marked `+no-store+`, and both
+are unauthenticated, because a target group polls them without
+credentials.
+
+Being unauthenticated makes them the most exposed surface of the
+deployment, so they are deliberately narrow, and a probe configuration
+that steps outside that shape gets a clear rejection rather than being
+served:
+
+* only `+GET+` and `+HEAD+` are answered. Everything else is `+405+`.
+  `+OPTIONS+`, `+POST+`, `+PUT+`, `+PATCH+` and `+DELETE+` are refused by
+  the endpoint itself, which answers `+405+` with an
+  `+Allow: GET, HEAD+` header and a `+{"status":"DOWN"}+` body. `+TRACE+`
+  is the one exception worth knowing about when writing a monitoring
+  check: Tomcat's connector refuses it before any filter runs, because
+  `+allowTrace+` defaults to `+false+`, so the observed answer is `+405+`
+  with the connector's own `+Allow: OPTIONS+` header and an HTML body.
+  The endpoint would refuse `+TRACE+` as well if a connector were ever
+  configured to pass it through, so assert on the `+405+` rather than on
+  the `+Allow+` value if a probe exercises `+TRACE+`;
+* a request that announces an entity body - a `+Content-Length+` above
+  zero or a chunked `+Transfer-Encoding+` - is `+400+`, decided from the
+  headers so that no part of the body is ever read;
+* only these two exact paths are anonymous. No `+/health+` prefix is
+  reserved, so `+/webtools/health+`, `+/webtools/health/live/+`,
+  `+/webtools/healthz/live+` and every other spelling is redirected to
+  the login-protected controller exactly as any other unknown path is;
+* a probe creates no session and therefore returns no `+JSESSIONID+`
+  cookie, which is what keeps continuous polling free of server-side
+  state;
+* every answer, a rejection included, still carries the framework's safe
+  response headers - `+X-Content-Type-Options: nosniff+`,
+  `+X-Frame-Options: sameorigin+` and
+  `+Referrer-Policy: no-referrer-when-downgrade+` - even though answering
+  early means the ordinary request handler never runs.
+  `+Strict-Transport-Security+` and `+Content-Security-Policy+` are
+  deliberately not emitted here: they are resolved through the entity
+  engine, which a probe must not depend on, and they carry no meaning on
+  a plaintext poll inside the load balancer's own network.
+
+Two limits belong to the layers above the application and are worth
+setting explicitly. Cap the request body the load balancer will forward
+to a probe path, and keep the Tomcat connector's `+maxPostSize+`,
+`+maxSwallowSize+` and `+maxHttpHeaderSize+` at or below their defaults
+(2MB, 2MB and 8KB); those are what bound a body that the endpoint has
+already refused to read. The connector attributes are listed, commented
+out at their default values, in `+framework/catalina/ofbiz-component.xml+`.
+
+At most two readiness probes query the datasource at the same time. A
+third concurrent probe is answered `+503+` straight away, without the
+datasource being touched at all. A readiness query borrows a pooled
+connection, and when the pool is exhausted that borrow blocks for up to
+the datasource's `+pool-sleeptime+` - 300000 milliseconds in the
+committed definitions - so an unbounded endpoint would park one
+container thread per probe for five minutes and starve real traffic
+while answering nothing but "are you ready". Two concurrent probes are
+enough for a load balancer and a human at once. The bound is worth
+knowing when configuring the check: keep the health-check interval
+longer than a probe takes to answer, and avoid pointing several target
+groups or an extra external monitor at `+/webtools/health/ready+` on
+the same instance, or an occasional `+503+` will be reporting a
+saturated probe path rather than an unhealthy database.
+`+/webtools/health/live+` is not bounded, performs no database access
+and can be polled at any rate.
+
+A readiness failure is logged once per minute per instance as the stable
+event code `+HEALTH-READINESS-DATASOURCE-UNAVAILABLE+`, with the
+occurrences suppressed in between counted into the next line. That code
+covers a datasource that cannot be reached and, equally, one that is
+reachable but whose `+SequenceValueItem+` is empty - the schema was
+never initialised or the seed data was never loaded, which is worth
+checking first when a freshly initialised fleet never becomes ready. A
+shed probe is reported the same way, under its own stable code
+`+HEALTH-READINESS-PROBE-SHED+`, with its own once-a-minute limit and
+its own suppressed count, so neither code can silence the other or
+report the other's occurrences as its own. Keeping the two codes apart
+is what lets an alert distinguish a database that needs attention from a
+probe path that only needs its check interval widened. The underlying
+entity-engine or JDBC detail is written only when verbose diagnostics
+are enabled, and it is sanitised first: connection URIs and credential
+assignments are redacted, control characters are folded away and the
+text is truncated. Alert on the event codes rather than on log wording.
+
+===== Running more than one instance
+
+Each instance keeps its own in-memory entity caches. On a single node
+that is invisible, but as soon as two instances share one database an
+update applied by one of them leaves the other serving the value it
+cached earlier, for as long as that entry lives. Set
+`+OFBIZ_DISTRIBUTED_CACHE_CLEAR=true+` on every instance of a fleet to
+turn that off: the container renders
+`+/ofbiz/config/entityengine.xml+` with
+`+distributed-cache-clear-enabled="true"+` on the `+default+` and
+`+default-no-eca+` delegators, which is what makes the delegator publish
+and consume invalidation messages. It works on embedded H2 as well as on a
+managed database, so the behaviour can be exercised locally. The flag is
+necessary but *not sufficient*: the plumbing it activates needs a message
+transport, and this image ships none - see the procedure below.
+
+Two things are deliberately left alone. The `+test+` delegator never
+receives the flag - it is a single-JVM integration-test delegator, and
+the container refuses to start if a configuration enables invalidation
+on it. And no new plumbing is introduced: the flag activates the
+`+DistributedCacheClear+` implementation OFBiz already ships,
+`+org.apache.ofbiz.entityext.cache.EntityCacheServices+`, running as the
+`+system+` user, both of which are schema defaults.
+
+The transport is the missing piece, and it is a hard prerequisite rather
+than an optional extra. Invalidation travels over the
+`+serviceMessenger+` JMS topic in
+`+framework/service/config/serviceengine.xml+`, and that topic is
+commented out in the distribution, so a stock image has no transport for
+it at all. To run a cache-coherent fleet, supply the transport as well:
+
+. Run a JMS broker that every instance can reach.
+. Add the client library of that broker to `+/ofbiz/lib-extra+`, which
+precedes `+/ofbiz/lib+` on the class path. The image ships the JMS 1.1 API
+only (`+geronimo-jms_1.1_spec+`, the `+javax.jms+` package) and no
+provider implementation, so the client library has to implement
+`+javax.jms+`. A client that only provides the newer `+jakarta.jms+`
+package will not work here.
+. Write a `+serviceengine.xml+` that declares an active `+jms-service+`
+named `+serviceMessenger+`, naming the JNDI connection factory, the topic
+and the credentials of that broker. The definition that ships commented
+out in `+framework/service/config/serviceengine.xml+` is the template: it
+expects the connection factory bound as `+jms/TopicConnectionFactory+` and
+the topic as `+jms/OFBTopic+`, with `+type="topic"+` and
+`+listen="true"+`. The `+jms+` service engine itself is already
+registered there, so only that one element and the provider library are
+missing.
+. Mount it at `+/ofbiz/config/serviceengine.xml+`, which precedes
+`+ofbiz.jar+` on the class path in the same way as the rendered
+`+entityengine.xml+`.
+. Set `+OFBIZ_DISTRIBUTED_CACHE_CLEAR=true+` on every instance.
+
+Setting the flag without the transport is *not* harmless, so the entry
+point checks for an active `+serviceMessenger+` on start up: with
+`+OFBIZ_PROFILE=prod+` the container refuses to start and reports the
+missing transport, and under the development profile it starts but warns.
+Without that check the failure surfaces much later and looks unrelated:
+the invalidation is dispatched to a JMS engine that has no configuration,
+the resulting `+NullPointerException+` is caught by the service
+dispatcher, and the dispatcher rolls back the transaction of the write
+that triggered the invalidation before reporting it. In practice the seed
+data load aborts and the container exits.
+
+Naming a broker is not enough on its own either: if the broker cannot be
+reached, the dispatcher rolls the transaction back in exactly the same
+way, because that rollback does not depend on why the dispatch failed.
+Verify that every instance can reach the broker, and verify propagation
+with two instances before relying on it: run both against the same
+database with the flag set and the topic configured, change one cached
+record through instance A (Web Tools -> Entity Data Maintenance is
+enough), then read the same record through instance B without restarting
+it and without clearing its cache. B has to report the new value, and
+neither log may contain a `+distributedClearCacheLine+` error. Repeating
+the check with the flag left at _false_ shows B still serving the stale
+value, which is the single-node behaviour this image ships. Until the
+transport is in place,
+run a single instance - or accept independent caches with sticky sessions
+at the load balancer and a shorter cache expiry for the entities that are
+updated most.
+
+Leaving `+OFBIZ_DISTRIBUTED_CACHE_CLEAR+` at its default of _false_ is
+correct for a single instance, and is the behaviour this image has always
+had.
+
+==== Secrets
+
+OFBiz needs three secret values at run time. None of them is stored in
+the source tree, in the distribution tarball or in any container image
+layer, so each one has to be supplied to the container through an
+environment variable.
+
+[width="100%",cols="34%,33%,33%",options="header",]
+|===
+|Environment variable |Default |Description
+|OFBIZ_ADMIN_KEY |_unset_ |Shared secret that authenticates a request on
+the OFBiz admin port, used by `+send_ofbiz_stop_signal.sh+` to shut the
+instance down. Rendered into
+`+/ofbiz/config/org/apache/ofbiz/base/start/start.properties+`. Must be
+at least 16 characters and must not contain a colon, because the admin
+port protocol splits an incoming request on the first colon.
+
+|OFBIZ_LOGIN_SECRET_KEY |_unset_ |Value of
+`+login.secret_key_string+`, which names the `+EntityKeyStore+` entry
+protecting the forgot-password token. Rendered into
+`+/ofbiz/config/security.properties+`. Must be at least 64 characters.
+
+|OFBIZ_JWT_TOKEN_KEY |_unset_ |Value of `+security.token.key+`, the key
+that signs and verifies OFBiz JSON Web Tokens. Rendered into
+`+/ofbiz/config/security.properties+`. Must be at least 64 characters,
+because OFBiz rejects a shorter JWT key.
+|===
+
+A supplied value is rejected, and the container refuses to start, when
+it is blank, is the literal `+NA+`, is shorter than the minimum length
+above, uses fewer than eight distinct characters, or contains a control
+character such as a newline or a NUL. A value drawn at random from any
+alphabet of sixteen or more symbols passes the distinct character floor
+with overwhelming probability, so only hand typed placeholders such as
+`+abababababababab+` are turned away. Rejection messages name the
+environment variable and the reason but never echo the value.
+
+`+OFBIZ_PROFILE+` decides what happens when a secret is absent or
+rejected:
+
+* `+prod+` - the container refuses to start. This is the intended
+setting for any deployment that serves real traffic, and for every
+multi-instance deployment, because the same three values have to be
+given to every instance for sessions, tokens and encrypted fields to
+remain valid across instances.
+* `+dev+` (the default) - a random value is generated so that an
+unconfigured container still boots, which keeps the demo image usable.
+The generated values are kept under
+`+/ofbiz/runtime/container_state/generated_secrets+`, in files only the
+`+ofbiz+` user can read, and are reused on every restart of that
+container. They are per container, so they are unsuitable for a
+multi-instance deployment.
+
+The three variables are handled so that they are not observable from
+outside the container:
+
+* Each rendered file is written atomically, is owned by the `+ofbiz+`
+user and has mode `+0600+`.
+* The values are substituted from a temporary file, never from a command
+line argument, so they never appear in the process table.
+* The variables are removed from the environment before OFBiz is
+started, so they are not readable through `+/proc/<pid>/environ+`.
+* Rendering starts from the pristine copy shipped in the distribution
+and runs on every start, so rotating a secret only takes a restart with
+the new value.
+
+Supply the values from the platform's secret store rather than from a
+shell, and prefer a file based mechanism such as `+docker run --env-file+`
+or a mounted secret over `+--env+` on the command line.
+
+Do not pass the admin key as a JVM system property, for example with
+`+-Dofbiz.admin.key+` or through `+JAVA_OPTS+`. A system property is
+visible in `+/proc/<pid>/cmdline+`, is reported by `+ps+` and by
+container inspection, and can be captured in a crash dump, so it cannot
+be withdrawn once it has been observed.
 
 ==== Hooks
 
@@ -178,39 +536,187 @@ variable.
 |===
 |Environment variable |Default |Description
 |OFBIZ_POSTGRES_HOST |_unset_ |Hostname of the PostgreSQL database
-server.
+server. The host only: a value with an embedded port, such as
+`+db.example.internal:5432+`, is refused, and an IPv6 literal must be
+bracketed as `+[fd00::1]+`.
+
+|OFBIZ_POSTGRES_PORT |5432 |TCP port of the PostgreSQL server, used by
+all three managed datasources. Must be a decimal integer between 1 and
+65535.
 
 |OFBIZ_POSTGRES_OFBIZ_DB |ofbiz |Name of the _ofbiz_ database.
 
 |OFBIZ_POSTGRES_OFBIZ_USER |ofbiz |Username when connecting to the ofbiz
 database.
 
-|OFBIZ_POSTGRES_OFBIZ_PASSWORD |ofbiz |Password when connecting to the
-ofbiz database.
+|OFBIZ_POSTGRES_OFBIZ_PASSWORD |_unset_ |Password when connecting to the
+ofbiz database. Required, see _Database passwords_ below.
 
 |OFBIZ_POSTGRES_OLAP_DB |ofbizolap |Name of the _olap_ database.
 
 |OFBIZ_POSTGRES_OLAP_USER |ofbizolap |Username when connecting to the
 olap database.
 
-|OFBIZ_POSTGRES_OLAP_PASSWORD |ofbizolap |Password when connecting to
-the olap database.
+|OFBIZ_POSTGRES_OLAP_PASSWORD |_unset_ |Password when connecting to
+the olap database. Required, see _Database passwords_ below.
 
 |OFBIZ_POSTGRES_TENANT_DB |ofbiztenant |Name of the _tenant_ database.
 
 |OFBIZ_POSTGRES_TENANT_USER |ofbiztenant |Username when connecting to
 the tenant database.
 
-|OFBIZ_POSTGRES_TENANT_PASSWORD |ofbiztenant |Password when connecting
-to the tenant database.
+|OFBIZ_POSTGRES_TENANT_PASSWORD |_unset_ |Password when connecting
+to the tenant database. Required, see _Database passwords_ below.
+
+|OFBIZ_POSTGRES_SSLMODE |verify-full |pgJDBC TLS mode used by all three
+managed datasources: one of `+disable+`, `+allow+`, `+prefer+`,
+`+require+`, `+verify-ca+` or `+verify-full+`. See _Transport security_
+below.
+
+|OFBIZ_POSTGRES_SSLROOTCERT |_unset_ |Path, inside the container, of the
+root certificate the database server's certificate must chain to. See
+_Transport security_ below.
+
+|OFBIZ_DB_POOL_MIN |2 |Minimum size of the JDBC connection pool of each
+of the three managed datasources. An integer between 1 and 10000 that
+must not exceed `+OFBIZ_DB_POOL_MAX+`.
+
+|OFBIZ_DB_POOL_MAX |250 |Maximum size of the JDBC connection pool of
+each of the three managed datasources. An integer between 1 and 10000.
+This is a *per-instance* bound, so size it against the server's
+`+max_connections+`: the whole fleet can open instances x 3 x this
+value. See _Connection pools_ below.
+
+|OFBIZ_SCHEMA_INIT |false |Selects the one-shot schema initialization
+execution instead of a serving start up. See _Schema initialization_
+below.
 |===
 
-The docker-entrypoint.sh script will download a JDBC driver to access
-the PostgreSQL server and place the script in the `+/ofbiz/lib-extra+`
-volume. If you wish to skip this step then set the
-OFBIZ_SKIP_DB_DRIVER_DOWNLOAD environment variable to a non-empty value.
-This would be useful if you have already placed a suitable database
-driver in the `+/ofbiz/lib-extra+` volume.
+====== Schema initialization
+
+A serving instance issues no DDL. The three managed datasources are
+rendered with `+check-on-start="false"+` and
+`+add-missing-on-start="false"+`, so the account a running container
+connects with needs no schema privileges at all, and a fleet that scales
+out cannot have two instances altering the same table at the same time.
+
+Schema changes are applied by running the image once, to completion, with
+the same database configuration plus `+OFBIZ_SCHEMA_INIT=true+`:
+
+[source,shell]
+----
+docker run --rm --env OFBIZ_SCHEMA_INIT=true --env-file ofbiz-postgres.env ofbiz-docker
+----
+
+That execution renders both flags as `+true+`, lets the entity engine
+create every missing table, column, index and key from the entity model,
+and then exits `+0+` without serving traffic. Run it as an init container
+or a job before the first release of a schema-affecting change, with a
+database account that may issue DDL; the serving instances keep using an
+account that may not. The DDL is additive - the engine creates what is
+missing and never drops - so re-running it is harmless, and
+`+OFBIZ_DATA_LOAD+` still controls whether data is loaded as well
+(`+none+` creates the schema and nothing else).
+
+The schema truth stays the entity model. There is no migration
+framework, no schema-version table and no hand-written DDL, so a change
+to an `+*-entitymodel.xml+` file is the whole change.
+
+Two guard rails are worth knowing about. `+OFBIZ_SCHEMA_INIT=true+`
+combined with `+OFBIZ_SKIP_INIT+` is refused, because skipping
+initialization is exactly what init mode consists of and the combination
+would exit successfully having created nothing. And after rendering the
+configuration the container re-reads it and refuses to start unless all
+three managed datasources agree on the requested mode, so an out-of-date
+copy of `+docker/templates/postgres-entityengine.xml+` cannot leave a
+serving instance issuing DDL, nor an init execution issuing none.
+
+Only the managed datasources are gated. The embedded H2 datasources keep
+both flags enabled, which is what makes a zero-configuration local run
+work; H2 is never part of a multi-instance fleet.
+
+====== Connection pools
+
+`+OFBIZ_DB_POOL_MIN+` and `+OFBIZ_DB_POOL_MAX+` size each managed
+datasource's DBCP pool, defaulting to the committed 2 and 250. Both
+bounds are validated as plain integers between 1 and 10000 and a minimum
+above the maximum is refused, so a mistyped value fails the start up
+instead of producing a pool that cannot serve.
+
+The default maximum long predates containers and is generous: it is a
+per-instance, per-datasource bound, so _n_ instances can open up to
+_n_ x 3 x `+OFBIZ_DB_POOL_MAX+` connections while PostgreSQL's own
+`+max_connections+` defaults to 100. Lower it when scaling out, or put a
+connection proxy in front of the database, rather than discovering the
+ceiling under load.
+
+====== Database passwords
+
+The three database passwords have no default. They previously defaulted
+to `+ofbiz+`, `+ofbizolap+` and `+ofbiztenant+`, which are published in
+this repository, so a deployment that omitted one authenticated with a
+value anybody could look up. The container now refuses to start when a
+password is missing, naming the variable, and refuses those three values
+outright - together with `+postgres+` and `+password+` - in every
+profile. Rotate the credentials of any database that was provisioned
+with them.
+
+When `+OFBIZ_PROFILE+` is `+prod+` a password must additionally be at
+least 16 characters long and use at least eight distinct characters. The
+`+dev+` profile applies no length or entropy floor, so a local database
+with a short password still works. As with the secrets above, the
+passwords are written only into the mode 0600 rendered
+`+/ofbiz/config/entityengine.xml+`, are substituted from a temporary file
+rather than a command-line argument, and are removed from the environment
+before OFBiz starts.
+
+====== Transport security
+
+The three managed datasources connect with `+sslmode=verify-full+` by
+default. That encrypts the connection, checks that the server
+certificate chains to a trusted root, and checks that the hostname
+matches that certificate. The weaker modes are unsafe in ways that are
+easy to miss: `+prefer+`, which is the driver's own default, silently
+falls back to an *unencrypted* connection when the server declines TLS;
+`+allow+` and `+disable+` send the password and every entity row in
+clear text; and `+require+` encrypts without authenticating the peer, so
+a man in the middle can present any certificate. Only `+verify-ca+` and
+`+verify-full+` are accepted when `+OFBIZ_PROFILE+` is `+prod+`.
+
+Verification needs a trusted root, and pgJDBC does not consult the JVM
+trust store by default - it reads `+sslrootcert+`, which defaults to
+`+${user.home}/.postgresql/root.crt+`. Either mount your provider's CA
+bundle and point `+OFBIZ_POSTGRES_SSLROOTCERT+` at it, or import the CA
+into the JVM trust store and add
+`+sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory+`.
+
+After rendering the configuration the container re-reads it and refuses
+to start unless every PostgreSQL URI in it carries the resolved
+`+sslmode+`, so an out-of-date copy of
+`+docker/templates/postgres-entityengine.xml+` cannot quietly produce
+unencrypted connections.
+
+The `+docker/examples/postgres-demo+` example sets
+`+OFBIZ_POSTGRES_SSLMODE: disable+` because the stock `+postgres+` image
+it starts has no TLS listener. Do not copy that setting into a
+deployment whose database is reached over a network.
+
+The PostgreSQL JDBC driver needed to access the PostgreSQL server is
+bundled with the distribution, declared in `+dependencies.gradle+`. No
+driver is downloaded at container start, so the container needs no
+network access to a driver host and always uses the reviewed, patched
+driver version shipped with the image.
+
+The `+/ofbiz/lib-extra+` volume remains available for operators who need
+to add a *different* database driver, for example for MySQL or Oracle,
+whose datasource definitions are retained in
+`+framework/entity/config/entityengine.xml+` but whose drivers are not
+bundled. `+/ofbiz/lib-extra+` takes precedence over the bundled
+libraries on the classpath, so a PostgreSQL driver left in that volume
+would silently shadow, and possibly downgrade, the bundled one. The
+container therefore refuses to start if it finds a `+postgresql-*.jar+`
+in `+/ofbiz/lib-extra+`; delete it from the volume to start
+successfully.
 
 === Examples of running the OFBiz container
 

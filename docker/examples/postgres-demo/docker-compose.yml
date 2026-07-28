@@ -49,3 +49,11 @@ services:
       OFBIZ_DATA_LOAD: demo
       OFBIZ_HOST: example.internal
       OFBIZ_CONTENT_URL_PREFIX: https://example.internal:8443
+      # The managed datasources verify the database server's certificate by default
+      # (OFBIZ_POSTGRES_SSLMODE=verify-full). The stock postgres image used by the db service above
+      # has no TLS listener and no certificate, so this example - a single-host demo on a private
+      # compose network - turns verification off explicitly. Only the dev profile accepts a
+      # non-verifying mode; a deployment that sets OFBIZ_PROFILE=prod is refused unless it uses
+      # verify-ca or verify-full, and should point OFBIZ_POSTGRES_SSLROOTCERT at its provider's CA
+      # bundle. Never copy this line into a deployment that reaches a database over a network.
+      OFBIZ_POSTGRES_SSLMODE: disable
