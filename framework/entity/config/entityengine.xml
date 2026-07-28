@@ -51,6 +51,33 @@ access. For a detailed description see the core/docs/entityconfig.html file.
 
     <debug-xa-resources value="false" />  <!-- see https://issues.apache.org/jira/browse/OFBIZ-4282 for more -->
     
+    <!-- Deployment profiles (see DOCKER.adoc):
+         * Development profile (this committed file, zero configuration): the default, default-no-eca and test
+           delegators all resolve to the embedded H2 datasources, so a bare checkout boots with no environment
+           variables and no secrets configured. This is the profile every local build and every gradlew task uses.
+         * Deployed profile (managed PostgreSQL): the container entry point renders
+           docker/templates/postgres-entityengine.xml into /ofbiz/config/entityengine.xml (which precedes
+           ofbiz.jar on the classpath) when OFBIZ_POSTGRES_HOST is set, repointing the default and
+           default-no-eca group-maps to localpostgres / localpostgresolap / localpostgrestenant. Connection
+           parameters come from OFBIZ_POSTGRES_HOST, OFBIZ_POSTGRES_PORT (default 5432),
+           OFBIZ_POSTGRES_{OFBIZ,OLAP,TENANT}_{DB,USER,PASSWORD}, OFBIZ_DB_POOL_MIN (default 2) and
+           OFBIZ_DB_POOL_MAX (default 250).
+         The test delegator ALWAYS stays on embedded H2 in both profiles so gradlew testIntegration is unaffected.
+         H2, MySQL and Oracle datasource definitions remain fully intact and selectable. -->
+    <!-- Objective 5 (multi-instance cache coherence): distributed-cache-clear-enabled is configuration-driven.
+         It stays "false" here so an unconfigured checkout keeps today's single-node cache behaviour exactly. Set
+         OFBIZ_DISTRIBUTED_CACHE_CLEAR=true and the container entry point rewrites this attribute to "true"
+         in /ofbiz/config/entityengine.xml, which is all that is required to make a fleet behind a load balancer
+         cache-coherent.
+         This reuses OFBiz's existing plumbing unchanged - the DistributedCacheClear interface
+         (framework/entity/src/main/java/org/apache/ofbiz/entity/util/DistributedCacheClear.java) and its default
+         implementation org.apache.ofbiz.entityext.cache.EntityCacheServices (the distributed-cache-clear-class-name
+         default), running as the "system" user (the distributed-cache-clear-user-login-id default). No additional
+         attribute is needed here.
+         CAVEAT: the JMS transport that carries the invalidation messages - the <jms-service name="serviceMessenger">
+         topic in framework/service/config/serviceengine.xml - is COMMENTED OUT by default, so an operator must
+         configure a JMS provider for cross-instance invalidation to actually propagate. Enabling the flag without
+         that configuration is safe: EntityCacheServices logs a warning and returns, and never fails a boot. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
@@ -393,12 +420,50 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/MySqlDataSource" isolation-level="Serializable"/> -->
     </datasource>
 
+    <!-- Objective 1 (managed PostgreSQL datasource): the three localpostgres* definitions below are the
+         deployed-profile datasources. The Entity Engine configuration parser reads these attributes LITERALLY;
+         there is no property-placeholder or system-property expansion anywhere in this file, so externalization
+         is performed by the container entry point, which renders
+         docker/templates/postgres-entityengine.xml into /ofbiz/config/entityengine.xml (first on the runtime
+         classpath) when OFBIZ_POSTGRES_HOST is set. Contract with that template, committed value on the left and
+         template token on the right:
+           jdbc-uri            //127.0.0.1:5432/ofbiz  ..  jdbc:postgresql://@HOST@:@PORT@/@OFBIZ_DB@
+                               host from OFBIZ_POSTGRES_HOST, port from OFBIZ_POSTGRES_PORT (default 5432)
+           jdbc-username       ofbiz   ..  @OFBIZ_USERNAME@  from OFBIZ_POSTGRES_OFBIZ_USER
+           jdbc-password       ofbiz   ..  @OFBIZ_PASSWORD@  from OFBIZ_POSTGRES_OFBIZ_PASSWORD
+           pool-minsize        2       ..  @DB_POOL_MIN@     from OFBIZ_DB_POOL_MIN
+           pool-maxsize        250     ..  @DB_POOL_MAX@     from OFBIZ_DB_POOL_MAX
+           check-on-start      false   ..  rendered true in init mode, false in run mode, from OFBIZ_SCHEMA_INIT
+           add-missing-on-start  false ..  rendered the same way from OFBIZ_SCHEMA_INIT
+           cache clear flag    false   ..  rendered from OFBIZ_DISTRIBUTED_CACHE_CLEAR
+           test delegator      localh2 datasources  ..  must ALSO stay on H2 in the template, so that
+                               gradlew loadAll and gradlew testIntegration keep running against embedded H2
+         The explicit :5432 port below is the PostgreSQL default, so this is a functional no op for anyone already
+         using these definitions, while giving the deployed profile an unambiguous host:port substitution shape.
+         The olap and tenant datasources follow the same pattern with the @OLAP_*@ and @TENANT_*@ tokens
+         (from OFBIZ_POSTGRES_OLAP_* and OFBIZ_POSTGRES_TENANT_*).
+         NOT A SECRET: the ofbiz / ofbiz username and password below are the long standing placeholders for a
+         locally installed PostgreSQL used during development. They are deliberately retained (jdbc-username is a
+         required attribute in entity-config.xsd, so removing it would make this file schema invalid) and they are
+         never used by the deployed profile, where the template tokens above supply real credentials from the
+         environment. Runtime secrets are externalized in framework/security/config/security.properties and in
+         framework/start/src/main/resources/org/apache/ofbiz/base/start/start.properties, not here. -->
+    <!-- Objective 4 (gated schema initialization): this managed-RDBMS run mode issues NO startup DDL, so a
+         serving instance needs no DDL privileges and a whole fleet can scale out without racing on schema
+         changes. Schema changes are applied exclusively by a separate one-shot init execution driven by
+         OFBIZ_SCHEMA_INIT=true, for which the container entry point renders both flags below as true; that
+         execution applies the entity-model DDL additively (it creates missing tables and columns, never drops)
+         and then exits without serving traffic. Note that check-on-start defaults to TRUE when the attribute is
+         absent (Datasource.java), so the literal false below is required in order to disable it.
+         Schema truth remains the entity model - no Flyway, Liquibase, schema-version table or hand-written DDL.
+         The embedded localh2* datasources deliberately keep both flags enabled for zero-configuration local
+         development, which is safe because H2 is single-node dev/test only and never part of a fleet. -->
     <datasource name="localpostgres"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             schema-name="public"
             field-type-name="postgres"
-            check-on-start="true"
-            add-missing-on-start="true"
+            check-on-start="false"
+            add-missing-on-start="false"
             use-fk-initially-deferred="false"
             alias-view-columns="false"
             join-style="ansi"
@@ -417,7 +482,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://127.0.0.1/ofbiz"
+                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbiz"
                 jdbc-username="ofbiz"
                 jdbc-password="ofbiz"
                 isolation-level="ReadCommitted"
@@ -432,12 +497,18 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <!-- <jndi-jdbc jndi-server-name="default" jndi-name="jdbc/localpostgres" isolation-level="ReadCommitted"/> --> <!-- JRun4 Style JNDI name -->
         <!-- <tyrex-dataSource dataSource-name="localpostgres" isolation-level="ReadCommitted"/> -->
     </datasource>
+    <!-- Objective 4 (gated schema initialization): this managed-RDBMS run mode issues NO startup DDL, so a
+         serving instance needs no DDL privileges. Schema changes are applied exclusively by a separate one-shot
+         init execution driven by OFBIZ_SCHEMA_INIT=true, for which the container entry point renders both flags
+         below as true. Note that check-on-start defaults to TRUE when the attribute is absent
+         (Datasource.java), so the literal false below is required in order to disable it.
+         Schema truth remains the entity model - no Flyway, Liquibase, schema-version table or hand-written DDL. -->
     <datasource name="localpostgresolap"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             schema-name="public"
             field-type-name="postgres"
-            check-on-start="true"
-            add-missing-on-start="true"
+            check-on-start="false"
+            add-missing-on-start="false"
             use-fk-initially-deferred="false"
             alias-view-columns="false"
             join-style="ansi"
@@ -454,7 +525,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://127.0.0.1/ofbizolap"
+                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbizolap"
                 jdbc-username="ofbiz"
                 jdbc-password="ofbiz"
                 isolation-level="ReadCommitted"
@@ -469,12 +540,18 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <!-- <jndi-jdbc jndi-server-name="default" jndi-name="jdbc/localpostgres" isolation-level="ReadCommitted"/> --> <!-- JRun4 Style JNDI name -->
         <!-- <tyrex-dataSource dataSource-name="localpostgres" isolation-level="ReadCommitted"/> -->
     </datasource>
+    <!-- Objective 4 (gated schema initialization): this managed-RDBMS run mode issues NO startup DDL, so a
+         serving instance needs no DDL privileges. Schema changes are applied exclusively by a separate one-shot
+         init execution driven by OFBIZ_SCHEMA_INIT=true, for which the container entry point renders both flags
+         below as true. Note that check-on-start defaults to TRUE when the attribute is absent
+         (Datasource.java), so the literal false below is required in order to disable it.
+         Schema truth remains the entity model - no Flyway, Liquibase, schema-version table or hand-written DDL. -->
     <datasource name="localpostgrestenant"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             schema-name="public"
             field-type-name="postgres"
-            check-on-start="true"
-            add-missing-on-start="true"
+            check-on-start="false"
+            add-missing-on-start="false"
             use-fk-initially-deferred="false"
             alias-view-columns="false"
             join-style="ansi"
@@ -491,7 +568,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://127.0.0.1/ofbiztenant"
+                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbiztenant"
                 jdbc-username="ofbiz"
                 jdbc-password="ofbiz"
                 isolation-level="ReadCommitted"
