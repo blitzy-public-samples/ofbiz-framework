@@ -36,6 +36,18 @@ under the License.
         <!-- configuration of the Tomcat service that hosts OFBiz applications: the service has one engine and one or more connectors -->
         <property name="default-server" value="engine">
             <property name="default-host" value="0.0.0.0"/>
+            <!-- Objective 5 (multi-instance / load-balancer readiness): per-instance sticky-session route id.
+                 Configurable via OFBIZ_JVM_ROUTE; the container entry point rewrites this value in place.
+                 Default "jvm1" preserves the pre-refactor single-instance behaviour exactly. Behind a load balancer
+                 that uses sticky sessions, give every instance a DISTINCT value so the balancer can route a session
+                 back to the instance that owns it. Note: an empty value is treated as absent by ContainerConfig,
+                 which means no JVM route is set at all - so keep a concrete default here.
+                 Entry-point contract: all three Objective 5 properties in this engine block are kept as single
+                 self-contained lines with the attributes in the order name then value and no extra whitespace inside
+                 the tag, so each can be rewritten with a simple s|<property name="NAME" value="[^"]*"/>|...|
+                 substitution. Beware: an identical "jvm-route" declaration also exists in the
+                 "catalina-container-test" container further down this file - substitute only THIS (first)
+                 occurrence so the test container is left untouched. -->
             <property name="jvm-route" value="jvm1"/>
             <property name="access-log-pattern">
                 <property-value>%h %l %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"</property-value>
@@ -63,7 +75,24 @@ under the License.
                 <property name="mcast-drop-time" value="3000"/>
             </property>
             -->
-            <!-- <property name="ssl-accelerator-port" value="8443"/> -->
+            <!-- Objective 5 (TLS-terminating proxy / load balancer): when a load balancer or reverse proxy
+                 terminates TLS and forwards plain HTTP to this instance, set this to the LOCAL port on which this
+                 instance receives that forwarded traffic - i.e. the port of the plain http-connector below, 8080
+                 out of the box. SslAcceleratorValve compares this value against request.getLocalPort() and, on a
+                 match, marks the request secure so OFBiz builds correct absolute https:// URLs. It is therefore
+                 NOT the public HTTPS port of the load balancer.
+                 Configurable via OFBIZ_SSL_ACCELERATOR_PORT; the container entry point rewrites this value in
+                 place and must inject a plain integer, because CatalinaContainer parses it with Integer.valueOf
+                 and an unparseable value aborts startup.
+                 Left EMPTY by default, which ContainerConfig treats as absent, so the SslAcceleratorValve is NOT
+                 installed - exactly the same behaviour as the previously commented-out declaration. -->
+            <property name="ssl-accelerator-port" value=""/>
+            <!-- Objective 5: share the session cookie across sub-domains (installs CrossSubdomainSessionValve).
+                 Configurable via OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS; the container entry point rewrites this value
+                 in place. Default "false" preserves current behaviour; only the literal "true" (case-insensitive)
+                 enables it. Enable this only when instances are served under multiple sub-domains of one parent
+                 domain and a shared session cookie is genuinely required - the valve calls request.getSession(true),
+                 so it forces a session to exist for every request. -->
             <property name="enable-cross-subdomain-sessions" value="false"/>
         </property>
         <property name="ajp-connector" value="connector">
