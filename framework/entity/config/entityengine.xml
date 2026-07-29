@@ -82,39 +82,19 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          two attributes of this file when no managed database is configured. Only these two delegators are ever
          rewritten, and after rendering the entry point re-reads the file and refuses to start unless both carry
          the requested value and "test" carries no such attribute at all.
-         The flag is NECESSARY BUT NOT SUFFICIENT for a cache-coherent fleet: it only makes the delegator
-         construct the cache clear plumbing, which then needs a message transport that this repository does not
-         ship. Do not treat the flag alone as fleet coherence.
-         This reuses OFBiz's existing plumbing unchanged - the DistributedCacheClear interface
-         (framework/entity/src/main/java/org/apache/ofbiz/entity/util/DistributedCacheClear.java) and its default
-         implementation org.apache.ofbiz.entityext.cache.EntityCacheServices (the distributed-cache-clear-class-name
-         default), running as the "system" user (the distributed-cache-clear-user-login-id default). No additional
-         attribute is needed here.
-         A MESSAGE TRANSPORT IS A HARD PREREQUISITE. All five distributedClear* sender services in
-         framework/entityext/servicedef/services.xml are declared engine="jms" location="serviceMessenger". The jms
-         ENGINE itself is registered (the engine name="jms" element of framework/service/config/serviceengine.xml)
-         and the JMS 1.1 API is already on the classpath (geronimo-jms_1.1_spec in dependencies.gradle), so what is
-         missing is only the jms-service definition of that name - COMMENTED OUT in serviceengine.xml by default,
-         where it expects jms/TopicConnectionFactory and jms/OFBTopic - together with a provider client library,
-         which OFBiz deliberately does not bundle. A stock checkout therefore has no transport for those five
-         services at all. Enabling the flag without one is NOT harmless, as running it proves:
-         ServiceEngine.getJmsServiceByName returns null, JmsServiceEngine.run dereferences it, and
-         ServiceDispatcher.runAsync marks the CALLER'S transaction rollback only before converting the failure into
-         a GenericServiceException, so the entity write that triggered the invalidation is lost. EntityCacheServices
-         only logs the failure afterwards and cannot prevent it, and a configured but unreachable broker fails the
-         same way. The damage is not confined to cache maintenance: a seed data load aborts, and web login stops
-         working, because the Visit and Visitor writes it performs are rolled back with it.
-         docker/docker-entrypoint.sh therefore pre-flights the transport whenever the flag is true: it refuses to
-         start under OFBIZ_PROFILE=prod and warns loudly under dev. DOCKER.adoc carries the operator procedure for
-         supplying an active serviceMessenger topic plus a javax.jms client library, and the two-instance
-         invalidation check to run before relying on it.
-         NOTED, NOT FIXED: activating a broker is deliberately out of scope here. It would mean editing
-         framework/service/config/serviceengine.xml, which AAP section 0.2.1 lists under "Reference-only models
-         (inspected, not modified)", and the entityext service definitions in
-         framework/entityext/servicedef/services.xml, which are not in scope at all; provisioning message
-         infrastructure is excluded by section 0.2.2; and sections 0.3.2 and 0.6.1 confine this objective to making
-         "the per-delegator enablement flag configuration-driven" rather than introducing a new mechanism. Both
-         files are therefore left exactly as upstream ships them. -->
+         Enabling the flag reuses OFBiz's existing plumbing unchanged: the delegator constructs the
+         DistributedCacheClear implementation org.apache.ofbiz.entityext.cache.EntityCacheServices (the
+         distributed-cache-clear-class-name default), running as the "system" user (the
+         distributed-cache-clear-user-login-id default), so no further attribute is needed here.
+         A MESSAGE TRANSPORT IS A HARD PREREQUISITE, so the flag alone is NOT a cache-coherent fleet. The
+         distributedClear* sender services in framework/entityext/servicedef/services.xml are declared
+         engine="jms" location="serviceMessenger", and a stock checkout has no jms-service of that name: the
+         definition is commented out in framework/service/config/serviceengine.xml and no JMS provider client
+         library is bundled. Enabling the flag without a working transport is not harmless - the failed
+         invalidation marks the caller's transaction rollback only, so the entity write that triggered it is lost.
+         docker/docker-entrypoint.sh therefore pre-flights the transport whenever the flag is true, refusing to
+         start under OFBIZ_PROFILE=prod and warning under dev, and DOCKER.adoc carries the operator procedure for
+         supplying the topic and the client library. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
@@ -498,9 +478,10 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          throws GenericEntityConfException naming the missing property rather than silently authenticating with a
          password that is public in the source tree. Supply the password through the deployed profile (the template
          token above), or, for a local PostgreSQL, add the jdbc-password.localpostgres* property to a
-         passwords.properties that is not committed. Runtime secrets live in
-         framework/security/config/security.properties and in
-         framework/start/src/main/resources/org/apache/ofbiz/base/start/start.properties, never here.
+         passwords.properties that is not committed. The application's other secrets are configured through
+         framework/security/config/security.properties and
+         framework/start/src/main/resources/org/apache/ofbiz/base/start/start.properties, which ship without a
+         value and are injected from the environment at deploy time; none of them belongs here.
          TLS REQUIRED AND VERIFIED, NOT PREFERRED: every managed URI below pins sslmode=verify-full, which
          encrypts the connection, checks that the server certificate chains to a trusted root AND checks that the
          hostname matches that certificate. This is deliberate: the pgJDBC default and sslmode=prefer silently fall

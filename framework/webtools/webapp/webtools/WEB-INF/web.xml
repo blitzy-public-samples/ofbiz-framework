@@ -69,12 +69,15 @@ under the License.
          and therefore outside the OFBTOOLS/WEBTOOLS base permission. No <load-on-startup>, so the
          servlet initialises lazily and cannot affect boot ordering.
 
-         NOTE - the probe paths are deliberately NOT in the ControlFilter allowedPaths list below.
-         ControlFilter matches that list with startsWith, so a bare /health entry would grant
-         anonymous passage to every /health* spelling and not only to the two probes; and because the
-         filter above short-circuits the chain, ControlFilter never sees a probe request in the first
-         place, so no allow-list entry is needed. Liveness always returns 200; readiness returns 200
-         when the delegator/database is reachable and 503 when it is not. See DOCKER.adoc. -->
+         NOTE - the probe paths are deliberately NOT in the ControlFilter allowedPaths list below,
+         because ControlFilter matches that list with startsWith and a bare /health entry would grant
+         anonymous passage to every /health* spelling, not only to the two probes. None is needed
+         either: the filter above short-circuits the chain before ControlFilter ever sees a probe.
+
+         Liveness always returns 200. Readiness returns 200 only when the entity engine counts
+         SequenceValueItem and the count is non-zero, and 503 otherwise - an unreachable datasource, a
+         count that did not complete, and a reachable datasource whose schema is still empty are all
+         "not ready". See the health and readiness endpoint section of DOCKER.adoc. -->
     <filter>
         <display-name>HealthCheckFilter</display-name>
         <filter-name>HealthCheckFilter</filter-name>

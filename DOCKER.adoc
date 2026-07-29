@@ -292,23 +292,28 @@ saturated probe path rather than an unhealthy database.
 `+/webtools/health/live+` is not bounded, performs no database access
 and can be polled at any rate.
 
-A readiness failure is logged once per minute per instance as the stable
-event code `+HEALTH-READINESS-DATASOURCE-UNAVAILABLE+`, with the
-occurrences suppressed in between counted into the next line. That code
-covers a datasource that cannot be reached and, equally, one that is
-reachable but whose `+SequenceValueItem+` is empty - the schema was
-never initialised or the seed data was never loaded, which is worth
-checking first when a freshly initialised fleet never becomes ready. A
-shed probe is reported the same way, under its own stable code
-`+HEALTH-READINESS-PROBE-SHED+`, with its own once-a-minute limit and
-its own suppressed count, so neither code can silence the other or
-report the other's occurrences as its own. Keeping the two codes apart
-is what lets an alert distinguish a database that needs attention from a
-probe path that only needs its check interval widened. The underlying
-entity-engine or JDBC detail is written only when verbose diagnostics
-are enabled, and it is sanitised first: connection URIs and credential
-assignments are redacted, control characters are folded away and the
-text is truncated. Alert on the event codes rather than on log wording.
+A readiness failure is logged once per minute per instance as a stable
+event code, with the occurrences suppressed in between counted into the
+next line. There are three codes, each with its own once-a-minute limit
+and its own suppressed count, so no code can silence another or report
+another's occurrences as its own:
+
+* `+HEALTH-READINESS-DATASOURCE-UNAVAILABLE+` - the datasource could not
+  be reached, or the count did not complete. The database needs
+  attention;
+* `+HEALTH-READINESS-SCHEMA-EMPTY+` - the datasource answered but
+  `+SequenceValueItem+` is empty, so the schema was never initialised or
+  the seed data was never loaded. Check this first when a freshly
+  initialised fleet never becomes ready;
+* `+HEALTH-READINESS-PROBE-SHED+` - the concurrency bound above was
+  reached. The probe path only needs its check interval widened.
+
+Keeping the three apart is what lets an alert tell those three
+situations apart without parsing any log text. Nothing else is written:
+no exception, no stack trace, no SQL, no connection string and no row
+count reaches the log from a probe, at any log level, verbose
+diagnostics included. Alert on the event codes rather than on log
+wording.
 
 ===== Running more than one instance
 

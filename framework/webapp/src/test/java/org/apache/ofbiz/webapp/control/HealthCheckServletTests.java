@@ -19,7 +19,6 @@
 package org.apache.ofbiz.webapp.control;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -41,12 +40,13 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.regex.Pattern;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.entity.Delegator;
 import org.apache.ofbiz.entity.GenericEntityException;
-import org.apache.ofbiz.entity.util.EntityQuery;
+import org.apache.ofbiz.entity.datasource.GenericHelper;
+import org.apache.ofbiz.entity.model.ModelEntity;
+import org.apache.ofbiz.entity.model.ModelReader;
 import org.apache.ofbiz.webapp.WebAppUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -73,9 +73,9 @@ import jakarta.servlet.http.HttpServletResponseWrapper;
  * JSON document, content type, character encoding, cache header and, where it matters, the
  * {@code Allow} header. Mocks only supply the collaborators; no assertion is ever made against a
  * value a mock was configured to return. The static seams the class depends on,
- * {@link WebAppUtil#getDelegator}, {@link EntityQuery#use} and {@link Debug}, are replaced with
- * scoped static mocks inside try-with-resources so nothing leaks into another test, and no test
- * opens a database connection, reads configuration or touches the network.
+ * {@link WebAppUtil#getDelegator} and {@link Debug}, are replaced with scoped static mocks inside
+ * try-with-resources so nothing leaks into another test, and no test opens a database connection,
+ * reads configuration or touches the network.
  *
  * <p>Three properties are pinned here that the probes' exposure depends on, since they answer
  * anonymous callers: the request body is never read, no method other than GET or HEAD is served,
@@ -109,7 +109,10 @@ public final class HealthCheckServletTests {
     /** The stable event code a readiness failure must log, in place of any internal detail. */
     private static final String EVENT_CODE = "HEALTH-READINESS-DATASOURCE-UNAVAILABLE";
 
-    /** The stable event code a shed probe must log - deliberately not the one above. */
+    /** The stable event code a reachable but unpopulated schema must log - deliberately its own. */
+    private static final String EMPTY_EVENT_CODE = "HEALTH-READINESS-SCHEMA-EMPTY";
+
+    /** The stable event code a shed probe must log - deliberately not one of the two above. */
     private static final String SHED_EVENT_CODE = "HEALTH-READINESS-PROBE-SHED";
 
     /** The framework-tier entity the readiness probe counts, mirroring {@code CommonServices.ping}. */
@@ -117,7 +120,7 @@ public final class HealthCheckServletTests {
 
     /** Field types that are safe to share between the servlet and the filter instance unguarded. */
     private static final List<Class<?>> IMMUTABLE_FIELD_TYPES =
-            List.of(String.class, Pattern.class, java.util.Set.class, int.class, long.class);
+            List.of(String.class, java.util.Set.class, int.class, long.class);
 
     private HttpServletRequest request;
     private HttpServletResponse response;
@@ -156,14 +159,12 @@ public final class HealthCheckServletTests {
     public void liveGetReturnsUpWithoutAnyDatabaseAccess() throws Exception {
         givenProbePath("/health/live", null);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             servlet.service(request, response);
 
             // Liveness must stay answerable while the datasource is unavailable, so neither the
             // delegator lookup nor the entity engine may be reached at all.
             webAppUtil.verifyNoInteractions();
-            entityQuery.verifyNoInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_OK, LIVE_UP);
     }
@@ -239,37 +240,56 @@ public final class HealthCheckServletTests {
     public void readyGetReturnsUpWhenTheEntityCountIsNotZero() throws Exception {
         givenProbePath("/health/ready", null);
         Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenReturn(42L);
+        ModelReader modelReader = mock(ModelReader.class);
+        ModelEntity modelEntity = mock(ModelEntity.class);
+        GenericHelper helper = mock(GenericHelper.class);
+        when(delegator.getModelReader()).thenReturn(modelReader);
+        when(modelReader.getModelEntity(READINESS_ENTITY)).thenReturn(modelEntity);
+        when(delegator.getEntityHelper(READINESS_ENTITY)).thenReturn(helper);
+        when(helper.findCountByCondition(delegator, modelEntity, null, null, null)).thenReturn(42L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
 
             servlet.service(request, response);
 
             // The probe must count the framework-tier entity the ping service uses, nothing else.
-            verify(query).from(READINESS_ENTITY);
-            verify(query).queryCount();
+            verify(modelReader).getModelEntity(READINESS_ENTITY);
+            verify(delegator).getEntityHelper(READINESS_ENTITY);
+            verify(helper).findCountByCondition(delegator, modelEntity, null, null, null);
         }
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+    }
+
+    @Test
+    public void theCountBypassesTheDelegatorsOwnCountApiSoNoLowerLayerLogsTheThrowable() throws Exception {
+        // EntityQuery.queryCount() routes through GenericDelegator.findCountByCondition, whose catch
+        // block logs the throwable and its stack trace before rethrowing and marks the transaction for
+        // rollback. That happens below this class and therefore outside its rate limit, so an anonymous
+        // poller could turn one datasource outage into an unbounded stream of stack traces. The probe
+        // must reach GenericDAO through the entity helper instead, which logs no throwable at all.
+        givenProbePath("/health/ready", null);
+        Delegator delegator = delegatorFailingWith(new GenericEntityException("datasource unreachable"));
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+
+            servlet.service(request, response);
+
+            verify(delegator, never()).findCountByCondition(anyString(), any(), any(), any());
+            verify(delegator, never()).findCountByCondition(anyString(), any(), any(), any(), any());
+        }
+        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
 
     @Test
     public void readyHeadReturnsUpWhenTheEntityCountIsNotZero() throws Exception {
         givenProbePath("/health", "/ready");
         givenMethod("HEAD");
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenReturn(1L);
+        Delegator delegator = delegatorCountingRows(1L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
 
             servlet.service(request, response);
         }
@@ -279,15 +299,10 @@ public final class HealthCheckServletTests {
     @Test
     public void readyGetReturnsDownWhenTheReachableDatabaseReportsZeroRows() throws Exception {
         givenProbePath("/health/ready", null);
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenReturn(0L);
+        Delegator delegator = delegatorCountingRows(0L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
 
             servlet.service(request, response);
         }
@@ -299,15 +314,10 @@ public final class HealthCheckServletTests {
     @Test
     public void readyGetReturnsDownOnGenericEntityException() throws Exception {
         givenProbePath("/health/ready", null);
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenThrow(new GenericEntityException("datasource unreachable"));
+        Delegator delegator = delegatorFailingWith(new GenericEntityException("datasource unreachable"));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
 
             servlet.service(request, response);
         }
@@ -317,16 +327,11 @@ public final class HealthCheckServletTests {
     @Test
     public void readyGetReturnsDownOnUncheckedQueryFailure() throws Exception {
         givenProbePath("/health/ready", null);
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
         // An exhausted connection pool surfaces as an unchecked exception; it must not escape.
-        when(query.queryCount()).thenThrow(new IllegalStateException("pool exhausted"));
+        Delegator delegator = delegatorFailingWith(new IllegalStateException("pool exhausted"));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
 
             servlet.service(request, response);
         }
@@ -337,15 +342,15 @@ public final class HealthCheckServletTests {
     public void readyGetReturnsDownWhenTheDelegatorLookupYieldsNull() throws Exception {
         givenProbePath("/health/ready", null);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             // WebAppUtil.getDelegator only logs and returns null when the delegator factory fails.
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
 
             servlet.service(request, response);
 
-            // No query may be attempted against a null delegator.
-            entityQuery.verifyNoInteractions();
+            // No count may be attempted against a null delegator.
+            webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext));
+            webAppUtil.verifyNoMoreInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
@@ -380,19 +385,14 @@ public final class HealthCheckServletTests {
     @Test
     public void readinessIsAnsweredWithoutTheServletHavingBeenInitialised() throws Exception {
         givenProbePath("/health/ready", null);
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenReturn(1L);
+        Delegator delegator = delegatorCountingRows(1L);
         // No init(ServletConfig): this is the state the instance is in when the container drives it
         // through the filter lifecycle, where there is no ServletConfig at all. Readiness must still
         // work, which is exactly why the context comes from the request.
         HealthCheckServlet uninitialised = new HealthCheckServlet();
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
 
             uninitialised.service(request, response);
         }
@@ -425,12 +425,10 @@ public final class HealthCheckServletTests {
     public void unmappedSubPathReturnsNotFoundAndNeverTouchesTheDatabase(String servletPath, String pathInfo) throws Exception {
         givenProbePath(servletPath, pathInfo);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             servlet.service(request, response);
 
             webAppUtil.verifyNoInteractions();
-            entityQuery.verifyNoInteractions();
         }
         // A mis-configured probe must fail visibly instead of reporting a false 200, which would
         // keep a broken instance in a load-balancer target group.
@@ -449,13 +447,11 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/live", null);
         givenMethod(method);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             servlet.service(request, response);
 
             // A refused method must cost nothing at all: no delegator, no query, no body read.
             webAppUtil.verifyNoInteractions();
-            entityQuery.verifyNoInteractions();
         }
         // The method comparison is case-sensitive on purpose: HTTP method tokens are case-sensitive,
         // so "get" is not GET and must not be served either.
@@ -470,12 +466,10 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         givenMethod("POST");
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             servlet.service(request, response);
 
             webAppUtil.verifyNoInteractions();
-            entityQuery.verifyNoInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_METHOD_NOT_ALLOWED, UNKNOWN);
     }
@@ -502,12 +496,10 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         when(request.getContentLengthLong()).thenReturn(contentLength);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             servlet.service(request, response);
 
             webAppUtil.verifyNoInteractions();
-            entityQuery.verifyNoInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_BAD_REQUEST, UNKNOWN);
     }
@@ -564,15 +556,10 @@ public final class HealthCheckServletTests {
         givenMethod(method);
         // The readiness row has to be given a reachable datasource, otherwise it would reach the real
         // entity engine, which both slows the test down and makes it write to the shared log.
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenReturn(42L);
+        Delegator delegator = delegatorCountingRows(42L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
 
             servlet.service(request, response);
         }
@@ -617,15 +604,10 @@ public final class HealthCheckServletTests {
         // cannot quietly reintroduce the coupling. Readiness is the path under test because it is the
         // one that legitimately reaches the entity engine, so it is where the coupling would appear.
         givenProbePath("/health/ready", null);
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenReturn(42L);
+        Delegator delegator = delegatorCountingRows(42L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
 
             servlet.service(request, response);
         }
@@ -650,15 +632,10 @@ public final class HealthCheckServletTests {
     public void aProbePathIsAnsweredByTheFilterWithoutContinuingTheChain(String probePath) throws Exception {
         givenProbePath(probePath, null);
         FilterChain chain = mock(FilterChain.class);
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenReturn(1L);
+        Delegator delegator = delegatorCountingRows(1L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
 
             servlet.doFilter(request, response, chain);
         }
@@ -737,30 +714,26 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void theVerboseDiagnosticRedactsConnectionStringsCredentialsAndNewlines() throws Exception {
+    public void noDriverDetailIsWrittenEvenWithVerboseDiagnosticsSwitchedOn() throws Exception {
+        // Sanitising a driver message is not enough: an entity-engine or JDBC message also names the
+        // entity, the datasource, the pooled driver class and the failing SQL, and none of that may be
+        // reachable through an anonymous caller's ability to trigger log writes. So the probe writes
+        // no diagnostic at all, at any level - not a redacted one.
         String leak = "connect failed\nat org.postgresql.Driver.connect\r\n"
                 + "url=jdbc:postgresql://db.internal:5432/ofbizmaindb?sslmode=verify-full password=Sup3rS3cret";
 
         List<String> verboseLines = readinessFailureLog(new GenericEntityException(leak), true);
 
-        assertEquals(1, verboseLines.size(), "exactly one verbose diagnostic");
-        String diagnostic = verboseLines.get(0);
-        assertTrue(diagnostic.startsWith(EVENT_CODE), "the diagnostic must stay keyed to the event code");
-        assertFalse(diagnostic.contains("jdbc:"), "a connection URI must not reach the log: " + diagnostic);
-        assertFalse(diagnostic.contains("Sup3rS3cret"), "a credential must not reach the log: " + diagnostic);
-        assertFalse(Pattern.compile("\\p{Cntrl}").matcher(diagnostic).find(),
-                "a control character would let a crafted message forge a log record: " + diagnostic);
-        assertTrue(diagnostic.contains("***"), "the redacted fragments must be visibly replaced: " + diagnostic);
+        assertEquals(List.of(), verboseLines, "no diagnostic may be written under verbose diagnostics either");
     }
 
     @Test
-    public void aPathologicallyLongDiagnosticIsTruncated() throws Exception {
+    public void aPathologicallyLongDriverMessageCannotInflateTheLogAtAll() throws Exception {
         List<String> verboseLines = readinessFailureLog(new GenericEntityException("x".repeat(5000)), true);
 
-        // The cap is the servlet's, not this test's: the assertion only pins that a 5000-character
-        // driver message cannot be used to inflate the log.
-        assertTrue(verboseLines.get(0).length() < 1000, "verbose diagnostic length " + verboseLines.get(0).length());
-        assertTrue(verboseLines.get(0).endsWith("..."), "a truncated diagnostic must say so: " + verboseLines.get(0));
+        // Nothing derived from the driver message is written, so a 5000-character message cannot be
+        // used to inflate the log whether or not a length cap is in place.
+        assertEquals(List.of(), verboseLines, "a driver message must not reach the log in any form");
     }
 
     @Test
@@ -852,6 +825,9 @@ public final class HealthCheckServletTests {
             assertEquals(SHED_EVENT_CODE, lines.getAllValues().get(0), "the first line of a saturated probe path");
             assertTrue(lines.getAllValues().get(1).startsWith(SHED_EVENT_CODE + " (2 further occurrences suppressed)"),
                     "the second line must account for what was suppressed: " + lines.getAllValues().get(1));
+            // Shedding happens before the datasource is touched, so not one of the four probes may
+            // have asked for a delegator.
+            webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext), never());
         }
 
         assertEquals(0L, readinessLogCounter("READINESS_LOG_SUPPRESSED").get(),
@@ -861,24 +837,84 @@ public final class HealthCheckServletTests {
     @Test
     public void aSuccessfulReadinessProbeLogsNothingAtAll() throws Exception {
         givenProbePath("/health/ready", null);
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenReturn(7L);
+        Delegator delegator = delegatorCountingRows(7L);
 
         try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
+            // Verbose diagnostics on is the demanding case: the row count of a healthy schema is
+            // itself information about the deployment and must not be written per anonymous probe.
+            debug.when(Debug::verboseOn).thenReturn(true);
 
             servlet.service(request, response);
 
             debug.verify(() -> Debug.logWarning(anyString(), anyString()), never());
             debug.verify(() -> Debug.logError(anyString(), anyString()), never());
             debug.verify(() -> Debug.logInfo(anyString(), anyString()), never());
+            debug.verify(() -> Debug.logVerbose(anyString(), anyString()), never());
         }
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+    }
+
+    @Test
+    public void anUnpopulatedSchemaIsReportedUnderItsOwnCode() throws Exception {
+        givenProbePath("/health/ready", null);
+        Delegator delegator = delegatorCountingRows(0L);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+
+            servlet.service(request, response);
+
+            ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
+            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
+            // The operator action differs from an outage - finish the schema-init execution and its
+            // data load - so the condition may not be reported as a datasource failure.
+            assertEquals(EMPTY_EVENT_CODE, lines.getValue(), "a reachable but empty schema needs its own code");
+        }
+        assertEquals(0L, readinessLogCounter("READINESS_LOG_LAST_AT").get(),
+                "an empty schema must not consume the rate-limit window an unavailable datasource needs");
+        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
+    }
+
+    @Test
+    public void anAlreadyPublishedDelegatorIsUsedWithoutAskingTheFactoryForOne() throws Exception {
+        // ContextFilter.init() publishes the delegator on the ServletContext when the webapp is
+        // deployed. Observing it there is what keeps a probe from asking DelegatorFactory for a
+        // delegator, which is the call that logs a throwable and its stack when construction fails and
+        // then re-logs it on every later call because the failed Future is cached.
+        givenProbePath("/health/ready", null);
+        Delegator delegator = delegatorCountingRows(3L);
+        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+            servlet.service(request, response);
+
+            webAppUtil.verifyNoInteractions();
+        }
+        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+    }
+
+    @Test
+    public void aFailingDelegatorLookupIsNotRetriedOnEveryProbe() throws Exception {
+        // DelegatorFactory caches the failed Future, so a construction that failed can never succeed
+        // later in the same JVM - but it re-throws and re-logs on every call. Retrying it per probe
+        // would let an anonymous poller amplify one broken datasource definition into an unbounded
+        // stream of stack traces from below this class, outside its rate limit.
+        givenProbePath("/health/ready", null);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
+
+            for (int probe = 0; probe < 25; probe++) {
+                servlet.service(request, response);
+            }
+
+            webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext), times(1));
+        }
+        // Every one of the 25 probes still got the same fail-closed verdict.
+        verify(response, times(25)).setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
     }
 
     /*
@@ -927,6 +963,41 @@ public final class HealthCheckServletTests {
     }
 
     /**
+     * Builds a delegator whose {@code SequenceValueItem} count answers with the given number of rows.
+     *
+     * <p>The stubbed path is the one the probe takes: the entity helper that owns the entity's group,
+     * reached through the model reader. That path ends in {@code GenericDAO.selectCountByCondition}
+     * without {@code GenericDelegator} logging the throwable and its stack first, which is why the
+     * probe uses it in place of {@code EntityQuery}.
+     */
+    private static Delegator delegatorCountingRows(long rows) throws Exception {
+        Delegator delegator = mock(Delegator.class);
+        ModelEntity modelEntity = givenReadinessModel(delegator);
+        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, null, null, null))
+                .thenReturn(rows);
+        return delegator;
+    }
+
+    /** Builds a delegator whose {@code SequenceValueItem} count fails with the given throwable. */
+    private static Delegator delegatorFailingWith(Throwable failure) throws Exception {
+        Delegator delegator = mock(Delegator.class);
+        ModelEntity modelEntity = givenReadinessModel(delegator);
+        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, null, null, null))
+                .thenThrow(failure);
+        return delegator;
+    }
+
+    /** Wires the model reader and the entity helper the readiness count resolves through. */
+    private static ModelEntity givenReadinessModel(Delegator delegator) throws Exception {
+        ModelReader modelReader = mock(ModelReader.class);
+        ModelEntity modelEntity = mock(ModelEntity.class);
+        when(delegator.getModelReader()).thenReturn(modelReader);
+        when(modelReader.getModelEntity(READINESS_ENTITY)).thenReturn(modelEntity);
+        when(delegator.getEntityHelper(READINESS_ENTITY)).thenReturn(mock(GenericHelper.class));
+        return modelEntity;
+    }
+
+    /**
      * Drives one failing readiness probe with {@link Debug} statically mocked and returns the lines
      * the servlet wrote: the normal-level lines when {@code verbose} is false, the verbose
      * diagnostics when it is true. Returning the captured lines rather than asserting inside keeps
@@ -934,23 +1005,21 @@ public final class HealthCheckServletTests {
      */
     private List<String> readinessFailureLog(Throwable failure, boolean verbose) throws Exception {
         givenProbePath("/health/ready", null);
-        Delegator delegator = mock(Delegator.class);
-        EntityQuery query = mock(EntityQuery.class);
-        when(query.from(READINESS_ENTITY)).thenReturn(query);
-        when(query.queryCount()).thenThrow(failure);
+        Delegator delegator = delegatorFailingWith(failure);
 
         try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<EntityQuery> entityQuery = mockStatic(EntityQuery.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-            entityQuery.when(() -> EntityQuery.use(delegator)).thenReturn(query);
             debug.when(Debug::verboseOn).thenReturn(verbose);
 
             servlet.service(request, response);
 
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
             if (verbose) {
-                debug.verify(() -> Debug.logVerbose(lines.capture(), anyString()));
+                // Nothing derived from the failure may be written at any level, verbose included, so
+                // there is nothing to capture and the returned list is expected to stay empty.
+                debug.verify(() -> Debug.logVerbose(anyString(), anyString()), never());
+                debug.verify(() -> Debug.logVerbose(any(Throwable.class), anyString()), never());
             } else {
                 debug.verify(() -> Debug.logWarning(lines.capture(), anyString()));
                 // A readiness failure is reported as the stable event code only. Logging the
@@ -973,11 +1042,17 @@ public final class HealthCheckServletTests {
     private static void resetReadinessLogState() throws Exception {
         readinessLogCounter("READINESS_LOG_LAST_AT").set(0L);
         readinessLogCounter("READINESS_LOG_SUPPRESSED").set(0L);
+        // Each event code owns its window and its suppressed count, so each has to be reset: an empty
+        // schema must not leak into the next test any more than an unavailable datasource may.
+        readinessLogCounter("READINESS_EMPTY_LOG_LAST_AT").set(0L);
+        readinessLogCounter("READINESS_EMPTY_LOG_SUPPRESSED").set(0L);
         // The shedding bookkeeping is separate state, and a saturated probe path must not leak from
         // one test into the next any more than a suppressed log line may.
         readinessLogCounter("READINESS_SHED_LOG_LAST_AT").set(0L);
         readinessLogCounter("READINESS_SHED_LOG_SUPPRESSED").set(0L);
         readinessLogCounter("READINESS_PROBES_IN_FLIGHT").set(0L);
+        // The delegator lookup is throttled through its own window, which a fresh JVM has open.
+        readinessLogCounter("DELEGATOR_LOOKUP_LAST_AT").set(0L);
     }
 
     /** Moves the rate-limit window into the past, which is what the passage of time does at runtime. */
