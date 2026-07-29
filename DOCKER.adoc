@@ -253,7 +253,14 @@ served:
 * only these two exact paths are anonymous. No `+/health+` prefix is
   reserved, so `+/webtools/health+`, `+/webtools/health/live/+`,
   `+/webtools/healthz/live+` and every other spelling is redirected to
-  the login-protected controller exactly as any other unknown path is;
+  the login-protected controller exactly as any other unknown path is.
+  Copy the two paths above into the target group verbatim: a mistyped one
+  answers `+302+` to `+/webtools/control/main+` and, being an ordinary
+  controller request, mints a `+JSESSIONID+`, so polling it continuously
+  accumulates one session per probe per balancer node until they expire.
+  Configure the check to expect `+200+` and the JSON body rather than
+  merely "not `+5xx+`", so that a typo fails the check instead of passing
+  it on a redirect;
 * a probe creates no session and therefore returns no `+JSESSIONID+`
   cookie, which is what keeps continuous polling free of server-side
   state;
@@ -275,28 +282,46 @@ to a probe path, and keep the Tomcat connector's `+maxPostSize+`,
 already refused to read. The connector attributes are listed, commented
 out at their default values, in `+framework/catalina/ofbiz-component.xml+`.
 
-At most two readiness probes query the datasource at the same time. A
-third concurrent probe is answered `+503+` straight away, without the
-datasource being touched at all. A readiness query borrows a pooled
-connection, and when the pool is exhausted that borrow blocks for up to
-the datasource's `+pool-sleeptime+` - 300000 milliseconds in the
-committed definitions - so an unbounded endpoint would park one
-container thread per probe for five minutes and starve real traffic
-while answering nothing but "are you ready". Two concurrent probes are
-enough for a load balancer and a human at once. The bound is worth
-knowing when configuring the check: keep the health-check interval
-longer than a probe takes to answer, and avoid pointing several target
-groups or an extra external monitor at `+/webtools/health/ready+` on
-the same instance, or an occasional `+503+` will be reporting a
-saturated probe path rather than an unhealthy database.
-`+/webtools/health/live+` is not bounded, performs no database access
-and can be polled at any rate.
+Exactly one readiness check queries the datasource at a time, and its
+verdict is shared with every probe that overlaps it. A verdict answers
+further probes on its own for one second after the datasource was
+observed, and a probe that arrives while a check is running repeats the
+verdict that check has not refuted yet, for up to five seconds. Probe
+concurrency therefore never manufactures a `+DOWN+` answer for a
+healthy datasource: an overlapping probe is answered from the check in
+flight or from the verdict that still stands, never from a rejection.
+
+Sharing the verdict is also what keeps the endpoint bounded. A readiness
+query borrows a pooled connection, and when the pool is exhausted that
+borrow blocks for up to the datasource's `+pool-sleeptime+` - 300000
+milliseconds in the committed definitions - so an endpoint that let
+every probe query would park one container thread per probe for five
+minutes and starve real traffic while answering nothing but "are you
+ready". Only the probe running the check holds a connection; the rest
+hold none. A probe with no verdict to fall back on - a JVM's first
+probes, or a probe arriving once a check has been running longer than
+the five seconds above - waits at most 500 milliseconds for the check in
+flight, and answers `+503+` under `+HEALTH-READINESS-PROBE-SHED+` only
+if that wait yields nothing either.
+
+Readiness stays a live signal despite the sharing, because a verdict is
+never honoured for longer than the second above: a datasource that fails
+is reported not ready, and one that recovers is reported ready again,
+within about a second and with no restart. Configuring the check
+therefore needs no special care - point as many target groups and
+external monitors at `+/webtools/health/ready+` as the deployment needs,
+at any interval, since they share one check instead of competing for the
+datasource. `+/webtools/health/live+` performs no database access at all
+and can likewise be polled at any rate.
 
 A readiness failure is logged once per minute per instance as a stable
 event code, with the occurrences suppressed in between counted into the
-next line. There are three codes, each with its own once-a-minute limit
-and its own suppressed count, so no code can silence another or report
-another's occurrences as its own:
+next line. A count still outstanding when the condition stops is written
+out by the next readiness probe once that minute has elapsed, so the
+tail of a burst - and a burst that ends inside its own minute - is
+accounted for rather than lost. There are three codes, each with its own
+once-a-minute limit and its own suppressed count, so no code can silence
+another or report another's occurrences as its own:
 
 * `+HEALTH-READINESS-DATASOURCE-UNAVAILABLE+` - the datasource could not
   be reached, or the count did not complete. The database needs
@@ -305,8 +330,12 @@ another's occurrences as its own:
   `+SequenceValueItem+` is empty, so the schema was never initialised or
   the seed data was never loaded. Check this first when a freshly
   initialised fleet never becomes ready;
-* `+HEALTH-READINESS-PROBE-SHED+` - the concurrency bound above was
-  reached. The probe path only needs its check interval widened.
+* `+HEALTH-READINESS-PROBE-SHED+` - no verdict could be obtained at all:
+  a readiness check was running, it published nothing within the wait
+  above, and no earlier verdict was recent enough to repeat. It reports
+  a check that is not completing, so look at what the datasource is
+  doing rather than at the probe configuration. A probe that repeats a
+  verdict is a normal answer and logs nothing.
 
 Keeping the three apart is what lets an alert tell those three
 situations apart without parsing any log text. Nothing else is written:

@@ -38,7 +38,9 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.ofbiz.base.util.Debug;
@@ -112,7 +114,11 @@ public final class HealthCheckServletTests {
     /** The stable event code a reachable but unpopulated schema must log - deliberately its own. */
     private static final String EMPTY_EVENT_CODE = "HEALTH-READINESS-SCHEMA-EMPTY";
 
-    /** The stable event code a shed probe must log - deliberately not one of the two above. */
+    /**
+     * The stable event code a probe must log when it could obtain no verdict at all - deliberately not
+     * one of the two above, because the operator action differs and because a probe that repeats an
+     * established verdict is a normal answer that logs nothing.
+     */
     private static final String SHED_EVENT_CODE = "HEALTH-READINESS-PROBE-SHED";
 
     /** The framework-tier entity the readiness probe counts, mirroring {@code CommonServices.ping}. */
@@ -397,6 +403,175 @@ public final class HealthCheckServletTests {
             uninitialised.service(request, response);
         }
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+    }
+
+    /*
+     * ---------------------------------------------------------------------------------------------
+     * Readiness under overlapping probes: one check, one shared verdict, never a manufactured DOWN
+     *
+     * A load-balancer target group is probed by one node per Availability Zone, so several readiness
+     * probes are in flight at once in normal operation. Answering a healthy instance "not ready"
+     * because probes overlapped drains it, which is why every case below asserts that concurrency
+     * alone can never change a verdict, and that a verdict is only ever one the datasource produced.
+     * ---------------------------------------------------------------------------------------------
+     */
+
+    @Test
+    public void overlappingProbesOnAHealthyDatasourceAreAllAnsweredUp() throws Exception {
+        // The regression this class exists to prevent: with an admission bound, the third and every
+        // later simultaneous probe was answered 503 DOWN while the datasource was demonstrably up.
+        Delegator delegator = mock(Delegator.class);
+        ModelEntity modelEntity = givenReadinessModel(delegator);
+        AtomicLong datasourceChecks = new AtomicLong(0L);
+        // A real count is not instantaneous, and it is the time a check spends in flight that the
+        // overlapping probes have to survive, so the stub occupies that time deliberately.
+        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, null, null, null))
+                .thenAnswer(invocation -> {
+                    datasourceChecks.incrementAndGet();
+                    Thread.sleep(150L);
+                    return 7L;
+                });
+        // Published on the ServletContext, the way ContextFilter.init() publishes it, so the probe
+        // needs no static seam and this test can run genuinely concurrent threads.
+        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+        int probes = 16;
+        List<HttpServletResponse> responses = new ArrayList<>();
+        List<StringWriter> bodies = new ArrayList<>();
+        List<Thread> threads = new ArrayList<>();
+        CyclicBarrier released = new CyclicBarrier(probes);
+
+        for (int probe = 0; probe < probes; probe++) {
+            HttpServletRequest concurrentRequest = mock(HttpServletRequest.class);
+            when(concurrentRequest.getMethod()).thenReturn("GET");
+            when(concurrentRequest.getServletPath()).thenReturn("/health/ready");
+            when(concurrentRequest.getServletContext()).thenReturn(servletContext);
+            HttpServletResponse concurrentResponse = mock(HttpServletResponse.class);
+            StringWriter body = new StringWriter();
+            when(concurrentResponse.getWriter()).thenReturn(new PrintWriter(body));
+            responses.add(concurrentResponse);
+            bodies.add(body);
+            threads.add(new Thread(() -> {
+                try {
+                    released.await();
+                    servlet.service(concurrentRequest, concurrentResponse);
+                } catch (Exception failure) {
+                    throw new IllegalStateException(failure);
+                }
+            }));
+        }
+        for (Thread thread : threads) {
+            thread.start();
+        }
+        for (Thread thread : threads) {
+            thread.join();
+        }
+
+        for (int probe = 0; probe < probes; probe++) {
+            verify(responses.get(probe)).setStatus(HttpServletResponse.SC_OK);
+            verify(responses.get(probe), never()).setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+            assertEquals(READY_UP, bodies.get(probe).toString(), "probe " + probe + " answered from a shared verdict");
+        }
+        // One check answered all sixteen: what is bounded is what the datasource sees, not what a probe
+        // is allowed to be told, which is the difference between coalescing and an admission bound.
+        assertEquals(1L, datasourceChecks.get(), "overlapping probes must share one check, not queue or shed");
+    }
+
+    @Test
+    public void anEstablishedVerdictAnswersAnOverlappingProbeWithoutTouchingTheDatasource() throws Exception {
+        givenProbePath("/health/ready", null);
+        // What a burst lands on: a verdict another probe established a few hundred milliseconds ago.
+        givenEstablishedVerdict(true, 200L);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            servlet.service(request, response);
+
+            webAppUtil.verifyNoInteractions();
+            // Not even the published-delegator lookup runs: the verdict is the whole answer.
+            verify(servletContext, never()).getAttribute(anyString());
+            debug.verify(() -> Debug.logWarning(anyString(), anyString()), never());
+        }
+        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+    }
+
+    @Test
+    public void anEstablishedNotReadyVerdictIsRepeatedWithoutRepeatingItsLogLine() throws Exception {
+        givenProbePath("/health/ready", null);
+        // A failing check publishes its verdict too, so an outage is reported to every overlapping
+        // probe - without the check, and without the event code being written once per probe.
+        givenEstablishedVerdict(false, 200L);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            servlet.service(request, response);
+
+            webAppUtil.verifyNoInteractions();
+            debug.verify(() -> Debug.logWarning(anyString(), anyString()), never());
+        }
+        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
+    }
+
+    @Test
+    public void aVerdictThatHasAgedOutIsMeasuredAgainSoReadinessStaysALiveSignal() throws Exception {
+        givenProbePath("/health/ready", null);
+        Delegator delegator = mock(Delegator.class);
+        ModelEntity modelEntity = givenReadinessModel(delegator);
+        GenericHelper helper = delegator.getEntityHelper(READINESS_ENTITY);
+        when(helper.findCountByCondition(delegator, modelEntity, null, null, null)).thenReturn(7L);
+        // Older than the window a verdict answers on its own, which is the state every probe of a
+        // normal load-balancer polling interval arrives in.
+        givenEstablishedVerdict(true, readinessConstant("READINESS_VERDICT_FRESH_MILLIS") + 50L);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+
+            servlet.service(request, response);
+
+            // The datasource was measured again rather than the stale verdict being repeated: a
+            // verdict that could outlive its window would stop readiness being a live signal.
+            verify(helper).findCountByCondition(delegator, modelEntity, null, null, null);
+        }
+        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+    }
+
+    @Test
+    public void aProbeArrivingWhileACheckRunsRepeatsTheVerdictThatHasNotBeenRefuted() throws Exception {
+        givenProbePath("/health/ready", null);
+        // A check is in flight and this probe's verdict is older than the fresh window but still inside
+        // the grace window, so it stands: the datasource has not said otherwise.
+        givenReadinessCheckRunning();
+        givenEstablishedVerdict(true, readinessConstant("READINESS_VERDICT_FRESH_MILLIS") + 100L);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            servlet.service(request, response);
+
+            // No second query while one is already running, and no event code: this is a normal answer.
+            webAppUtil.verifyNoInteractions();
+            verify(servletContext, never()).getAttribute(anyString());
+            debug.verify(() -> Debug.logWarning(anyString(), anyString()), never());
+        }
+        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+    }
+
+    @Test
+    public void aVerdictOlderThanTheGraceWindowIsNotRepeated() throws Exception {
+        givenProbePath("/health/ready", null);
+        // Nothing recent enough to stand on: a check that has been running longer than the grace
+        // window has to be reported as not ready rather than answered with a verdict from before it.
+        givenReadinessCheckRunning();
+        givenEstablishedVerdict(true, readinessConstant("READINESS_VERDICT_GRACE_MILLIS") + 1000L);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            servlet.service(request, response);
+
+            ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
+            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
+            assertEquals(SHED_EVENT_CODE, lines.getValue(), "a verdict too old to repeat needs its own code");
+            webAppUtil.verifyNoInteractions();
+        }
+        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
 
     /*
@@ -745,6 +920,9 @@ public final class HealthCheckServletTests {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
 
             for (int probe = 0; probe < 25; probe++) {
+                // Ageing the verdict out between probes is what the polling interval does at runtime,
+                // so all 25 probes genuinely run a check and each one has a failure to report.
+                givenNoEstablishedVerdict();
                 servlet.service(request, response);
             }
 
@@ -764,11 +942,17 @@ public final class HealthCheckServletTests {
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
 
+            // Three probe rounds of an outage - the verdict ages out between them, as the polling
+            // interval makes it - so three checks fail and two of them are held back by the limit.
+            givenNoEstablishedVerdict();
             servlet.service(request, response);
+            givenNoEstablishedVerdict();
             servlet.service(request, response);
+            givenNoEstablishedVerdict();
             servlet.service(request, response);
             // Re-opening the window is what a later probe does once the rate-limit interval elapses.
             reopenReadinessLogWindow();
+            givenNoEstablishedVerdict();
             servlet.service(request, response);
 
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
@@ -780,10 +964,76 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void aShedProbeIsReportedUnderItsOwnCodeAndNeverTouchesTheDatasource() throws Exception {
+    public void suppressedOccurrencesAreWrittenOutOnceTheConditionStops() throws Exception {
+        // The counter used to be carried only by the NEXT occurrence of the same code, so everything
+        // suppressed after the last one - the tail of every burst, and the whole of a burst that ends
+        // inside its own window - never reached the log at all. A later probe has to write it out.
         givenProbePath("/health/ready", null);
-        // Saturating the bound is what a burst of overlapping probes does to a real instance.
-        saturateReadinessProbeBound();
+        Delegator healthy = delegatorCountingRows(7L);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
+
+            givenNoEstablishedVerdict();
+            servlet.service(request, response);
+            givenNoEstablishedVerdict();
+            servlet.service(request, response);
+            givenNoEstablishedVerdict();
+            servlet.service(request, response);
+            assertEquals(2L, readinessLogCounter("READINESS_LOG_SUPPRESSED").get(),
+                    "two of the three failures must have been held back by the rate limit");
+
+            // The datasource recovers, so no further occurrence will ever carry the count. The next
+            // probe still has to account for it once the window has elapsed. The recovered delegator
+            // arrives on the ServletContext, which is where a deployed webapp publishes it.
+            when(servletContext.getAttribute("delegator")).thenReturn(healthy);
+            reopenReadinessLogWindow();
+            givenNoEstablishedVerdict();
+            servlet.service(request, response);
+
+            ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
+            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(2));
+            assertEquals(EVENT_CODE, lines.getAllValues().get(0), "the first line of the outage");
+            assertEquals(EVENT_CODE + " (2 further occurrences suppressed)", lines.getAllValues().get(1),
+                    "the recovered probe must write out what the limit held back");
+        }
+        assertEquals(0L, readinessLogCounter("READINESS_LOG_SUPPRESSED").get(),
+                "the flushed count must be cleared, so it can never be reported twice");
+        // The probe that flushed it is a healthy one and answered as such.
+        verify(response).setStatus(HttpServletResponse.SC_OK);
+    }
+
+    @Test
+    public void aHealthyProbeWithNothingOutstandingStillWritesNothing() throws Exception {
+        // The flush above may not turn continuous polling into log traffic: with no suppressed
+        // occurrences there is nothing to write, and a healthy probe has to stay completely silent.
+        givenProbePath("/health/ready", null);
+        Delegator delegator = delegatorCountingRows(7L);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+
+            for (int probe = 0; probe < 25; probe++) {
+                givenNoEstablishedVerdict();
+                servlet.service(request, response);
+            }
+
+            debug.verify(() -> Debug.logWarning(anyString(), anyString()), never());
+            debug.verify(() -> Debug.logError(anyString(), anyString()), never());
+        }
+        assertEquals(0L, readinessLogCounter("READINESS_LOG_LAST_AT").get(),
+                "a healthy probe must not consume a rate-limit window either");
+    }
+
+    @Test
+    public void aProbeWithNoVerdictToObtainIsReportedUnderItsOwnCodeAndNeverTouchesTheDatasource() throws Exception {
+        givenProbePath("/health/ready", null);
+        // The one state that answers not-ready without the datasource having said so: a check has been
+        // running longer than the bounded wait and there is no verdict at all to stand on.
+        givenReadinessCheckRunning();
+        givenNoEstablishedVerdict();
 
         try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
@@ -792,46 +1042,46 @@ public final class HealthCheckServletTests {
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
             debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
             assertEquals(SHED_EVENT_CODE, lines.getValue(),
-                    "a shed probe must be reported under its own code, so an alert can tell a saturated"
-                            + " probe path from a database that needs attention");
+                    "a probe that could obtain no verdict must be reported under its own code, so an alert"
+                            + " can tell a check that is not completing from a database that needs attention");
             debug.verify(() -> Debug.logError(anyString(), anyString()), never());
-            // Shedding happens before the datasource is touched, which is the whole point of the bound.
+            // A second query is never issued while one is already running - that is what bounds what
+            // the datasource sees, and it is why waiting costs no pooled connection.
             webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext), never());
+            verify(servletContext, never()).getAttribute(anyString());
         }
 
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
         assertEquals(0L, readinessLogCounter("READINESS_LOG_SUPPRESSED").get(),
-                "a shed probe must not be counted as a datasource failure");
+                "a probe without a verdict must not be counted as a datasource failure");
         assertEquals(0L, readinessLogCounter("READINESS_LOG_LAST_AT").get(),
-                "a shed probe must not consume the rate-limit window an unavailable datasource needs");
+                "it must not consume the rate-limit window an unavailable datasource needs");
     }
 
     @Test
-    public void suppressedShedOccurrencesAreCountedIntoTheNextShedLine() throws Exception {
+    public void everyEventCodeKeepsItsOwnSuppressedCountAndItsOwnWindow() throws Exception {
         givenProbePath("/health/ready", null);
-        saturateReadinessProbeBound();
+        givenReadinessCheckRunning();
 
         try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            givenNoEstablishedVerdict();
             servlet.service(request, response);
-            servlet.service(request, response);
-            servlet.service(request, response);
-            // Re-opening the window is what a later probe does once the rate-limit interval elapses.
-            readinessLogCounter("READINESS_SHED_LOG_LAST_AT").set(0L);
+            givenNoEstablishedVerdict();
             servlet.service(request, response);
 
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
-            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(2));
-            assertEquals(SHED_EVENT_CODE, lines.getAllValues().get(0), "the first line of a saturated probe path");
-            assertTrue(lines.getAllValues().get(1).startsWith(SHED_EVENT_CODE + " (2 further occurrences suppressed)"),
-                    "the second line must account for what was suppressed: " + lines.getAllValues().get(1));
-            // Shedding happens before the datasource is touched, so not one of the four probes may
-            // have asked for a delegator.
+            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
+            assertEquals(SHED_EVENT_CODE, lines.getValue(), "the first line of a check that is not completing");
             webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext), never());
         }
 
+        assertEquals(1L, readinessLogCounter("READINESS_SHED_LOG_SUPPRESSED").get(),
+                "the second occurrence must be counted onto its own code");
         assertEquals(0L, readinessLogCounter("READINESS_LOG_SUPPRESSED").get(),
-                "suppressed sheds must never be reported on the datasource line as if they were failures");
+                "it must never be reported on the datasource line as if it were a failure");
+        assertEquals(0L, readinessLogCounter("READINESS_EMPTY_LOG_SUPPRESSED").get(),
+                "nor on the empty-schema line");
     }
 
     @Test
@@ -908,6 +1158,9 @@ public final class HealthCheckServletTests {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
 
             for (int probe = 0; probe < 25; probe++) {
+                // Ageing the verdict out between probes makes all 25 run a check of their own, so it
+                // is the lookup throttle being asserted here rather than the shared verdict.
+                givenNoEstablishedVerdict();
                 servlet.service(request, response);
             }
 
@@ -1046,11 +1299,15 @@ public final class HealthCheckServletTests {
         // schema must not leak into the next test any more than an unavailable datasource may.
         readinessLogCounter("READINESS_EMPTY_LOG_LAST_AT").set(0L);
         readinessLogCounter("READINESS_EMPTY_LOG_SUPPRESSED").set(0L);
-        // The shedding bookkeeping is separate state, and a saturated probe path must not leak from
-        // one test into the next any more than a suppressed log line may.
+        // The bookkeeping for a probe that could obtain no verdict is separate state, and it must not
+        // leak from one test into the next any more than a suppressed log line may.
         readinessLogCounter("READINESS_SHED_LOG_LAST_AT").set(0L);
         readinessLogCounter("READINESS_SHED_LOG_SUPPRESSED").set(0L);
-        readinessLogCounter("READINESS_PROBES_IN_FLIGHT").set(0L);
+        // The shared verdict is what lets overlapping probes answer without each querying the
+        // datasource. A fresh JVM holds none, and one test's verdict must not answer the next test's
+        // probe, so it is cleared along with the flag that says a check is running.
+        readinessLogCounter("READINESS_VERDICT").set(0L);
+        readinessLogCounter("READINESS_CHECK_RUNNING").set(0L);
         // The delegator lookup is throttled through its own window, which a fresh JVM has open.
         readinessLogCounter("DELEGATOR_LOOKUP_LAST_AT").set(0L);
     }
@@ -1061,13 +1318,36 @@ public final class HealthCheckServletTests {
     }
 
     /**
-     * Fills the servlet's concurrency bound, which is what makes the next probe shed. The bound is
-     * read from the servlet rather than restated here, so the helper stays correct if it is retuned.
+     * Puts the servlet in the state a first probe after start-up finds: no verdict has been
+     * established, so the probe has to measure the datasource itself.
      */
-    private static void saturateReadinessProbeBound() throws Exception {
-        Field bound = HealthCheckServlet.class.getDeclaredField("MAX_CONCURRENT_READINESS_PROBES");
-        bound.setAccessible(true);
-        readinessLogCounter("READINESS_PROBES_IN_FLIGHT").set(bound.getLong(null));
+    private static void givenNoEstablishedVerdict() throws Exception {
+        readinessLogCounter("READINESS_VERDICT").set(0L);
+    }
+
+    /**
+     * Publishes a verdict of the given readiness aged by the given number of milliseconds, which is
+     * what an earlier probe leaves behind. The encoding is the servlet's own: the sign carries the
+     * verdict and the magnitude carries the instant it was established.
+     */
+    private static void givenEstablishedVerdict(boolean ready, long ageMillis) throws Exception {
+        long establishedAt = System.currentTimeMillis() - ageMillis;
+        readinessLogCounter("READINESS_VERDICT").set(ready ? establishedAt : -establishedAt);
+    }
+
+    /** Marks a readiness check as already running, which is what an overlapping probe arrives into. */
+    private static void givenReadinessCheckRunning() throws Exception {
+        readinessLogCounter("READINESS_CHECK_RUNNING").set(1L);
+    }
+
+    /**
+     * Reads one of the servlet's tuning constants, so a test can express an age relative to the
+     * window it is exercising instead of restating a number the servlet owns.
+     */
+    private static long readinessConstant(String name) throws Exception {
+        Field field = HealthCheckServlet.class.getDeclaredField(name);
+        field.setAccessible(true);
+        return field.getLong(null);
     }
 
     private static AtomicLong readinessLogCounter(String name) throws Exception {
