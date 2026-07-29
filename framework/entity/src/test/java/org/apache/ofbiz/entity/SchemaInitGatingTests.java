@@ -22,6 +22,7 @@ import org.apache.ofbiz.entity.config.model.Datasource;
 import org.apache.ofbiz.entity.config.model.DelegatorElement;
 import org.apache.ofbiz.entity.config.model.EntityConfig;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -75,8 +76,17 @@ public final class SchemaInitGatingTests {
      *
      * <p>{@link EntityConfig} builds its singleton in a static initializer, so every reference to
      * it below is deliberately confined to a test-method body: referencing it from a field or
-     * static initializer of this class would load it before this method has run. Nothing else
-     * global is changed, which is why this class needs no teardown.</p>
+     * static initializer of this class would load it before this method has run.</p>
+     *
+     * <p>That system property is the <em>only</em> piece of global state this class touches, and it
+     * is deliberately left in place instead of being torn down, which is the established convention
+     * of this test tree. The value written is exactly {@code user.dir}, identical to the value
+     * {@code DelegatorUnitTests}, {@code FreeMarkerWorkerTests} and {@code ModelServiceTest} already
+     * set in the same shared test JVM; the only classes that need a <i>different</i> value,
+     * {@code SecurityUtilTest} and {@code AdminKeyConfigTests}, snapshot it and restore it
+     * themselves. Leaving it set can therefore neither contaminate a peer nor be depended upon by
+     * one, in any execution order. Nothing else global is changed: no file is written, no connection
+     * is opened and no engine state is mutated, so no other teardown is required either.</p>
      */
     @BeforeEach
     public void initialize() {
@@ -129,9 +139,34 @@ public final class SchemaInitGatingTests {
      * Every datasource in the committed configuration states both attributes explicitly, so the
      * absent-attribute defaults cannot be observed from it; the discriminating contrast below
      * proves what is observable, namely that these accessors report the declared literal.</p>
+     *
+     * <p>Because that analogue is the one result in this class a reader could over-credit, the
+     * boundary is published <i>into the test report</i> and not only into this Javadoc, which no
+     * Gradle or JUnit report renders. The {@link DisplayName} below travels into the JUnit XML
+     * {@code testcase} name and the HTML report's "Test" column — leaving the fully qualified class
+     * name in the {@code classname} attribute and the method name in the HTML "Method name" column
+     * untouched — and the two lines printed first travel into the XML {@code system-out} element and
+     * the HTML "Standard output" section. A reader of the report alone can therefore tell that this
+     * method pins a configuration analogue and is <b>not</b> the deployed-profile schema-init proof:
+     * that gate needs the entry point, a real database and a DDL audit, none of which a hermetic unit
+     * test can supply.</p>
      */
     @Test
+    @DisplayName("init-mode DDL flag pair via the localh2 ANALOGUE - not proof of the real"
+            + " OFBIZ_SCHEMA_INIT rendering, of PostgreSQL DDL application, or of one-shot init exit")
     public void initModeEnablesDdl() {
+        // Report-level disclosure of the coverage boundary, captured by Gradle into the JUnit XML
+        // system-out element and the HTML report's "Standard output" section for this class.
+        System.out.println("SchemaInitGatingTests.initModeEnablesDdl asserts an ANALOGUE of init mode:"
+                + " the committed localh2 datasource carries the same check-on-start=true and"
+                + " add-missing-on-start=true pair that the container entry point renders onto the"
+                + " localpostgres datasources when OFBIZ_SCHEMA_INIT=true.");
+        System.out.println("It is deliberately NOT proof of: docker-entrypoint.sh rendering"
+                + " docker/templates/postgres-entityengine.xml, DDL applied to a real PostgreSQL"
+                + " database, a one-shot init execution exiting without serving traffic, or a"
+                + " DDL-free serving fleet. Those are deployment-level gates; this class is a"
+                + " hermetic configuration assertion that opens no database connection.");
+
         Datasource initModeAnalogue = EntityConfig.getDatasource("localh2");
         assertNotNull(initModeAnalogue, "localh2 must stay declared: it is the init-mode flag-pair analogue"
                 + " and the zero-configuration development datasource");
@@ -200,6 +235,20 @@ public final class SchemaInitGatingTests {
      * the existing {@code DistributedCacheClear} plumbing. Leaving the committed value at
      * {@code false} is what keeps the change backward compatible, and it also avoids enabling a
      * sender that has no message transport in a stock checkout.</p>
+     *
+     * <p>What this method pins is the <i>resolved posture</i> — what the engine will actually do —
+     * rather than the presence of the attribute, and deliberately so: {@code DelegatorElement} reads
+     * the flag as {@code "true".equalsIgnoreCase(value)}, so an absent attribute also resolves to
+     * {@code false} and cannot be told apart here from the committed literal. The
+     * <i>explicitness</i> of that literal still matters, because it is the anchor the entry point
+     * rewrites, and it is pinned by the purpose-built sibling contract test:
+     * {@code EntityEngineConfigContractTests} (in {@code org.apache.ofbiz.entity.config.model},
+     * whose package-private DOM constructors it can reach) compares the raw attribute text of every
+     * delegator in the authoritative file, so deleting the attribute fails
+     * {@code delegatorCacheAndEcaAttributesAreExactlyTheCommittedLiterals}. Contrast
+     * {@code check-on-start}, whose absence flips the meaning to {@code true}: there the literal is
+     * load-bearing for the resolved posture itself, which is why
+     * {@link #managedRdbmsRunModeHasDdlDisabled()} catches its removal directly.</p>
      *
      * @throws GenericEntityConfException if the entity-engine configuration could not be loaded at
      *         all, which fails the test rather than being handled: a suite that cannot read the
