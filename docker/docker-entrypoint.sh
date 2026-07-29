@@ -112,6 +112,59 @@
 # framework/webapp/config/url.properties.
 # Default: <empty>
 #
+# OFBIZ_CONTENT_STORE_PROVIDER
+# Selects the storage backend for DataResource content and uploads, written to the
+# content.store.provider property of the content resource and read by
+# org.apache.ofbiz.content.data.store.ContentStoreFactory.
+# - database:   the committed default. The pre-existing DataResource database storage handles content
+#               exactly as before, no provider is constructed and the bundled S3 client stays inert.
+# - filesystem: the pre-existing content.upload.path.prefix location (runtime/uploads). Node-local, so
+#               it is NOT suitable for a load-balanced fleet unless that path is shared storage.
+# - s3:         an S3-compatible object store, configured from the OFBIZ_S3_* variables below. This is
+#               the option that makes an instance hold no durable local content.
+# Values: database, filesystem, s3
+# Default: database
+#
+# OFBIZ_S3_BUCKET
+# The bucket every content object is stored in, written to content.store.s3.bucket.
+# REQUIRED when OFBIZ_CONTENT_STORE_PROVIDER=s3, in every profile: a provider with no bucket cannot
+# store or serve a single object, and discovering that on the first upload rather than at start up
+# means the failure surfaces as broken content instead of a misconfigured container.
+# Default: <empty>
+#
+# OFBIZ_S3_REGION
+# The region identifier of the object store, written to content.store.s3.region.
+# REQUIRED when OFBIZ_CONTENT_STORE_PROVIDER=s3, for the same reason as the bucket. An S3-compatible
+# store that has no meaningful regions still needs a syntactically valid one - 'us-east-1' is the
+# value such stores conventionally accept.
+# Default: <empty>
+#
+# OFBIZ_S3_ENDPOINT
+# Endpoint override URL of an S3-compatible store, written to content.store.s3.endpoint and applied by
+# S3ContentStore as endpointOverride. Leave it empty for Amazon S3, where the SDK resolves the endpoint
+# from the region; set it to reach MinIO, Ceph or any other compatible store, usually together with
+# OFBIZ_S3_PATH_STYLE=true.
+# Default: <empty> (Amazon S3)
+#
+# OFBIZ_S3_ACCESS_KEY_ID
+# OFBIZ_S3_SECRET_ACCESS_KEY
+# Static object-store credentials, written to content.store.s3.access.key.id and
+# content.store.s3.secret.access.key. Supply BOTH or NEITHER. When both are omitted the provider falls
+# back to the AWS default credential provider chain, which is how a deployment should normally
+# authenticate: an IAM role attached to the task or instance issues short-lived credentials that never
+# exist as a configuration value at all. Supply them only for an S3-compatible store that has no such
+# mechanism.
+# Like the other secrets here they are written only into /ofbiz/config, with mode 0600, and are removed
+# from the environment before OFBiz is executed.
+# Default: <empty> (the AWS default credential provider chain)
+#
+# OFBIZ_S3_PATH_STYLE
+# Written to content.store.s3.path.style and applied by S3ContentStore as forcePathStyle. Path-style
+# addressing puts the bucket in the URL path rather than in the host name, which is what most
+# S3-compatible stores require because they have no wildcard DNS for virtual-host-style buckets.
+# Values: true, false
+# Default: false
+#
 # OFBIZ_ENABLE_AJP_PORT
 # Enable the AJP (Apache JServe Protocol) port to allow communication with OFBiz via a reverse proxy.
 # Enabled when this environment variable contains a non-empty value.
@@ -371,6 +424,27 @@ DB_POOL_MIN_DEFAULT=2
 DB_POOL_MAX_DEFAULT=250
 DB_POOL_SIZE_LIMIT=10000
 
+# Pristine content.properties of the Content component, and the generated override.
+#
+# Unlike start.properties this one is NOT package qualified: build.gradle adds every active component's
+# 'config' directory to the main resource roots, so content.properties sits at the root of ofbiz.jar and
+# a flat config/content.properties shadows it - the same mechanism that makes the rendered
+# security.properties and url.properties take effect. UtilProperties names the resource without its
+# extension, which is why ContentStoreFactory and S3ContentStore look it up as the 'content' resource.
+CONTENT_PROPERTIES_SOURCE="applications/content/config/content.properties"
+CONTENT_PROPERTIES_OVERRIDE="config/content.properties"
+
+# The storage backends ContentStoreFactory recognises, and the committed default. 'database' keeps the
+# pre-existing DataResource database storage, which is why it is both the default and the value an
+# unrecognised spelling must never be allowed to silently become.
+#
+# The authoritative operator documentation for these variables is the header contract above. Two
+# documentation gaps are RECORDED here rather than repaired, because neither file may be modified by
+# this change: DOCKER.adoc does not yet list the seven OFBIZ_CONTENT_STORE_PROVIDER / OFBIZ_S3_*
+# variables, and the compose files under docker/examples/ do not demonstrate them.
+CONTENT_STORE_PROVIDERS=(database filesystem s3)
+CONTENT_STORE_PROVIDER_DEFAULT='database'
+
 # Pristine start.properties shipped with the distribution, and the package qualified override that
 # Config.java resolves ahead of it through the class loader. The override MUST keep the
 # org/apache/ofbiz/base/start/ path: a flat config/start.properties does not shadow the shipped file.
@@ -409,6 +483,11 @@ MIN_DISTINCT_CHARACTERS=8
 # The length and entropy floor is only applied in the prod profile: a local development database with
 # a short password is not a production risk, and refusing it would push developers towards disabling
 # the check altogether.
+#
+# Only the MANAGED database passwords are governed here. framework/base/config/passwords.properties
+# still ships the embedded H2 development passwords in the source tree; that is RECORDED rather than
+# repaired, because those values only ever unlock a container-local H2 file that is not part of a
+# load-balanced fleet, and that file is not one this change is permitted to modify.
 DATABASE_PASSWORD_MIN_LENGTH=16
 RETIRED_DATABASE_PASSWORDS=(ofbiz ofbizolap ofbiztenant postgres password)
 
@@ -1124,6 +1203,15 @@ render_config_from() {
 # jar left behind in the persistent lib-extra volume by an older image would silently downgrade the
 # driver, so this fails closed rather than loading it in preference to the bundled one.
 guard_against_stale_jdbc_drivers() {
+  # OFBIZ_SKIP_DB_DRIVER_DOWNLOAD used to suppress that download. It is still accepted so that an
+  # existing deployment manifest keeps working unchanged, but it now has nothing to suppress, and
+  # saying so once is better than leaving an operator to conclude from silence that it still applies.
+  # The variable never holds a secret, so reporting that it was set is safe.
+  if [ -n "$OFBIZ_SKIP_DB_DRIVER_DOWNLOAD" ]; then
+    printf '%s\n' \
+      "NOTICE: OFBIZ_SKIP_DB_DRIVER_DOWNLOAD is obsolete and has no effect. The PostgreSQL JDBC driver is bundled with this distribution and no driver is downloaded at runtime."
+  fi
+
   local staleDrivers
   staleDrivers=$(find "$LIB_EXTRA_DIR" -maxdepth 1 -type f -name 'postgresql-*.jar' -printf '%f ' 2>/dev/null || true)
   if [ -n "$staleDrivers" ]; then
@@ -1296,6 +1384,16 @@ ofbiz_setup_env() {
   OFBIZ_DB_POOL_MIN=${OFBIZ_DB_POOL_MIN:-$DB_POOL_MIN_DEFAULT}
   OFBIZ_DB_POOL_MAX=${OFBIZ_DB_POOL_MAX:-$DB_POOL_MAX_DEFAULT}
 
+  # Objective 3 (object storage). Both are defaulted to the values applications/content/config/content.properties
+  # already carries, so an unconfigured container resolves exactly the committed configuration: content
+  # keeps being stored in the DataResource entity and the bundled S3 client is never constructed. The
+  # bucket, region, endpoint and the two credentials deliberately get NO default - they are only
+  # meaningful for the s3 provider, and a blank credential is what selects the AWS default credential
+  # provider chain. Validated in render_content_store_configuration, the only place they are used, so a
+  # typo cannot stop an unrelated container from starting.
+  OFBIZ_CONTENT_STORE_PROVIDER=${OFBIZ_CONTENT_STORE_PROVIDER:-$CONTENT_STORE_PROVIDER_DEFAULT}
+  OFBIZ_S3_PATH_STYLE=${OFBIZ_S3_PATH_STYLE:-false}
+
   OFBIZ_DISABLE_COMPONENTS=${OFBIZ_DISABLE_COMPONENTS-plugins/birt/ofbiz-component.xml}
 
   restore_trace
@@ -1356,6 +1454,17 @@ load_data() {
       if [ "${RESOLVED_SCHEMA_INIT:-false}" = "true" ]; then
         /ofbiz/bin/ofbiz --load-data readers=none
       fi
+      # RECORDED, NOT REPAIRED: OFBIZ_DATA_LOAD=none against a database that holds no seed data
+      # leaves this container's own load_admin_user step unable to succeed, because the admin user is
+      # granted the SUPER security group and UserLoginSecurityGroup has a foreign key onto
+      # SecurityGroup, which seed data populates. The insert therefore fails referential integrity and
+      # the container exits non-zero. This is pre-existing upstream behaviour and is unrelated to
+      # OFBIZ_SCHEMA_INIT: _main has always called load_admin_user unconditionally after load_data,
+      # with no OFBIZ_DATA_LOAD condition, so the same failure occurs on the embedded H2 default with
+      # no managed database and no schema-init flag involved. Repairing it would mean restructuring
+      # load_data/load_admin_user, which this change is explicitly not permitted to do. Operators
+      # running a one-shot schema-init job should therefore leave OFBIZ_DATA_LOAD at its 'seed'
+      # default, which applies the DDL and populates the seed data the admin user depends on.
       ;;
 
     seed)
@@ -1489,11 +1598,20 @@ disable_components() {
 # Render security.properties into /ofbiz/config with the runtime signing keys, and the allowed
 # host header, substituted.
 #
-# The login and JWT signing keys used to be generated into the source tree while the distribution
-# was being built, which baked a live signing key into the distribution tarball and into a layer of
-# every published image, where anyone able to pull the image could read it. The build no longer
-# generates them; they are resolved from the environment on each start and written only here, into a
-# mode 0600 file on a container-local volume.
+# The login and JWT signing keys are resolved from the environment on each start and written only
+# here, into a mode 0600 file on a container-local volume, so a deployment never depends on a key
+# that was fixed at build time.
+#
+# RECORDED, NOT REPAIRED: the build still has a generateSecretKeys task, and loadAll still depends on
+# it, so a live 64-character key is written into the source-tree framework/security/config copy
+# whenever that copy is blank - which is how the repository ships it. Anything built from a tree in
+# that state carries the key in the distribution jar and in an image layer. Neither build.gradle nor
+# the Dockerfile may be modified by this change, so the behaviour is recorded here instead of fixed.
+# Two consequences matter. Operators must treat the source-tree copy as build output and never commit
+# it. And the substitutions below are deliberately anchored with '=.*' rather than matching only a
+# blank value, so this render OVERWRITES a baked key instead of silently leaving it in place; because
+# /ofbiz/config precedes the distribution on the class path, the value written here is the one the
+# running system reads.
 #
 # The sed program is written to a mode 0600 temporary file rather than passed on the command line, so
 # a key never appears in the process table, and tracing is suspended for the whole function so it
@@ -1577,6 +1695,199 @@ render_admin_key_configuration() {
   discard_secret_temp_files
 
   require_rendered_declaration "$ADMIN_KEY_OVERRIDE" 'ofbiz\.admin\.key' "$START_PROPERTIES_SOURCE"
+
+  restore_trace
+}
+
+###############################################################################
+# Require a value that is usable as an S3 bucket name.
+#
+# The value lands in a properties value rather than in a URI, so the only hard requirement is that it
+# stays on a single line. It is nevertheless held to the characters a bucket name may contain and to
+# S3's own length limits, because a value no S3-compatible store could accept is a typo, and catching
+# it here yields an actionable startup error instead of an SdkException on the first content upload.
+# Uppercase letters are tolerated: Amazon rejects them, but some compatible stores accept them, and
+# this script must not be stricter about a name than the store it is pointed at.
+# $1 - variable name, $2 - value
+require_object_store_bucket() {
+  reject_unsafe_value "$1" "$2"
+  case "$2" in
+  '')
+    config_fatal "$1 must be set when OFBIZ_CONTENT_STORE_PROVIDER=s3. There is no default bucket."
+    ;;
+  *[!A-Za-z0-9.-]*)
+    config_fatal "$1 must contain only letters, digits, '.' or '-'. It contains a character that is not valid in an S3 bucket name."
+    ;;
+  esac
+  if [ "${#2}" -lt 3 ] || [ "${#2}" -gt 63 ]; then
+    config_fatal "$1 must be between 3 and 63 characters long, which is the range S3 bucket names are limited to."
+  fi
+}
+
+###############################################################################
+# Require a value that is usable as an object store region identifier.
+#
+# Region.of() accepts any non-empty string, so the SDK itself catches nothing here: a malformed value
+# surfaces later as a DNS or signing failure on the first content upload. Restricting the value to the
+# characters AWS and S3-compatible region identifiers are built from turns that into a startup error.
+# $1 - variable name, $2 - value
+require_object_store_region() {
+  reject_unsafe_value "$1" "$2"
+  case "$2" in
+  '')
+    config_fatal "$1 must be set when OFBIZ_CONTENT_STORE_PROVIDER=s3. There is no default region."
+    ;;
+  *[!A-Za-z0-9-]*)
+    config_fatal "$1 must contain only letters, digits or '-'. It contains a character that is not valid in a region identifier."
+    ;;
+  esac
+}
+
+###############################################################################
+# Require an object store endpoint override that is an absolute http or https URL.
+#
+# A blank value is the documented default and selects Amazon S3's own endpoint, so it is accepted and
+# simply carried through. A non-blank value reaches URI.create() inside S3ContentStore, which throws
+# IllegalArgumentException on a malformed value - and does so on the FIRST storage operation rather
+# than at start up, so a typo would present itself much later as a failed upload. Checking the scheme
+# here fails fast instead.
+#
+# In the prod profile a plaintext 'http://' endpoint is refused, because the request carrying the
+# object store credentials would then cross the network unencrypted; that is the same posture
+# require_postgres_ssl_parameters holds the managed database connection to. Plaintext stays available
+# in the dev profile so a developer's local MinIO on http://127.0.0.1:9000 still works.
+# $1 - variable name, $2 - value
+require_object_store_endpoint() {
+  reject_unsafe_value "$1" "$2"
+  case "$2" in
+  '')
+    return 0
+    ;;
+  *[[:space:]]*)
+    config_fatal "$1 must not contain whitespace. Supply an absolute endpoint URL such as https://s3.example.internal:9000."
+    ;;
+  https://?*) ;;
+  http://?*)
+    if [ "$OFBIZ_PROFILE" = 'prod' ]; then
+      config_fatal "$1 uses plaintext http. OFBIZ_PROFILE=prod requires an https endpoint so that the object store credentials are not sent in clear text."
+    fi
+    ;;
+  *)
+    config_fatal "$1 must be an absolute URL beginning with 'https://' or 'http://'."
+    ;;
+  esac
+}
+
+###############################################################################
+# Render the Content component's content.properties into /ofbiz/config with the storage backend and the
+# object store configuration substituted.
+#
+# This is the injection point for stateless content storage: with the s3 provider selected, uploaded
+# content and DataResource files live in an object store that every instance shares, so no instance
+# holds durable local state and any instance can be replaced.
+#
+# DEFAULT OFF, and deliberately by SKIPPING THE RENDER rather than by rendering the defaults. When the
+# effective configuration is the one the committed file already carries, /ofbiz/config gains no
+# content.properties at all and UtilProperties keeps reading the committed file byte for byte: content
+# stays in the DataResource entity exactly as before and the bundled S3 client is never constructed.
+# That is the same shape as render_embedded_cache_clear_configuration, for the same reason.
+#
+# The gate cannot mask a misconfiguration. It opens on ANY departure from the committed values, so a
+# misspelled provider, a non-boolean path style or a stray credential each open it and are then
+# validated and refused; only an exact match with the committed configuration closes it, and in that
+# case there is nothing left to validate.
+#
+# The two credentials are secrets, so the sed program is written to a mode 0600 temporary file instead
+# of being passed on the command line, where it would be visible in the process table, and tracing is
+# suspended for the whole function so they cannot reach the container log either.
+render_content_store_configuration() {
+  hide_secrets
+
+  local provider="$OFBIZ_CONTENT_STORE_PROVIDER"
+  local pathStyle="$OFBIZ_S3_PATH_STYLE"
+
+  if [ "$provider" = "$CONTENT_STORE_PROVIDER_DEFAULT" ] && [ "$pathStyle" = 'false' ] \
+    && [ -z "$OFBIZ_S3_BUCKET$OFBIZ_S3_REGION$OFBIZ_S3_ENDPOINT" ] \
+    && [ -z "$OFBIZ_S3_ACCESS_KEY_ID$OFBIZ_S3_SECRET_ACCESS_KEY" ]; then
+    restore_trace
+    return 0
+  fi
+
+  require_enum OFBIZ_CONTENT_STORE_PROVIDER "$provider" "${CONTENT_STORE_PROVIDERS[@]}"
+
+  # The status is checked explicitly, as it is in resolve_entity_engine_flags: require_boolean reports
+  # the normalised token on stdout, so it has to be read through a command substitution, and there its
+  # config_fatal exits only the subshell - leaving an empty value that getPropertyAsBoolean would
+  # silently read as false, quietly selecting virtual-host-style addressing.
+  pathStyle=$(require_boolean OFBIZ_S3_PATH_STYLE "$pathStyle") \
+    || config_fatal "OFBIZ_S3_PATH_STYLE must be a boolean: true or false."
+
+  # Only the s3 provider addresses an object store, so its bucket and region are required exactly
+  # there and in every profile. The database and filesystem providers ignore both keys. Refusing an
+  # incomplete s3 configuration here is what turns it into a startup error rather than a
+  # GeneralException raised by S3ContentStore on the first content operation.
+  if [ "$provider" = 's3' ]; then
+    require_object_store_bucket OFBIZ_S3_BUCKET "$OFBIZ_S3_BUCKET"
+    require_object_store_region OFBIZ_S3_REGION "$OFBIZ_S3_REGION"
+  fi
+  require_object_store_endpoint OFBIZ_S3_ENDPOINT "$OFBIZ_S3_ENDPOINT"
+
+  # Both credentials or neither. S3ContentStore builds static credentials only when BOTH values are
+  # non-empty and otherwise falls back to the AWS default credential provider chain without
+  # complaining, so a half-supplied pair would silently authenticate as whatever that chain resolves -
+  # or fail with an SDK credential error that says nothing about this container's configuration.
+  # Supplying neither is the documented way to ASK for the chain, which is why it stays valid.
+  reject_unsafe_value OFBIZ_S3_ACCESS_KEY_ID "$OFBIZ_S3_ACCESS_KEY_ID"
+  reject_unsafe_value OFBIZ_S3_SECRET_ACCESS_KEY "$OFBIZ_S3_SECRET_ACCESS_KEY"
+  if [ -n "$OFBIZ_S3_ACCESS_KEY_ID" ] && [ -z "$OFBIZ_S3_SECRET_ACCESS_KEY" ]; then
+    config_fatal "OFBIZ_S3_ACCESS_KEY_ID is set but OFBIZ_S3_SECRET_ACCESS_KEY is not. Set both to authenticate with static credentials, or neither to use the AWS default credential provider chain."
+  fi
+  if [ -z "$OFBIZ_S3_ACCESS_KEY_ID" ] && [ -n "$OFBIZ_S3_SECRET_ACCESS_KEY" ]; then
+    config_fatal "OFBIZ_S3_SECRET_ACCESS_KEY is set but OFBIZ_S3_ACCESS_KEY_ID is not. Set both to authenticate with static credentials, or neither to use the AWS default credential provider chain."
+  fi
+
+  # Every key is substituted in a single render, because render_config_from always starts from the
+  # pristine source file and a second render would discard the first one's substitutions. Each
+  # expression is anchored at the start of the line, so a commented example can never be matched, and
+  # each literal '.' is escaped so it cannot match an arbitrary character in a neighbouring key.
+  local sedScript
+  sedScript=$(mktemp)
+  chmod 600 "$sedScript"
+  register_secret_temp_file "$sedScript"
+  {
+    printf 's|^content\\.store\\.provider=.*|content.store.provider=%s|\n' \
+      "$(sed_escape_replacement "$(properties_escape_value "$provider")")"
+    printf 's|^content\\.store\\.s3\\.bucket=.*|content.store.s3.bucket=%s|\n' \
+      "$(sed_escape_replacement "$(properties_escape_value "$OFBIZ_S3_BUCKET")")"
+    printf 's|^content\\.store\\.s3\\.region=.*|content.store.s3.region=%s|\n' \
+      "$(sed_escape_replacement "$(properties_escape_value "$OFBIZ_S3_REGION")")"
+    printf 's|^content\\.store\\.s3\\.endpoint=.*|content.store.s3.endpoint=%s|\n' \
+      "$(sed_escape_replacement "$(properties_escape_value "$OFBIZ_S3_ENDPOINT")")"
+    printf 's|^content\\.store\\.s3\\.access\\.key\\.id=.*|content.store.s3.access.key.id=%s|\n' \
+      "$(sed_escape_replacement "$(properties_escape_value "$OFBIZ_S3_ACCESS_KEY_ID")")"
+    printf 's|^content\\.store\\.s3\\.secret\\.access\\.key=.*|content.store.s3.secret.access.key=%s|\n' \
+      "$(sed_escape_replacement "$(properties_escape_value "$OFBIZ_S3_SECRET_ACCESS_KEY")")"
+    printf 's|^content\\.store\\.s3\\.path\\.style=.*|content.store.s3.path.style=%s|\n' \
+      "$(sed_escape_replacement "$(properties_escape_value "$pathStyle")")"
+  } >"$sedScript"
+
+  render_config_from "$CONTENT_PROPERTIES_OVERRIDE" "$CONTENT_PROPERTIES_SOURCE" --file="$sedScript"
+  discard_secret_temp_files
+
+  # Fails closed if an anchor is ever renamed in the committed file. An unsubstituted provider would
+  # send content back to database storage while the deployment believed it was writing to the object
+  # store, and that divergence would only ever show up as content missing from the store.
+  require_rendered_declaration "$CONTENT_PROPERTIES_OVERRIDE" 'content\.store\.provider' \
+    "$CONTENT_PROPERTIES_SOURCE"
+  if ! grep --quiet "^content\.store\.provider=$provider\$" "$CONTENT_PROPERTIES_OVERRIDE"; then
+    config_fatal "Rendered $CONTENT_PROPERTIES_OVERRIDE does not carry the requested OFBIZ_CONTENT_STORE_PROVIDER value. The anchor for content.store.provider in $CONTENT_PROPERTIES_SOURCE has been reformatted."
+  fi
+  if [ "$provider" = 's3' ]; then
+    require_rendered_declaration "$CONTENT_PROPERTIES_OVERRIDE" 'content\.store\.s3\.bucket' \
+      "$CONTENT_PROPERTIES_SOURCE"
+    require_rendered_declaration "$CONTENT_PROPERTIES_OVERRIDE" 'content\.store\.s3\.region' \
+      "$CONTENT_PROPERTIES_SOURCE"
+  fi
 
   restore_trace
 }
@@ -1694,6 +2005,7 @@ render_catalina_configuration() {
 render_runtime_configuration() {
   render_security_configuration
   render_admin_key_configuration
+  render_content_store_configuration
 
   if [ -n "$OFBIZ_CONTENT_URL_PREFIX" ]; then
     reject_unsafe_value OFBIZ_CONTENT_URL_PREFIX "$OFBIZ_CONTENT_URL_PREFIX"
@@ -1723,6 +2035,15 @@ apply_configuration() {
 
     if [ -n "$OFBIZ_ENABLE_AJP_PORT" ]; then
       # Configure tomcat to listen for AJP connections on all interfaces within the container.
+      #
+      # Left exactly as it was, deliberately. Two pre-existing defects are RECORDED here rather than
+      # repaired, because this change is limited to what the deployment objectives require: the address
+      # is APPENDED rather than substituted, so a second run would insert a duplicate line, and the
+      # match is unanchored, so it fires on the "catalina-container-test" descriptor block as well as
+      # the production one. Neither is currently reachable - the marker file above makes this a
+      # once-per-container step, and the test container is not started by this entry point - and the
+      # substitutions in render_catalina_configuration are written so that they can never match or
+      # shift either ajp-connector line.
       sed --in-place \
         '/<property name="ajp-connector" value="connector">/ a <property name="address" value="0.0.0.0"/>' \
         "$CATALINA_COMPONENT_DESCRIPTOR"
@@ -1936,6 +2257,12 @@ _main() {
     load_admin_user
   fi
 
+  # Only the variables this script consumes are removed, and the list keeps its original order with the
+  # newly consumed names appended. Three long standing entries are missing from it -
+  # OFBIZ_POSTGRES_HOST, OFBIZ_SKIP_DB_DRIVER_DOWNLOAD and OFBIZ_DISABLE_COMPONENTS - and that is
+  # RECORDED here rather than repaired: none of the three carries a secret, and adding them would
+  # change the environment an existing deployment's OFBiz process and its hook scripts already observe,
+  # which is outside what these deployment objectives call for.
   unset OFBIZ_TRACE
   unset OFBIZ_SKIP_INIT
   unset OFBIZ_PROFILE
@@ -1971,6 +2298,18 @@ _main() {
   unset OFBIZ_DB_POOL_MAX
   unset OFBIZ_SCHEMA_INIT
   unset OFBIZ_DISTRIBUTED_CACHE_CLEAR
+  unset OFBIZ_CONTENT_STORE_PROVIDER
+  unset OFBIZ_S3_BUCKET
+  unset OFBIZ_S3_REGION
+  unset OFBIZ_S3_ENDPOINT
+  unset OFBIZ_S3_PATH_STYLE
+  # Object store credentials, removed for the same reason as the signing keys above: they have been
+  # written to the mode 0600 rendered content.properties, which is the only place S3ContentStore reads
+  # them from, so the OFBiz JVM never needs them in its environment. The AWS default credential
+  # provider chain is unaffected either way - it reads the AWS_* names, not these - so a deployment
+  # that deliberately leaves both blank to use an instance role keeps working.
+  unset OFBIZ_S3_ACCESS_KEY_ID
+  unset OFBIZ_S3_SECRET_ACCESS_KEY
 
   # Schema initialisation is a one-shot job, not a way to start a server. The configuration was rendered
   # with startup DDL enabled and the data load above created the delegator, which is what applied the
