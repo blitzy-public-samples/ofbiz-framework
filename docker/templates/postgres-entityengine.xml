@@ -100,6 +100,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <group-map group-name="org.apache.ofbiz.tenant" datasource-name="localh2tenant"/>
     </delegator>
 
+
     <!-- need to at least define a name for each component to use -->
     <entity-model-reader name="main"/>
 
@@ -118,9 +119,12 @@ access. For a detailed description see the core/docs/entityconfig.html file.
     <entity-data-reader name="ext-test"/>
     <entity-data-reader name="ext-demo"/>
 
-    <field-type name="postgres" loader="fieldfile" location="fieldtypepostgres.xml"/>
-    <!-- Required by the localh2* datasources at the end of this file, which back the "test" delegator. -->
+    <!-- Required by the localh2* datasources at the end of this file, which back the "test" delegator. Declared
+         ahead of the postgres mapping so that the field-type group reads in the same h2-then-postgres order as
+         framework/entity/config/entityengine.xml; the entity-config schema fixes the position of the group, not
+         the order within it. -->
     <field-type name="h2" loader="fieldfile" location="fieldtypeh2.xml"/>
+    <field-type name="postgres" loader="fieldfile" location="fieldtypepostgres.xml"/>
 
     <!-- Objective 1 / transport security: docker-entrypoint.sh renders this template into
          /ofbiz/config/entityengine.xml by substituting the at-sign delimited placeholders below.
