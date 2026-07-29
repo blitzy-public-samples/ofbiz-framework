@@ -506,8 +506,10 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          successfully having created nothing. After rendering, the entry point re-reads the file and refuses to
          start unless all three managed datasources agree on the requested mode, so neither a stale template nor
          a hand-edited copy can leave a serving instance issuing DDL.
-         Note that check-on-start defaults to TRUE when the attribute is
-         absent (Datasource.java), so the literal false below is required in order to disable it.
+         Note how Datasource.java parses the two flags: check-on-start is read as
+         !"false".equals(attribute), so an absent attribute means TRUE and the literal false below is what
+         actually disables the startup schema check, while add-missing-on-start is read as
+         "true".equals(attribute), so its false is explicit rather than required.
          Schema truth remains the entity model - no Flyway, Liquibase, schema-version table or hand-written DDL.
          The embedded localh2* datasources deliberately keep both flags enabled for zero-configuration local
          development, which is safe because H2 is single-node dev/test only and never part of a fleet. -->
