@@ -34,6 +34,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -107,18 +108,82 @@ public final class EntityEngineConfigContractTests {
     private static final String H2_COORDINATE = "com.h2database:h2:2.4.240";
     private static final String RUNTIME_ONLY = "runtimeOnly";
 
-    /** The only TLS mode that both encrypts the connection and authenticates the server it is talking to. */
-    private static final String REQUIRED_SSL_MODE = "sslmode=verify-full";
+    /**
+     * The pgJDBC network deadlines every managed URI must carry, in the exact order and with the exact values the
+     * committed definitions pin and the entry point defaults to.
+     *
+     * <p>They are asserted as a literal because the values that apply when they are ABSENT are not deadlines at
+     * all: pgJDBC leaves {@code socketTimeout} and {@code loginTimeout} at 0, meaning no limit, so a thread that
+     * reaches a database which has stopped answering blocks on the socket read for as long as the kernel keeps the
+     * connection open. That strands request threads, the startup entity check and the readiness query alike, which
+     * is what makes a waiting instance indistinguishable from a wedged one. Asserting on the committed URI is what
+     * stops the parameters being "tidied away" as noise.</p>
+     */
+    private static final String REQUIRED_DEADLINES =
+            "&connectTimeout=10&socketTimeout=60&loginTimeout=30&cancelSignalTimeout=10&tcpKeepAlive=true";
 
-    /** Placeholder the entry point substitutes with the resolved TLS query string of the managed datasources. */
-    private static final String SSL_PARAMS_TOKEN = "@SSL_PARAMS@";
+    /**
+     * The same deadlines as they appear in the FILE rather than in the parsed attribute.
+     *
+     * <p>The pgJDBC parameter separator is an ampersand, which cannot appear literally inside an XML attribute, so
+     * both the committed configuration and the entry point's render carry it escaped and the parser hands back the
+     * plain form above. Substituting the escaped form here is what makes the template render exercise the same
+     * bytes the container writes.</p>
+     */
+    private static final String RENDERED_DEADLINES = REQUIRED_DEADLINES.replace("&", "&amp;");
 
     /** The render template's placeholder for the database port, validated as an integer by the entry point. */
     private static final String PORT_TOKEN = "@PORT@";
-    private static final String SCHEMA_DDL_TOKEN = "@SCHEMA_DDL@";
+
+    /**
+     * The render template's placeholder for the whole TLS query string of a managed URI. It is one token rather
+     * than one per parameter because it renders as {@code ?sslmode=<mode>} with an optional
+     * {@code &sslrootcert=<path>}, and a per-parameter split would need a {@code ?} or an {@code &} in the
+     * template that is wrong in the other case.
+     */
+    private static final String SSL_PARAMS_TOKEN = "@SSL_PARAMS@";
+
+    /**
+     * The pgJDBC sslmode the committed managed datasources pin, and the strongest of the two modes that
+     * authenticate the server. It encrypts, checks that the server certificate chains to a trusted root and
+     * checks that the hostname matches that certificate.
+     */
+    private static final String VERIFYING_SSL_MODE = "verify-full";
+
+    /**
+     * The same mode as {@link #VERIFYING_SSL_MODE}, in the {@code sslmode=<mode>} form a URI carries it in, so the
+     * assertions that quote the whole parameter and the assertions that quote only the mode cannot drift apart.
+     */
+    private static final String REQUIRED_SSL_MODE = "sslmode=" + VERIFYING_SSL_MODE;
+
+    /**
+     * The two startup-DDL placeholders. They are separate names, one per attribute, so that each attribute is
+     * independently substituted by the entry point and independently verified in the rendered artifact. They
+     * carry the same resolved value, but they must remain separate placeholders because the parser reads the
+     * two attributes by different rules: check-on-start defaults to TRUE when absent or unparseable, while
+     * add-missing-on-start defaults to false.
+     */
+    private static final String CHECK_ON_START_TOKEN = "@CHECK_ON_START@";
+    private static final String ADD_MISSING_ON_START_TOKEN = "@ADD_MISSING_ON_START@";
     private static final String CACHE_CLEAR_TOKEN = "@DISTRIBUTED_CACHE_CLEAR@";
     private static final String POOL_MIN_TOKEN = "@DB_POOL_MIN@";
     private static final String POOL_MAX_TOKEN = "@DB_POOL_MAX@";
+
+    /** Token the entry point substitutes with the resolved pgJDBC network deadlines of the managed URIs. */
+    private static final String JDBC_PARAMS_TOKEN = "@JDBC_PARAMS@";
+
+    /** Token for the pool borrow wait, which must be rendered rather than left to the engine's default. */
+    private static final String POOL_WAIT_TOKEN = "@DB_POOL_WAIT@";
+    private static final String POOL_TEST_ON_BORROW_TOKEN = "@DB_POOL_TEST_ON_BORROW@";
+
+    /** The committed and default borrow wait, in milliseconds. */
+    private static final int REQUIRED_POOL_WAIT_MILLIS = 20000;
+
+    /** The engine's borrow wait when {@code pool-sleeptime} is absent: five minutes, and the reason it is pinned. */
+    private static final int ABSENT_POOL_WAIT_MILLIS = 300000;
+
+    /** The validation query the managed pools use; without one DBCP performs no validation at all. */
+    private static final String REQUIRED_TEST_STATEMENT = "SELECT 1";
 
     /** Reported for an attribute that is absent, so absence is distinguishable from an empty value. */
     private static final String ABSENT = "(absent)";
@@ -126,15 +191,21 @@ public final class EntityEngineConfigContractTests {
     /** Any at-sign delimited render placeholder. */
     private static final Pattern PLACEHOLDER = Pattern.compile("@[A-Z_0-9]+@");
 
+    /** An XML comment including its delimiters, matched non-greedily so adjacent comments stay separate. */
+    private static final Pattern XML_COMMENT = Pattern.compile("<!--.*?-->", Pattern.DOTALL);
+
     /**
      * Every placeholder of the render template, with a value of the same shape the entry point substitutes:
-     * validated host, port and database names, a TLS query string, the normalised boolean of an init-mode start
-     * up, and the default pool bounds. Nothing here is a credential of any system.
+     * validated host, port and database names, a TLS query string, the network deadlines, the normalised boolean of
+     * an init-mode start up, and the default pool bounds and borrow wait. Nothing here is a credential of any
+     * system.
      */
     private static final Map<String, String> TEMPLATE_SUBSTITUTIONS = Map.ofEntries(
             Map.entry("@HOST@", "db.example.internal"),
             Map.entry(PORT_TOKEN, "5432"),
-            Map.entry(SSL_PARAMS_TOKEN, "?" + REQUIRED_SSL_MODE),
+            Map.entry(JDBC_PARAMS_TOKEN, RENDERED_DEADLINES),
+            Map.entry(POOL_WAIT_TOKEN, String.valueOf(REQUIRED_POOL_WAIT_MILLIS)),
+            Map.entry(POOL_TEST_ON_BORROW_TOKEN, "false"),
             Map.entry("@OFBIZ_DB@", "ofbizmaindb"),
             Map.entry("@OFBIZ_USERNAME@", "ofbizmain"),
             Map.entry("@OFBIZ_PASSWORD@", "rendered-ofbiz-password"),
@@ -144,7 +215,9 @@ public final class EntityEngineConfigContractTests {
             Map.entry("@TENANT_DB@", "ofbiztenantdb"),
             Map.entry("@TENANT_USERNAME@", "ofbiztenant"),
             Map.entry("@TENANT_PASSWORD@", "rendered-tenant-password"),
-            Map.entry(SCHEMA_DDL_TOKEN, "true"),
+            Map.entry(SSL_PARAMS_TOKEN, "?sslmode=" + VERIFYING_SSL_MODE),
+            Map.entry(CHECK_ON_START_TOKEN, "true"),
+            Map.entry(ADD_MISSING_ON_START_TOKEN, "true"),
             Map.entry(CACHE_CLEAR_TOKEN, "true"),
             Map.entry(POOL_MIN_TOKEN, "2"),
             Map.entry(POOL_MAX_TOKEN, "250"));
@@ -174,6 +247,12 @@ public final class EntityEngineConfigContractTests {
 
     /** The managed-RDBMS datasources the deployed profile repoints the default delegators to. */
     private static final List<String> POSTGRES_DATASOURCES = List.of("localpostgres", "localpostgresolap", "localpostgrestenant");
+
+    /** The committed database name of each managed datasource, used to pin the exact committed URI shape. */
+    private static final Map<String, String> POSTGRES_DATABASE_NAMES = Map.of(
+            "localpostgres", "ofbiz",
+            "localpostgresolap", "ofbizolap",
+            "localpostgrestenant", "ofbiztenant");
 
     /** Abstract field-type name to per-dialect mapping file. An immutable interface: 12 dialects, no more, no fewer. */
     private static final Map<String, String> EXPECTED_FIELD_TYPES = Map.ofEntries(
@@ -378,12 +457,14 @@ public final class EntityEngineConfigContractTests {
         // needs no DDL privilege and instances cannot race each other on schema changes. The entry point renders
         // both as true only for the one-shot OFBIZ_SCHEMA_INIT execution.
         // Each URI carries the EXPLICIT :5432 default port, a functional no-op for existing users that gives the
-        // template an unambiguous host:port shape to substitute (jdbc:postgresql://@HOST@:@PORT@/@DB@), and pins
-        // sslmode=verify-full - see managedPostgresDatasourcesRequireVerifiedTls for why that literal matters.
+        // template an unambiguous host:port shape to substitute (jdbc:postgresql://@HOST@:@PORT@/@DB@), then a
+        // peer-verifying sslmode - see theCommittedManagedUrisRequireVerifiedTransportSecurity for why that
+        // parameter is not optional - and then the pgJDBC network deadlines, whose values when ABSENT are not
+        // deadlines at all but "no limit" - see managedPostgresUrisBoundEveryWaitThatWouldOtherwiseBeUnlimited.
         assertEquals(Map.of(
-                "localpostgres", postgresTuple("jdbc:postgresql://127.0.0.1:5432/ofbiz?" + REQUIRED_SSL_MODE),
-                "localpostgresolap", postgresTuple("jdbc:postgresql://127.0.0.1:5432/ofbizolap?" + REQUIRED_SSL_MODE),
-                "localpostgrestenant", postgresTuple("jdbc:postgresql://127.0.0.1:5432/ofbiztenant?" + REQUIRED_SSL_MODE)),
+                "localpostgres", postgresTuple(managedUri("ofbiz")),
+                "localpostgresolap", postgresTuple(managedUri("ofbizolap")),
+                "localpostgrestenant", postgresTuple(managedUri("ofbiztenant"))),
                 tuples, "managed PostgreSQL dialect, DDL tuple, driver and URI per datasource");
     }
 
@@ -451,25 +532,41 @@ public final class EntityEngineConfigContractTests {
     }
 
     @Test
-    public void managedPostgresDatasourcesRequireVerifiedTls() {
+    public void theCommittedManagedUrisRequireVerifiedTransportSecurity() {
         for (String name : POSTGRES_DATASOURCES) {
             String uri = inlineJdbcOf(name).getAttribute("jdbc-uri");
 
-            // verify-full is the only mode that both encrypts AND authenticates the server: it checks the
-            // certificate chain and the hostname. Every weaker mode is a downgrade an attacker on the network can
-            // exploit - pgJDBC's own default, prefer, silently falls back to an UNENCRYPTED connection when the
-            // server declines TLS, and require encrypts without checking who answered. Asserting on the committed
-            // URI is what stops the parameter being "tidied away" as noise.
-            assertTrue(uri.contains("?" + REQUIRED_SSL_MODE),
-                    name + " must pin " + REQUIRED_SSL_MODE + ", was: " + uri);
-            for (String weaker : List.of("sslmode=disable", "sslmode=allow", "sslmode=prefer", "sslmode=require")) {
-                assertFalse(uri.contains(weaker), name + " must not use " + weaker);
-            }
+            // Every managed URI must pin a PEER-VERIFYING sslmode. An absent query string is not a neutral
+            // default: pgJDBC then applies its own default, sslmode=prefer, which silently negotiates down to an
+            // UNENCRYPTED connection whenever the server declines TLS, so the database credentials and every
+            // entity row after them cross the network in clear text. sslmode=require is no better in the way that
+            // matters here - it encrypts without authenticating the peer, so a man in the middle can present any
+            // certificate - which is why only verify-ca and verify-full count. Asserting the presence here is what
+            // stops the parameter being dropped again as "not a container concern": the committed value is the one
+            // a local PostgreSQL and an operator maintained copy of the render template both start from.
+            //
+            // Committing the strong mode does NOT make these definitions unusable against a PostgreSQL with
+            // no TLS listener, which is the objection that would otherwise argue for an empty query string.
+            // The deployed profile never reads this attribute: docker-entrypoint.sh renders the whole managed
+            // URI from the template, where the query string is the single @SSL_PARAMS@ placeholder that
+            // OFBIZ_POSTGRES_SSLMODE fills - see theRenderTemplateParameterisesEveryManagedUriAndNothingElse
+            // - so relaxing the mode is a documented environment variable rather than an edit to a committed
+            // file. What the committed literal decides is only the direction a deployment has to opt OUT of,
+            // and it is deliberately the safe one.
+            assertTrue(uri.contains("?"), name + " must commit its transport-security parameters, was: " + uri);
+            assertEquals(managedUri(POSTGRES_DATABASE_NAMES.get(name)), uri,
+                    name + " must commit exactly the host:port/database shape the render template substitutes,"
+                            + " with a peer-verifying sslmode and then the network deadlines");
+
+            // The exact-equality assertion above already pins the whole query string, so no certificate path
+            // can be committed either: sslrootcert names a per-deployment file location, and pinning one here
+            // would name a path that only one host has.
+            assertFalse(uri.contains("sslrootcert"), name + " must commit no certificate path, was: " + uri);
         }
     }
 
     @Test
-    public void theRenderTemplateCarriesTheTlsPlaceholderOnEveryManagedUri() throws Exception {
+    public void theRenderTemplateParameterisesEveryManagedUriAndNothingElse() throws Exception {
         Path template = repositoryRoot().resolve(POSTGRES_TEMPLATE);
         assertTrue(Files.isRegularFile(template), "missing render template " + POSTGRES_TEMPLATE);
         List<String> managedUris = new ArrayList<>();
@@ -480,20 +577,249 @@ public final class EntityEngineConfigContractTests {
             }
         }
 
-        // The other half of the transport-security contract. The committed file above states the mode literally;
-        // the deployed profile receives it through this placeholder, which the entry point substitutes with the
+        // The other half of the transport-security contract. The committed file states the mode literally; the
+        // deployed profile receives it through this placeholder, which the entry point substitutes with the
         // resolved sslmode (and any sslrootcert). A template that lost the placeholder would render URIs with no
         // TLS parameters at all, so the shape is pinned here and re-checked at runtime on the rendered file.
         //
+        // Pinning the exact shape is equally what stops an unparameterised TLS parameter being written in
+        // here, where it would be invisible to the environment-variable catalog and could not be relaxed for
+        // a database without a TLS listener. Host, port and database arrive through placeholders the entry
+        // point validates, the TLS mode and the deadlines arrive through two more, and nothing else is
+        // appended.
+        //
         // The port placeholder is pinned in the same assertion. Every structural component of the rendered URI has
         // to arrive through a placeholder the entry point validates; a port folded into @HOST@ would be the one
-        // component that reached the connection string unchecked.
+        // component that reached the connection string unchecked, which is why host and port are separate names.
+        //
+        // The TLS parameters are the one deliberate exception to "one placeholder per component": the whole query
+        // string is a single token, because it renders as "?sslmode=<mode>" with an optional "&sslrootcert=<path>"
+        // and splitting it would need a '?' or an '&' in the template that is wrong in the other case.
+        //
+        // The deadline placeholder is pinned in the same assertion, and pinned in this ORDER on purpose. It always
+        // renders as a non-empty '&'-prefixed fragment, so it is only well formed immediately after @SSL_PARAMS@,
+        // which always renders as a query string beginning with '?'. Putting it first, or on its own, would produce
+        // a URI with two '?' or with a leading '&' in a configuration the template cannot see. Both tokens sit at
+        // the very END of the URI, immediately after the database name, so what they carry is query parameters and
+        // never part of the database name.
         assertEquals(List.of(
-                "jdbc:postgresql://@HOST@:" + PORT_TOKEN + "/@OFBIZ_DB@" + SSL_PARAMS_TOKEN,
-                "jdbc:postgresql://@HOST@:" + PORT_TOKEN + "/@OLAP_DB@" + SSL_PARAMS_TOKEN,
-                "jdbc:postgresql://@HOST@:" + PORT_TOKEN + "/@TENANT_DB@" + SSL_PARAMS_TOKEN),
+                "jdbc:postgresql://@HOST@:" + PORT_TOKEN + "/@OFBIZ_DB@" + SSL_PARAMS_TOKEN + JDBC_PARAMS_TOKEN,
+                "jdbc:postgresql://@HOST@:" + PORT_TOKEN + "/@OLAP_DB@" + SSL_PARAMS_TOKEN + JDBC_PARAMS_TOKEN,
+                "jdbc:postgresql://@HOST@:" + PORT_TOKEN + "/@TENANT_DB@" + SSL_PARAMS_TOKEN + JDBC_PARAMS_TOKEN),
                 managedUris, "every managed URI in " + POSTGRES_TEMPLATE + " must carry " + PORT_TOKEN
-                        + " and end with " + SSL_PARAMS_TOKEN);
+                        + " and end with " + SSL_PARAMS_TOKEN + JDBC_PARAMS_TOKEN);
+    }
+
+    /*
+     * ---------------------------------------------------------------------------------------------
+     * Bounded network and pool waits: every wait whose absent default is "forever" is stated
+     * ---------------------------------------------------------------------------------------------
+     */
+
+    @Test
+    public void managedPostgresUrisBoundEveryWaitThatWouldOtherwiseBeUnlimited() {
+        for (String name : POSTGRES_DATASOURCES) {
+            String uri = inlineJdbcOf(name).getAttribute("jdbc-uri");
+
+            // Each parameter is asserted individually so a failure names the one that went missing. socketTimeout
+            // and loginTimeout are the two that matter most: pgJDBC leaves both at 0, which means NO LIMIT, so a
+            // thread that reaches a database which has stopped answering - a failed-over managed instance, a
+            // dropped NAT mapping, a network partition - blocks on the socket for as long as the kernel keeps the
+            // connection open. That is not confined to request threads; it also strands the startup entity check
+            // and the readiness probe's query, which is what made a waiting instance look like a wedged one.
+            for (String deadline : List.of("connectTimeout=10", "socketTimeout=60", "loginTimeout=30",
+                    "cancelSignalTimeout=10", "tcpKeepAlive=true")) {
+                assertTrue(uri.contains("&" + deadline), name + " must pin " + deadline + ", was: " + uri);
+            }
+
+            // Deliberately ABSENT. queryTimeout applies to EVERY statement, so committing one would abort
+            // legitimately long work - a data load, a large report - and break functional parity for an unchanged
+            // application. It is opt-in through OFBIZ_POSTGRES_QUERY_TIMEOUT, which the entry point renders into
+            // the URI only when it is set above zero.
+            assertFalse(uri.contains("queryTimeout"),
+                    name + " must not commit a global statement timeout, was: " + uri);
+
+            // The deadlines follow the TLS mode rather than preceding it. They are '&'-prefixed, so they are only
+            // well formed after a query string that has already been opened with '?'.
+            assertTrue(uri.endsWith("?" + REQUIRED_SSL_MODE + REQUIRED_DEADLINES),
+                    name + " must state the TLS mode and then the deadlines, was: " + uri);
+        }
+    }
+
+    @Test
+    public void managedPostgresPoolsPinTheBorrowWaitAndValidateIdleConnections() throws Exception {
+        for (String name : POSTGRES_DATASOURCES) {
+            Element element = datasourcesByName().get(name);
+            InlineJdbc pool = new Datasource(element).getInlineJdbc();
+
+            // pool-sleeptime is the borrow wait, and DBCPConnectionFactory maps it onto setMaxWaitMillis. It is
+            // stated rather than left absent because InlineJdbc reads an absent value as five minutes, which is
+            // longer than any load-balancer health-check timeout and longer than most HTTP client timeouts - so an
+            // exhausted pool used to be reported as a hung instance instead of as pool exhaustion.
+            assertEquals(REQUIRED_POOL_WAIT_MILLIS, pool.getPoolSleeptime(), name + " borrow wait");
+
+            // A validation query with idle validation is what stops the pool handing out a connection that died
+            // while idle, the ordinary outcome of a managed-database failover. DBCP performs NO validation at all
+            // without the query, whichever of the test-* flags is set, so the pair is asserted together.
+            assertEquals(REQUIRED_TEST_STATEMENT, pool.getPoolJdbcTestStmt(), name + " validation query");
+            assertTrue(pool.getTestWhileIdle(), name + " must validate connections while they sit idle");
+
+            // Borrow-time validation stays OFF by default: it adds a round trip to every single database access.
+            // OFBIZ_DB_POOL_TEST_ON_BORROW switches it on for a deployment that would rather pay that.
+            assertFalse(pool.getTestOnBorrow(), name + " must not validate on every borrow by default");
+
+            // The discriminating contrast, in the same spirit as the check-on-start assertion above: DELETING the
+            // attribute does not fall back to a sane value, it falls back to the five-minute wait. That is the trap
+            // this asserts against - tidying away a "default looking" number restores the original defect.
+            Element withoutWait = (Element) element.cloneNode(true);
+            soleChild(withoutWait, "inline-jdbc").removeAttribute("pool-sleeptime");
+            assertEquals(ABSENT_POOL_WAIT_MILLIS, new Datasource(withoutWait).getInlineJdbc().getPoolSleeptime(),
+                    name + " proves an absent pool-sleeptime resolves to the engine's five-minute wait");
+        }
+    }
+
+    @Test
+    public void onlyTheManagedPostgresDefinitionsCarryDeadlinesSoPortabilityIsUntouched() {
+        List<String> withDeadlines = new ArrayList<>();
+        for (Map.Entry<String, Element> datasource : datasourcesByName().entrySet()) {
+            for (Element inlineJdbc : childElements(datasource.getValue(), "inline-jdbc")) {
+                if (inlineJdbc.getAttribute("jdbc-uri").contains("socketTimeout")) {
+                    withDeadlines.add(datasource.getKey());
+                }
+            }
+        }
+
+        // Minimal change, and database portability: the MySQL, Oracle, Sybase, SAP DB, Firebird, MSSQL, p6spy and
+        // remaining definitions are left exactly as they were. Only the three datasources the deployed profile
+        // actually repoints the default delegators to are hardened, so no other dialect's connection string is
+        // altered by this work.
+        assertEquals(POSTGRES_DATASOURCES, withDeadlines,
+                "exactly the managed PostgreSQL datasources may carry pgJDBC deadlines");
+    }
+
+    @Test
+    public void theRenderTemplatePinsTheBorrowWaitAndTheValidationPolicyOnEveryManagedPool() throws Exception {
+        Map<String, Element> datasources = childrenByName(templateRoot(), "datasource");
+        Map<String, Map<String, String>> poolPolicies = new LinkedHashMap<>();
+        for (String name : POSTGRES_DATASOURCES) {
+            Element inlineJdbc = soleChild(datasources.get(name), "inline-jdbc");
+            poolPolicies.put(name, Map.of(
+                    "pool-sleeptime", inlineJdbc.getAttribute("pool-sleeptime"),
+                    "pool-jdbc-test-stmt", inlineJdbc.getAttribute("pool-jdbc-test-stmt"),
+                    "test-while-idle", inlineJdbc.getAttribute("test-while-idle"),
+                    "test-on-borrow", inlineJdbc.getAttribute("test-on-borrow")));
+        }
+
+        // The template half of the bounded-wait contract. The borrow wait and the borrow-validation boolean arrive
+        // through placeholders the entry point validates; the validation query and idle validation are fixed
+        // literals because there is no configuration under which a managed pool should hand out a connection it
+        // never checked. A template that lost the placeholders would render pools with the engine's five-minute
+        // wait, which is why the entry point re-reads the rendered file and refuses to start without them.
+        Map<String, String> expected = Map.of(
+                "pool-sleeptime", POOL_WAIT_TOKEN,
+                "pool-jdbc-test-stmt", REQUIRED_TEST_STATEMENT,
+                "test-while-idle", "true",
+                "test-on-borrow", POOL_TEST_ON_BORROW_TOKEN);
+        assertEquals(Map.of("localpostgres", expected, "localpostgresolap", expected,
+                "localpostgrestenant", expected), poolPolicies,
+                "pool wait and validation policy per managed datasource in " + POSTGRES_TEMPLATE);
+
+        // The embedded datasources of the template keep their own upstream policy, untouched: they exist only to
+        // keep the test delegator on H2 inside a container, and their borrow wait is not a fleet concern.
+        for (String name : H2_DATASOURCES) {
+            Element inlineJdbc = soleChild(datasources.get(name), "inline-jdbc");
+            assertEquals(String.valueOf(ABSENT_POOL_WAIT_MILLIS), inlineJdbc.getAttribute("pool-sleeptime"),
+                    name + " in the template must keep the upstream embedded borrow wait");
+            assertFalse(inlineJdbc.getAttribute("jdbc-uri").contains("socketTimeout"),
+                    name + " is an H2 file database and must carry no pgJDBC parameter");
+        }
+    }
+
+    @Test
+    public void theRenderTemplateDeclaresExactlyTheAgreedPlaceholderCensus() throws Exception {
+        Path template = repositoryRoot().resolve(POSTGRES_TEMPLATE);
+        assertTrue(Files.isRegularFile(template), "missing render template " + POSTGRES_TEMPLATE);
+
+        Map<String, Integer> census = new TreeMap<>();
+        for (String line : Files.readAllLines(template)) {
+            Matcher matcher = PLACEHOLDER.matcher(line);
+            while (matcher.find()) {
+                census.merge(matcher.group(), 1, Integer::sum);
+            }
+        }
+
+        // The exact placeholder census of the template, pinned name by name and count by count. This is the
+        // contract between the template and docker-entrypoint.sh, and it is asserted in full rather than as a
+        // subset for two reasons.
+        //
+        // A placeholder in the template with NO writer in the entry point renders as a literal '@NAME@' in the
+        // installed configuration. The Entity Engine does not recognise that as a placeholder - it is simply part
+        // of the attribute value - so an unsubstituted host becomes a name that fails to resolve, and an
+        // unsubstituted check-on-start is not the literal "false", which is what switches startup DDL back ON for
+        // the entire serving fleet. The entry point now refuses such an artifact at run time; this test refuses it
+        // at build time.
+        //
+        // A placeholder mentioned in PROSE is substituted there too, because sed rewrites comments as readily as
+        // attributes. That is why the counts are exact: the credential placeholders must appear exactly once each,
+        // on the one attribute meant to hold them, and never in a comment.
+        Map<String, Integer> expected = new TreeMap<>(Map.ofEntries(
+                Map.entry("@HOST@", 3),
+                Map.entry(PORT_TOKEN, 3),
+                Map.entry("@OFBIZ_DB@", 1),
+                Map.entry("@OLAP_DB@", 1),
+                Map.entry("@TENANT_DB@", 1),
+                Map.entry("@OFBIZ_USERNAME@", 1),
+                Map.entry("@OLAP_USERNAME@", 1),
+                Map.entry("@TENANT_USERNAME@", 1),
+                Map.entry("@OFBIZ_PASSWORD@", 1),
+                Map.entry("@OLAP_PASSWORD@", 1),
+                Map.entry("@TENANT_PASSWORD@", 1),
+                Map.entry(SSL_PARAMS_TOKEN, 3),
+                Map.entry(JDBC_PARAMS_TOKEN, 3),
+                Map.entry(POOL_MIN_TOKEN, 3),
+                Map.entry(POOL_MAX_TOKEN, 3),
+                Map.entry(POOL_WAIT_TOKEN, 3),
+                Map.entry(POOL_TEST_ON_BORROW_TOKEN, 3),
+                Map.entry(CHECK_ON_START_TOKEN, 3),
+                Map.entry(ADD_MISSING_ON_START_TOKEN, 3),
+                Map.entry(CACHE_CLEAR_TOKEN, 2)));
+
+        assertEquals(expected, census, "placeholder census of " + POSTGRES_TEMPLATE);
+        assertEquals(20, census.size(), "the template must declare exactly 20 distinct placeholders");
+        assertEquals(41, census.values().stream().mapToInt(Integer::intValue).sum(),
+                "the template must contain exactly 41 placeholder occurrences");
+
+        // Every placeholder in the template must also be one the substitution map above knows how to fill, so
+        // this test and the render tests below cannot drift apart.
+        assertEquals(TEMPLATE_SUBSTITUTIONS.keySet(), census.keySet(),
+                "the template placeholders and the substitutions this test renders with must be the same set");
+    }
+
+    @Test
+    public void theCommittedConfigurationDeclaresNoPlaceholderBecauseItIsItselfARenderSource() throws Exception {
+        Path committed = repositoryRoot().resolve(ENTITY_ENGINE_XML);
+        assertTrue(Files.isRegularFile(committed), "missing " + ENTITY_ENGINE_XML);
+
+        Map<String, Integer> census = new TreeMap<>();
+        for (String line : Files.readAllLines(committed)) {
+            Matcher matcher = PLACEHOLDER.matcher(line);
+            while (matcher.find()) {
+                census.merge(matcher.group(), 1, Integer::sum);
+            }
+        }
+
+        // The committed configuration is the second render source in the container: when no managed database is
+        // configured but distributed cache invalidation is, docker-entrypoint.sh runs sed over THIS file to produce
+        // config/entityengine.xml. sed rewrites comments exactly as readily as attributes, so a placeholder NAME
+        // written here - even purely as documentation of the template contract - is substituted along with the real
+        // ones, and an unsubstituted leftover is installed verbatim into the serving configuration.
+        //
+        // Naming a credential placeholder here is the worst case: '@OFBIZ_PASSWORD@' in a comment would have a real
+        // database password written into it, in cleartext, in a file that outlives the container on a volume. This
+        // file therefore documents the contract by naming the source ENVIRONMENT VARIABLE, never the placeholder.
+        assertEquals(Map.of(), census, ENTITY_ENGINE_XML
+                + " must contain no @PLACEHOLDER@ anywhere, comments included, because it is itself a sed source"
+                + " for the embedded render path; document the contract by naming the environment variable instead");
     }
 
     @Test
@@ -530,7 +856,7 @@ public final class EntityEngineConfigContractTests {
      */
 
     @Test
-    public void theRenderTemplateGatesStartupDdlThroughOneSharedPlaceholderPerManagedDatasource() throws Exception {
+    public void theRenderTemplateGatesStartupDdlThroughItsOwnPlaceholderPerAttribute() throws Exception {
         Map<String, Map<String, String>> flags = new LinkedHashMap<>();
         for (Map.Entry<String, Element> entry : childrenByName(templateRoot(), "datasource").entrySet()) {
             flags.put(entry.getKey(), Map.of(
@@ -538,11 +864,17 @@ public final class EntityEngineConfigContractTests {
                     ADD_MISSING_ON_START, entry.getValue().getAttribute(ADD_MISSING_ON_START)));
         }
 
-        // Objective 4, the deployed half. Both flags of all three managed datasources carry the SAME placeholder,
-        // so init mode and run mode cannot disagree with each other: the entry point substitutes the normalised
-        // OFBIZ_SCHEMA_INIT once and every managed datasource moves together. A hardcoded "true" here would hand
-        // startup DDL back to every serving instance, which is precisely what this refactor removed.
-        Map<String, String> gated = Map.of(CHECK_ON_START, SCHEMA_DDL_TOKEN, ADD_MISSING_ON_START, SCHEMA_DDL_TOKEN);
+        // Objective 4, the deployed half. Each flag of each managed datasource carries its own placeholder, and
+        // the entry point substitutes both from the one normalised OFBIZ_SCHEMA_INIT value, so init mode and run
+        // mode cannot disagree with each other while each attribute stays independently verifiable in the rendered
+        // artifact. A hardcoded "true" here would hand startup DDL back to every serving instance, which is
+        // precisely what this refactor removed.
+        //
+        // The one-placeholder-per-attribute shape is also what keeps the substitution auditable: a reader of
+        // either the template or the entry point can see which attribute each value lands in, and the
+        // post-render guard names the attribute that is missing rather than a shared token that covered both.
+        Map<String, String> gated =
+                Map.of(CHECK_ON_START, CHECK_ON_START_TOKEN, ADD_MISSING_ON_START, ADD_MISSING_ON_START_TOKEN);
         // The embedded datasources are NOT gated: they back the test delegator, which must self-initialise.
         Map<String, String> alwaysOn = Map.of(CHECK_ON_START, "true", ADD_MISSING_ON_START, "true");
         assertEquals(Map.of(
@@ -645,24 +977,59 @@ public final class EntityEngineConfigContractTests {
     }
 
     @Test
-    public void theRenderTemplateNamesNoSecretPlaceholderOutsideAJdbcPasswordAttribute() throws Exception {
-        Path template = repositoryRoot().resolve(POSTGRES_TEMPLATE);
+    public void theRenderTemplateNamesNoPlaceholderInsideAnyCommentAndNoSecretOneOutsideAJdbcPassword()
+            throws Exception {
+        String template = Files.readString(repositoryRoot().resolve(POSTGRES_TEMPLATE));
+        List<String> placeholdersInComments = new ArrayList<>();
+        Matcher comment = XML_COMMENT.matcher(template);
+        while (comment.find()) {
+            Matcher placeholder = PLACEHOLDER.matcher(comment.group());
+            while (placeholder.find()) {
+                placeholdersInComments.add(placeholder.group() + " at offset " + (comment.start() + placeholder.start()));
+            }
+        }
+
+        // The renderer rewrites a comment as readily as an attribute, so a placeholder named in prose - a token
+        // inventory in the file header, say - is substituted THERE as well. Two things follow, and both are
+        // failures rather than untidiness. A password placeholder makes the rendered configuration repeat all
+        // three database passwords in clear text outside the attributes meant to hold them. ANY placeholder makes
+        // the render dependent on the value: one containing a double hyphen closes or corrupts the surrounding
+        // comment and the rendered file is no longer well-formed XML, so a host name such as an internal
+        // "db--primary" would take the start up down. The entry point refuses to render a template that names a
+        // placeholder inside a comment; asserting it here catches the mistake at build time instead.
+        assertEquals(List.of(), placeholdersInComments,
+                POSTGRES_TEMPLATE + " must name no placeholder inside an XML comment");
+
         List<String> offendingLines = new ArrayList<>();
         int lineNumber = 0;
-        for (String line : Files.readAllLines(template)) {
+        for (String line : template.lines().toList()) {
             lineNumber++;
             if (line.contains("_PASSWORD@") && !line.contains(JDBC_PASSWORD + "=\"")) {
                 offendingLines.add(lineNumber + ": " + line.trim());
             }
         }
-
-        // sed rewrites a comment as readily as an attribute. A password placeholder named in prose - a token
-        // inventory in the file header, say - is therefore substituted THERE as well, and the rendered
-        // configuration repeats all three database passwords in clear text outside the attributes meant to hold
-        // them. The entry point refuses to render a template that does this; asserting it here means the mistake
-        // is caught at build time rather than by the container. Documentation names the environment variables.
         assertEquals(List.of(), offendingLines,
                 POSTGRES_TEMPLATE + " may only name a password placeholder on a " + JDBC_PASSWORD + " attribute");
+    }
+
+    @Test
+    public void theRenderTemplateContainsNoDoubleHyphenInsideAComment() throws Exception {
+        String template = Files.readString(repositoryRoot().resolve(POSTGRES_TEMPLATE));
+        List<String> offending = new ArrayList<>();
+        Matcher comment = XML_COMMENT.matcher(template);
+        while (comment.find()) {
+            String body = comment.group();
+            body = body.substring("<!--".length(), body.length() - "-->".length());
+            if (body.contains("--")) {
+                offending.add("comment at offset " + comment.start());
+            }
+        }
+
+        // XML forbids a double hyphen inside a comment outright, so this is well-formedness rather than style. It
+        // is asserted separately because the template is edited as prose: a wrapped sentence that happens to
+        // introduce one would make every rendered configuration unparseable, and the failure would surface as a
+        // container that cannot read its own entity engine configuration.
+        assertEquals(List.of(), offending, POSTGRES_TEMPLATE + " must contain no double hyphen inside a comment");
     }
 
     @Test
@@ -677,10 +1044,20 @@ public final class EntityEngineConfigContractTests {
         Element root = parseXml(rendered);
         // Every placeholder the template carries must be in the map above, which is what turns "someone added a
         // token" into a failing test rather than a literal at-sign in a production connection string. Attribute
-        // values are scanned rather than raw text, because the placeholder NAMES appear legitimately in comments.
+        // values are scanned first, because that is where a surviving placeholder does damage.
         List<String> unsubstituted = new ArrayList<>();
         collectPlaceholders(root, unsubstituted);
         assertEquals(List.of(), unsubstituted, "attribute values still carrying a placeholder after substitution");
+
+        // Then the RAW rendered text, with nothing excused. The template names no placeholder in prose either, so
+        // a complete substitution leaves not one at-sign delimited token anywhere in the file; this is the same
+        // zero-residual postcondition the entry point asserts on the artifact it installs.
+        List<String> residual = new ArrayList<>();
+        Matcher leftover = PLACEHOLDER.matcher(rendered);
+        while (leftover.find()) {
+            residual.add(leftover.group());
+        }
+        assertEquals(List.of(), residual, "rendered text still carrying a placeholder anywhere, comments included");
 
         assertEquals(List.of(), validateAgainstEntityConfigSchema(rendered), "schema validation problems");
 
@@ -690,8 +1067,19 @@ public final class EntityEngineConfigContractTests {
             Datasource parsed = new Datasource(datasources.get(name));
             assertTrue(parsed.getCheckOnStart(), name + " must check the schema when init mode is substituted");
             assertTrue(parsed.getAddMissingOnStart(), name + " must add the missing schema in init mode");
-            assertEquals(2, parsed.getInlineJdbc().getPoolMinsize(), name + " pool minimum");
-            assertEquals(250, parsed.getInlineJdbc().getPoolMaxsize(), name + " pool maximum");
+            InlineJdbc pool = parsed.getInlineJdbc();
+            assertEquals(2, pool.getPoolMinsize(), name + " pool minimum");
+            assertEquals(250, pool.getPoolMaxsize(), name + " pool maximum");
+
+            // The deadlines and the borrow wait have to survive the render as parsed values, not merely as text:
+            // this is the state OFBiz actually reads, and each of these three settings has an absent-value default
+            // that is the unbounded one.
+            assertTrue(pool.getJdbcUri().endsWith("?" + REQUIRED_SSL_MODE + REQUIRED_DEADLINES),
+                    name + " rendered URI must carry the TLS mode then the deadlines, was: " + pool.getJdbcUri());
+            assertEquals(REQUIRED_POOL_WAIT_MILLIS, pool.getPoolSleeptime(), name + " rendered borrow wait");
+            assertEquals(REQUIRED_TEST_STATEMENT, pool.getPoolJdbcTestStmt(), name + " rendered validation query");
+            assertTrue(pool.getTestWhileIdle(), name + " must validate idle connections after the render");
+            assertFalse(pool.getTestOnBorrow(), name + " must render the substituted borrow-validation boolean");
         }
         for (String name : H2_DATASOURCES) {
             assertTrue(new Datasource(datasources.get(name)).getCheckOnStart(),
@@ -793,6 +1181,16 @@ public final class EntityEngineConfigContractTests {
      * Helpers
      * ---------------------------------------------------------------------------------------------
      */
+
+    /**
+     * The complete committed URI of a managed datasource: explicit default port, verified TLS, then the deadlines.
+     *
+     * @param databaseName the database component of the URI
+     * @return the URI exactly as the committed configuration must state it
+     */
+    private static String managedUri(String databaseName) {
+        return "jdbc:postgresql://127.0.0.1:5432/" + databaseName + "?" + REQUIRED_SSL_MODE + REQUIRED_DEADLINES;
+    }
 
     private static Map<String, String> postgresTuple(String jdbcUri) {
         return Map.of(

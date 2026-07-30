@@ -27,14 +27,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.Reader;
+import java.io.StringReader;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -56,6 +62,15 @@ import org.junit.jupiter.params.provider.ValueSource;
  * {@code security.properties} through the classloader - {@code UtilProperties} included - would read the
  * populated test fixture and pass no matter what the repository actually contains. One of the tests
  * below pins that shadowing relationship explicitly so the hazard cannot be forgotten.
+ *
+ * <p>The second half of this suite pins the INTEGRATION TIER's secret path, which is a different
+ * problem with the same cause. {@code gradlew ofbiz --test} builds its classpath as
+ * {@code sourceSets.main.runtimeClasspath} followed by {@code sourceSets.test.runtimeClasspath}, and every
+ * component {@code config} directory is a MAIN resource, so {@code build/resources/main/security.properties}
+ * - the blank production copy - preceded the populated fixture and {@code JWTManager.getJWTKey} rejected
+ * the empty {@code security.token.key} with "The JWT secret key is too short.". The fix prepends a
+ * generated, git-ignored override to that one classpath; the tests below fail if the generator task, the
+ * ordering, the git-ignored location, or the verbatim-copy contract is broken.
  */
 public final class SecurityPropertiesAnchorTests {
 
@@ -68,6 +83,20 @@ public final class SecurityPropertiesAnchorTests {
     private static final String ENTRY_POINT = "docker/docker-entrypoint.sh";
     /** generateSecretKeys emits 48 SecureRandom bytes Base64 encoded, i.e. exactly 64 characters. */
     private static final int GENERATED_KEY_LENGTH = 64;
+
+    private static final String BUILD_SCRIPT = "build.gradle";
+    private static final String GIT_IGNORE = ".gitignore";
+    private static final String OVERRIDE_TASK = "generateIntegrationTestSecurityOverride";
+    private static final String KEY_GENERATOR_TASK = "generateSecretKeys";
+    private static final String PACKAGING_GUARD_TASK = "verifySigningKeyAnchorsAreBlank";
+    private static final String OVERRIDE_DIRECTORY_ACCESSOR = "integrationTestSecurityOverrideDirectory()";
+    private static final String OVERRIDE_DIRECTORY_NAME = "integration-test-config";
+    private static final String OVERRIDE_FILE = "build/" + OVERRIDE_DIRECTORY_NAME + "/" + CLASSPATH_RESOURCE;
+    private static final String MAIN_RUNTIME_CLASSPATH = "sourceSets.main.runtimeClasspath";
+    private static final String TEST_RUNTIME_CLASSPATH = "sourceSets.test.runtimeClasspath";
+    private static final String OFBIZ_TEST_BRANCH = "if (taskName ==~ /^ofbiz.*(--test|-t).*/) {";
+    /** JWTManager.getJWTKey throws when security.token.key is shorter than this (HMAC512, OFBIZ-12724). */
+    private static final int JWT_KEY_MIN_LENGTH = 64;
 
     @ParameterizedTest(name = "{0} is declared blank")
     @ValueSource(strings = {LOGIN_SECRET_KEY, JWT_TOKEN_KEY})
@@ -202,6 +231,355 @@ public final class SecurityPropertiesAnchorTests {
         // substitutions must be delivered through a sed program file instead.
         assertTrue(entryPoint.contains("--file=\"$sedScript\""),
                 "secret substitutions must be delivered through a sed program file, not --expression");
+    }
+
+    @Test
+    public void integrationTestClasspathPrependsTheSyntheticSecurityOverrideBeforeTheMainResources() throws IOException {
+        String testBranch = integrationTestClasspathBranch();
+
+        // Without the dependency the directory would be empty on a clean checkout and the blank
+        // production copy would win again, silently, with no build failure to point at.
+        assertTrue(testBranch.contains("dependsOn '" + OVERRIDE_TASK + "'"),
+                "the 'ofbiz --test' task must build the synthetic security override before it runs");
+
+        int overrideAt = testBranch.indexOf("files(" + OVERRIDE_DIRECTORY_ACCESSOR + ")");
+        int mainAt = testBranch.indexOf(MAIN_RUNTIME_CLASSPATH);
+        int testAt = testBranch.indexOf(TEST_RUNTIME_CLASSPATH);
+        assertTrue(overrideAt >= 0, "the 'ofbiz --test' classpath must include " + OVERRIDE_DIRECTORY_ACCESSOR);
+        assertTrue(mainAt >= 0, "the 'ofbiz --test' classpath must still include " + MAIN_RUNTIME_CLASSPATH);
+        assertTrue(testAt >= 0, "the 'ofbiz --test' classpath must still include " + TEST_RUNTIME_CLASSPATH);
+        // ORDER is the whole point: ClassLoader.getResource returns the FIRST match and UtilProperties
+        // never merges, so the override has to precede build/resources/main.
+        assertTrue(overrideAt < mainAt,
+                "the synthetic security override must PRECEDE " + MAIN_RUNTIME_CLASSPATH + " or the blank key wins again");
+        assertTrue(mainAt < testAt, "the main runtime classpath must still precede the test runtime classpath");
+    }
+
+    @Test
+    public void everyOtherOfbizInvocationAndTheDistributionKeepTheUntouchedClasspath() throws IOException {
+        String plainBranch = plainOfbizClasspathBranch();
+        String buildScript = Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8);
+
+        // A plain 'gradlew ofbiz' run, and therefore anything a developer or an image serves from, must
+        // never see synthetic key material; it keeps resolving whatever the deployment supplied.
+        assertTrue(plainBranch.contains("classpath = " + MAIN_RUNTIME_CLASSPATH),
+                "a plain 'ofbiz' run must keep the untouched main runtime classpath");
+        assertFalse(plainBranch.contains(OVERRIDE_DIRECTORY_ACCESSOR),
+                "a plain 'ofbiz' run must not see the synthetic security override");
+        assertFalse(plainBranch.contains(OVERRIDE_TASK),
+                "a plain 'ofbiz' run must not depend on the synthetic security override generator");
+        // distributions.main copies source trees only, so a build directory artefact can never be
+        // packaged into the tarball the container image is built from.
+        assertTrue(buildScript.contains("include 'framework/**', 'applications/**', 'themes/**', 'plugins/**'"),
+                "the distribution must keep copying source trees only");
+    }
+
+    @Test
+    public void theSyntheticOverrideIsGeneratedOnlyIntoTheGitIgnoredBuildDirectory() throws IOException {
+        String buildScript = Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8);
+        List<String> ignored = Files.readAllLines(repositoryRoot().resolve(GIT_IGNORE), StandardCharsets.UTF_8);
+
+        assertTrue(buildScript.contains("task " + OVERRIDE_TASK),
+                BUILD_SCRIPT + " must declare the " + OVERRIDE_TASK + " task");
+        assertTrue(buildScript.contains("layout.buildDirectory.dir('" + OVERRIDE_DIRECTORY_NAME + "')"),
+                "the override must be generated under the build directory, not into the source tree");
+        assertTrue(ignored.contains("build/"),
+                "the build directory must stay git-ignored so the synthetic key can never be committed");
+        // A world-readable file would leak the value to any other account on the build host; the entry
+        // point renders its own overrides at 0600 for the same reason.
+        assertTrue(buildScript.contains("PosixFilePermissions.fromString('rw-------')"),
+                "the generated override must be written with owner-only permissions");
+        assertTrue(buildScript.contains("outputs.file overrideFile"),
+                "the generated override must be declared as a task output so Gradle regenerates it when stale");
+        assertTrue(buildScript.contains("inputs.file productionSecurityProperties"),
+                "the production file must be declared as a task input so an edit to it regenerates the override");
+    }
+
+    @Test
+    public void theSyntheticSigningKeysClearTheHmac512FloorAndCannotBeMistakenForRealSecrets() throws IOException {
+        Map<String, String> synthetic = syntheticIntegrationTestKeys();
+        String production = Files.readString(repositoryRoot().resolve(PRODUCTION_FILE), StandardCharsets.UTF_8);
+        Properties shadow = loadProperties(repositoryRoot().resolve(SHADOW_TEST_FILE));
+
+        assertEquals(2, synthetic.size(), "both signing keys must have a synthetic integration test value");
+        for (Map.Entry<String, String> entry : synthetic.entrySet()) {
+            String value = entry.getValue();
+            assertTrue(value.length() >= JWT_KEY_MIN_LENGTH,
+                    entry.getKey() + " must be at least " + JWT_KEY_MIN_LENGTH + " chars or JWTManager rejects it");
+            // Restricting the alphabet keeps the value free of java.util.Properties metacharacters, so the
+            // generated line never needs escaping and cannot be mangled into a shorter key.
+            assertTrue(value.matches("[A-Za-z0-9]+"),
+                    entry.getKey() + " must avoid java.util.Properties metacharacters: " + value);
+            assertTrue(value.contains("Synthetic") && value.contains("NotARealSecret"),
+                    entry.getKey() + " must describe itself as synthetic so it is never mistaken for a credential");
+            assertFalse(production.contains(value),
+                    "the synthetic value for " + entry.getKey() + " must never appear in the tracked production file");
+            assertNotEquals(shadow.getProperty(entry.getKey()), value,
+                    "the synthetic value for " + entry.getKey() + " must be distinguishable from the shadow fixture value");
+        }
+        assertNotEquals(synthetic.get(LOGIN_SECRET_KEY), synthetic.get(JWT_TOKEN_KEY),
+                "the two synthetic keys must differ, exactly as two real keys would");
+    }
+
+    @Test
+    public void theGeneratedOverrideKeepsEveryProductionSecurityPropertyAndFillsOnlyTheTwoSecrets() throws IOException {
+        Path productionPath = repositoryRoot().resolve(PRODUCTION_FILE);
+        Properties production = loadProperties(productionPath);
+        Map<String, String> synthetic = syntheticIntegrationTestKeys();
+
+        Properties override = loadPropertiesFrom(
+                applyOverrideSubstitutions(Files.readString(productionPath, StandardCharsets.UTF_8), synthetic));
+
+        // THIS is why the override is a verbatim copy rather than a small fixture. UtilProperties resolves
+        // security.properties to ONE classpath URL and never merges, so an override that declared only the
+        // two secrets would delete every other production security property - allow lists, CSRF strategy,
+        // password hashing, host headers, upload extension filters - from the whole integration run.
+        assertEquals(production.stringPropertyNames(), override.stringPropertyNames(),
+                "the override must declare exactly the production property set, no more and no fewer");
+        List<String> changed = new ArrayList<>();
+        for (String name : production.stringPropertyNames()) {
+            if (!production.getProperty(name).equals(override.getProperty(name))) {
+                changed.add(name);
+            }
+        }
+        assertEquals(List.of(LOGIN_SECRET_KEY, JWT_TOKEN_KEY), changed.stream().sorted().toList(),
+                "only the two signing keys may differ between the production file and the override");
+        for (String name : List.of(LOGIN_SECRET_KEY, JWT_TOKEN_KEY)) {
+            assertEquals(synthetic.get(name), override.getProperty(name), name + " must carry the synthetic value");
+        }
+    }
+
+    @Test
+    public void theGeneratedOverrideOnDiskMatchesTheDocumentedContract() throws IOException {
+        Path overridePath = repositoryRoot().resolve(OVERRIDE_FILE);
+        // The unit test task depends on the generator, so the artefact is asserted directly rather than
+        // through a re-implementation: a divergence between this contract and the real Groovy task fails here.
+        assertTrue(Files.isRegularFile(overridePath),
+                OVERRIDE_FILE + " must exist; the 'test' task must depend on " + OVERRIDE_TASK);
+        String expected = applyOverrideSubstitutions(
+                Files.readString(repositoryRoot().resolve(PRODUCTION_FILE), StandardCharsets.UTF_8),
+                syntheticIntegrationTestKeys());
+
+        assertEquals(normalize(expected), normalize(Files.readString(overridePath, StandardCharsets.UTF_8)),
+                "the generated override must be the production file with only the two signing keys filled");
+        assertTrue(loadPropertiesFrom(Files.readString(overridePath, StandardCharsets.UTF_8))
+                        .getProperty(JWT_TOKEN_KEY).length() >= JWT_KEY_MIN_LENGTH,
+                "the generated security.token.key must clear the JWTManager floor");
+        if (overridePath.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            assertEquals(PosixFilePermissions.fromString("rw-------"), Files.getPosixFilePermissions(overridePath),
+                    "the generated override must be readable only by its owner");
+        }
+    }
+
+    @Test
+    public void theOverrideGeneratorOverwritesAnAlreadyPopulatedKeyInsteadOfSkippingIt() throws IOException {
+        Map<String, String> synthetic = syntheticIntegrationTestKeys();
+        String leakedKey = "A".repeat(GENERATED_KEY_LENGTH);
+        // A developer may still invoke generateSecretKeys by hand, and it fills the TRACKED production file
+        // in place. If the generator skipped an already populated line - the way generateSecretKeys itself
+        // does - that real key would be copied into the build directory and the integration tier would be
+        // back to depending on a mutated tracked file.
+        String populated = applyOverrideSubstitutions(
+                Files.readString(repositoryRoot().resolve(PRODUCTION_FILE), StandardCharsets.UTF_8),
+                Map.of(LOGIN_SECRET_KEY, leakedKey, JWT_TOKEN_KEY, leakedKey));
+        assertTrue(populated.contains(JWT_TOKEN_KEY + "=" + leakedKey), "the populated fixture should carry the leaked key");
+
+        String override = applyOverrideSubstitutions(populated, synthetic);
+
+        assertFalse(override.contains(leakedKey), "a key already present in the production file must not survive into the override");
+        for (String name : List.of(LOGIN_SECRET_KEY, JWT_TOKEN_KEY)) {
+            assertEquals(synthetic.get(name), loadPropertiesFrom(override).getProperty(name),
+                    name + " must be overwritten with the synthetic value, not skipped");
+        }
+        String buildScript = Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8);
+        assertFalse(integrationTestOverrideTask(buildScript).contains("skipping"),
+                "the override generator must not adopt generateSecretKeys' skip-if-already-set behaviour");
+    }
+
+    @Test
+    public void theOverrideGeneratorFailsLoudlyIfAProductionAnchorDisappears() throws IOException {
+        String generator = integrationTestOverrideTask(
+                Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8));
+
+        // Renaming or deleting an anchor would otherwise produce an override that silently lacks the
+        // secret, which looks exactly like the bug this whole mechanism exists to fix.
+        assertTrue(generator.contains("throw new GradleException("),
+                "the override generator must fail the build when a production anchor is missing");
+        for (String key : List.of(LOGIN_SECRET_KEY, JWT_TOKEN_KEY)) {
+            String anchorless = Files.readString(repositoryRoot().resolve(PRODUCTION_FILE), StandardCharsets.UTF_8)
+                    .replaceAll("(?m)^#?" + key.replace(".", "\\.") + "=.*$", "");
+            assertFalse(Pattern.compile("(?m)^#?" + key.replace(".", "\\.") + "=.*$").matcher(anchorless).find(),
+                    "removing the " + key + " anchor must leave nothing for the generator to substitute");
+        }
+    }
+
+    @Test
+    public void theIntegrationTierDoesNotRelyOnGenerateSecretKeysRewritingTheTrackedFile() throws IOException {
+        String buildScript = Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8);
+
+        // testIntegration is 'ofbiz --test' and nothing else, so the synthetic override on that task's
+        // classpath is the only thing that supplies key material. generateSecretKeys survives untouched as
+        // a developer convenience, but the integration tier must pass with the tracked file left blank.
+        assertFalse(integrationTestClasspathBranch().contains("generateSecretKeys"),
+                "the integration test classpath must not depend on generateSecretKeys rewriting the tracked file");
+        assertTrue(buildScript.contains("task testIntegration(group: ofbizServer) {\n    dependsOn 'ofbiz --test'"),
+                "testIntegration must still be exactly 'ofbiz --test'");
+        assertTrue(buildScript.contains("def propertiesFile = file('framework/security/config/security.properties')"),
+                "generateSecretKeys must keep writing only the tracked production file it always wrote");
+        assertTrue(buildScript.contains("dependsOn '" + OVERRIDE_TASK + "'"),
+                "the unit and integration tiers must both build the override from the task, never by hand");
+    }
+
+    @Test
+    public void theRequiredDataLoadWorkflowDoesNotWriteASigningKeyIntoTheTrackedFile() throws IOException {
+        String buildScript = Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8);
+
+        // 'gradlew loadAll' is the documented, REQUIRED step before running or testing OFBiz, so having it
+        // depend on generateSecretKeys meant the ordinary workflow populated the tracked file - and the
+        // 'config' resource srcDir then carried that value into build/resources/main, into ofbiz.jar and
+        // into ofbiz.tar, i.e. into an image layer from which it can never be withdrawn.
+        String loadAll = declarationOf("task loadAll(group: ofbizServer)", buildScript);
+        assertTrue(loadAll.contains("dependsOn 'ofbiz --load-data'"), "loadAll must still run the data loader");
+        assertEquals(1, loadAll.split("dependsOn", -1).length - 1,
+                "loadAll must declare exactly one dependsOn, on the data loader alone: " + loadAll);
+        assertFalse(loadAll.contains(KEY_GENERATOR_TASK),
+                "loadAll must not run " + KEY_GENERATOR_TASK + ": loading data needs no signing key");
+        // Any other wiring would reintroduce the same defect through a different route, so no task at all
+        // may depend on the generator.
+        assertFalse(buildScript.contains("dependsOn '" + KEY_GENERATOR_TASK + "'"),
+                KEY_GENERATOR_TASK + " must stay a manual task; nothing may depend on it");
+        assertFalse(buildScript.contains("\"" + KEY_GENERATOR_TASK + "\","),
+                KEY_GENERATOR_TASK + " must not be listed in a task argument array");
+    }
+
+    @Test
+    public void everyPackagingTaskRefusesToRunWhileASigningKeyAnchorIsPopulated() throws IOException {
+        String buildScript = Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8);
+        String guard = declarationOf("task " + PACKAGING_GUARD_TASK, buildScript);
+
+        assertTrue(buildScript.contains("task " + PACKAGING_GUARD_TASK),
+                BUILD_SCRIPT + " must declare the " + PACKAGING_GUARD_TASK + " guard");
+        // Both packaging inputs: the tracked source, which distributions.main copies into ofbiz.tar, and
+        // the processed copy under build/resources/main, which 'jar' seals into ofbiz.jar. A stale
+        // populated copy left behind by an earlier build must not survive into the archive either.
+        assertTrue(guard.contains("framework/security/config/security.properties"),
+                "the guard must read the tracked security.properties");
+        assertTrue(guard.contains("resources/main/security.properties"),
+                "the guard must also read the processed copy that ends up inside ofbiz.jar");
+        assertTrue(guard.contains("mustRunAfter 'processResources'"),
+                "the guard must run after processResources so it sees the final processed copy");
+        // java.util.Properties applies the same canonicalization the running application does, so a value
+        // hidden behind escaping or a continuation line still counts as populated.
+        assertTrue(guard.contains("new Properties()"),
+                "the guard must parse the files with java.util.Properties, not with a regular expression");
+        assertTrue(guard.contains("throw new GradleException("),
+                "the guard must fail the build rather than warn");
+        assertTrue(guard.contains("outputs.upToDateWhen { false }"),
+                "the guard must never be skipped as up to date");
+        assertTrue(buildScript.contains("def packagedSigningKeyAnchors = ['" + LOGIN_SECRET_KEY + "', '" + JWT_TOKEN_KEY + "']"),
+                "the guard must cover both signing keys");
+
+        // Wiring: everything that turns this tree into a distributable artefact.
+        for (String wiring : List.of("tasks.named('jar') { dependsOn '" + PACKAGING_GUARD_TASK + "' }",
+                "tasks.named('installDist') { dependsOn '" + PACKAGING_GUARD_TASK + "' }",
+                "tasks.withType(Tar).configureEach { dependsOn '" + PACKAGING_GUARD_TASK + "' }",
+                "tasks.withType(Zip).configureEach { dependsOn '" + PACKAGING_GUARD_TASK + "' }")) {
+            assertTrue(buildScript.contains(wiring), BUILD_SCRIPT + " must contain: " + wiring);
+        }
+    }
+
+    @Test
+    public void theProcessedResourceCopyThatIsSealedIntoTheJarCarriesBlankAnchors() throws IOException {
+        // The artefact itself, not the build script: 'test' depends on 'classes', so processResources has
+        // already produced this copy by the time this assertion runs. It is the exact byte stream 'jar'
+        // packages, so a populated value here would be a populated value inside ofbiz.jar.
+        Path processed = repositoryRoot().resolve("build/resources/main/" + CLASSPATH_RESOURCE);
+        assertTrue(Files.isRegularFile(processed),
+                processed + " must exist; the unit test tier depends on processResources");
+
+        Properties packaged = loadProperties(processed);
+        for (String key : List.of(LOGIN_SECRET_KEY, JWT_TOKEN_KEY)) {
+            assertNotNull(packaged.getProperty(key), key + " must stay declared in the packaged copy");
+            assertEquals("", packaged.getProperty(key),
+                    key + " must be blank in the packaged copy or the value is readable inside ofbiz.jar");
+        }
+    }
+
+    /** The declaration that starts with {@code header}, up to its closing brace at column zero. */
+    private static String declarationOf(String header, String buildScript) {
+        int start = buildScript.indexOf(header);
+        assertTrue(start > 0, BUILD_SCRIPT + " must declare " + header);
+        int end = buildScript.indexOf("\n}\n", start);
+        assertTrue(end > start, header + " must be closed");
+        return buildScript.substring(start, end);
+    }
+
+    /** The body of the {@code --test} branch of {@code createOfbizCommandTask}: the integration test classpath. */
+    private static String integrationTestClasspathBranch() throws IOException {
+        String buildScript = Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8);
+        int branch = buildScript.indexOf(OFBIZ_TEST_BRANCH);
+        assertTrue(branch > 0, BUILD_SCRIPT + " must still branch the 'ofbiz --test' classpath on " + OFBIZ_TEST_BRANCH);
+        int elseBranch = buildScript.indexOf("} else {", branch);
+        assertTrue(elseBranch > branch, "the '--test' branch must still be followed by the plain 'ofbiz' branch");
+        return buildScript.substring(branch, elseBranch);
+    }
+
+    /** The body of the {@code else} branch of {@code createOfbizCommandTask}: every non-test invocation. */
+    private static String plainOfbizClasspathBranch() throws IOException {
+        String buildScript = Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8);
+        int elseBranch = buildScript.indexOf("} else {", buildScript.indexOf(OFBIZ_TEST_BRANCH));
+        assertTrue(elseBranch > 0, "the plain 'ofbiz' classpath branch must still exist");
+        int end = buildScript.indexOf("mainClass = application.mainClass", elseBranch);
+        assertTrue(end > elseBranch, "createOfbizCommandTask must still configure the main class after the branches");
+        return buildScript.substring(elseBranch, end);
+    }
+
+    /** The declaration of the {@code generateIntegrationTestSecurityOverride} task. */
+    private static String integrationTestOverrideTask(String buildScript) {
+        int start = buildScript.indexOf("task " + OVERRIDE_TASK);
+        assertTrue(start > 0, BUILD_SCRIPT + " must declare the " + OVERRIDE_TASK + " task");
+        int end = buildScript.indexOf("\n}\n", start);
+        assertTrue(end > start, "the " + OVERRIDE_TASK + " task declaration must be closed");
+        return buildScript.substring(start, end);
+    }
+
+    /** The synthetic signing keys declared in {@code build.gradle}, read from the build script itself. */
+    private static Map<String, String> syntheticIntegrationTestKeys() throws IOException {
+        String buildScript = Files.readString(repositoryRoot().resolve(BUILD_SCRIPT), StandardCharsets.UTF_8);
+        Map<String, String> keys = new LinkedHashMap<>();
+        keys.put(LOGIN_SECRET_KEY, declaredGroovyString(buildScript, "integrationTestLoginSecretKey"));
+        keys.put(JWT_TOKEN_KEY, declaredGroovyString(buildScript, "integrationTestJwtTokenKey"));
+        return keys;
+    }
+
+    private static String declaredGroovyString(String buildScript, String variable) {
+        Matcher matcher = Pattern.compile("(?m)^def " + variable + " = '([^']*)'$").matcher(buildScript);
+        assertTrue(matcher.find(), BUILD_SCRIPT + " must declare " + variable);
+        return matcher.group(1);
+    }
+
+    /**
+     * The substitution the {@code generateIntegrationTestSecurityOverride} task performs: rewrite each named
+     * declaration in place, whether it was blank, populated or commented out, and change nothing else.
+     */
+    private static String applyOverrideSubstitutions(String content, Map<String, String> replacements) {
+        String result = content;
+        for (Map.Entry<String, String> entry : replacements.entrySet()) {
+            String declaration = "(?m)^#?" + entry.getKey().replace(".", "\\.") + "=.*$";
+            assertTrue(Pattern.compile(declaration).matcher(result).find(),
+                    "no declaration of " + entry.getKey() + " to substitute");
+            result = result.replaceAll(declaration,
+                    Matcher.quoteReplacement(entry.getKey() + "=" + entry.getValue()));
+        }
+        return result;
+    }
+
+    private static Properties loadPropertiesFrom(String content) throws IOException {
+        Properties properties = new Properties();
+        try (Reader reader = new StringReader(content)) {
+            properties.load(reader);
+        }
+        return properties;
     }
 
     private static String normalize(String content) {

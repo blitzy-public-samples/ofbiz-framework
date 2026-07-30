@@ -41,55 +41,18 @@ under the License.
         <param-value>component://webtools/widget/CommonScreens.xml</param-value>
     </context-param>
 
-    <!-- Load-balancer health probes. HealthCheckServlet is mapped BOTH as this filter and as the
-         servlet declared further down, and the two mappings deliberately carry the same two exact
-         paths.
-
-         The filter is what makes the anonymous probe surface safe, and its <filter-mapping> is
-         therefore declared FIRST below: the servlet specification builds the chain in the order the
-         url-pattern mappings appear in this descriptor, so this filter runs before ControlFilter,
-         CacheFilter, ContextFilter and SameSiteFilter. It answers the probe and does not call
-         chain.doFilter, so none of those filters is entered for a probe request. That matters for two
-         concrete reasons:
-           - ControlFilter and ContextFilter both call getSession() unconditionally, so every probe
-             would otherwise mint an HttpSession and a JSESSIONID that a target group never returns,
-             together with the session listeners, the expiry bookkeeping and the log churn behind them;
-           - ContextFilter calls WebAppUtil.setAttributesFromRequestBody, which reads an
-             application/json body of ANY size into a String and then into a Map before a servlet
-             method is dispatched. Terminating the chain first means an anonymous caller can no longer
-             reach that parser through these paths at all, and the servlet itself refuses any request
-             that merely announces a body, from Content-Length and Transfer-Encoding, without reading
-             it. What is then left of an unread body is bounded by the connector, whose Tomcat default
-             maxSwallowSize discards at most 2MB before closing the connection.
-         A request whose path is not exactly one of the two probe paths is passed through untouched,
-         so this filter cannot affect anything else in the webapp.
-
-         The servlet mapping is kept as well: it is what makes the container resolve these two paths
-         to this component rather than to the default servlet, and it keeps the probes off /control/*
-         and therefore outside the OFBTOOLS/WEBTOOLS base permission. No <load-on-startup>, so the
-         servlet initialises lazily and cannot affect boot ordering.
-
-         NOTE - the probe paths are deliberately NOT in the ControlFilter allowedPaths list below,
-         because ControlFilter matches that list with startsWith and a bare /health entry would grant
-         anonymous passage to every /health* spelling, not only to the two probes. None is needed
-         either: the filter above short-circuits the chain before ControlFilter ever sees a probe.
-
-         Liveness always returns 200. Readiness returns 200 only when the entity engine counts
-         SequenceValueItem and the count is non-zero, and 503 otherwise - an unreachable datasource, a
-         count that did not complete, and a reachable datasource whose schema is still empty are all
-         "not ready". See the health and readiness endpoint section of DOCKER.adoc. -->
-    <filter>
-        <display-name>HealthCheckFilter</display-name>
-        <filter-name>HealthCheckFilter</filter-name>
-        <filter-class>org.apache.ofbiz.webapp.control.HealthCheckServlet</filter-class>
-    </filter>
     <filter>
         <display-name>ControlFilter</display-name>
         <filter-name>ControlFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.ControlFilter</filter-class>
         <init-param>
             <param-name>allowedPaths</param-name>
-            <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp</param-value>
+            <!-- /health lets the load-balancer probes through anonymously. ControlFilter matches this
+                 list with startsWith, so this one entry covers both /health/live and /health/ready;
+                 without it a probe would be redirected to /control/main and a target group would read
+                 the 302 as an unhealthy target. Only the two exact probe paths are mapped to the
+                 health servlet further down, so no other /health* spelling reaches it. -->
+            <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp:/health</param-value>
         </init-param>
         <init-param>
             <param-name>redirectPath</param-name>
@@ -111,13 +74,6 @@ under the License.
         <filter-name>SameSiteFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.SameSiteFilter</filter-class>
     </filter>
-    <!-- Declared first on purpose: the chain is built in this order, and the probes must be answered
-         before any filter that creates a session or parses the request body is reached. -->
-    <filter-mapping>
-        <filter-name>HealthCheckFilter</filter-name>
-        <url-pattern>/health/live</url-pattern>
-        <url-pattern>/health/ready</url-pattern>
-    </filter-mapping>
     <filter-mapping>
         <filter-name>ControlFilter</filter-name>
         <url-pattern>/*</url-pattern>
@@ -156,9 +112,21 @@ under the License.
         <url-pattern>/control/*</url-pattern>
     </servlet-mapping>
 
-    <!-- Health and readiness endpoints for load-balancer target-group probes. The full rationale,
-         including why the same class is also registered as the first filter, is documented with the
-         HealthCheckFilter declaration above. -->
+    <!-- Health and readiness endpoints for load-balancer target-group probes.
+
+         Registered as a plain servlet, and reached anonymously because /health is in the ControlFilter
+         allowedPaths list above. The probes stay off /control/*, so they are outside the OFBTOOLS and
+         WEBTOOLS base permissions, and the servlet initialises lazily, with no load-on-startup, so it
+         cannot affect boot ordering. Carrying both url-patterns in a single mapping element has been
+         legal since Servlet 2.5 and this descriptor declares 4.0, so the servlet is declared exactly
+         once.
+
+         Liveness always returns 200 and touches no datasource. Readiness returns 200 only when the
+         entity engine counts SequenceValueItem and the count is non-zero, and 503 otherwise - an
+         unavailable delegator, an unreachable datasource, a count that did not complete, and a
+         reachable datasource whose schema is still empty are all "not ready". Any other path under
+         /health/ returns 404 rather than a misleading 200. See the health and readiness endpoint
+         section of DOCKER.adoc. -->
     <servlet>
         <description>Health and readiness check servlet for load balancer probes</description>
         <display-name>HealthCheckServlet</display-name>

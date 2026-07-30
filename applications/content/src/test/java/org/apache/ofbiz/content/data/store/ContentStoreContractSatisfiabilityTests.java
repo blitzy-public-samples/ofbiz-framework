@@ -26,36 +26,42 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 
 import org.apache.ofbiz.base.util.GeneralException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Executes the whole {@link ContentStoreBehaviourContract} against a provider that performs genuine
- * filesystem I/O, and adds the expectations that are specific to a root-relative, path-backed provider.
+ * Checks that {@link ContentStoreBehaviourContract} is SATISFIABLE - that the documented SPI can be honoured
+ * in full by an implementation written from nothing but its javadoc.
  *
- * <p>The provider used here, {@link DirectoryContentStore}, is a REFERENCE implementation written directly
- * from the {@link ContentStore} javadoc and living only in the test tree. It exists for two reasons. First, it
- * turns the contract from prose into something executable today: the production {@code FileSystemContentStore}
- * and {@code S3ContentStore} are later deliverables, and a contract that cannot be run until they arrive would
- * not protect the SPI in the meantime. Second, and more importantly, it proves the documented contract is
- * actually SATISFIABLE and self-consistent - an SPI whose javadoc demands a combination no implementation can
- * honour is a defect that only shows up when the first provider is written.
+ * <p><strong>This suite is not coverage of either shipped provider, and must never be read as such.</strong>
+ * The provider it runs, {@link DirectoryContentStore}, is a reference implementation that lives only in the
+ * test tree and is deployed nowhere. Behaviour coverage of the real providers lives in
+ * {@link FileSystemContentStoreTests} and {@link S3ContentStoreTests}, which subclass the same contract and
+ * execute {@link FileSystemContentStore} and {@link S3ContentStore} themselves; provider selection is covered
+ * by {@link ContentStoreProviderSelectionTests}.
  *
- * <p>Every assertion runs against real bytes on a real filesystem: files are written, read back, streamed twice
- * and deleted. Nothing is stubbed and no {@code ContentStore} mock is involved, so a pass here says something
- * about storage behaviour rather than about test scaffolding.
+ * <p>What this suite is for is the one thing those three cannot establish. An SPI whose javadoc demands a
+ * combination of behaviours that no implementation can actually honour - a null-key rule that contradicts a
+ * stream-ownership rule, say - is a defect in the contract rather than in any provider, and it stays invisible
+ * for as long as the only implementations are the ones the contract was reverse-engineered from. Writing a
+ * fresh implementation straight from the prose and passing the same thirteen assertions is what rules that out,
+ * and it also keeps the contract honest as it grows: a new clause that cannot be met from the javadoc alone
+ * fails here first.
  *
- * <p>When the production providers land, each subclasses {@link ContentStoreBehaviourContract} in exactly the
- * way this class does - the S3 one supplying a provider whose SDK client boundary is mocked - and inherits this
- * identical suite, which is what makes provider parity structural rather than a matter of remembering to
- * re-assert the same things twice.
+ * <p>Because it is a reference implementation rather than a mock, every assertion still moves real bytes
+ * through a real filesystem - written, read back, streamed twice and deleted - so a pass says something about
+ * storage semantics and not about scaffolding. The two expectations added on top of the contract are the ones
+ * specific to any root-relative, path-backed provider: content lands at the key-relative path, and a key that
+ * would escape the configured root is refused.
  */
-public final class TempDirContentStoreBehaviourTests extends ContentStoreBehaviourContract {
+public final class ContentStoreContractSatisfiabilityTests extends ContentStoreBehaviourContract {
 
     private static final byte[] PAYLOAD = "stored on a real filesystem".getBytes(StandardCharsets.UTF_8);
 
@@ -103,8 +109,9 @@ public final class TempDirContentStoreBehaviourTests extends ContentStoreBehavio
 
     /**
      * Minimal root-relative {@link ContentStore} implemented straight from the SPI javadoc: replace-in-full
-     * writes, {@link FileNotFoundException} for an absent key from both readers, independent streams, an
-     * idempotent delete, and {@link GeneralException} for a key that is null, empty or would escape the root.
+     * writes in both the convenience and the known-length streaming form, {@link FileNotFoundException} for an
+     * absent key from every reader including the length probe, independent streams, an idempotent delete, an
+     * idempotent close, and {@link GeneralException} for a key that is null, empty or would escape the root.
      */
     private static final class DirectoryContentStore implements ContentStore {
 
@@ -129,6 +136,36 @@ public final class TempDirContentStoreBehaviourTests extends ContentStoreBehavio
         }
 
         @Override
+        public void put(String key, InputStream content, long length) throws GeneralException, IOException {
+            Path target = resolve(key);
+            if (content == null) {
+                throw new GeneralException("content stream must not be null for storage key [" + key + "]");
+            }
+            if (length < 0L) {
+                throw new GeneralException("declared length " + length + " is negative for storage key [" + key + "]");
+            }
+            Path parent = target.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            // Staged then moved into place, so a stream that ends early leaves no short entry behind - which is
+            // what the shared contract asserts, and what a provider writing straight to the target could not do.
+            Path staging = Files.createTempFile(parent == null ? root : parent, ".staging-", ".tmp");
+            boolean placed = false;
+            try {
+                try (OutputStream sink = Files.newOutputStream(staging)) {
+                    copyExactly(content, sink, length, key);
+                }
+                Files.move(staging, target, StandardCopyOption.REPLACE_EXISTING);
+                placed = true;
+            } finally {
+                if (!placed) {
+                    Files.deleteIfExists(staging);
+                }
+            }
+        }
+
+        @Override
         public byte[] get(String key) throws GeneralException, IOException {
             return Files.readAllBytes(existing(key));
         }
@@ -139,6 +176,11 @@ public final class TempDirContentStoreBehaviourTests extends ContentStoreBehavio
         }
 
         @Override
+        public long size(String key) throws GeneralException, IOException {
+            return Files.size(existing(key));
+        }
+
+        @Override
         public boolean exists(String key) throws GeneralException, IOException {
             return Files.isRegularFile(resolve(key));
         }
@@ -146,6 +188,36 @@ public final class TempDirContentStoreBehaviourTests extends ContentStoreBehavio
         @Override
         public void delete(String key) throws GeneralException, IOException {
             Files.deleteIfExists(resolve(key));
+        }
+
+        @Override
+        public void close() throws GeneralException, IOException {
+            // A path-backed provider holds nothing beyond the per-call streams the caller already closes, so
+            // close is a documented no-op here - and therefore trivially idempotent.
+        }
+
+        /**
+         * Copies exactly {@code length} bytes, failing rather than writing a short entry if the source ends first.
+         *
+         * @param source the stream to read from
+         * @param sink the stream to write to
+         * @param length the exact number of bytes to move
+         * @param key the storage key, for the failure message
+         * @throws IOException if the source ends before {@code length} bytes have been read
+         */
+        private static void copyExactly(InputStream source, OutputStream sink, long length, String key) throws IOException {
+            byte[] buffer = new byte[8192];
+            long remaining = length;
+            while (remaining > 0L) {
+                int wanted = (int) Math.min(buffer.length, remaining);
+                int read = source.read(buffer, 0, wanted);
+                if (read < 0) {
+                    throw new IOException("content under key [" + key + "] ended after " + (length - remaining)
+                            + " of the declared " + length + " bytes");
+                }
+                sink.write(buffer, 0, read);
+                remaining -= read;
+            }
         }
 
         /** Resolves a key that must already hold content, signalling absence the way the SPI documents. */

@@ -60,8 +60,11 @@ dependencies {
     implementation 'org.apache.tika:tika-parsers:3.3.1'
     implementation 'org.apache.tika:tika-parser-pdf-module:3.3.1'
     implementation 'org.apache.cxf:cxf-rt-frontend-jaxrs:4.2.0'
-    implementation 'org.apache.tomcat:tomcat-catalina-ha:10.1.56' // Remember to change the version number (10 now) in javadoc block if needed.
-    implementation 'org.apache.tomcat:tomcat-jasper:10.1.56'
+    // Keep the whole embedded Tomcat set on ONE version: catalina-ha drags in tomcat-catalina, -coyote,
+    // -util and -juli transitively, so a split version here silently mixes servlet container internals.
+    // 10.1.57 is the release that fixes CVE-2026-59083 and CVE-2026-59084; do not move back to 10.1.56.
+    implementation 'org.apache.tomcat:tomcat-catalina-ha:10.1.57' // Remember to change the version number (10 now) in javadoc block if needed.
+    implementation 'org.apache.tomcat:tomcat-jasper:10.1.57'
     implementation 'org.apache.axis2:axis2-kernel:1.8.2'
     implementation 'org.apache.xmlgraphics:batik-anim:1.19'
     implementation 'org.apache.xmlgraphics:batik-util:1.19'

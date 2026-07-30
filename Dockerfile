@@ -124,10 +124,17 @@ FROM runtimebase AS demo
 USER ofbiz
 
 RUN /ofbiz/bin/ofbiz --load-data
-RUN mkdir --parents /ofbiz/runtime/container_state
-RUN touch /ofbiz/runtime/container_state/data_loaded
-RUN touch /ofbiz/runtime/container_state/admin_loaded
-RUN touch /ofbiz/runtime/container_state/db_config_applied
+
+# Record that load, so a container from this image starts immediately instead of loading the demo data
+# a second time. The entry point owns the format of the container state markers, so it writes them:
+# these used to be three empty files created with 'touch', which a checksummed marker no longer accepts,
+# and which was also wrong - an empty data_loaded suppressed the load even when the image was pointed at
+# an external database, leaving the container serving an empty schema. The marker written here is bound
+# to the embedded database baked into this image, so that case now loads correctly.
+#
+# No db_config_applied marker is written: no database is configured at build time, so there is nothing
+# for it to record.
+RUN ["/ofbiz/docker-entrypoint.sh", "--write-initial-container-state"]
 
 VOLUME ["/docker-entrypoint-hooks"]
 VOLUME ["/ofbiz/config", "/ofbiz/runtime", "/ofbiz/lib-extra"]

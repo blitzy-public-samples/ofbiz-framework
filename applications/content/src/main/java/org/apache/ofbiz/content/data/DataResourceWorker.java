@@ -25,6 +25,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.StringWriter;
 import java.io.Writer;
 import java.net.HttpURLConnection;
@@ -36,8 +37,10 @@ import java.net.URLConnection;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -46,6 +49,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -65,6 +69,7 @@ import org.apache.ofbiz.base.location.FlexibleLocation;
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.FileUtil;
 import org.apache.ofbiz.base.util.GeneralException;
+import org.apache.ofbiz.base.util.GeneralRuntimeException;
 import org.apache.ofbiz.base.util.StringUtil;
 import org.apache.ofbiz.base.util.UtilCodec;
 import org.apache.ofbiz.base.util.UtilDateTime;
@@ -81,6 +86,9 @@ import org.apache.ofbiz.base.util.template.FreeMarkerWorker;
 import org.apache.ofbiz.base.util.template.XslTransform;
 import org.apache.ofbiz.common.email.NotificationServices;
 import org.apache.ofbiz.content.content.UploadContentAndImage;
+import org.apache.ofbiz.content.data.store.ContentStore;
+import org.apache.ofbiz.content.data.store.ContentStoreFactory;
+import org.apache.ofbiz.content.data.store.LocalContentStore;
 import org.apache.ofbiz.entity.Delegator;
 import org.apache.ofbiz.entity.GenericEntityException;
 import org.apache.ofbiz.entity.GenericValue;
@@ -117,6 +125,45 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     private static final String MODULE = DataResourceWorker.class.getName();
     private static final String ERR_RESOURCE = "ContentErrorUiLabels";
     private static final String PROPERTY_RESOURCE = "content";
+
+    /** Stable log identifier for a read that was served from the configured content store. */
+    private static final String EVENT_STORE_READ = "CONTENT-STORE-WORKER-READ";
+    /** Stable log identifier for a local file that was published to the configured content store. */
+    private static final String EVENT_STORE_PUBLISHED = "CONTENT-STORE-WORKER-PUBLISHED";
+    /** Stable log identifier for an object that was removed from the configured content store. */
+    private static final String EVENT_STORE_REMOVED = "CONTENT-STORE-WORKER-REMOVED";
+    /** Stable log identifier for a synchronisation record that was dropped to keep the register bounded. */
+    private static final String EVENT_STORE_REGISTER_BOUNDED = "CONTENT-STORE-WORKER-REGISTER-BOUNDED";
+
+    /** File name prefix for the staging file a materialisation is written to before it is moved into place. */
+    private static final String MATERIALISE_PREFIX = ".ofbiz-content-store-";
+    /** File name suffix for that staging file. */
+    private static final String MATERIALISE_SUFFIX = ".part";
+
+    /**
+     * Records, per storage key, the {@code length:lastModified} pair of the local working copy as this JVM last
+     * synchronised it with the configured content store.
+     *
+     * <p>This is write-through bookkeeping, not durable state, and it is deliberately safe to lose. Its only
+     * job is to answer one question at resolution time: has the local working copy been overwritten since we
+     * last agreed with the store about it? A missing record therefore means "we do not know", and the
+     * resolution rules below treat the store as authoritative in that case - which is the correct direction to
+     * be wrong in for a fleet whose instances are freely replaceable, because it can only ever cost a
+     * redundant transfer and can never lose content.
+     *
+     * <p>A stat pair rather than a digest is compared, so an ordinary read costs no file content at all. Every
+     * writer that reaches the returned {@link File} does so through {@link java.io.FileOutputStream}, which
+     * updates both members of the pair, so an overwrite is always detected.
+     */
+    private static final Map<String, String> STORE_SYNC_REGISTER = new ConcurrentHashMap<>();
+
+    /**
+     * Upper bound on {@link #STORE_SYNC_REGISTER}, so that a long-lived instance serving many distinct
+     * resources cannot grow it without limit. Reaching the bound clears the register rather than evicting one
+     * entry: forgetting is always safe (see above), and clearing keeps the accounting free of a per-entry
+     * ordering structure.
+     */
+    private static final int STORE_SYNC_REGISTER_MAX = 20000;
 
     /**
      * Traverses the DataCategory parent/child structure and put it in categoryNode. Returns non-null error string if there is an error.
@@ -629,19 +676,73 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         }
     }
 
+    /**
+     * Resolves the local file a file-backed {@code DataResource} is carried by, reconciling it with the
+     * configured content store when one is configured.
+     *
+     * <p>The signature, the return type and every existing failure mode are unchanged, and so is the whole
+     * resolution when no content store is configured - which is the committed default, so an unmodified
+     * checkout behaves exactly as it did before. The reconciliation is layered on top rather than replacing
+     * anything: the path is still computed the same way, and every existing allow-list and boundary check
+     * still runs against it, so no deployment can reach a location through the store that it could not reach
+     * before.
+     *
+     * <p>When a provider IS configured, the resolution becomes a write-through/read-through reconciliation
+     * between the local working copy and the store:
+     * <ul>
+     *   <li>if the local copy has been overwritten since this JVM last agreed with the store about it, the
+     *       local copy is <strong>published</strong>. This is what carries a write performed through the
+     *       returned {@link File} - which is how the binary-file content services write - into the store;</li>
+     *   <li>otherwise the store is authoritative: an object that exists is <strong>materialised</strong> over
+     *       the local copy, so an instance that has never seen this resource before can still serve it;</li>
+     *   <li>a local file that the store does not have yet is published, which is what lets a deployment that
+     *       already holds content on disk adopt object storage without a migration step;</li>
+     *   <li>if neither the store nor the local filesystem has the content, the original
+     *       {@link FileNotFoundException} is raised, with the same message as before.</li>
+     * </ul>
+     *
+     * @param dataResourceTypeId the {@code DataResource} type, which selects how the path is resolved
+     * @param objectInfo the type-relative location recorded on the {@code DataResource}
+     * @param contextRoot the webapp context root, required for the {@code CONTEXT_FILE} types
+     * @return the local file carrying the content, never null for a file-backed type
+     * @throws GeneralException if the location is unusable, is refused by an allow list, or the configured
+     *     content store cannot be reached
+     * @throws FileNotFoundException if neither the content store nor the local filesystem holds the content
+     */
     public static File getContentFile(String dataResourceTypeId, String objectInfo, String contextRoot)
             throws GeneralException, FileNotFoundException {
+        // Content storage seam. The resolution below is the pre-existing one, with the configured provider
+        // reconciled against the local working copy inside each branch: when a non-database provider is
+        // configured the bytes live in that provider rather than only on this instance's disk, they are
+        // materialised as a local file here, and whatever the caller writes through that file is published
+        // back. That is what makes the write callers store their content without any change to their own
+        // code - DataServices.createBinaryFileMethod and updateBinaryFileMethod open a FileOutputStream on
+        // exactly this file. In the default database mode the factory answers null before anything is
+        // derived, so every line below runs exactly as it always has.
+        //
+        // ContentStoreFactory.materialiseContentFile is the bridge's transaction-scoped form of the same
+        // read. The reconciliation here is what this method uses instead, for two reasons: it also carries
+        // the write direction, so a caller that writes through the returned File with no transaction to hang
+        // a publication on is still published on the next resolution; and it leaves every allow-list and
+        // boundary check in the position it has always occupied rather than moving them behind an early
+        // return.
         File file = null;
+        // Resolved once, before any path is touched, so that the checks below keep running in exactly the order
+        // they always have: the store only ever widens the "is the content available?" verdict, and every
+        // boundary and allow-list check still gates the reconciliation that follows it.
+        ContentStore store = configuredContentStore();
+        String key = store == null ? null : contentStoreKey(dataResourceTypeId, objectInfo, contextRoot);
 
         if ("LOCAL_FILE".equals(dataResourceTypeId) || "LOCAL_FILE_BIN".equals(dataResourceTypeId)) {
             file = FileUtil.getFile(objectInfo);
-            if (!file.exists()) {
+            if (!contentAvailable(store, key, file)) {
                 throw new FileNotFoundException("No file found: " + (objectInfo));
             }
             if (!file.isAbsolute()) {
                 throw new GeneralException("File (" + objectInfo + ") is not absolute");
             }
             SecurityUtil.checkLocalFileAllowList(file);
+            reconcileWithContentStore(store, key, file);
         } else if ("OFBIZ_FILE".equals(dataResourceTypeId) || "OFBIZ_FILE_BIN".equals(dataResourceTypeId)) {
             String prefix = System.getProperty("ofbiz.home");
 
@@ -650,10 +751,11 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 sep = "/";
             }
             file = FileUtil.getFile(prefix + sep + objectInfo);
-            if (!file.exists()) {
+            if (!contentAvailable(store, key, file)) {
                 throw new FileNotFoundException("No file found: " + (prefix + sep + objectInfo));
             }
             SecurityUtil.checkOfbizFileAllowList(file);
+            reconcileWithContentStore(store, key, file);
         } else if ("CONTEXT_FILE".equals(dataResourceTypeId) || "CONTEXT_FILE_BIN".equals(dataResourceTypeId)) {
             if (UtilValidate.isEmpty(contextRoot)) {
                 throw new GeneralException("Cannot find CONTEXT_FILE with an empty context root!");
@@ -665,12 +767,72 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
             file = FileUtil.getFile(contextRoot + sep + objectInfo);
             checkContextFileBoundary(file, contextRoot);
-            if (!file.exists()) {
+            if (!contentAvailable(store, key, file)) {
                 throw new FileNotFoundException("No file found: " + (contextRoot + sep + objectInfo));
             }
+            reconcileWithContentStore(store, key, file);
         }
 
         return file;
+    }
+
+    /**
+     * Publishes the content of a local file into the configured content store, so that content written through
+     * the local filesystem becomes durable for the whole fleet rather than for one instance.
+     *
+     * <p>This is the explicit write half of the store seam, for a caller that has just produced content and
+     * does not want to wait for the next resolution to reconcile it. It is a no-op that reports {@code false}
+     * when no content store is configured, so a caller can invoke it unconditionally: in the committed default
+     * the {@code DataResource} database storage remains the only place content lives, exactly as before.
+     *
+     * @param dataResourceTypeId the {@code DataResource} type, which selects how the storage key is derived
+     * @param objectInfo the type-relative location recorded on the {@code DataResource}
+     * @param contextRoot the webapp context root, required for the {@code CONTEXT_FILE} types
+     * @param source the local file whose content is to be published; must exist
+     * @return {@code true} if the content was published, {@code false} if no content store is configured
+     * @throws GeneralException if the type is not file-backed, the key cannot be derived, or the store refuses
+     *     the content
+     * @throws IOException if the local file cannot be read or the store cannot be written to
+     */
+    public static boolean storeContentFile(String dataResourceTypeId, String objectInfo, String contextRoot, File source)
+            throws GeneralException, IOException {
+        ContentStore store = configuredContentStore();
+        if (store == null) {
+            return false;
+        }
+        if (source == null) {
+            throw new GeneralException("Cannot publish a null file for dataResourceTypeId [" + dataResourceTypeId + "]");
+        }
+        String key = contentStoreKey(dataResourceTypeId, objectInfo, contextRoot);
+        publish(store, key, source);
+        return true;
+    }
+
+    /**
+     * Removes the object a file-backed {@code DataResource} is carried by from the configured content store.
+     *
+     * <p>Idempotent, because the underlying providers are: removing content that is not there is a successful
+     * no-op, so replayed clean-up is safe. As with {@link #storeContentFile}, this reports {@code false}
+     * without touching anything when no content store is configured.
+     *
+     * @param dataResourceTypeId the {@code DataResource} type, which selects how the storage key is derived
+     * @param objectInfo the type-relative location recorded on the {@code DataResource}
+     * @param contextRoot the webapp context root, required for the {@code CONTEXT_FILE} types
+     * @return {@code true} if the removal was issued, {@code false} if no content store is configured
+     * @throws GeneralException if the type is not file-backed or the key cannot be derived
+     * @throws IOException if the store cannot be modified
+     */
+    public static boolean removeContentFile(String dataResourceTypeId, String objectInfo, String contextRoot)
+            throws GeneralException, IOException {
+        ContentStore store = configuredContentStore();
+        if (store == null) {
+            return false;
+        }
+        String key = contentStoreKey(dataResourceTypeId, objectInfo, contextRoot);
+        store.delete(key);
+        STORE_SYNC_REGISTER.remove(key);
+        Debug.logVerbose(EVENT_STORE_REMOVED + " key [" + key + "]", MODULE);
+        return true;
     }
 
 
@@ -692,7 +854,18 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         return getDataResourceContentUploadPath(true);
     }
 
+    /**
+     * Returns the location a new upload should be placed in, taken from the configured content store when one
+     * supplies an upload location and computed exactly as before otherwise.
+     *
+     * @param absolute whether the absolute path is wanted rather than the deployment-relative one
+     * @return the upload location, in the requested form
+     */
     public static String getDataResourceContentUploadPath(boolean absolute) {
+        String provided = contentStoreUploadPath(null, absolute);
+        if (provided != null) {
+            return provided;
+        }
         String initialPath = UtilProperties.getPropertyValue("content", "content.upload.path.prefix");
         double maxFiles = UtilProperties.getPropertyNumber("content", "content.upload.max.files");
         if (maxFiles < 1) {
@@ -702,7 +875,23 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         return getDataResourceContentUploadPath(initialPath, maxFiles, absolute);
     }
 
+    /**
+     * Returns the location a new upload should be placed in, resolving deployment configuration through the
+     * supplied delegator.
+     *
+     * <p>The delegator is passed on to the content store, so a deployment that keeps its storage configuration
+     * in {@code SystemProperty} rather than in {@code content.properties} is honoured here too, exactly as it
+     * already is for the upload path prefix.
+     *
+     * @param delegator the delegator to resolve deployment configuration through
+     * @param absolute whether the absolute path is wanted rather than the deployment-relative one
+     * @return the upload location, in the requested form
+     */
     public static String getDataResourceContentUploadPath(Delegator delegator, boolean absolute) {
+        String provided = contentStoreUploadPath(delegator, absolute);
+        if (provided != null) {
+            return provided;
+        }
         String initialPath = EntityUtilProperties.getPropertyValue("content", "content.upload.path.prefix", delegator);
         double maxFiles = UtilProperties.getPropertyNumber("content", "content.upload.max.files");
         if (maxFiles < 1) {
@@ -723,6 +912,21 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * @return the absolute path to the directory where the file should be placed
      */
     public static String getDataResourceContentUploadPath(String initialPath, double maxFiles, boolean absolute) {
+        // Content storage seam. This is the one implementation every upload-path overload delegates
+        // to, so hooking it here - rather than each overload - covers the delegator-aware caller in
+        // DataServicesScript as well as the property-driven ones, with the resolved prefix already
+        // passed in. With a non-database provider configured the upload is staged in a directory of
+        // its own and everything written there is published when the transaction commits, which
+        // captures the writers that never consult this package: DataServices.createFileMethod and
+        // updateFileMethod build their target with new File(objectInfo), and objectInfo is always
+        // derived from the path returned here. The maxFiles fan-out has nothing to do in that mode,
+        // because an object store has neither directories nor a per-directory limit. In the default
+        // database mode the factory answers null and the local allocation below runs unchanged.
+        String staged = ContentStoreFactory.uploadStagingPath(initialPath, absolute);
+        if (staged != null) {
+            return staged;
+        }
+
         String ofbizHome = System.getProperty("ofbiz.home");
 
         if (!initialPath.startsWith("/")) {
@@ -1207,9 +1411,39 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         return writer.toString();
     }
 
+    /**
+     * Renders a file-backed {@code DataResource} into the supplied output, reading it from the configured
+     * content store when one is configured and holds it.
+     *
+     * <p>The store is read as a stream rather than as a whole value, so the content crosses this method
+     * without ever being held in the heap in full - which matters here because the same method serves a
+     * template of a few hundred bytes and an uploaded document of arbitrary size. The stream is opened and
+     * closed by this method, because it is this method that consumes it; nothing about the stream escapes.
+     *
+     * <p>When no content store is configured, or the store does not hold this resource, the resolution falls
+     * back to the local filesystem exactly as before, with the same allow-list and boundary checks.
+     *
+     * @param dataResourceTypeId the {@code DataResource} type, which selects how the location is resolved
+     * @param objectInfo the type-relative location recorded on the {@code DataResource}
+     * @param rootDir the webapp context root, required for the {@code CONTEXT_FILE} type
+     * @param out the output to render into
+     * @throws GeneralException if the location is unusable, is refused by an allow list, or the configured
+     *     content store cannot be reached
+     * @throws IOException if the content cannot be read or written
+     */
     public static void renderFile(String dataResourceTypeId, String objectInfo, String rootDir, Appendable out) throws GeneralException, IOException {
         // TODO: this method assumes the file is a text file, if it is an image we should respond differently,
         //  see the comment above for IMAGE_OBJECT type data RESOURCE
+
+        // Content storage seam. This method only copies bytes through to the caller's Appendable, so a
+        // stream is all it needs and nothing is ever published from here. The helper's type guard repeats
+        // exactly the three types resolved below - deliberately not the _BIN types, which this method has
+        // never handled - so an unhandled type still writes nothing at all rather than being streamed as
+        // text. In the default database mode no provider is consulted and the local resolution below runs
+        // exactly as it always has.
+        if (renderFromContentStore(dataResourceTypeId, objectInfo, rootDir, out)) {
+            return;
+        }
 
         if ("LOCAL_FILE".equals(dataResourceTypeId) && UtilValidate.isNotEmpty(objectInfo)) {
             File file = FileUtil.getFile(objectInfo);
@@ -1344,6 +1578,13 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         } else if (dataResourceTypeId.endsWith("_FILE") || dataResourceTypeId.endsWith("_FILE_BIN")) {
             String objectInfo = dataResource.getString("objectInfo");
             if (UtilValidate.isNotEmpty(objectInfo)) {
+                // Served straight from the configured content store when one holds it, so that a large upload is
+                // streamed rather than materialised locally first. Ownership of the returned stream passes to the
+                // caller either way, exactly as it always has, and the caller cannot tell the two apart.
+                Map<String, Object> fromStore = streamFromContentStore(dataResourceTypeId, objectInfo, contextRoot);
+                if (fromStore != null) {
+                    return fromStore;
+                }
                 File file = DataResourceWorker.getContentFile(dataResourceTypeId, objectInfo, contextRoot);
                 if (!file.exists()) {
                     throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
@@ -1428,5 +1669,382 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     public String renderDataResourceAsTextExt(Delegator delegator, String dataResourceId, Map<String, Object> templateContext,
             Locale locale, String targetMimeTypeId, boolean cache) throws GeneralException, IOException {
         return renderDataResourceAsText(null, delegator, dataResourceId, templateContext, locale, targetMimeTypeId, cache);
+    }
+
+    // -------------------------------------------------------------------------------------------------
+    // Content store seam
+    //
+    // The whole integration with the object-storage providers lives below. It is deliberately confined to
+    // this one region, and every method in it returns "nothing to do" when no provider is configured, so the
+    // committed default - DataResource database storage, with file-backed resources on the local filesystem -
+    // reaches none of it.
+    // -------------------------------------------------------------------------------------------------
+
+    /**
+     * Returns the configured content store, or null when the deployment stores content in the database.
+     *
+     * <p>Failing to resolve a provider is deliberately not softened into "no provider": a deployment that
+     * asked for object storage and cannot have it must be told, rather than quietly writing content to a local
+     * disk that the next request may not land on.
+     *
+     * @return the configured provider, or null when content is stored in the database
+     * @throws GeneralException if a provider was configured but cannot be used
+     */
+    private static ContentStore configuredContentStore() throws GeneralException {
+        return ContentStoreFactory.getContentStore();
+    }
+
+    /**
+     * Derives the storage key a file-backed {@code DataResource} is addressed by.
+     *
+     * <p>The derivation itself belongs to {@link ContentStoreFactory#storageKeyFor(String, String, String)},
+     * which owns the key space for the whole package: the key is the resource's location expressed relative to
+     * whatever root its type implies - the deployment home for {@code LOCAL_FILE} and {@code OFBIZ_FILE}, and
+     * the context root's own identity for {@code CONTEXT_FILE}, which a single location could not otherwise
+     * distinguish between two webapps. Deriving it from {@code objectInfo} rather than inventing an identifier
+     * is what keeps the {@code DataResource} entity model untouched: the same rows address the same content
+     * whether the deployment stores it on a disk or in a bucket, so switching a deployment over is a
+     * configuration change and not a migration. The roots the local path is built from are per-instance
+     * paths, so they are deliberately not part of the key - two instances unpacked at different paths must
+     * address one object, not two.
+     *
+     * <p>This method delegates rather than repeating those rules, because the key a write publishes under has
+     * to be the key a later read derives, and two independent derivations cannot guarantee that.
+     *
+     * @param dataResourceTypeId the {@code DataResource} type
+     * @param objectInfo the type-relative location recorded on the {@code DataResource}
+     * @param contextRoot the webapp context root, required for the {@code CONTEXT_FILE} types
+     * @return the storage key, never null or empty
+     * @throws GeneralException if the type is not one of the six file-backed types, if the location is empty,
+     *     if it traverses above its root, or if a {@code CONTEXT_FILE} arrives without a context root
+     */
+    private static String contentStoreKey(String dataResourceTypeId, String objectInfo, String contextRoot) throws GeneralException {
+        return ContentStoreFactory.storageKeyFor(dataResourceTypeId, objectInfo, contextRoot);
+    }
+
+    /**
+     * Reports whether a {@code DataResource} type is one this class renders as text.
+     *
+     * <p>The three {@code _BIN} companions are excluded on purpose:
+     * {@link #renderFile(String, String, String, Appendable)} has never handled them, so the store seam in
+     * front of it must not start handling them either.
+     *
+     * @param dataResourceTypeId the type to classify
+     * @return {@code true} for the three rendered file types
+     */
+    private static boolean isRenderedFileType(String dataResourceTypeId) {
+        return "LOCAL_FILE".equals(dataResourceTypeId) || "OFBIZ_FILE".equals(dataResourceTypeId)
+                || "CONTEXT_FILE".equals(dataResourceTypeId);
+    }
+
+    /**
+     * Reports whether the content is available at all, from either side of the seam.
+     *
+     * <p>This exists so that the existing existence check keeps its exact position in
+     * {@link #getContentFile(String, String, String)} while becoming aware of the store. In the committed
+     * default it is precisely the {@code file.exists()} call it replaced.
+     *
+     * @param store the configured provider, or null when content is stored in the database
+     * @param key the storage key, or null when there is no provider
+     * @param file the local working copy
+     * @return {@code true} if either the local copy or the stored object exists
+     * @throws GeneralException if the provider cannot be interrogated
+     */
+    private static boolean contentAvailable(ContentStore store, String key, File file) throws GeneralException {
+        if (file.exists()) {
+            return true;
+        }
+        if (store == null) {
+            return false;
+        }
+        try {
+            return store.exists(key);
+        } catch (IOException e) {
+            throw new GeneralException("The configured content store could not be interrogated for key [" + key + "]", e);
+        }
+    }
+
+    /**
+     * Brings the local working copy and the stored object into agreement, in whichever direction is correct.
+     *
+     * <p>Direction is decided by one question: has this JVM overwritten the local copy since it last agreed
+     * with the store about it? If it has, the local copy is the newer content and is published - this is what
+     * carries a write made through the {@link File} returned by
+     * {@link #getContentFile(String, String, String)} into the store. If it has not, the store is
+     * authoritative and the local copy is refreshed from it, which is what lets any instance serve content
+     * another instance wrote.
+     *
+     * <p>A local file the store has never held is published rather than deleted, so a deployment that already
+     * has content on disk adopts object storage on first use instead of losing it.
+     *
+     * @param store the configured provider, or null when content is stored in the database
+     * @param key the storage key, or null when there is no provider
+     * @param file the local working copy
+     * @throws GeneralException if the provider cannot be reached or the local copy cannot be reconciled
+     */
+    private static void reconcileWithContentStore(ContentStore store, String key, File file) throws GeneralException {
+        if (store == null || backsTheSameFile(store, key, file)) {
+            return;
+        }
+        try {
+            boolean present = file.exists();
+            if (present && isLocallyModified(key, file)) {
+                publish(store, key, file);
+                return;
+            }
+            if (present && isSynchronised(key, file)) {
+                // this JVM already agreed with the store about this exact copy and has not overwritten it since,
+                // so there is nothing to move in either direction
+                return;
+            }
+            if (store.exists(key)) {
+                materialise(store, key, file);
+                return;
+            }
+            if (present) {
+                publish(store, key, file);
+            }
+        } catch (IOException e) {
+            throw new GeneralException("The configured content store could not be reconciled for key [" + key + "]", e);
+        }
+    }
+
+    /**
+     * Reports whether the store's content for this key and the local working copy are literally the same file.
+     *
+     * <p>They are, for a provider that keeps content on the local filesystem, whenever a location resolves the
+     * same way through both routes - which is the ordinary case for relative {@code OFBIZ_FILE} content.
+     * Reconciling a file with itself would rewrite it on every single read, so this is checked first and
+     * exactly, by asking the provider which file backs the key rather than by comparing sizes.
+     *
+     * @param store the configured provider
+     * @param key the storage key
+     * @param file the local working copy
+     * @return {@code true} if there is nothing to reconcile because both sides name one file
+     * @throws GeneralException if the provider refuses to resolve the key
+     */
+    private static boolean backsTheSameFile(ContentStore store, String key, File file) throws GeneralException {
+        if (!(store instanceof LocalContentStore)) {
+            return false;
+        }
+        Path backing = ((LocalContentStore) store).backingPath(key);
+        return backing.equals(file.toPath().toAbsolutePath().normalize());
+    }
+
+    /**
+     * Reports whether the local working copy is exactly the copy this JVM last synchronised with the store.
+     *
+     * @param key the storage key
+     * @param file the local working copy
+     * @return {@code true} if a synchronisation was recorded and the copy still matches it
+     */
+    private static boolean isSynchronised(String key, File file) {
+        return syncStamp(file).equals(STORE_SYNC_REGISTER.get(key));
+    }
+
+    /**
+     * Reports whether the local working copy has changed since this JVM last synchronised it with the store.
+     *
+     * @param key the storage key
+     * @param file the local working copy
+     * @return {@code true} if the copy is known to have been overwritten locally
+     */
+    private static boolean isLocallyModified(String key, File file) {
+        String recorded = STORE_SYNC_REGISTER.get(key);
+        return recorded != null && !recorded.equals(syncStamp(file));
+    }
+
+    /**
+     * The stat pair a synchronisation is recorded by.
+     *
+     * @param file the local working copy
+     * @return the {@code length:lastModified} pair
+     */
+    private static String syncStamp(File file) {
+        return file.length() + ":" + file.lastModified();
+    }
+
+    /**
+     * Records that the local working copy and the stored object now agree.
+     *
+     * @param key the storage key
+     * @param file the local working copy
+     */
+    private static void recordSynchronised(String key, File file) {
+        if (STORE_SYNC_REGISTER.size() >= STORE_SYNC_REGISTER_MAX) {
+            // forgetting is always safe: an absent record means "we do not know", and the reconciliation then
+            // treats the store as authoritative, which costs a transfer and never content
+            STORE_SYNC_REGISTER.clear();
+            Debug.logInfo(EVENT_STORE_REGISTER_BOUNDED + ": the content store synchronisation register reached "
+                    + STORE_SYNC_REGISTER_MAX + " entries and was cleared", MODULE);
+        }
+        STORE_SYNC_REGISTER.put(key, syncStamp(file));
+    }
+
+    /**
+     * Writes the local working copy into the store, streaming it with its length declared up front.
+     *
+     * @param store the configured provider
+     * @param key the storage key
+     * @param file the local working copy to publish
+     * @throws GeneralException if the store refuses the content
+     * @throws IOException if the local copy cannot be read or the store cannot be written to
+     */
+    private static void publish(ContentStore store, String key, File file) throws GeneralException, IOException {
+        Path path = file.toPath();
+        long length = Files.size(path);
+        try (InputStream content = Files.newInputStream(path, StandardOpenOption.READ)) {
+            store.put(key, content, length);
+        }
+        recordSynchronised(key, file);
+        Debug.logVerbose(EVENT_STORE_PUBLISHED + " key [" + key + "] length [" + length + "]", MODULE);
+    }
+
+    /**
+     * Writes the stored object over the local working copy, so that a caller holding a {@link File} sees the
+     * content the store holds.
+     *
+     * <p>The copy is staged beside its destination and moved into place, so a reader that opens the working
+     * copy while this is happening sees either the whole previous content or the whole new content and never a
+     * partially written file. The staging file is removed on every path, so a failed materialisation leaves
+     * nothing behind to be mistaken for content.
+     *
+     * @param store the configured provider
+     * @param key the storage key
+     * @param file the local working copy to overwrite
+     * @throws GeneralException if the store refuses the read
+     * @throws IOException if the object cannot be read or the local copy cannot be written
+     */
+    private static void materialise(ContentStore store, String key, File file) throws GeneralException, IOException {
+        Path target = file.toPath();
+        Path parent = target.getParent();
+        if (parent == null) {
+            throw new IOException("Cannot materialise key [" + key + "]: [" + file.getPath() + "] has no parent directory");
+        }
+        Files.createDirectories(parent);
+        Path staging = Files.createTempFile(parent, MATERIALISE_PREFIX, MATERIALISE_SUFFIX);
+        boolean placed = false;
+        try {
+            try (InputStream content = store.openStream(key);
+                    OutputStream sink = Files.newOutputStream(staging, StandardOpenOption.WRITE,
+                            StandardOpenOption.TRUNCATE_EXISTING)) {
+                content.transferTo(sink);
+            }
+            try {
+                Files.move(staging, target, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(staging, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            placed = true;
+        } finally {
+            if (!placed) {
+                Files.deleteIfExists(staging);
+            }
+        }
+        recordSynchronised(key, file);
+        Debug.logVerbose(EVENT_STORE_READ + " key [" + key + "] materialised for local access", MODULE);
+    }
+
+    /**
+     * Renders a file-backed resource directly out of the store, when the store holds it.
+     *
+     * <p>The type guard is deliberately narrower than {@code _FILE}/{@code _FILE_BIN}: it admits exactly the
+     * three types the local resolution below the seam renders, so a {@code _BIN} type - which this method has
+     * never rendered as text - still writes nothing at all rather than starting to be rendered the moment a
+     * provider is configured.
+     *
+     * <p>The stream is opened through {@link ContentStoreFactory#openContentStream(String, String, String)},
+     * which is the bridge form of exactly this read, so the key a render resolves is by construction the key
+     * a write published under. Absence is answered by falling back to the local filesystem rather than by
+     * failing, which is what lets a deployment that already holds content on disk adopt object storage
+     * without a migration step.
+     *
+     * @param dataResourceTypeId the {@code DataResource} type
+     * @param objectInfo the type-relative location recorded on the {@code DataResource}
+     * @param contextRoot the webapp context root, required for the {@code CONTEXT_FILE} type
+     * @param out the output to render into
+     * @return {@code true} if the content was rendered from the store, {@code false} if the caller should fall
+     *     back to the local filesystem
+     * @throws GeneralException if the provider cannot be reached
+     * @throws IOException if the content cannot be read or written
+     */
+    private static boolean renderFromContentStore(String dataResourceTypeId, String objectInfo, String contextRoot, Appendable out)
+            throws GeneralException, IOException {
+        if (!isRenderedFileType(dataResourceTypeId) || UtilValidate.isEmpty(objectInfo)) {
+            return false;
+        }
+        if (configuredContentStore() == null) {
+            // Database mode: no key is derived and no provider is consulted, so the local resolution runs
+            // exactly as it did before this seam existed.
+            return false;
+        }
+        String key = contentStoreKey(dataResourceTypeId, objectInfo, contextRoot);
+        InputStream content;
+        try {
+            content = ContentStoreFactory.openContentStream(dataResourceTypeId, objectInfo, contextRoot);
+        } catch (FileNotFoundException absent) {
+            return false;
+        }
+        if (content == null) {
+            return false;
+        }
+        try (InputStream owned = content;
+                InputStreamReader in = new InputStreamReader(owned, StandardCharsets.UTF_8)) {
+            UtilIO.copy(in, out);
+        }
+        Debug.logVerbose(EVENT_STORE_READ + " key [" + key + "] rendered", MODULE);
+        return true;
+    }
+
+    /**
+     * Opens a stream over a file-backed resource in the store, when the store holds it.
+     *
+     * <p><strong>Ownership of the returned stream passes to the caller</strong>, which is the same contract the
+     * local {@link Files#newInputStream} branch has always had, so the two are interchangeable from a caller's
+     * point of view.
+     *
+     * @param dataResourceTypeId the {@code DataResource} type
+     * @param objectInfo the type-relative location recorded on the {@code DataResource}
+     * @param contextRoot the webapp context root, required for the {@code CONTEXT_FILE} type
+     * @return the {@code stream}/{@code length} pair, or null if the caller should fall back to the local
+     *     filesystem
+     * @throws GeneralException if the provider cannot be reached
+     * @throws IOException if the stream cannot be opened
+     */
+    private static Map<String, Object> streamFromContentStore(String dataResourceTypeId, String objectInfo, String contextRoot)
+            throws GeneralException, IOException {
+        ContentStore store = configuredContentStore();
+        if (store == null) {
+            return null;
+        }
+        String key = ContentStoreFactory.storageKeyFor(dataResourceTypeId, objectInfo, contextRoot);
+        if (!store.exists(key)) {
+            return null;
+        }
+        long length = store.size(key);
+        InputStream content = store.openStream(key);
+        Debug.logVerbose(EVENT_STORE_READ + " key [" + key + "] streamed length [" + length + "]", MODULE);
+        return UtilMisc.toMap("stream", content, "length", length);
+    }
+
+    /**
+     * Returns the upload location the configured content store supplies, or null when it supplies none.
+     *
+     * @param delegator the delegator to resolve deployment configuration through, may be null
+     * @param absolute whether the absolute form is wanted
+     * @return the store-supplied upload location, or null when the local computation should be used
+     */
+    private static String contentStoreUploadPath(Delegator delegator, boolean absolute) {
+        try {
+            // The delegator is handed on rather than resolved around, so a SystemProperty override selects the
+            // same provider here as it does everywhere else, and database mode simply answers null.
+            return ContentStoreFactory.resolveUploadPath(delegator, absolute);
+        } catch (GeneralException e) {
+            // These two methods have never declared a checked exception and widening them would change a public
+            // signature, so the failure is raised unchecked rather than swallowed. Failing the request is the
+            // point: handing back a local path to a deployment that believes it is writing to object storage is
+            // how one instance ends up holding the only copy of an upload.
+            throw new GeneralRuntimeException("The configured content store provider could not supply an upload location", e);
+        }
     }
 }

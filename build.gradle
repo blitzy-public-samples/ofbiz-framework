@@ -375,6 +375,27 @@ tasks.eclipse.dependsOn(cleanEclipse)
 
 test {
     useJUnitPlatform()
+    /*
+     * SecurityPropertiesAnchorTests asserts the REAL generated integration test security override rather
+     * than a re-implementation of it, so the artefact has to exist before the unit tier runs. Generating
+     * it costs one file copy and keeps the regression test unconditional: if the generator task is
+     * deleted, renamed or changed, the unit tier fails instead of silently losing coverage.
+     */
+    dependsOn 'generateIntegrationTestSecurityOverride'
+    /*
+     * DatabaseLeastPrivilegeTests proves that a serving database account cannot issue DDL, which needs a
+     * real PostgreSQL server to refuse it. It is therefore opt-in and skips itself unless these are
+     * supplied. Forwarded explicitly because a Test task runs in a forked JVM that inherits neither the
+     * daemon's system properties nor a -P project property, so without this the settings would silently
+     * fail to arrive and the test would report as skipped while looking as though it had been asked to run.
+     */
+    ['ofbiz.test.postgres.host', 'ofbiz.test.postgres.port', 'ofbiz.test.postgres.superuser',
+     'ofbiz.test.postgres.password', 'ofbiz.test.postgres.sslmode'].each { optInKey ->
+        def optInValue = System.getProperty(optInKey) ?: (project.findProperty(optInKey) as String)
+        if (optInValue) {
+            systemProperty optInKey, optInValue
+        }
+    }
     jvmArgs "-javaagent:${classpath.find { it.name.contains('jmockit') }.absolutePath}"
     // Required for JMockit instrumentation, Mockito, and Spring Test under Java 21
     jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED'
@@ -399,8 +420,25 @@ def sysadminGroup = 'System Administration'
 
 // ========== OFBiz Server tasks ==========
 
+/*
+ * NOTE: this task deliberately does NOT depend on 'generateSecretKeys'.
+ *
+ * It used to, and that made the REQUIRED data-load workflow write freshly generated
+ * login.secret_key_string / security.token.key values into the tracked
+ * framework/security/config/security.properties. Everything downstream then packaged them: 'config' is a
+ * main resource srcDir, so the mutated file was copied into build/resources/main and sealed into
+ * ofbiz.jar, and distributions.main copies framework/** into ofbiz.tar, which is what the container image
+ * is built from. A signing key in an image layer cannot be removed by overwriting the file at run time,
+ * so anybody able to read a layer or the jar could forge JWTs.
+ *
+ * Loading data needs no signing key: JWTManager only reads security.token.key when a token is actually
+ * created or validated, and login.secret_key_string is read as a plain string. The two keys are supplied
+ * at run time instead - by docker-entrypoint.sh in a container, and by the synthetic
+ * generateIntegrationTestSecurityOverride on the 'ofbiz --test' classpath for the integration tier.
+ * 'generateSecretKeys' remains available as an explicit, manually invoked local convenience.
+ */
 task loadAll(group: ofbizServer) {
-    dependsOn 'generateSecretKeys', 'ofbiz --load-data'
+    dependsOn 'ofbiz --load-data'
     description = 'Load default data; meant for OFBiz development, testing, and demo purposes'
 }
 
@@ -750,8 +788,20 @@ task gitInfoFooter(group: sysadminGroup, description: 'Update the Git Branch-rev
     }
 }
 
+/*
+ * MANUAL, LOCAL-ONLY convenience task. It writes real key material into the TRACKED
+ * framework/security/config/security.properties, so it must never be wired into another task: nothing in
+ * this build depends on it, and 'verifySigningKeyAnchorsAreBlank' below refuses to package the result.
+ *
+ * A container never needs it (docker-entrypoint.sh renders both keys into /ofbiz/config/security.properties
+ * at run time), the integration tier never needs it (generateIntegrationTestSecurityOverride supplies
+ * synthetic material on the 'ofbiz --test' classpath), and 'gradlew loadAll' no longer runs it. It exists
+ * only for a developer who wants persistent keys in a local checkout - and such a checkout can no longer
+ * be packaged until the file is restored with
+ * 'git checkout -- framework/security/config/security.properties'.
+ */
 task generateSecretKeys(group: sysadminGroup,
-        description: 'Generate cryptographically secure 512-bit (64-char) secret keys for JWT token signing and password encryption, and write them to security.properties') {
+        description: 'LOCAL DEVELOPMENT ONLY: generate 512-bit (64-char) secret keys for JWT token signing and password encryption and write them into the tracked security.properties; the result must never be committed or packaged') {
     doLast {
         def propertiesFile = file('framework/security/config/security.properties')
 
@@ -778,6 +828,159 @@ task generateSecretKeys(group: sysadminGroup,
         generateAndWriteKey('security.token.key')
 
         println "Secret key generation complete. Keep any new keys secret and do not commit them to version control."
+        println "${propertiesFile} is now a MODIFIED TRACKED file holding live key material."
+        println "Packaging tasks (jar, distTar, distZip, installDist) will refuse to run until you restore it with"
+        println "  git checkout -- framework/security/config/security.properties"
+    }
+}
+
+/*
+ * The two deployment signing keys must reach no packaged artefact.
+ *
+ * framework/security/config/security.properties is a MAIN RESOURCE (the 'config' srcDir above), so it is
+ * copied into build/resources/main and sealed into ofbiz.jar, and distributions.main additionally copies
+ * framework/** into ofbiz.tar - the archive the container image is built from. A key baked into either
+ * artefact survives in image history no matter what the entry point renders at run time, so the only
+ * durable control is to refuse to package a populated file at all.
+ *
+ * The check reads the SOURCE file rather than build/resources/main so the failure names the file the
+ * developer has to restore, and it is deliberately attached to the packaging tasks only: 'gradlew ofbiz'
+ * needs no more than 'classes', so a developer who ran generateSecretKeys can still run locally.
+ */
+def packagedSigningKeyAnchors = ['login.secret_key_string', 'security.token.key']
+
+task verifySigningKeyAnchorsAreBlank(group: sysadminGroup,
+        description: 'Fail the build when a signing key anchor carries a value that packaging would seal into ofbiz.jar or ofbiz.tar') {
+    def trackedSecurityProperties = file('framework/security/config/security.properties')
+    def processedSecurityProperties = layout.buildDirectory.file('resources/main/security.properties')
+
+    // A guard that Gradle can declare up to date is not a guard: reading two property files costs
+    // nothing, and skipping the check is exactly the state in which a key slips into an artefact.
+    outputs.upToDateWhen { false }
+    // BOTH packaging inputs are checked. 'processResources' copies the tracked file into
+    // build/resources/main, which is what 'jar' seals into ofbiz.jar, and a stale copy left behind by an
+    // earlier populated build must not survive into the archive either. Ordering the check after the copy
+    // - rather than depending on it - keeps the check runnable on its own.
+    mustRunAfter 'processResources'
+
+    doLast {
+        if (!trackedSecurityProperties.isFile()) {
+            throw new GradleException("${trackedSecurityProperties} is missing;"
+                    + ' the signing key anchors cannot be verified before packaging')
+        }
+        // java.util.Properties, not a regex: it applies the same canonicalization the running application
+        // does, so a value hidden behind escaping or a continuation line is still seen as populated.
+        def readAnchors = { File source ->
+            def declared = new Properties()
+            source.withInputStream { declared.load(it) }
+            return declared
+        }
+        def refuse = { File source, List<String> populated ->
+            throw new GradleException('Refusing to package live signing key material.\n'
+                    + "  ${source} declares a non-blank value for: ${populated.join(', ')}\n"
+                    + '  That file is a main resource and is copied into ofbiz.jar and into ofbiz.tar, so the value\n'
+                    + '  would be readable in every image layer built from this tree and could be used to forge JWTs.\n'
+                    + '  Restore the blank anchors before packaging:\n'
+                    + '    git checkout -- framework/security/config/security.properties\n'
+                    + '  then re-run the build so the copy under build/resources/main is refreshed.\n'
+                    + '  Supply the keys at run time through OFBIZ_LOGIN_SECRET_KEY and OFBIZ_JWT_TOKEN_KEY instead.')
+        }
+
+        def tracked = readAnchors(trackedSecurityProperties)
+        packagedSigningKeyAnchors.each { name ->
+            if (tracked.getProperty(name) == null) {
+                throw new GradleException("${trackedSecurityProperties} no longer declares the ${name} anchor;"
+                        + ' the container entry point substitutes over that anchor and a missing one silently'
+                        + ' produces a configuration with no secret')
+            }
+        }
+        def populatedInSource = packagedSigningKeyAnchors.findAll { !tracked.getProperty(it).trim().isEmpty() }
+        if (!populatedInSource.isEmpty()) {
+            refuse(trackedSecurityProperties, populatedInSource)
+        }
+
+        def processed = processedSecurityProperties.get().asFile
+        if (processed.isFile()) {
+            def copied = readAnchors(processed)
+            def populatedInCopy = packagedSigningKeyAnchors.findAll {
+                copied.getProperty(it) != null && !copied.getProperty(it).trim().isEmpty()
+            }
+            if (!populatedInCopy.isEmpty()) {
+                refuse(processed, populatedInCopy)
+            }
+        }
+    }
+}
+
+/*
+ * Every task that turns this source tree into a distributable artefact. 'jar' covers ofbiz.jar (and
+ * therefore build/resources/main), the Tar/Zip types cover distTar and distZip, and installDist covers the
+ * exploded distribution. Wiring by type rather than by name also catches an archive task added later.
+ */
+tasks.named('jar') { dependsOn 'verifySigningKeyAnchorsAreBlank' }
+tasks.named('installDist') { dependsOn 'verifySigningKeyAnchorsAreBlank' }
+tasks.withType(Tar).configureEach { dependsOn 'verifySigningKeyAnchorsAreBlank' }
+tasks.withType(Zip).configureEach { dependsOn 'verifySigningKeyAnchorsAreBlank' }
+
+/*
+ * Synthetic, test-only signing material for the integration test tier.
+ *
+ * The two deployment secrets are deliberately blank in the tracked
+ * framework/security/config/security.properties, because a committed value would be a security
+ * regression and the container entry point substitutes them at run time from OFBIZ_LOGIN_SECRET_KEY
+ * and OFBIZ_JWT_TOKEN_KEY. JWTManager.getJWTKey however rejects any security.token.key shorter than
+ * 64 characters (HMAC512, cf. OFBIZ-12724), so the integration tier still needs SOME key material.
+ *
+ * These two values provide it. They are fixed rather than random so that a build is reproducible and
+ * so that anybody inspecting the generated file can see at a glance that the value is not a
+ * credential. They are exactly 64 characters long, drawn from [A-Za-z0-9] so no java.util.Properties
+ * escaping is ever required, and they only ever reach the git-ignored build directory - never the
+ * repository, never distributions.main, never an image layer.
+ */
+def integrationTestLoginSecretKey = 'SyntheticIntegrationTestOnlyLoginSecretKeyNotARealSecretNoDeploy'
+def integrationTestJwtTokenKey = 'SyntheticIntegrationTestOnlyJwtTokenKeyNotARealSecretNeverDeploy'
+
+task generateIntegrationTestSecurityOverride(group: sysadminGroup,
+        description: 'Write the synthetic, test-only security.properties override used by the "ofbiz --test" classpath') {
+    def productionSecurityProperties = file('framework/security/config/security.properties')
+    def overrideFile = integrationTestSecurityOverride()
+    def replacements = ['login.secret_key_string': integrationTestLoginSecretKey,
+                        'security.token.key': integrationTestJwtTokenKey]
+
+    inputs.file productionSecurityProperties
+    inputs.property 'replacements', replacements
+    outputs.file overrideFile
+
+    doLast {
+        /*
+         * A VERBATIM copy of the production file with only the two secret anchors rewritten. Copying
+         * rather than authoring a small fixture is essential: UtilProperties resolves
+         * security.properties through ClassLoader.getResource and returns that ONE file without
+         * merging, so an override that declared only the secrets would silently remove every other
+         * production security property (allow lists, CSRF strategy, password hashing, host headers,
+         * upload extension filters, ...) from the integration run.
+         */
+        def content = productionSecurityProperties.text
+        replacements.each { propertyName, value ->
+            def escapedName = propertyName.replace('.', '\\.')
+            def declaration = ~/(?m)^#?${escapedName}=.*$/
+            if (!(content =~ declaration)) {
+                throw new GradleException("${productionSecurityProperties} no longer declares ${propertyName};"
+                        + ' the integration test security override has nothing to substitute')
+            }
+            // Unconditionally SET the value. Never skip an already populated line: a local
+            // a developer may still invoke generateSecretKeys by hand, which fills the tracked file in place, and
+            // that real key must not be copied into the build directory.
+            content = content.replaceAll(declaration) { "${propertyName}=${value}" }
+        }
+
+        overrideFile.parentFile.mkdirs()
+        overrideFile.text = content
+        def overridePath = overrideFile.toPath()
+        if (overridePath.fileSystem.supportedFileAttributeViews().contains('posix')) {
+            java.nio.file.Files.setPosixFilePermissions(overridePath,
+                    java.nio.file.attribute.PosixFilePermissions.fromString('rw-------'))
+        }
     }
 }
 
@@ -1048,11 +1251,43 @@ tasks.addRule('Pattern: ofbizBackground <Commands>: Execute OFBiz startup comman
  * Helper Functions
  * ======================================================== */
 
+/*
+ * Directory holding the synthetic security.properties override for the integration test tier, and the
+ * override file itself. A method rather than a script variable because Groovy script-level 'def'
+ * locals are invisible inside script methods such as createOfbizCommandTask below.
+ *
+ * The location is deliberately inside the build directory: '.gitignore' ignores 'build/', and
+ * distributions.main only copies framework/**, applications/**, themes/** and plugins/**, so the
+ * synthetic key can reach neither the repository nor a distribution archive nor an image layer.
+ */
+def integrationTestSecurityOverrideDirectory() {
+    return layout.buildDirectory.dir('integration-test-config').get().asFile
+}
+
+def integrationTestSecurityOverride() {
+    return new File(integrationTestSecurityOverrideDirectory(), 'security.properties')
+}
+
 def createOfbizCommandTask(taskName, arguments) {
     task(type: JavaExec, dependsOn: classes, taskName) {
         jvmArgs(application.applicationDefaultJvmArgs)
         if (taskName ==~ /^ofbiz.*(--test|-t).*/) {
-            classpath = sourceSets.main.runtimeClasspath + sourceSets.test.runtimeClasspath
+            /*
+             * The integration tier must not depend on anything having written a secret into the
+             * tracked framework/security/config/security.properties. That file ships BLANK, it is
+             * copied into build/resources/main by the 'config' resource srcDir, and
+             * build/resources/main precedes the test output on this classpath - so the blank
+             * security.token.key used to win over the populated test fixture and every JWT
+             * integration test failed with "The JWT secret key is too short.".
+             *
+             * Prepending the generated, git-ignored override makes ClassLoader.getResource find
+             * usable key material first, without altering the production source and without
+             * shadowing any of the other production security properties. Only the '--test' form of
+             * the task is affected; a plain 'gradlew ofbiz' run keeps the untouched classpath below.
+             */
+            dependsOn 'generateIntegrationTestSecurityOverride'
+            classpath = files(integrationTestSecurityOverrideDirectory()) +
+                    sourceSets.main.runtimeClasspath + sourceSets.test.runtimeClasspath
             finalizedBy(createTestReports)
         } else {
             classpath = sourceSets.main.runtimeClasspath

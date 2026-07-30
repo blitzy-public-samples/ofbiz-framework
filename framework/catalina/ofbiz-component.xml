@@ -33,12 +33,40 @@ under the License.
         <property name="apps-context-reloadable" value="false"/>
         <property name="apps-cross-context" value="false"/>
         <property name="apps-distributable" value="false"/><!-- you must also set all the webapps you want distributable, by adding <distributable/> in their web.xml file -->
+        <!-- SESSION SCOPE OF THIS CONFIGURATION - read this before relying on jvm-route below.
+
+             HTTP sessions in this configuration are INSTANCE-LOCAL. They are held in the memory of the one
+             instance that created them and are neither replicated to another instance nor stored anywhere
+             outside the JVM: apps-distributable is false above, the cluster/session-replication block further
+             down is commented out, and no external session store is configured. The consequence is explicit:
+             if an instance is replaced, scaled in, restarted or lost, every session it was holding is LOST,
+             and the users holding those sessions are logged out and have to sign in again on the instance
+             they land on next.
+
+             jvm-route below does NOT change that. It is sticky-routing metadata only: it appends this
+             instance's id to the session cookie so a load balancer configured for sticky sessions can send a
+             returning request back to the instance that owns the session. It provides no replication and no
+             failover - there is nothing for the balancer to fail over TO. Sticky routing keeps a session
+             usable while its instance is alive; it cannot restore one after that instance is gone.
+
+             This is a deliberate, documented limitation of the stateless-deployment work rather than an
+             oversight. Instances are freely replaceable because they hold no DURABLE state - the database
+             holds the data, the object store holds the content, and the entity caches are kept coherent by
+             distributed cache clear - and a lost session is recoverable by signing in again, which durable
+             state is not. Adding session replication or an external session store would be a separate change
+             with its own transport, serialization and operational cost; see the "Running more than one
+             instance" section of DOCKER.adoc, which states the same limitation for operators. Two practical
+             consequences worth planning around: drain connections before terminating an instance so sessions
+             end at a moment of your choosing, and expect a deployment that rolls every instance to log every
+             signed-in user out. -->
         <!-- configuration of the Tomcat service that hosts OFBiz applications: the service has one engine and one or more connectors -->
         <property name="default-server" value="engine">
             <property name="default-host" value="0.0.0.0"/>
             <!-- Per-instance sticky-session route id. Behind a load balancer that uses sticky sessions, give every
                  instance a DISTINCT value so the balancer can route a session back to the instance that owns it.
-                 An empty value is treated as absent by ContainerConfig, so no JVM route is set at all. -->
+                 An empty value is treated as absent by ContainerConfig, so no JVM route is set at all.
+                 STICKY ROUTING ONLY - it is not session replication and provides no failover. See the session
+                 scope note above: a session does not survive the instance that created it. -->
             <property name="jvm-route" value="jvm1"/>
             <property name="access-log-pattern">
                 <property-value>%h %l %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"</property-value>
@@ -101,9 +129,19 @@ under the License.
                  to come from the network restriction and header hygiene described above. -->
             <property name="ssl-accelerator-port" value=""/>
             <!-- Shares the session cookie across sub-domains by installing CrossSubdomainSessionValve. Only the
-                 literal "true" (case-insensitive) enables it; the default is "false". Enable it only when instances
-                 are served under several sub-domains of one parent domain and a shared session cookie is genuinely
-                 required - the valve calls request.getSession(true), so it forces a session for every request. -->
+                 literal "true" (case-insensitive) enables it; the default is "false". Configurable via
+                 OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS, which the container entry point validates as a boolean.
+                 Enable it only when instances are served under several sub-domains of one parent domain and a
+                 shared session cookie is genuinely required - the valve calls request.getSession(true), so it
+                 forces a session for every request it handles.
+                 The valve exempts the two health probe paths and passes them straight down the pipeline without
+                 touching a session, because it is installed at ENGINE scope and would otherwise create and then
+                 rewrite the cookie of a session for every load balancer and orchestrator probe. Those requests
+                 carry no session to share, are unauthenticated by design and arrive continuously from every
+                 health-check node, so forcing a session for each of them would accumulate short-lived sessions
+                 in the manager for as long as the instance lives. The paths it exempts are the servlet's own
+                 published HealthCheckServlet.isProbePath contract, not a copy of the literals, so the exemption
+                 cannot drift from what the endpoint serves. -->
             <property name="enable-cross-subdomain-sessions" value="false"/>
         </property>
         <property name="ajp-connector" value="connector">
@@ -227,6 +265,10 @@ under the License.
         <!-- one or more tomcat engines (servers); map to this + host -->
         <property name="default-server" value="engine">
             <property name="default-host" value="0.0.0.0"/>
+            <!-- Per-instance sticky-session route id for the test loader, exactly as in the container above.
+                 STICKY ROUTING ONLY - it is not session replication and provides no failover. Sessions are
+                 instance-local here too, so a session does not survive the instance that created it; see the
+                 session scope note in the container above, which applies unchanged. -->
             <property name="jvm-route" value="jvm1"/>
             <property name="access-log-pattern">
                 <property-value>%h %l %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"</property-value>

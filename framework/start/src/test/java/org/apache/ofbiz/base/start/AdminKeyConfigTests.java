@@ -91,6 +91,12 @@ public final class AdminKeyConfigTests {
     private static final String INJECTED_KEY = "injected/Key+With$pecials";
     /** 48 SecureRandom bytes Base64 encoded, which is what the entry point generates in the dev profile. */
     private static final int GENERATED_KEY_LENGTH = 64;
+    /** The security.properties copy the skipped rendering would have written the signing keys into. */
+    private static final String SECURITY_PROPERTIES_OVERRIDE = "config/security.properties";
+    /** An admin key that satisfies every rule the rendering path enforces: 16 characters, no ':', mixed. */
+    private static final String USABLE_ADMIN_KEY = "Xk7Qm2Rv9Tz4Lp8B";
+    /** A signing key that satisfies every rule the rendering path enforces: 64 characters, mixed. */
+    private static final String USABLE_SIGNING_KEY = "Hs92Kf47Qz10Bv63Nw85Yr21Ct40Jm79Px38Dl56Gt17Vb94Zq62Ke83Rn05Ao1X";
 
     /**
      * Every system property {@link Config}'s constructor writes, plus the one these tests set. The
@@ -318,6 +324,35 @@ public final class AdminKeyConfigTests {
                 "a flat config/start.properties shadows nothing and must not be written");
         assertTrue(executable.contains("unset OFBIZ_ADMIN_KEY"),
                 "the injected key must be removed from the environment OFBiz inherits");
+        assertTrue(executable.contains("capture_secret_environment"),
+                "the injected key must be moved out of the exported environment before any child process runs");
+    }
+
+    @Test
+    public void entryPointRemovesTheAdminKeyFromTheEnvironmentBeforeAnyChildProcessRuns(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareEntryPointSandbox(tempDir);
+        Path childEnvironment = sandbox.resolve("child-environment");
+
+        EntryPointRun run = renderAdminKeyConfiguration(tempDir, sandbox,
+                Map.of("OFBIZ_PROFILE", "prod", "OFBIZ_ADMIN_KEY", INJECTED_KEY),
+                "env >" + shellQuote(childEnvironment) + "\n");
+
+        assertEquals(0, run.getExitCode(), "the render must succeed, output was:\n" + run.getOutput());
+        // 'env' is an ordinary child process, so what it reports is exactly what an initialisation JVM, an
+        // executable hook or a crash handler would inherit - and would republish through
+        // /proc/<pid>/environ, a heap dump or an hs_err file. Removing the variable before any of them
+        // exists is what makes the key unobservable to them, rather than observable then withdrawn.
+        String observed = Files.readString(childEnvironment, StandardCharsets.UTF_8);
+        assertFalse(observed.contains("OFBIZ_ADMIN_KEY"),
+                "the variable name must not reach a child process, environment was:\n" + observed);
+        assertFalse(observed.contains(INJECTED_KEY), "the secret value must not reach a child process");
+        assertFalse(observed.contains("CAPTURED_"),
+                "the shell copy the entry point keeps must not be exported, environment was:\n" + observed);
+        // The removal would be worthless if the key had not reached the file the JVM actually reads.
+        assertEquals(INJECTED_KEY, loadProperties(sandbox.resolve(ADMIN_KEY_OVERRIDE)).getProperty(ADMIN_KEY_PROPERTY),
+                "the key must still be rendered into the package qualified override");
     }
 
     @Test
@@ -403,7 +438,288 @@ public final class AdminKeyConfigTests {
                     "a key that " + unusableKey.getValue() + " must be rejected, output was:\n" + run.getOutput());
             assertFalse(Files.exists(sandbox.resolve(ADMIN_KEY_OVERRIDE)),
                     "a rejected key must leave no configuration behind (" + unusableKey.getValue() + ")");
+            // A rejected secret is still a secret. The natural way to write this diagnostic is to quote
+            // the offending value, which would put an operator's mistyped production key into the
+            // container log - a place it cannot be redacted from afterwards. The script therefore reports
+            // the variable name and the reason only, and that has to be asserted per case rather than
+            // once, because each rejection reason is produced by a different branch.
+            assertFalse(run.getOutput().contains(unusableKey.getKey()),
+                    "the rejected key leaked into the output (" + unusableKey.getValue() + "):\n" + run.getOutput());
+            assertTrue(run.getOutput().contains("OFBIZ_ADMIN_KEY"),
+                    "the failure must name the variable to act on (" + unusableKey.getValue() + "):\n"
+                            + run.getOutput());
         }
+    }
+
+    /**
+     * An admin key that begins with whitespace is refused rather than silently shortened, and the rendered
+     * override is read back so it cannot hand {@code Config} a value that was never validated.
+     *
+     * <p>Every check the entry point applies runs on the shell's copy of the value, but {@code Config} reads
+     * whatever {@code java.util.Properties} makes of the rendered line - and {@code Properties} discards blanks
+     * between the {@code =} and the first non-blank character. A 16 character key with two leading spaces
+     * therefore clears the length floor in the shell and reaches {@code AdminServerContainer} as 14 characters.
+     * Nothing fails visibly: the key simply is not the key the operator set, and the first symptom is a shutdown
+     * request that is refused. A leading space is what a YAML block scalar or a copied secret-manager value
+     * produces, so this is an ordinary configuration mistake and has to be reported at start up.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void entryPointRefusesAnAdminKeyPropertiesWouldShortenAndVerifiesWhatItRendered(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        for (String blank : List.of(" ", "  ", "\t")) {
+            Path sandbox = prepareEntryPointSandbox(Files.createTempDirectory(tempDir, "blank"));
+            String padded = blank + INJECTED_KEY;
+
+            EntryPointRun run = renderAdminKeyConfiguration(tempDir, sandbox,
+                    Map.of("OFBIZ_PROFILE", "prod", "OFBIZ_ADMIN_KEY", padded));
+
+            assertNotEquals(0, run.getExitCode(),
+                    "an admin key with leading whitespace must be refused, output was:\n" + run.getOutput());
+            assertTrue(run.getOutput().contains("OFBIZ_ADMIN_KEY"),
+                    "the failure must name the variable, output was:\n" + run.getOutput());
+            assertFalse(Files.exists(sandbox.resolve(ADMIN_KEY_OVERRIDE)),
+                    "a refused key must leave no configuration behind");
+            assertFalse(run.getOutput().contains(INJECTED_KEY),
+                    "the refused key leaked into the output:\n" + run.getOutput());
+        }
+
+        // A duplicated anchor is the other half of the same hazard: Properties takes the LAST declaration, so a
+        // source file carrying the anchor twice - a merge, a patch applied twice - would decide the effective
+        // key. The render must read its own output back rather than trusting that it substituted the right line.
+        Path duplicated = prepareEntryPointSandbox(Files.createTempDirectory(tempDir, "duplicate"));
+        Path source = duplicated.resolve(START_PROPERTIES);
+        Files.writeString(source, Files.readString(source, StandardCharsets.UTF_8)
+                + "\n" + ADMIN_KEY_PROPERTY + "=" + ADMIN_KEY_DEFAULT + "\n", StandardCharsets.UTF_8);
+
+        EntryPointRun run = renderAdminKeyConfiguration(tempDir, duplicated,
+                Map.of("OFBIZ_PROFILE", "prod", "OFBIZ_ADMIN_KEY", INJECTED_KEY));
+
+        assertNotEquals(0, run.getExitCode(),
+                "a duplicated admin key anchor must be refused, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains("exactly one declaration")
+                || run.getOutput().contains("does not read back"),
+                "the failure must say why the rendered file is unusable, output was:\n" + run.getOutput());
+        assertFalse(run.getOutput().contains(INJECTED_KEY),
+                "the key must not be echoed while the render is being refused:\n" + run.getOutput());
+    }
+
+    /**
+     * A configuration one of the entry point's verifiers has just declared untrustworthy is DISCARDED when
+     * it is an override the entry point owns, and LEFT ALONE when it is the file the distribution ships.
+     *
+     * <p>Discarding an override is part of the check rather than tidiness. Every override the entry point
+     * writes lands under {@code config/}, which takes class path precedence over the distribution, so an
+     * artefact that failed validation must not survive on a persistent {@code /ofbiz/config} volume for a
+     * later start to load in preference to the committed defaults - a start that supplies no configuration
+     * at all would otherwise run on a value that has already been refused.</p>
+     *
+     * <p>That reasoning stops at {@code start.properties} itself, which is the one file verified here that
+     * the entry point does not own. It is rendered from ITSELF, because it is what {@code bin/ofbiz} reads
+     * to authenticate a shutdown request, and it is also the anchor every one of these renders is built
+     * from. Deleting it would destroy that anchor: the next start would abort on a missing source file
+     * rather than on the real problem, and recovery would mean restoring a distribution file instead of
+     * correcting the environment. Nothing reads the rejected value in the meantime, because every caller
+     * aborts the start immediately afterwards - so the removal buys nothing here and costs the anchor.</p>
+     *
+     * <p>The two verifiers are driven directly rather than through {@code render_admin_key_configuration}.
+     * The renderer writes both destinations from a single sed program and checks the override first, so the
+     * two files always carry the same content and can only be told apart by naming the one under test.</p>
+     *
+     * @param tempDir a per-test temporary directory
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    @Test
+    public void aRefusedRenderIsDiscardedOnlyWhenItIsAnOverrideTheEntryPointOwns(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        String missingValue = "require_rendered_declaration %s 'ofbiz\\.admin\\.key' \"$START_PROPERTIES_SOURCE\"";
+        String wrongValue = "require_rendered_property_value %s 'ofbiz\\.admin\\.key' OFBIZ_ADMIN_KEY "
+                + "'" + USABLE_ADMIN_KEY + "'";
+
+        RefusalOutcome overrideWithoutAValue = verifyRenderedFile(tempDir, "declaration-override", ANCHOR_LINE,
+                String.format(missingValue, "\"$ADMIN_KEY_OVERRIDE\""));
+        assertNotEquals(0, overrideWithoutAValue.getRun().getExitCode(),
+                "a rendered override that declares no value must be refused, output was:\n"
+                        + overrideWithoutAValue.getRun().getOutput());
+        assertFalse(overrideWithoutAValue.isOverridePresent(),
+                "the refused override must not be left in config/ for a later start to load");
+        assertTrue(overrideWithoutAValue.isShippedFilePresent(),
+                "refusing the override must not touch the shipped file it was rendered from");
+
+        RefusalOutcome shippedWithoutAValue = verifyRenderedFile(tempDir, "declaration-shipped", ANCHOR_LINE,
+                String.format(missingValue, "\"$START_PROPERTIES_SOURCE\""));
+        assertNotEquals(0, shippedWithoutAValue.getRun().getExitCode(),
+                "a shipped file that declares no value must still be refused, output was:\n"
+                        + shippedWithoutAValue.getRun().getOutput());
+        assertTrue(shippedWithoutAValue.isShippedFilePresent(),
+                "the shipped start.properties is the anchor every render is built from and must survive a refusal");
+
+        RefusalOutcome overrideWithTheWrongValue = verifyRenderedFile(tempDir, "value-override",
+                ADMIN_KEY_PROPERTY + "=" + ADMIN_KEY_DEFAULT,
+                String.format(wrongValue, "\"$ADMIN_KEY_OVERRIDE\""));
+        assertNotEquals(0, overrideWithTheWrongValue.getRun().getExitCode(),
+                "a rendered override that reads back a different value must be refused, output was:\n"
+                        + overrideWithTheWrongValue.getRun().getOutput());
+        assertFalse(overrideWithTheWrongValue.isOverridePresent(),
+                "an override carrying an unintended value must not be left in config/");
+        assertTrue(overrideWithTheWrongValue.isShippedFilePresent(),
+                "refusing the override must not touch the shipped file it was rendered from");
+
+        RefusalOutcome shippedWithTheWrongValue = verifyRenderedFile(tempDir, "value-shipped",
+                ADMIN_KEY_PROPERTY + "=" + ADMIN_KEY_DEFAULT,
+                String.format(wrongValue, "\"$START_PROPERTIES_SOURCE\""));
+        assertNotEquals(0, shippedWithTheWrongValue.getRun().getExitCode(),
+                "a shipped file that reads back a different value must still be refused, output was:\n"
+                        + shippedWithTheWrongValue.getRun().getOutput());
+        assertTrue(shippedWithTheWrongValue.isShippedFilePresent(),
+                "the shipped start.properties must survive a refusal so that the next start can render from it");
+    }
+
+    /**
+     * Optional shell tracing must never publish a supplied secret, not even while merely counting which
+     * variables the operator set.
+     *
+     * <p>{@code record_supplied_variables} exists to tell the operator which supplied variables an
+     * {@code OFBIZ_SKIP_INIT} container is ignoring, so it needs only their NAMES. It obtains them with
+     * {@code [ -n "${!variableName:-}" ]}, and an indirect expansion expands the VALUE before the test
+     * runs: under {@code set -x} bash echoes the expanded command, so with {@code OFBIZ_TRACE} enabled
+     * every supplied secret was written to the container log as {@code + [ -n <the secret> ]}. Tracing is
+     * an operator-facing diagnostic, so it must be safe to switch on in the environment where diagnostics
+     * are actually needed.</p>
+     *
+     * <p>The whole {@code _main} prologue is executed, not the one function, because that is what proves
+     * the guarantee end to end: the snapshot, the defaulting, and the advisory that prints the collected
+     * names all run with tracing on, and the assertion is that the names appear and the values do not.</p>
+     *
+     * @param tempDir a per-test temporary directory
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    @Test
+    public void entryPointNeverTracesASuppliedSecretWhileRecordingWhatWasSupplied(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSkipInitSandbox(Files.createTempDirectory(tempDir, "trace"),
+                USABLE_ADMIN_KEY, USABLE_SIGNING_KEY, USABLE_SIGNING_KEY);
+        Map<String, String> environment = new LinkedHashMap<>();
+        environment.put("OFBIZ_TRACE", "1");
+        environment.put("OFBIZ_PROFILE", "prod");
+        environment.put("OFBIZ_SKIP_INIT", "1");
+        environment.put("OFBIZ_ADMIN_KEY", "traced-admin-key-8Kq2Vz");
+        environment.put("OFBIZ_LOGIN_SECRET_KEY", "traced-login-key-4Rm9Tb");
+        environment.put("OFBIZ_JWT_TOKEN_KEY", "traced-jwt-key-7Yc3Nd");
+        environment.put("OFBIZ_POSTGRES_OFBIZ_PASSWORD", "traced-db-password-2Xw6Ph");
+        environment.put("OFBIZ_S3_SECRET_ACCESS_KEY", "traced-s3-secret-5Lg1Ju");
+
+        EntryPointRun run = runEntryPoint(tempDir, sandbox, environment,
+                "record_supplied_variables\nofbiz_setup_env\nrequire_preprovisioned_runtime_configuration");
+
+        assertEquals(0, run.getExitCode(),
+                "a fully pre-provisioned prod container must still start, output was:\n" + run.getOutput());
+        for (Map.Entry<String, String> supplied : environment.entrySet()) {
+            if (!supplied.getKey().endsWith("KEY") && !supplied.getKey().endsWith("PASSWORD")) {
+                continue;
+            }
+            assertFalse(run.getOutput().contains(supplied.getValue()),
+                    supplied.getKey() + " leaked its VALUE into the traced output, which in a container is the log"
+                            + " stream. Tracing must be suspended around every expansion of a secret, including the"
+                            + " indirect expansion that only wants to know whether it is empty. Output was:\n"
+                            + run.getOutput());
+        }
+        assertTrue(run.getOutput().contains("OFBIZ_ADMIN_KEY"),
+                "the NAMES are the point of the snapshot and must still be reported, output was:\n" + run.getOutput());
+    }
+
+    /**
+     * {@code OFBIZ_SKIP_INIT} must require a pre-provisioned secret to be USABLE, not merely present.
+     *
+     * <p>Skipping the rendering skips the validation that goes with it, so the pre-flight has to apply
+     * the same test to what the operator provisioned. Checking only that something follows the {@code =}
+     * accepted {@code ofbiz.admin.key=NA} - the published {@link Config} default, identical on every
+     * instance of an image and readable by anyone who can pull it - along with one-character login keys
+     * and JWT keys shorter than the 64 characters {@code JWTManager.getJWTKey} requires.</p>
+     *
+     * <p>Each case below is rejected for a different reason, and the reason must reach the operator while
+     * the value must not. The last two cases are the ones a presence check cannot distinguish at all: a
+     * value that is long enough but is a repeated pattern, and a second declaration of the same property
+     * that overrides a good first one - {@code java.util.Properties} resolves a duplicate key to the LAST
+     * declaration, so that is the one the pre-flight has to judge.</p>
+     *
+     * @param tempDir a per-test temporary directory
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    @Test
+    public void entryPointRefusesAnUnusablePreprovisionedSecretWhenInitialisationIsSkipped(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Map<String, String> environment = Map.of("OFBIZ_PROFILE", "prod", "OFBIZ_SKIP_INIT", "1");
+
+        // A fully provisioned prod container is the control: the pre-flight must accept it.
+        Path provisioned = prepareSkipInitSandbox(Files.createTempDirectory(tempDir, "usable"),
+                USABLE_ADMIN_KEY, USABLE_SIGNING_KEY, USABLE_SIGNING_KEY);
+        EntryPointRun accepted = runEntryPoint(tempDir, provisioned, environment,
+                "ofbiz_setup_env\nrequire_preprovisioned_runtime_configuration");
+        assertEquals(0, accepted.getExitCode(),
+                "usable pre-provisioned secrets must be accepted, output was:\n" + accepted.getOutput());
+
+        Map<String, String[]> unusable = new LinkedHashMap<>();
+        unusable.put("the publicly known NA default",
+                new String[] {ADMIN_KEY_DEFAULT, USABLE_SIGNING_KEY, USABLE_SIGNING_KEY, "placeholder"});
+        unusable.put("a one-character admin key",
+                new String[] {"x", USABLE_SIGNING_KEY, USABLE_SIGNING_KEY, "at least 16 characters"});
+        unusable.put("an admin key containing the request delimiter",
+                new String[] {"Xk7Qm2Rv9Tz4Lp8:", USABLE_SIGNING_KEY, USABLE_SIGNING_KEY, "must not contain"});
+        unusable.put("an admin key containing a control character",
+                new String[] {"Xk7Qm2Rv\t9Tz4Lp8B", USABLE_SIGNING_KEY, USABLE_SIGNING_KEY, "control character"});
+        unusable.put("a login key shorter than HMAC512 requires",
+                new String[] {USABLE_ADMIN_KEY, "Hs92Kf47Qz10Bv63Nw85Yr21Ct40Jm7", USABLE_SIGNING_KEY,
+                    "at least 64 characters"});
+        unusable.put("a JWT key that is long but is a repeated pattern",
+                new String[] {USABLE_ADMIN_KEY, USABLE_SIGNING_KEY,
+                    "abababababababababababababababababababababababababababababababab", "entropy"});
+
+        for (Map.Entry<String, String[]> unusableCase : unusable.entrySet()) {
+            String[] values = unusableCase.getValue();
+            Path sandbox = prepareSkipInitSandbox(Files.createTempDirectory(tempDir, "case"),
+                    values[0], values[1], values[2]);
+            EntryPointRun run = runEntryPoint(tempDir, sandbox, environment,
+                    "ofbiz_setup_env\nrequire_preprovisioned_runtime_configuration");
+
+            assertNotEquals(0, run.getExitCode(), "OFBIZ_SKIP_INIT with " + unusableCase.getKey()
+                    + " must fail fast rather than serve production traffic, output was:\n" + run.getOutput());
+            assertTrue(run.getOutput().contains(values[3]), "the operator must be told that the pre-provisioned"
+                    + " value is unusable and why - expected \"" + values[3] + "\" for " + unusableCase.getKey()
+                    + ", output was:\n" + run.getOutput());
+            // Asserted only for values that are actually secret-like. The published "NA" placeholder is
+            // named in the guidance on purpose - telling the operator which value is rejected is the
+            // point of it - and a one-character value cannot be distinguished from ordinary prose, so
+            // neither would be evidence of a leak.
+            for (String value : List.of(values[0], values[1], values[2])) {
+                if (!isDistinctiveSecret(value)) {
+                    continue;
+                }
+                assertFalse(run.getOutput().contains(value), "the pre-flight named the VALUE of a provisioned"
+                        + " secret (" + unusableCase.getKey() + "). It may name the property, the file and the"
+                        + " variable only. Output was:\n" + run.getOutput());
+            }
+        }
+
+        // A later declaration overrides an earlier one in java.util.Properties, so a good value followed
+        // by the NA default is an unusable file however good the first line looks.
+        Path shadowed = prepareSkipInitSandbox(Files.createTempDirectory(tempDir, "shadowed"),
+                USABLE_ADMIN_KEY, USABLE_SIGNING_KEY, USABLE_SIGNING_KEY);
+        Files.writeString(shadowed.resolve(ADMIN_KEY_OVERRIDE),
+                Files.readString(shadowed.resolve(ADMIN_KEY_OVERRIDE), StandardCharsets.UTF_8)
+                        + ADMIN_KEY_PROPERTY + "=" + ADMIN_KEY_DEFAULT + "\n", StandardCharsets.UTF_8);
+        EntryPointRun overridden = runEntryPoint(tempDir, shadowed, environment,
+                "ofbiz_setup_env\nrequire_preprovisioned_runtime_configuration");
+        assertNotEquals(0, overridden.getExitCode(), "the LAST declaration of a duplicated property is the one"
+                + " OFBiz loads, so it is the one that must be judged, output was:\n" + overridden.getOutput());
     }
 
     /*
@@ -411,6 +727,45 @@ public final class AdminKeyConfigTests {
      * Helpers
      * ---------------------------------------------------------------------------------------------
      */
+
+    /**
+     * Whether finding this value in the output would really be evidence that a secret was printed.
+     *
+     * <p>Excludes the published {@code "NA"} default, which the guidance names deliberately, and anything
+     * too short to be told apart from ordinary words in a diagnostic message.</p>
+     *
+     * @param value a provisioned value
+     * @return {@code true} when the value is long enough and private enough for the check to mean something
+     */
+    private static boolean isDistinctiveSecret(String value) {
+        return value.length() >= "12345678".length() && !ADMIN_KEY_DEFAULT.equals(value);
+    }
+
+    /**
+     * Builds a container layout whose {@code config/} overrides are already provisioned, which is the
+     * state an {@code OFBIZ_SKIP_INIT} container is started in.
+     *
+     * @param base the directory to build the layout under
+     * @param adminKey the value to declare for {@code ofbiz.admin.key}
+     * @param loginKey the value to declare for {@code login.secret_key_string}
+     * @param jwtKey the value to declare for {@code security.token.key}
+     * @return the sandbox directory the entry point should treat as the OFBiz home
+     * @throws IOException if the layout cannot be written
+     */
+    private static Path prepareSkipInitSandbox(Path base, String adminKey, String loginKey, String jwtKey)
+            throws IOException {
+        Path sandbox = prepareEntryPointSandbox(base);
+        Path adminOverride = sandbox.resolve(ADMIN_KEY_OVERRIDE);
+        Files.createDirectories(adminOverride.getParent());
+        Files.writeString(adminOverride, ADMIN_KEY_PROPERTY + "=" + adminKey + "\n"
+                + ADMIN_PORT_PROPERTY + "=" + SHIPPED_ADMIN_PORT + "\n", StandardCharsets.UTF_8);
+        Path securityOverride = sandbox.resolve(SECURITY_PROPERTIES_OVERRIDE);
+        Files.createDirectories(securityOverride.getParent());
+        Files.writeString(securityOverride, "login.secret_key_string=" + loginKey + "\n"
+                + "security.token.key=" + jwtKey + "\n"
+                + "host-headers-allowed=localhost\n", StandardCharsets.UTF_8);
+        return sandbox;
+    }
 
     /** The file's lines with every whole-line comment removed, so documentation cannot satisfy an assertion. */
     private static String executableLinesOf(Path file) throws IOException {
@@ -434,12 +789,49 @@ public final class AdminKeyConfigTests {
     }
 
     /**
+     * Plants {@code declaration} in place of the shipped commented anchor in BOTH the pristine
+     * {@code start.properties} and the package qualified override, runs {@code invocation} against the
+     * sandbox, and reports which of the two files survived.
+     *
+     * <p>Both files are written with the same content on purpose: that is what the renderer produces, so a
+     * difference in the outcome can only come from which path the verifier was pointed at.</p>
+     *
+     * @param tempDir a per-test temporary directory for the sandbox and the generated driver scripts
+     * @param prefix a name fragment that keeps each leg's sandbox separate and legible
+     * @param declaration the {@code ofbiz.admin.key} line both files carry
+     * @param invocation the verifier call to execute once the entry point has been sourced
+     * @return the run and what it left on disk
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    private static RefusalOutcome verifyRenderedFile(Path tempDir, String prefix, String declaration,
+            String invocation) throws Exception {
+        Path sandbox = prepareEntryPointSandbox(Files.createTempDirectory(tempDir, prefix));
+        Path shipped = sandbox.resolve(START_PROPERTIES);
+        String content = Files.readString(shipped, StandardCharsets.UTF_8);
+        assertTrue(content.contains(ANCHOR_LINE), "the sandbox copy must carry the shipped anchor to rewrite");
+        content = content.replace(ANCHOR_LINE, declaration);
+        Files.writeString(shipped, content, StandardCharsets.UTF_8);
+        Path override = sandbox.resolve(ADMIN_KEY_OVERRIDE);
+        Files.createDirectories(override.getParent());
+        Files.writeString(override, content, StandardCharsets.UTF_8);
+
+        EntryPointRun run = runEntryPoint(tempDir, sandbox, Map.of(), invocation);
+        return new RefusalOutcome(run, Files.exists(shipped), Files.exists(override));
+    }
+
+    /**
      * Runs the real entry point's admin key renderer as a black box against a sandbox.
      *
      * <p>The entry point is sourced with its trailing {@code _main "$@"} line removed so that the single
      * function under test can be invoked without starting OFBiz, and the generated-secret store is
      * redirected into the sandbox because the script otherwise keeps it under the absolute
      * {@code /ofbiz/runtime} path.
+     *
+     * <p>{@code capture_secret_environment} is invoked first because that is exactly what {@code _main}
+     * does: it is the entry point's first statement, and it moves every injected secret out of the
+     * exported environment - where any child process could read it - into non exported shell state that
+     * the renderer then consumes. Driving the renderer without it would exercise a sequence the container
+     * never performs, and the renderer would correctly see no key at all.
      * @param workDir a per-test temporary directory for the generated driver scripts
      * @param sandbox the directory the renderer treats as the OFBiz home
      * @param environment the OFBIZ_* variables to supply; every other OFBIZ_* secret is removed
@@ -447,6 +839,45 @@ public final class AdminKeyConfigTests {
      */
     private static EntryPointRun renderAdminKeyConfiguration(Path workDir, Path sandbox, Map<String, String> environment)
             throws Exception {
+        return renderAdminKeyConfiguration(workDir, sandbox, environment, "");
+    }
+
+    /**
+     * As above, with extra shell lines appended after the render so that a test can observe the state the
+     * entry point leaves behind - most usefully the environment a child process would inherit at the
+     * point where the data loader, an executable hook or a crash handler would run.
+     *
+     * @param workDir a per-test temporary directory for the generated driver scripts
+     * @param sandbox the directory the renderer treats as the OFBiz home
+     * @param environment the OFBIZ_* variables to supply; every other OFBIZ_* secret is removed
+     * @param trailingScript shell lines appended after the render, or an empty string for none
+     * @return the exit code and the combined output of the run
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    private static EntryPointRun renderAdminKeyConfiguration(Path workDir, Path sandbox, Map<String, String> environment,
+            String trailingScript) throws Exception {
+        return runEntryPoint(workDir, sandbox, environment,
+                "capture_secret_environment\nrender_admin_key_configuration\n" + trailingScript);
+    }
+
+    /**
+     * Runs an arbitrary sequence of the real entry point's functions as a black box against a sandbox.
+     *
+     * <p>Extracted from {@link #renderAdminKeyConfiguration} so that the pre-flight and the supplied
+     * variable snapshot can be exercised the same way. The entry point is sourced with its trailing
+     * {@code _main "$@"} line removed so that the functions under test can be invoked without starting
+     * OFBiz, and the generated-secret store is redirected into the sandbox because the script otherwise
+     * keeps it under the absolute {@code /ofbiz/runtime} path.</p>
+     *
+     * @param workDir a per-test temporary directory for the generated driver scripts
+     * @param sandbox the directory the functions treat as the OFBiz home
+     * @param environment the OFBIZ_* variables to supply; every other OFBIZ_* secret is removed
+     * @param invocation the shell statements to execute once the entry point has been sourced
+     * @return the exit code and the combined output of the run
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    private static EntryPointRun runEntryPoint(Path workDir, Path sandbox, Map<String, String> environment,
+            String invocation) throws Exception {
         Path library = workDir.resolve("entrypoint-library.sh");
         if (!Files.exists(library)) {
             List<String> sourced = new ArrayList<>();
@@ -457,18 +888,24 @@ public final class AdminKeyConfigTests {
             }
             Files.write(library, sourced, StandardCharsets.UTF_8);
         }
-        Path driver = Files.createTempFile(workDir, "render-admin-key", ".sh");
+        Path driver = Files.createTempFile(workDir, "entry-point-", ".sh");
         Files.writeString(driver, "#!/usr/bin/env bash\n"
                 + ". " + shellQuote(library) + "\n"
                 + "CONTAINER_GENERATED_SECRETS_DIR=" + shellQuote(sandbox.resolve("secrets")) + "\n"
                 + "cd " + shellQuote(sandbox) + " || exit 1\n"
-                + "render_admin_key_configuration\n", StandardCharsets.UTF_8);
+                + invocation + "\n", StandardCharsets.UTF_8);
 
         ProcessBuilder builder = new ProcessBuilder("bash", driver.toString());
         builder.directory(sandbox.toFile());
         builder.redirectErrorStream(true);
         Map<String, String> processEnvironment = builder.environment();
-        for (String name : List.of("OFBIZ_TRACE", "OFBIZ_PROFILE", "OFBIZ_ADMIN_KEY",
+        // Both routes to tracing are scrubbed, because stderr is merged into the stream these tests
+        // assert against and a value exported into the build's own environment must not be able to turn
+        // tracing on inside a case that did not ask for it. SHELLOPTS is read by bash at start up, so an
+        // inherited value containing xtrace would switch tracing on before the entry point is even
+        // sourced; OFBIZ_TRACE is the entry point's own switch. A case that WANTS tracing puts it back
+        // through the environment map below.
+        for (String name : List.of("SHELLOPTS", "OFBIZ_TRACE", "OFBIZ_PROFILE", "OFBIZ_ADMIN_KEY",
                 "OFBIZ_LOGIN_SECRET_KEY", "OFBIZ_JWT_TOKEN_KEY", "OFBIZ_HOST")) {
             processEnvironment.remove(name);
         }
@@ -570,6 +1007,31 @@ public final class AdminKeyConfigTests {
 
         String getOutput() {
             return output;
+        }
+    }
+
+    /** What one refused verification left on disk, together with the run that refused it. */
+    private static final class RefusalOutcome {
+        private final EntryPointRun run;
+        private final boolean shippedFilePresent;
+        private final boolean overridePresent;
+
+        RefusalOutcome(EntryPointRun run, boolean shippedFilePresent, boolean overridePresent) {
+            this.run = run;
+            this.shippedFilePresent = shippedFilePresent;
+            this.overridePresent = overridePresent;
+        }
+
+        EntryPointRun getRun() {
+            return run;
+        }
+
+        boolean isShippedFilePresent() {
+            return shippedFilePresent;
+        }
+
+        boolean isOverridePresent() {
+            return overridePresent;
         }
     }
 

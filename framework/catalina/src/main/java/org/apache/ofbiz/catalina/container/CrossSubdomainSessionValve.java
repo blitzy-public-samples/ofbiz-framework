@@ -23,14 +23,17 @@ import java.io.IOException;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.Cookie;
 
+import org.apache.catalina.Context;
 import org.apache.catalina.connector.Request;
 import org.apache.catalina.connector.Response;
 import org.apache.catalina.util.SessionConfig;
 import org.apache.catalina.valves.ValveBase;
 import org.apache.ofbiz.base.util.Debug;
+import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.base.util.UtilValidate;
 import org.apache.ofbiz.entity.Delegator;
 import org.apache.ofbiz.entity.util.EntityUtilProperties;
+import org.apache.ofbiz.webapp.control.HealthCheckServlet;
 import org.apache.tomcat.util.buf.MessageBytes;
 import org.apache.tomcat.util.http.MimeHeaders;
 
@@ -44,6 +47,25 @@ public class CrossSubdomainSessionValve extends ValveBase {
 
     @Override
     public void invoke(Request request, Response response) throws IOException, ServletException {
+
+        // The load-balancer health probes are exempt from everything this valve does.
+        //
+        // This valve is installed at ENGINE scope, so it runs before any webapp's filter chain and
+        // before the servlet that answers a probe without ever touching a session - the probe endpoint
+        // is a servlet and nothing else. Creating the session below therefore used to defeat that design
+        // whenever enable-cross-subdomain-sessions was switched on: every probe minted an HttpSession
+        // and a JSESSIONID, and a probe client never returns a cookie, so each one produced a session
+        // that lived until it expired. A target group polls every few seconds, per instance, forever, so
+        // that is an unbounded number of sessions - with their listeners, their expiry bookkeeping and
+        // their heap - created by an anonymous caller, plus a Set-Cookie header on a response that is
+        // documented as carrying none.
+        //
+        // Skipping straight to the next valve is the whole exemption. Nothing is lost by it: a probe has
+        // no session to share across subdomains, which is the only thing this valve exists to arrange.
+        if (isHealthProbe(request)) {
+            getNext().invoke(request, response);
+            return;
+        }
 
         // this will cause Request.doGetSession to create the session cookie if necessary
         request.getSession(true);
@@ -63,6 +85,55 @@ public class CrossSubdomainSessionValve extends ValveBase {
     }
 
     /**
+     * Reports whether the request addresses one of the load-balancer health probe paths.
+     *
+     * <p>The two paths are not restated here. {@link HealthCheckServlet#isProbePath(String)} owns them,
+     * so this valve and the endpoint itself can never disagree about what a probe is - a second copy of
+     * the literals would be a copy that drifts, and a valve exempting a stale spelling would quietly
+     * resume creating a session for every probe.
+     *
+     * <p>The mapped path is tried first, using the same two accessors {@code HealthCheckServlet} uses,
+     * so both arrive at the identical string for either mapping style. They are populated even at engine
+     * scope: Tomcat's {@code CoyoteAdapter} runs the mapper in {@code postParseRequest}, before it
+     * invokes the engine pipeline, and both values are decoded and normalised by then - so no
+     * {@code ../}, {@code %2e} or {@code ;jsessionid} spelling reaches the comparison.
+     *
+     * <p>The decoded request URI is then tried as a fallback, with the context path removed, so the
+     * exemption does not depend on the probe servlet being mapped in the context that received the
+     * request. Only {@code webtools} declares the probe mapping, yet a probe path can be addressed to
+     * any context - a mis-pointed target group, or a proxy rewriting the prefix - and such a request
+     * must not mint a session either. Refusing a session to anything spelt like a probe is the safe
+     * direction: the worst it costs is one cross-subdomain cookie that a probe client never wanted.
+     *
+     * @param request the request being processed
+     * @return {@code true} if this request is a health probe and must not be given a session
+     */
+    private static boolean isHealthProbe(Request request) {
+        StringBuilder mapped = new StringBuilder();
+        String servletPath = request.getServletPath();
+        if (servletPath != null) {
+            mapped.append(servletPath);
+        }
+        String pathInfo = request.getPathInfo();
+        if (pathInfo != null) {
+            mapped.append(pathInfo);
+        }
+        if (HealthCheckServlet.isProbePath(mapped.toString())) {
+            return true;
+        }
+        Context context = request.getContext();
+        String decodedUri = request.getDecodedRequestURI();
+        if (context == null || decodedUri == null) {
+            return false;
+        }
+        String contextPath = context.getPath() == null ? "" : context.getPath();
+        if (!decodedUri.startsWith(contextPath)) {
+            return false;
+        }
+        return HealthCheckServlet.isProbePath(decodedUri.substring(contextPath.length()));
+    }
+
+    /**
      * Replace cookie.
      * @param request the request
      * @param response the response
@@ -70,10 +141,25 @@ public class CrossSubdomainSessionValve extends ValveBase {
      */
     private void replaceCookie(Request request, Response response, Cookie cookie) {
 
+        // Copy the existing session cookie, but use a different domain (only if domain is valid).
+        //
+        // The delegator is published as a request attribute by ContextFilter. This valve runs at ENGINE scope,
+        // above every context, so that filter has NOT run yet and the attribute is normally absent. Handing the
+        // resulting null to the entity-aware lookup reaches EntityQuery.use(null), and the NullPointerException
+        // that follows is not a GenericEntityException, so the catch inside EntityUtilProperties does not stop
+        // it. Thrown from the outermost valve - above ErrorReportValve and StandardHostValve - it escapes to
+        // CoyoteAdapter, which answers a bare HTTP 500 with no body and logs nothing. Because this method runs
+        // only when the request already carries a session cookie, the visible effect was that every returning
+        // client received an unexplained 500 on every path once cross-subdomain sessions were enabled.
+        //
+        // Falling back to the file-based lookup keeps the documented meaning of the property - 'cookie.domain'
+        // in url.properties - and is exactly the source EntityUtilProperties itself consults when the property
+        // has no SystemProperty row. The entity-aware lookup, which additionally honours such a row, is still
+        // used whenever a delegator really is available.
         Delegator delegator = (Delegator) request.getAttribute("delegator");
-        // copy the existing session cookie, but use a different domain (only if domain is valid)
-        String cookieDomain = null;
-        cookieDomain = EntityUtilProperties.getPropertyValue("url", "cookie.domain", "", delegator);
+        String cookieDomain = delegator == null
+                ? UtilProperties.getPropertyValue("url", "cookie.domain", "")
+                : EntityUtilProperties.getPropertyValue("url", "cookie.domain", "", delegator);
 
         if (UtilValidate.isEmpty(cookieDomain)) {
             String serverName = request.getServerName();

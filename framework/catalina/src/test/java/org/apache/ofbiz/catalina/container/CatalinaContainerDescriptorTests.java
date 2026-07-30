@@ -32,6 +32,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -88,6 +90,7 @@ public final class CatalinaContainerDescriptorTests {
     private static final String SSL_ACCELERATOR_PORT = "ssl-accelerator-port";
     private static final String CROSS_SUBDOMAIN_SESSIONS = "enable-cross-subdomain-sessions";
     private static final String HTTP_CONNECTOR = "http-connector";
+    private static final String ENTRY_POINT = "docker/docker-entrypoint.sh";
 
     /** The descriptor is parsed once per test so that element identities can be compared. */
     private Element descriptorRoot;
@@ -321,6 +324,219 @@ public final class CatalinaContainerDescriptorTests {
         assertTrue(commentStart > 0 && commentEnd > commentStart,
                 SSL_ACCELERATOR_PORT + " must be preceded by an explanatory comment");
         return descriptor.substring(commentStart, commentEnd);
+    }
+
+    /*
+     * ---------------------------------------------------------------------------------------------
+     * The session scope this configuration actually provides
+     *
+     * jvm-route is sticky-routing metadata and nothing more. Sessions here are held in the memory of
+     * the instance that created them: apps-distributable is false, the cluster block is commented out
+     * and no external session store is configured, so replacing an instance loses every session it
+     * held. That limitation has to be stated where it is configured, because "sticky sessions are
+     * enabled" reads to an operator as "sessions survive an instance", and the two are not the same.
+     *
+     * The entry point restores these defaults from constants of its own, which must not drift
+     * ---------------------------------------------------------------------------------------------
+     */
+
+    @Test
+    public void theDescriptorStatesThatASessionDoesNotSurviveTheInstanceThatCreatedIt() throws Exception {
+        String note = sessionScopeNote();
+
+        assertTrue(note.contains("INSTANCE-LOCAL"),
+                "the session scope note must say plainly that sessions are instance-local");
+        assertTrue(note.contains("LOST"),
+                "it must say what happens to them when an instance is replaced, in as many words");
+        assertTrue(note.contains("sticky-routing metadata only"),
+                "it must state what " + JVM_ROUTE + " is, since that declaration is what invites the assumption");
+        assertTrue(note.contains("no replication and no failover"),
+                "it must deny both replication and failover, not merely omit them");
+        assertTrue(note.contains("DOCKER.adoc"),
+                "it must point at the operator documentation that repeats the limitation");
+        // The claim is narrowed rather than the statelessness claim being abandoned: an instance still
+        // holds no DURABLE state, which is what makes it replaceable, and a session is recoverable by
+        // signing in again. The note has to make that distinction, or it reads as an unresolved defect.
+        assertTrue(note.contains("DURABLE"),
+                "it must distinguish durable state, which is shared, from a session, which is not");
+    }
+
+    @Test
+    public void theSessionScopeNoteIsReadBeforeTheEngineItQualifies() throws Exception {
+        String descriptor = Files.readString(repositoryRoot().resolve(DESCRIPTOR));
+        int note = descriptor.indexOf("SESSION SCOPE OF THIS CONFIGURATION");
+        int engine = descriptor.indexOf("<property name=\"" + ENGINE_PROPERTY + "\"");
+
+        // Placement is the point: an operator configuring jvm-route reads downwards from the engine
+        // declaration, so a note about what jvm-route does not provide has to precede it.
+        assertTrue(note > 0, "the session scope note must be present in " + DESCRIPTOR);
+        assertTrue(engine > note,
+                "the session scope note must precede the engine declaration it qualifies, not follow it");
+    }
+
+    @Test
+    public void everyJvmRouteDeclarationSaysItProvidesNoFailover() throws Exception {
+        List<Element> routes = allPropertyDeclarations(JVM_ROUTE);
+        assertEquals(2, routes.size(), "both containers are expected to declare " + JVM_ROUTE);
+
+        // Both containers, because the test container's declaration is read by the same operators and
+        // invites the same assumption. The guidance is asserted per declaration rather than once for the
+        // file, so adding a third container without the note fails here.
+        for (int route = 0; route < routes.size(); route++) {
+            String guidance = commentPreceding("<property name=\"" + JVM_ROUTE + "\" value=", route);
+            assertTrue(guidance.contains("STICKY ROUTING ONLY"),
+                    "declaration " + route + " of " + JVM_ROUTE + " must state that it is sticky routing only");
+            assertTrue(guidance.contains("no failover"),
+                    "declaration " + route + " of " + JVM_ROUTE + " must deny failover explicitly");
+            assertTrue(guidance.contains("does not survive"),
+                    "declaration " + route + " of " + JVM_ROUTE + " must say a session does not survive its instance");
+        }
+    }
+
+    @Test
+    public void theDescriptorStillMatchesTheSessionClaimItMakes() {
+        // The note above is only true while these two things hold, and neither is enforced by anything
+        // else: enabling distributable webapps or uncommenting the cluster block would change what the
+        // deployment actually provides and leave the note - and DOCKER.adoc - asserting the opposite.
+        assertEquals("false", containerProperty(PRODUCTION_CONTAINER, "apps-distributable").getAttribute("value"),
+                "the session scope note states that sessions are not distributed, so this must stay false");
+        assertEquals(List.of(), allPropertyDeclarations("default-server-cluster"),
+                "the session scope note states that clustering is not configured, so no active cluster property"
+                        + " may be declared - uncommenting the block means the note has to be rewritten with it");
+    }
+
+    /**
+     * The comment block that states the session scope of this configuration.
+     *
+     * <p>Read from the raw file for the same reason the accelerator guidance is: these assertions are
+     * about the text an operator reads at the point of configuration, and a comment's position relative
+     * to the declaration it qualifies is what makes it that text.
+     */
+    private String sessionScopeNote() throws Exception {
+        String descriptor = Files.readString(repositoryRoot().resolve(DESCRIPTOR));
+        int heading = descriptor.indexOf("SESSION SCOPE OF THIS CONFIGURATION");
+        assertTrue(heading > 0, "the session scope note must be present in " + DESCRIPTOR);
+        int commentStart = descriptor.lastIndexOf("<!--", heading);
+        int commentEnd = descriptor.indexOf("-->", heading);
+        assertTrue(commentStart >= 0 && commentEnd > commentStart, "the session scope note must be a comment block");
+        return unwrapped(descriptor.substring(commentStart, commentEnd));
+    }
+
+    /**
+     * One comment block as a single line, so an assertion about its prose is not an assertion about where
+     * the text happens to be wrapped. Re-flowing a comment for width must not fail a test about wording.
+     */
+    private static String unwrapped(String comment) {
+        return comment.replaceAll("\\s+", " ");
+    }
+
+    /**
+     * The comment immediately preceding the n-th occurrence of a declaration, counted from the start of
+     * the file, so a per-declaration guarantee can be asserted on each declaration separately.
+     */
+    private String commentPreceding(String declaration, int occurrence) throws Exception {
+        String descriptor = Files.readString(repositoryRoot().resolve(DESCRIPTOR));
+        int at = -1;
+        for (int found = 0; found <= occurrence; found++) {
+            at = descriptor.indexOf(declaration, at + 1);
+            assertTrue(at > 0, "occurrence " + occurrence + " of " + declaration + " must exist in " + DESCRIPTOR);
+        }
+        int commentEnd = descriptor.lastIndexOf("-->", at);
+        int commentStart = descriptor.lastIndexOf("<!--", commentEnd);
+        assertTrue(commentStart > 0 && commentEnd > commentStart,
+                declaration + " occurrence " + occurrence + " must be preceded by an explanatory comment");
+        return unwrapped(descriptor.substring(commentStart, commentEnd));
+    }
+
+    @Test
+    public void theEntryPointRestoreDefaultsMatchTheCommittedDeclarations() throws Exception {
+        String entryPoint = containerEntryPoint();
+
+        // The entry point rewrites these three declarations IN PLACE, so after the first start the
+        // committed default is gone from the file and cannot be recovered from it. To make withdrawing a
+        // variable actually take effect, the entry point restores the default from a constant of its own -
+        // which means the default now exists in two places that no compiler relates. This test is that
+        // relation: it reads each constant out of the shipped script and requires it to equal the value
+        // this descriptor declares, so changing one without the other fails the build instead of silently
+        // teaching the container to "restore" a default the descriptor never had.
+        assertEquals(productionEngineValue(JVM_ROUTE), shellConstant(entryPoint, "CATALINA_DEFAULT_JVM_ROUTE"),
+                "CATALINA_DEFAULT_JVM_ROUTE must equal the " + JVM_ROUTE + " value declared in " + DESCRIPTOR);
+        assertEquals(productionEngineValue(SSL_ACCELERATOR_PORT),
+                shellConstant(entryPoint, "CATALINA_DEFAULT_SSL_ACCELERATOR_PORT"),
+                "CATALINA_DEFAULT_SSL_ACCELERATOR_PORT must equal the " + SSL_ACCELERATOR_PORT
+                        + " value declared in " + DESCRIPTOR);
+        assertEquals(productionEngineValue(CROSS_SUBDOMAIN_SESSIONS),
+                shellConstant(entryPoint, "CATALINA_DEFAULT_CROSS_SUBDOMAIN_SESSIONS"),
+                "CATALINA_DEFAULT_CROSS_SUBDOMAIN_SESSIONS must equal the " + CROSS_SUBDOMAIN_SESSIONS
+                        + " value declared in " + DESCRIPTOR);
+    }
+
+    @Test
+    public void theEntryPointContainerPatternsCannotConfuseTheTwoContainers() throws Exception {
+        String entryPoint = containerEntryPoint();
+        String descriptor = Files.readString(repositoryRoot().resolve(DESCRIPTOR));
+
+        // "catalina-container" is a PREFIX of "catalina-container-test", so a pattern that stops at the
+        // container name matches both blocks and every positional edit lands in the wrong place. The
+        // closing quote is what separates them, and it is load bearing rather than cosmetic.
+        String production = shellConstant(entryPoint, "CATALINA_PRODUCTION_CONTAINER");
+        String test = shellConstant(entryPoint, "CATALINA_TEST_CONTAINER");
+        assertEquals("name=\"" + PRODUCTION_CONTAINER + "\"", production,
+                "the production block pattern must be terminated by the closing quote");
+        assertEquals("name=\"" + TEST_CONTAINER + "\"", test,
+                "the test block pattern must be terminated by the closing quote");
+        assertFalse(test.contains(production),
+                "the production pattern must not be a substring of the test container's own name attribute");
+        assertEquals(1, countOf(descriptor, production), "occurrences of " + production + " in " + DESCRIPTOR);
+        assertEquals(1, countOf(descriptor, test), "occurrences of " + test + " in " + DESCRIPTOR);
+
+        // The AJP bind-address insertion is anchored on this exact text, which BOTH containers declare -
+        // hence the entry point restricts itself to the first match. Asserting the count here is what
+        // keeps that restriction meaningful: were it ever to become 1, an unbounded edit would look correct.
+        String ajpAnchor = shellConstant(entryPoint, "CATALINA_AJP_CONNECTOR_ANCHOR");
+        assertEquals(2, countOf(descriptor, ajpAnchor),
+                "both containers must declare the AJP connector anchor " + ajpAnchor);
+        assertTrue(descriptor.contains("<!--" + shellConstant(entryPoint, "CATALINA_CONNECTOR_ADDRESS_ANCHOR")),
+                "the bind-address anchor must also appear COMMENTED OUT, which is why the entry point"
+                        + " anchors its search at the start of the line");
+    }
+
+    /** The value the production engine block declares for a load-balancer property. */
+    private String productionEngineValue(String propertyName) {
+        return enginePropertyOf(PRODUCTION_CONTAINER, propertyName).getAttribute("value");
+    }
+
+    /** The shipped container entry point, read as text because its constants are shell assignments. */
+    private String containerEntryPoint() throws Exception {
+        Path entryPoint = repositoryRoot().resolve(ENTRY_POINT);
+        assertTrue(Files.isRegularFile(entryPoint), "missing container entry point " + entryPoint);
+        return Files.readString(entryPoint);
+    }
+
+    /**
+     * The value of a single top-level scalar assignment in the entry point.
+     *
+     * <p>Matched at column one with either quoting style and nothing but the value between the quotes, so
+     * a constant that grows a substitution or a concatenation is reported as missing rather than silently
+     * compared against a fragment of itself.</p>
+     */
+    private static String shellConstant(String script, String name) {
+        Matcher matcher = Pattern.compile("^" + Pattern.quote(name) + "=(?:\"([^\"]*)\"|'([^']*)')$",
+                Pattern.MULTILINE).matcher(script);
+        assertTrue(matcher.find(), "the entry point must declare the constant " + name
+                + " as a single quoted literal at column one");
+        String value = matcher.group(1) != null ? matcher.group(1) : matcher.group(2);
+        assertFalse(matcher.find(), name + " must be assigned exactly once");
+        return value;
+    }
+
+    /** Occurrences of a literal in a text, counted without overlap. */
+    private static int countOf(String text, String literal) {
+        int count = 0;
+        for (int at = text.indexOf(literal); at >= 0; at = text.indexOf(literal, at + literal.length())) {
+            count++;
+        }
+        return count;
     }
 
     /*

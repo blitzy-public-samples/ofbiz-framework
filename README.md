@@ -510,6 +510,16 @@ OR
 
 `gradlew 'ofbiz --test'`
 
+Both forms supply their own JWT and login signing keys, so they pass on a fresh
+checkout where `framework/security/config/security.properties` still ships those
+two secrets blank. The `generateIntegrationTestSecurityOverride` task writes a
+copy of that file - identical except for the two keys, which are filled with
+fixed, clearly synthetic, test-only values - into the git-ignored
+`build/integration-test-config` directory, and only the `--test` form of the
+`ofbiz` task puts that directory first on its classpath. Nothing rewrites the
+tracked file, and no other `gradlew ofbiz` invocation and no distribution
+archive ever sees the synthetic values.
+
 #### Execute integration tests with a different log level
 
 It is possible to start integration tests with a log level different from the

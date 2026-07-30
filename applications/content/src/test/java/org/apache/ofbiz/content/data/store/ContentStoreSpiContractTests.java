@@ -46,16 +46,19 @@ import org.junit.jupiter.api.Test;
  * compiling only as long as the declared checked exceptions stay exactly what those call sites already catch.
  * Compilation alone proves the interface is legal Java; it does not protect any of that.
  *
- * <p>So this test pins the shape by reflection - the five operations with their exact parameter and return
+ * <p>So this test pins the shape by reflection - the eight operations with their exact parameter and return
  * types, the exact declared exceptions in their declared order, and the deliberate absence of anything else.
- * Three drifts in particular would be invisible without it:
+ * Four drifts in particular would be invisible without it:
  * <ul>
  * <li>adding a checked exception, which would silently break every existing {@code DataResourceWorker} catch
  *     block that has to keep compiling unchanged;</li>
  * <li>turning an operation into a {@code default} method, which would let a provider inherit a silent no-op
  *     instead of being forced to implement storage;</li>
  * <li>letting a {@code File}, a {@code Path} or an object-store client type into a signature, which would
- *     couple callers to one backing store and defeat the whole point of the abstraction.</li>
+ *     couple callers to one backing store and defeat the whole point of the abstraction;</li>
+ * <li>losing the known-length streaming {@code put} or the {@code size} probe, which are the only operations
+ *     that let arbitrarily large content move through a provider without being held in the heap first, or
+ *     losing {@code close}, without which a provider holding a network client leaks it on replacement.</li>
  * </ul>
  *
  * <p>Nothing here instantiates or mocks a {@code ContentStore}: a mock returning its own configured value
@@ -73,27 +76,34 @@ public final class ContentStoreSpiContractTests {
      * declared order, which is what pins {@code throws GeneralException, IOException} as written.
      */
     private static final List<String> EXPECTED_OPERATIONS = List.of(
+            "void close() throws org.apache.ofbiz.base.util.GeneralException, java.io.IOException",
             "void delete(java.lang.String) throws org.apache.ofbiz.base.util.GeneralException, java.io.IOException",
             "boolean exists(java.lang.String) throws org.apache.ofbiz.base.util.GeneralException, java.io.IOException",
             "byte[] get(java.lang.String) throws org.apache.ofbiz.base.util.GeneralException, java.io.IOException",
             "java.io.InputStream openStream(java.lang.String) throws org.apache.ofbiz.base.util.GeneralException, java.io.IOException",
-            "void put(java.lang.String, byte[]) throws org.apache.ofbiz.base.util.GeneralException, java.io.IOException");
+            "void put(java.lang.String, byte[]) throws org.apache.ofbiz.base.util.GeneralException, java.io.IOException",
+            "void put(java.lang.String, java.io.InputStream, long) throws org.apache.ofbiz.base.util.GeneralException, java.io.IOException",
+            "long size(java.lang.String) throws org.apache.ofbiz.base.util.GeneralException, java.io.IOException");
+
+    /** The number of operations {@link #EXPECTED_OPERATIONS} is expected to describe. */
+    private static final int EXPECTED_OPERATION_COUNT = 8;
 
     /** The only types the SPI surface is allowed to mention, so no caller can be coupled to a backing store. */
     private static final Set<Class<?>> ALLOWED_SURFACE_TYPES =
-            Set.of(void.class, boolean.class, String.class, byte[].class, InputStream.class);
+            Set.of(void.class, boolean.class, long.class, String.class, byte[].class, InputStream.class);
 
     @Test
-    public void theSpiDeclaresExactlyTheFiveStorageOperations() {
+    public void theSpiDeclaresExactlyTheEightStorageOperations() {
         List<String> declared = declaredOperations().stream().map(ContentStoreSpiContractTests::describe).sorted().toList();
         List<String> expected = EXPECTED_OPERATIONS.stream().sorted().toList();
 
         // One assertion for the whole surface: a removed operation, an added one, a changed parameter or return
         // type and an altered throws clause are all caught by the same comparison.
         assertEquals(expected, declared, "the complete " + ContentStore.class.getSimpleName() + " operation set");
-        // Guard the expectation itself: five DISTINCT operations, so a copy-paste duplicate in the constant above
+        // Guard the expectation itself: eight DISTINCT operations, so a copy-paste duplicate in the constant above
         // cannot mask a genuinely missing operation.
-        assertEquals(5, expected.stream().distinct().count(), "the SPI must declare five distinct storage operations");
+        assertEquals(EXPECTED_OPERATION_COUNT, expected.stream().distinct().count(),
+                "the SPI must declare " + EXPECTED_OPERATION_COUNT + " distinct storage operations");
     }
 
     @Test
@@ -106,7 +116,7 @@ public final class ContentStoreSpiContractTests {
         }
         // No static or private helper may hide in the SPI either - the declared set IS the whole interface.
         assertEquals(declaredOperations().size(), ContentStore.class.getDeclaredMethods().length,
-                "the interface must declare nothing besides its five abstract operations");
+                "the interface must declare nothing besides its " + EXPECTED_OPERATION_COUNT + " abstract operations");
     }
 
     @Test
@@ -117,8 +127,8 @@ public final class ContentStoreSpiContractTests {
             surface.addAll(Arrays.asList(operation.getParameterTypes()));
         }
 
-        // Keys are opaque strings and payloads are plain bytes, so neither a local-file handle nor an
-        // object-store client type can appear. This is what keeps the contract below the service layer: no
+        // Keys are opaque strings, payloads are plain bytes or a plain stream and lengths are plain longs, so
+        // neither a local-file handle nor an object-store client type can appear. This is what keeps the contract below the service layer: no
         // java.io.File, no java.nio.file.Path, no software.amazon.* and no entity or service type.
         assertEquals(ALLOWED_SURFACE_TYPES, surface, "the union of every return and parameter type of the SPI");
         for (Class<?> type : surface) {
@@ -147,9 +157,10 @@ public final class ContentStoreSpiContractTests {
 
     @Test
     public void theDocumentedAbsentKeySignalFitsInsideTheDeclaredExceptionSet() {
-        // Both get() and openStream() are documented to throw FileNotFoundException for an absent key rather than
-        // returning null. That is only possible without widening the throws clause because FileNotFoundException
-        // IS an IOException - which is precisely why the declared set could be held to exactly two types.
+        // get(), openStream() and size() are documented to throw FileNotFoundException for an absent key rather
+        // than returning null or a sentinel. That is only possible without widening the throws clause because
+        // FileNotFoundException IS an IOException - which is why the declared set could be held to exactly two
+        // types even as the SPI grew the streaming, measuring and lifecycle operations.
         assertTrue(IOException.class.isAssignableFrom(FileNotFoundException.class),
                 "the documented absent-key signal must be expressible under the declared IOException");
         for (Method operation : declaredOperations()) {
