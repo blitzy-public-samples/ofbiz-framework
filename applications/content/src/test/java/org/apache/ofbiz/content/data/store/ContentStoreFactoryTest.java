@@ -18,26 +18,30 @@
  *******************************************************************************/
 package org.apache.ofbiz.content.data.store;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
+import java.io.ByteArrayInputStream;
+import java.io.FileNotFoundException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -47,79 +51,144 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.ofbiz.base.util.GeneralException;
 import org.apache.ofbiz.base.util.UtilProperties;
-import org.apache.ofbiz.entity.Delegator;
-import org.apache.ofbiz.entity.util.EntityUtilProperties;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Answers;
 import org.mockito.MockedStatic;
 
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.http.AbortableInputStream;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
 /**
- * Unit tests for {@link ContentStoreFactory}: how a configured value is normalised, how the outcome
- * it resolves to is cached and released, and what happens when a provider the deployment explicitly
- * named cannot be built.
+ * Unit tests for the content storage provider selection performed by {@link ContentStoreFactory}, and
+ * for the object-storage provider it selects, exercised against a mocked object-storage client.
  *
- * <p><strong>Why these tests reach past the two public methods.</strong> Both public forms read
- * {@code content.store.provider} from the {@code content} resource, and the copy of that resource on
- * the test classpath carries the committed default, {@code database}. Several tests therefore drive
- * the private resolution seam directly, which is the same code the public methods run and is the only
- * way to exercise {@code filesystem}, {@code s3} and an unrecognised value in one JVM without
- * rewriting a file on the classpath mid-run. That the public methods reach that seam - and that the
- * committed configuration really does select database storage - is covered separately, by stubbing
- * the property lookup itself. The keys and committed values of the resource are pinned by
- * {@link ContentStorePropertiesContractTests}.
+ * <p>These are pure unit tests. No delegator, no dispatcher, no database, no filesystem write and no
+ * network: the configured value is varied in memory and read back through the public lookup production
+ * code calls, and the cases that reach the object store drive a client the test itself supplied.
  *
- * <p><strong>Why the object-storage client type appears here.</strong> One test has to observe that
- * clearing the cache closes a client the factory had opened, and the only way to observe that is to
- * verify {@code close()} on a client the test supplied. The reference is confined to that one
- * concern; no production class outside {@link S3ContentStore} refers to the client library.
+ * <p><strong>Why {@code null} is an asserted outcome rather than a defect.</strong> An absent, blank or
+ * {@code database} value resolves to no provider at all, and that is the single documented signal for
+ * "keep using the pre-existing {@code DataResource} database storage, untouched". There is no sentinel
+ * provider type and no {@code Optional}, so {@code assertNull} is how the default-off guarantee - the
+ * state of an unmodified checkout - is asserted.
+ *
+ * <p><strong>Why an unrecognised value is asserted to fail rather than to fall back.</strong> A typo
+ * must not be read as a deliberate instruction: {@link ContentStoreFactory} refuses it with a
+ * {@link ContentStoreConfigurationException} instead of quietly selecting database storage, which would
+ * put content in a backend nobody chose. That refusal is confined to the content operation that asked -
+ * nothing resolves a provider while the container starts - so a misconfigured deployment fails the
+ * operation it misconfigured rather than the process, which is asserted here as well.
+ *
+ * <p><strong>Why the class is {@code final}.</strong> Checkstyle's {@code DesignForExtension} exempts
+ * only the JUnit 4 lifecycle annotations, so a non-final class carrying a {@code @BeforeEach} or an
+ * {@code @AfterEach} - which the configuration restore below requires - fails the build.
+ *
+ * <p><strong>Why the configured value is restored after every test.</strong>
+ * {@code UtilProperties.setPropertyValueInMemory} mutates the cached {@code Properties} instance the
+ * whole JVM shares, and the unit tier runs every test class in one JVM, so an override left behind
+ * would change what another class observes. It is therefore captured before each test and written back
+ * after it, together with the factory's own resolution cache.
  */
 public final class ContentStoreFactoryTest {
 
+    /** The resource the factory reads its selection from; the bare name, never the file name. */
     private static final String RESOURCE = "content";
     private static final String PROPERTY_PROVIDER = "content.store.provider";
+    private static final String PROPERTY_S3_BUCKET = "content.store.s3.bucket";
+
     private static final String PROVIDER_DATABASE = "database";
     private static final String PROVIDER_FILESYSTEM = "filesystem";
     private static final String PROVIDER_S3 = "s3";
 
-    /** The private resolution seam these tests drive; see the type comment for why. */
-    private static final Method RESOLVE = resolutionSeam();
+    /** An obviously fake bucket, so no test ever needs a real one, and no credential is involved. */
+    private static final String BUCKET = "test-bucket";
+    private static final String KEY = "uploads/party/logo.png";
+    private static final byte[] PAYLOAD = "content bound for an object store".getBytes(StandardCharsets.UTF_8);
+
+    /** The status a compatible object store answers an absent key with. */
+    private static final int HTTP_NOT_FOUND = 404;
+
+    private static final int WORKERS = 32;
+    private static final long PATIENCE_SECONDS = 30L;
+
+    /** The configured value as the classpath resource carries it, restored after every test. */
+    private String committedProvider;
 
     @BeforeEach
-    public void discardAnyOutcomeAnEarlierTestCached() {
+    public void captureTheConfigurationAndDiscardAnyOutcomeAnEarlierTestCached() {
+        // setPropertyValueInMemory returns silently when the resource cannot be resolved, so a test whose
+        // override never took effect would quietly assert against the committed value instead. Proving the
+        // resource is on the test classpath up front is what turns that into a failure here.
+        assertNotNull(UtilProperties.getProperties(RESOURCE), "the [" + RESOURCE + "] resource must be resolvable"
+                + " on the test classpath, otherwise an in-memory override is silently discarded");
+        // Never null: the two-argument lookup answers "" for an absent key, so this is always safe to write
+        // straight back in the restore below.
+        committedProvider = UtilProperties.getPropertyValue(RESOURCE, PROPERTY_PROVIDER);
         ContentStoreFactory.clearCache();
     }
 
     @AfterEach
-    public void leaveNoOutcomeBehindForTheNextTest() {
+    public void restoreTheConfigurationAndLeaveNoOutcomeBehind() {
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_PROVIDER, committedProvider);
         ContentStoreFactory.clearCache();
     }
 
     @Test
     public void everyValueThatMeansDatabaseStorageResolvesToNoProvider() throws Exception {
-        // null covers a lookup that yielded nothing at all; the rest are the shapes a deployment can
-        // write. Each must leave the existing DataResource database-storage path in charge.
-        for (String value : new String[] {null, "", "   ", PROVIDER_DATABASE, "DATABASE", "  Database  "}) {
+        // Every shape a deployment can write for "leave content exactly where it is": the blank a
+        // commented-out or emptied key leaves behind, and the letter cases and padding a hand-edited file
+        // or a SystemProperty row arrives with. Each must leave the existing DataResource database-storage
+        // path in charge. The blank is written explicitly rather than left to an absent key: this component
+        // ships the key with a value, so a case that asserted nothing at all would read that shipped value
+        // and quietly stop distinguishing "unset" from "database".
+        for (String value : new String[] {"", "   ", PROVIDER_DATABASE, "DATABASE", "  Database  "}) {
             ContentStoreFactory.clearCache();
-            assertNull(resolve(value), "[" + value + "] must select database storage");
+            assertNull(storeConfiguredAs(value), "[" + value + "] must select database storage");
         }
     }
 
     @Test
+    public void theFilesystemValueResolvesToTheFilesystemProvider() throws Exception {
+        ContentStore selected = storeConfiguredAs(PROVIDER_FILESYSTEM);
+
+        // The type is the whole assertion. Asking the provider for an upload location would create a real
+        // timestamped directory under the working tree as a side effect, which no unit test may do.
+        assertNotNull(selected, "[" + PROVIDER_FILESYSTEM + "] must select a provider");
+        assertTrue(selected instanceof FileSystemContentStore, "[" + PROVIDER_FILESYSTEM + "] must select the"
+                + " filesystem provider, was: " + selected.getClass().getName());
+    }
+
+    @Test
+    public void theObjectStoreValueResolvesToTheObjectStoreProvider() throws Exception {
+        // No object-store configuration is written first, and none is needed: selecting this provider reads
+        // configuration only. No client is built, no credential is resolved and no endpoint is contacted
+        // until a storage operation is actually issued, which is what keeps selection free of I/O.
+        ContentStore selected = storeConfiguredAs(PROVIDER_S3);
+
+        assertNotNull(selected, "[" + PROVIDER_S3 + "] must select a provider");
+        assertTrue(selected instanceof S3ContentStore, "[" + PROVIDER_S3 + "] must select the object-storage"
+                + " provider, was: " + selected.getClass().getName());
+    }
+
+    @Test
     public void anUnrecognisedValueIsRefusedRatherThanReadAsDatabaseStorage() {
-        // A typo must never be mistaken for a deliberate instruction. It is refused rather than read as
-        // database storage: every one of these values names a backend the deployment is not provisioned
-        // for, and quietly answering "database" would send content somewhere nobody asked for. Nothing
-        // is resolved during start up - the factory is reached from a content operation - so a refusal
-        // here fails the operation that is misconfigured instead of the container.
+        // A typo must never be mistaken for a deliberate instruction. Every one of these values names a
+        // backend the deployment is not provisioned for, and quietly answering "database" would send content
+        // somewhere nobody asked for. Note that "fs" and "local" are refused too: there are no aliases.
         for (String value : new String[] {"nonsense", "postgres", "file system", "s-3", "fs", "local", "S3Bucket"}) {
             ContentStoreFactory.clearCache();
-            ContentStoreConfigurationException refused = assertThrows(
-                    ContentStoreConfigurationException.class, () -> resolve(value),
-                    "[" + value + "] is unrecognised and must be refused");
+            ContentStoreConfigurationException refused = refusalOf(value);
             // The value as it was spelt, so a mis-cased typo can be found in the file it was written in,
             // and the key that carries it, so the operator knows where to correct it.
             assertTrue(refused.getMessage().contains(value), refused.getMessage());
@@ -129,80 +198,89 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
-    public void theFilesystemValueResolvesToTheFilesystemProvider() throws Exception {
-        assertInstanceOf(FileSystemContentStore.class, resolve(PROVIDER_FILESYSTEM));
-    }
+    public void aRefusalStaysConfinedToTheValueThatEarnedIt() throws Exception {
+        // This is how "a misconfigured value never fails the container" is asserted. Nothing resolves a
+        // provider while the container starts, so the refusal above can only reach the content operation
+        // that asked for it: the factory itself stays perfectly usable afterwards.
+        refusalOf("nonsense");
 
-    @Test
-    public void theObjectStoreValueResolvesToTheObjectStoreProvider() throws Exception {
-        assertInstanceOf(S3ContentStore.class, resolve(PROVIDER_S3));
+        assertDoesNotThrow(() -> storeConfiguredAs(PROVIDER_DATABASE),
+                "a refused value must not stop database storage being selected");
+        assertNull(storeConfiguredAs(PROVIDER_DATABASE));
+        assertTrue(storeConfiguredAs(PROVIDER_FILESYSTEM) instanceof FileSystemContentStore,
+                "a refused value must not stop another provider being built");
+        assertTrue(storeConfiguredAs(PROVIDER_S3) instanceof S3ContentStore,
+                "a refused value must not stop another provider being built");
     }
 
     @Test
     public void oneCanonicalValueYieldsOneProviderHoweverItIsSpelt() throws Exception {
-        // Matching has always ignored case and surrounding whitespace; what these spellings pin is
-        // that the cache is keyed by the same canonical form, so none of them rebuilds the provider.
-        ContentStore first = resolve(PROVIDER_FILESYSTEM);
+        // Matching ignores case and surrounding whitespace; what these spellings pin is that the cache is
+        // keyed by the same canonical form, so none of them rebuilds the provider.
+        ContentStore first = storeConfiguredAs(PROVIDER_FILESYSTEM);
         assertNotNull(first);
-        assertSame(first, resolve("FileSystem"));
-        assertSame(first, resolve("FILESYSTEM"));
-        assertSame(first, resolve("  filesystem  "));
-        assertSame(first, resolve("\tFileSystem\n"));
+        assertSame(first, storeConfiguredAs("FileSystem"));
+        assertSame(first, storeConfiguredAs("FILESYSTEM"));
+        assertSame(first, storeConfiguredAs("  filesystem  "));
+        assertSame(first, storeConfiguredAs("\tFileSystem\n"));
     }
 
     @Test
     public void aCaseOnlyDifferenceNeverRebuildsTheObjectStoreProvider() throws Exception {
-        // The object-storage provider is the expensive one to rebuild: each instance lazily opens its
-        // own client, and a rebuild would abandon the previous client still holding its connections.
-        ContentStore first = resolve(PROVIDER_S3);
-        assertInstanceOf(S3ContentStore.class, first);
-        assertSame(first, resolve("S3"));
-        assertSame(first, resolve(" s3 "));
-        assertSame(first, resolve("  S3  "));
+        // The object-storage provider is the expensive one to rebuild: each instance lazily opens its own
+        // client, and a rebuild would abandon the previous client still holding its connections.
+        ContentStore first = storeConfiguredAs(PROVIDER_S3);
+        assertTrue(first instanceof S3ContentStore, "the object-storage provider");
+        assertSame(first, storeConfiguredAs("S3"));
+        assertSame(first, storeConfiguredAs(" s3 "));
+        assertSame(first, storeConfiguredAs("  S3  "));
     }
 
     @Test
     public void distinctValuesEachKeepTheirOwnOutcome() throws Exception {
-        // The two public forms can legitimately see different values at the same moment, so resolving
-        // one value must not evict another: alternating between them would otherwise rebuild both
-        // providers over and over.
-        ContentStore fileSystem = resolve(PROVIDER_FILESYSTEM);
-        ContentStore objectStore = resolve(PROVIDER_S3);
+        // A SystemProperty row can override the resource for one caller while another still reads the
+        // resource, so the two can legitimately see different values at the same moment. Selecting one must
+        // therefore not evict another: alternating between them would otherwise rebuild both providers over
+        // and over, abandoning a client each time.
+        ContentStore fileSystem = storeConfiguredAs(PROVIDER_FILESYSTEM);
+        ContentStore objectStore = storeConfiguredAs(PROVIDER_S3);
         assertNotNull(fileSystem);
         assertNotNull(objectStore);
         assertNotSame(fileSystem, objectStore);
-        assertNull(resolve(PROVIDER_DATABASE));
-        assertSame(fileSystem, resolve(PROVIDER_FILESYSTEM));
-        assertSame(objectStore, resolve(PROVIDER_S3));
+        assertNull(storeConfiguredAs(PROVIDER_DATABASE));
+        assertSame(fileSystem, storeConfiguredAs(PROVIDER_FILESYSTEM));
+        assertSame(objectStore, storeConfiguredAs(PROVIDER_S3));
     }
 
     @Test
     public void concurrentResolutionOfOneValueConstructsExactlyOneProvider() throws Exception {
-        int workers = 32;
-        ExecutorService pool = Executors.newFixedThreadPool(workers);
+        // Written once, before any worker is released, so every thread reads the same configured value and
+        // they contend for the one outcome that value does not have yet.
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_PROVIDER, PROVIDER_S3);
+        ExecutorService pool = Executors.newFixedThreadPool(WORKERS);
         try {
-            CountDownLatch atTheGate = new CountDownLatch(workers);
+            CountDownLatch atTheGate = new CountDownLatch(WORKERS);
             CountDownLatch gateOpen = new CountDownLatch(1);
             Callable<ContentStore> worker = () -> {
                 atTheGate.countDown();
-                if (!gateOpen.await(30, TimeUnit.SECONDS)) {
+                if (!gateOpen.await(PATIENCE_SECONDS, TimeUnit.SECONDS)) {
                     throw new IllegalStateException("the starting gate never opened");
                 }
-                return resolve(PROVIDER_S3);
+                return ContentStoreFactory.getContentStore();
             };
             List<Future<ContentStore>> outcomes = new ArrayList<>();
-            for (int worker0 = 0; worker0 < workers; worker0++) {
+            for (int started = 0; started < WORKERS; started++) {
                 outcomes.add(pool.submit(worker));
             }
-            assertTrue(atTheGate.await(30, TimeUnit.SECONDS), "not every worker reached the starting gate");
+            assertTrue(atTheGate.await(PATIENCE_SECONDS, TimeUnit.SECONDS), "not every worker reached the gate");
             // Releasing every thread at once is what makes them contend for the same unresolved value.
             gateOpen.countDown();
 
-            ContentStore only = outcomes.get(0).get(30, TimeUnit.SECONDS);
-            assertInstanceOf(S3ContentStore.class, only);
+            ContentStore only = outcomes.get(0).get(PATIENCE_SECONDS, TimeUnit.SECONDS);
+            assertTrue(only instanceof S3ContentStore, "the object-storage provider");
             for (Future<ContentStore> outcome : outcomes) {
                 // A second instance here would be one that no caller keeps and nothing ever closes.
-                assertSame(only, outcome.get(30, TimeUnit.SECONDS),
+                assertSame(only, outcome.get(PATIENCE_SECONDS, TimeUnit.SECONDS),
                         "concurrent resolution built more than one provider for one value");
             }
         } finally {
@@ -211,76 +289,69 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
-    public void clearingTheCacheClosesAnObjectStoreClientTheProviderOpened() throws Exception {
-        S3ContentStore cached = assertInstanceOf(S3ContentStore.class, resolve(PROVIDER_S3));
+    public void clearingTheCacheClosesTheClientOfTheProviderItDiscards() throws Exception {
         S3Client opened = mock(S3Client.class);
-        // The provider came from the factory, so it owns whatever client it holds; standing one in
-        // here is the only way to watch the factory release it.
-        injectClient(cached, opened);
+        // Seated through the factory's own test seam, holding a client this test can watch. A provider the
+        // factory discards owns an HTTP connection pool and its idle threads, so a reset that dropped the
+        // provider without closing it would leak that pool for the lifetime of the JVM.
+        S3ContentStore cached = new S3ContentStore(opened, BUCKET);
+        ContentStoreFactory.installForTesting(PROVIDER_S3, cached);
+        assertSame(cached, storeConfiguredAs(PROVIDER_S3), "the seated provider must be the outcome");
 
         ContentStoreFactory.clearCache();
 
         verify(opened, times(1)).close();
-        // Releasing the client is only half of it: the outcome must be gone too, so the next call
-        // resolves the configuration afresh rather than handing back a provider with a closed client.
-        assertNotSame(cached, resolve(PROVIDER_S3));
+        // Releasing the client is only half of it: the outcome must be gone too, so the next call resolves
+        // the configuration afresh rather than handing back a provider whose client is closed.
+        assertNotSame(cached, storeConfiguredAs(PROVIDER_S3));
+        assertThrows(GeneralException.class, () -> cached.exists(KEY),
+                "the discarded provider must refuse a later operation rather than rebuild a client");
     }
 
     @Test
-    public void clearingTheCacheIsHarmlessWhenNoObjectStoreProviderWasEverResolved() throws Exception {
-        // Every outcome that holds no object-storage client has to be passed over rather than
-        // narrowed to one: a filesystem provider narrowed to the object-storage type would fail, an
-        // outcome holding no provider at all would be dereferenced, and a recorded refusal holds no
-        // provider to close either. All three shapes are cached here before the reset.
-        assertNull(resolve(PROVIDER_DATABASE));
-        assertThrows(ContentStoreConfigurationException.class, () -> resolve("nonsense"));
-        ContentStore beforeTheReset = resolve(PROVIDER_FILESYSTEM);
+    public void clearingTheCacheIsHarmlessWhateverTheCachedOutcomesAre() throws Exception {
+        // Every shape of outcome has to survive the reset rather than being narrowed to one: an outcome
+        // holding no provider at all would be dereferenced, a recorded refusal holds no provider to close,
+        // and a filesystem provider holds no object-storage client. All three are cached here first.
+        assertNull(storeConfiguredAs(PROVIDER_DATABASE));
+        refusalOf("nonsense");
+        ContentStore beforeTheReset = storeConfiguredAs(PROVIDER_FILESYSTEM);
         assertNotNull(beforeTheReset);
 
         assertDoesNotThrow(ContentStoreFactory::clearCache);
-        // The reset really happened, rather than being abandoned part-way: the filesystem provider is
-        // built afresh, and the refusal is re-derived rather than served from a surviving entry.
-        assertNotSame(beforeTheReset, resolve(PROVIDER_FILESYSTEM));
-        assertThrows(ContentStoreConfigurationException.class, () -> resolve("nonsense"));
-    }
 
-    @Test
-    public void clearingTheCacheReleasesEveryCachedOutcome() throws Exception {
-        ContentStore fileSystem = resolve(PROVIDER_FILESYSTEM);
-        S3ContentStore objectStore = assertInstanceOf(S3ContentStore.class, resolve(PROVIDER_S3));
-        S3Client opened = mock(S3Client.class);
-        injectClient(objectStore, opened);
-        assertEquals(2, cachedOutcomes().size());
-
-        ContentStoreFactory.clearCache();
-
-        assertTrue(cachedOutcomes().isEmpty(), "the cache still holds an outcome");
-        verify(opened, times(1)).close();
-        assertNotSame(fileSystem, resolve(PROVIDER_FILESYSTEM));
+        // The reset really happened, rather than being abandoned part-way: the filesystem provider is built
+        // afresh, and the refusal is re-derived rather than served from a surviving entry.
+        assertNotSame(beforeTheReset, storeConfiguredAs(PROVIDER_FILESYSTEM));
+        refusalOf("nonsense");
     }
 
     @Test
     public void aRecognisedProviderThatCannotBeBuiltFailsRatherThanSwitchingToDatabaseStorage() {
-        ContentStoreConfigurationException refused = withUnreadableObjectStoreConfiguration(() ->
-                assertThrows(ContentStoreConfigurationException.class, () -> resolve(PROVIDER_S3)));
+        // The configured value is written before the configuration is broken, so what fails here is the
+        // provider's own construction rather than the factory's reading of the selection.
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_PROVIDER, PROVIDER_S3);
+
+        ContentStoreConfigurationException refused = withUnreadableObjectStoreConfiguration(() -> assertThrows(
+                ContentStoreConfigurationException.class, ContentStoreFactory::getContentStore));
 
         // Silently answering null here would send content to a backend nobody asked for.
         assertTrue(refused.getMessage().contains(PROVIDER_S3), refused.getMessage());
         assertTrue(refused.getMessage().contains(RESOURCE + ":" + PROPERTY_PROVIDER), refused.getMessage());
-        assertInstanceOf(IllegalStateException.class, refused.getNested());
+        assertTrue(refused.getNested() instanceof IllegalStateException,
+                "the underlying reason must be kept, was: " + refused.getNested());
     }
 
     @Test
     public void aConstructionFailureKeepsFailingIdenticallyOnceTheCauseHasPassed() {
-        ContentStoreConfigurationException first = withUnreadableObjectStoreConfiguration(() ->
-                assertThrows(ContentStoreConfigurationException.class, () -> resolve(PROVIDER_S3)));
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_PROVIDER, PROVIDER_S3);
+        ContentStoreConfigurationException first = withUnreadableObjectStoreConfiguration(() -> assertThrows(
+                ContentStoreConfigurationException.class, ContentStoreFactory::getContentStore));
 
-        // The transient condition is over, yet the answer must not change: an outcome that depended
-        // on how often it was asked for would let one caller store content while another was refused.
-        ContentStoreConfigurationException later =
-                assertThrows(ContentStoreConfigurationException.class, () -> resolve(PROVIDER_S3));
-        ContentStoreConfigurationException laterStill =
-                assertThrows(ContentStoreConfigurationException.class, () -> resolve("  S3  "));
+        // The transient condition is over, yet the answer must not change: an outcome that depended on how
+        // often it was asked for would let one caller store content while another was refused.
+        ContentStoreConfigurationException later = refusalOf(PROVIDER_S3);
+        ContentStoreConfigurationException laterStill = refusalOf("  S3  ");
 
         assertEquals(first.getMessage(), later.getMessage());
         assertEquals(first.getMessage(), laterStill.getMessage());
@@ -291,96 +362,138 @@ public final class ContentStoreFactoryTest {
 
     @Test
     public void clearingTheCacheLetsARepairedProviderBeBuiltAgain() throws Exception {
-        withUnreadableObjectStoreConfiguration(() ->
-                assertThrows(ContentStoreConfigurationException.class, () -> resolve(PROVIDER_S3)));
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_PROVIDER, PROVIDER_S3);
+        withUnreadableObjectStoreConfiguration(() -> assertThrows(
+                ContentStoreConfigurationException.class, ContentStoreFactory::getContentStore));
 
         ContentStoreFactory.clearCache();
 
         // Nothing is permanently poisoned: once the configuration is readable the provider is built.
-        assertInstanceOf(S3ContentStore.class, resolve(PROVIDER_S3));
+        assertTrue(storeConfiguredAs(PROVIDER_S3) instanceof S3ContentStore,
+                "a repaired configuration must build the provider it names");
     }
 
     @Test
-    public void aFailureForOneValueLeavesTheOtherValuesAlone() throws Exception {
-        withUnreadableObjectStoreConfiguration(() ->
-                assertThrows(ContentStoreConfigurationException.class, () -> resolve(PROVIDER_S3)));
+    public void anOverrideReachesTheVeryResourceInstanceTheFactoryReads() throws Exception {
+        // The guard against a write that never landed. setPropertyValueInMemory mutates the cached
+        // Properties instance and returns without a word when the resource cannot be resolved, so a case
+        // whose override was discarded would silently assert against the value this component ships and
+        // pass for the wrong reason. Reading the value back, and then watching the selection follow it and
+        // follow it back again, is what rules that out for every other case here.
+        ContentStore selected = storeConfiguredAs("  FileSystem  ");
 
-        // Each value keeps its own outcome, so a failure recorded against one must not spread: the
-        // configured database value still selects database storage, an unrecognised value is still
-        // refused for its own reason rather than for this one, and the filesystem provider still
-        // builds.
-        assertNull(resolve(PROVIDER_DATABASE));
-        ContentStoreConfigurationException unrelated =
-                assertThrows(ContentStoreConfigurationException.class, () -> resolve("nonsense"));
-        assertTrue(unrelated.getMessage().contains("not a recognised"), unrelated.getMessage());
-        assertInstanceOf(FileSystemContentStore.class, resolve(PROVIDER_FILESYSTEM));
+        assertTrue(selected instanceof FileSystemContentStore, "the selection must follow the override, was: "
+                + (selected == null ? PROVIDER_DATABASE : selected.getClass().getName()));
+
+        ContentStoreFactory.clearCache();
+
+        assertNull(storeConfiguredAs(""), "withdrawing the override must return the selection to database storage");
     }
 
     @Test
-    public void theCommittedConfigurationSelectsDatabaseStorage() throws Exception {
-        // No stubbing at all: this is the real content.properties on the classpath, and an unmodified
-        // checkout must keep using the existing DataResource database storage.
-        assertNull(ContentStoreFactory.getContentStore());
-        assertNull(ContentStoreFactory.getContentStore(null));
-    }
+    public void everyStorageOperationIsIssuedThroughTheClientTheSeamWasGiven() throws Exception {
+        S3Client client = mock(S3Client.class);
+        when(client.headObject(HeadObjectRequest.builder().bucket(BUCKET).key(KEY).build()))
+                .thenReturn(HeadObjectResponse.builder().contentLength((long) PAYLOAD.length).build());
+        when(client.getObject(GetObjectRequest.builder().bucket(BUCKET).key(KEY).build()))
+                .thenAnswer(invocation -> storedObject(PAYLOAD));
+        // The production provider, with only the SDK boundary replaced: no configuration is read, no
+        // credential is resolved and no endpoint is contacted, yet the provider's own request building,
+        // absence mapping and stream ownership are the code under test.
+        ContentStore provider = new S3ContentStore(client, BUCKET);
 
-    @Test
-    public void theClasspathFormResolvesTheProviderTheResourceNames() throws Exception {
-        try (MockedStatic<UtilProperties> properties = mockStatic(UtilProperties.class, Answers.CALLS_REAL_METHODS)) {
-            properties.when(() -> UtilProperties.getPropertyValue(RESOURCE, PROPERTY_PROVIDER, PROVIDER_DATABASE))
-                    .thenReturn("  FileSystem  ");
-
-            ContentStore selected = ContentStoreFactory.getContentStore();
-
-            assertInstanceOf(FileSystemContentStore.class, selected);
-            // The public form shares the cache with every other form, padding and case included.
-            assertSame(selected, resolve(PROVIDER_FILESYSTEM));
+        provider.put(KEY, PAYLOAD);
+        assertTrue(provider.exists(KEY), "a stored key must be reported as present");
+        assertEquals(PAYLOAD.length, provider.size(KEY), "the length must come from the object's metadata");
+        assertArrayEquals(PAYLOAD, provider.get(KEY), "the whole object must be returned");
+        try (InputStream streamed = provider.openStream(KEY)) {
+            assertArrayEquals(PAYLOAD, streamed.readAllBytes(), "openStream must serve the object from its start");
         }
+        provider.delete(KEY);
+
+        // Each operation must reach the store as the one request S3 expects, addressed to the configured
+        // bucket and the caller's key. The write declares its length up front, which is what lets content
+        // of any size cross the boundary in a single request without a second copy being held.
+        verify(client).putObject(eq(PutObjectRequest.builder().bucket(BUCKET).key(KEY)
+                .contentLength((long) PAYLOAD.length).build()), any(RequestBody.class));
+        verify(client).deleteObject(DeleteObjectRequest.builder().bucket(BUCKET).key(KEY).build());
     }
 
     @Test
-    public void theDelegatorFormHonoursASystemPropertyOverride() throws Exception {
-        Delegator delegator = mock(Delegator.class);
-        try (MockedStatic<EntityUtilProperties> properties =
-                mockStatic(EntityUtilProperties.class, Answers.CALLS_REAL_METHODS)) {
-            properties.when(() -> EntityUtilProperties
-                            .getPropertyValue(RESOURCE, PROPERTY_PROVIDER, PROVIDER_DATABASE, delegator))
-                    .thenReturn("S3");
+    public void anAbsentObjectIsReportedAsAbsenceRatherThanAsAStoreFailure() throws Exception {
+        S3Client client = mock(S3Client.class);
+        NoSuchKeyException absent = NoSuchKeyException.builder()
+                .statusCode(HTTP_NOT_FOUND)
+                .message("The specified key does not exist")
+                .build();
+        when(client.headObject(any(HeadObjectRequest.class))).thenThrow(absent);
+        when(client.getObject(any(GetObjectRequest.class))).thenThrow(absent);
+        when(client.deleteObject(any(DeleteObjectRequest.class))).thenThrow(absent);
+        ContentStore provider = new S3ContentStore(client, BUCKET);
 
-            ContentStore selected = ContentStoreFactory.getContentStore(delegator);
-
-            assertInstanceOf(S3ContentStore.class, selected);
-            assertSame(selected, resolve(PROVIDER_S3));
-        }
-    }
-
-    @Test
-    public void aNullDelegatorFallsBackToTheClasspathLookup() throws Exception {
-        try (MockedStatic<UtilProperties> properties = mockStatic(UtilProperties.class, Answers.CALLS_REAL_METHODS)) {
-            properties.when(() -> UtilProperties.getPropertyValue(RESOURCE, PROPERTY_PROVIDER, PROVIDER_DATABASE))
-                    .thenReturn(PROVIDER_FILESYSTEM);
-
-            // EntityUtilProperties dereferences the delegator, so a null one has to take this route.
-            assertInstanceOf(FileSystemContentStore.class, ContentStoreFactory.getContentStore(null));
-        }
-    }
-
-    @Test
-    public void aConstructionFailureSurfacesThroughThePublicFormsToo() {
-        try (MockedStatic<UtilProperties> properties = mockStatic(UtilProperties.class, Answers.CALLS_REAL_METHODS)) {
-            properties.when(() -> UtilProperties.getPropertyValue(RESOURCE, PROPERTY_PROVIDER, PROVIDER_DATABASE))
-                    .thenReturn(PROVIDER_S3);
-            properties.when(() -> UtilProperties.getPropertyValue(RESOURCE, "content.store.s3.bucket", ""))
-                    .thenThrow(new IllegalStateException("configuration store unreadable"));
-
-            assertThrows(ContentStoreConfigurationException.class, ContentStoreFactory::getContentStore);
-        }
+        // A key that resolves to nothing is a fact about the store, not a failure of it: the probe answers
+        // false rather than raising, so a caller can ask without having to catch.
+        assertFalse(provider.exists(KEY), "an absent key must be reported as absent, not as a failure");
+        // The reading operations do raise - so that neither of them can ever answer null - and they raise
+        // the platform's own absence type, which is what lets the delegation seam treat a missing object
+        // exactly as it treats a missing file.
+        assertThrows(FileNotFoundException.class, () -> provider.get(KEY));
+        assertThrows(FileNotFoundException.class, () -> provider.openStream(KEY));
+        // And removal is idempotent, so replayed or repeated clean-up is safe.
+        assertDoesNotThrow(() -> provider.delete(KEY), "deleting an absent key must be a successful no-op");
     }
 
     /**
-     * Runs the supplied assertion while the object-storage provider's own first configuration read
-     * fails, which is how a provider that a deployment explicitly named comes to be unbuildable
-     * without the client library being absent.
+     * Configures the supplied value and hands back what the factory then selects, which is how every case
+     * here drives the selection: through the configuration a deployment actually writes and the public
+     * lookup production code actually calls, rather than around either of them.
+     *
+     * <p>The value is read straight back before the lookup because
+     * {@code UtilProperties.setPropertyValueInMemory} is documented to return without a word when the
+     * resource cannot be resolved. A discarded write would otherwise leave the case asserting against the
+     * value this component ships, so this is the guard that turns that into a failure. The comparison drops
+     * the padding because the two-argument lookup trims what it returns.
+     *
+     * <p>The factory's own cache is deliberately <em>not</em> reset here: a case that wants a provider built
+     * afresh resets it first, and the cases that pin canonicalisation rely on a second spelling of the same
+     * value reaching the outcome already cached for it.
+     *
+     * @param configuredProvider the value to configure; never null, because the setter is backed by a
+     *     {@code Hashtable} and blank is how an unset key is expressed
+     * @return the provider the factory selects for that value, or {@code null} for database mode
+     * @throws GeneralException if the factory refuses the configured value
+     */
+    private static ContentStore storeConfiguredAs(String configuredProvider) throws GeneralException {
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_PROVIDER, configuredProvider);
+        assertEquals(configuredProvider.trim(), UtilProperties.getPropertyValue(RESOURCE, PROPERTY_PROVIDER),
+                "the in-memory override never reached the resource the factory reads");
+        return ContentStoreFactory.getContentStore();
+    }
+
+    /**
+     * Configures a value that must not be honoured, and hands back the refusal it earned.
+     *
+     * <p>Named once here because a refusal is asserted from several angles - an unrecognised value, the same
+     * value asked for again, and a refusal standing beside outcomes that must survive it - and every one of
+     * them wants the exception itself rather than only the fact that one was raised.
+     *
+     * @param configuredProvider the value expected to be refused; never null
+     * @return the refusal the factory raised for that value
+     */
+    private static ContentStoreConfigurationException refusalOf(String configuredProvider) {
+        return assertThrows(ContentStoreConfigurationException.class, () -> storeConfiguredAs(configuredProvider),
+                "[" + configuredProvider + "] must be refused rather than honoured");
+    }
+
+    /**
+     * Runs the supplied assertion while the object-storage provider's own first configuration read fails,
+     * which is how a provider that a deployment explicitly named comes to be unbuildable without the
+     * client library being absent.
+     *
+     * <p>Stubbing the configuration lookup is the only way to reach this state: neither provider
+     * constructor validates anything, so no configured value can make one of them fail. Only that single
+     * lookup is broken - every other static call keeps its real behaviour - so the failure arises inside
+     * the constructor exactly as an environmental fault would.
      *
      * @param <T> the type the assertion yields
      * @param assertion the assertion to run against the broken configuration
@@ -388,9 +501,7 @@ public final class ContentStoreFactoryTest {
      */
     private static <T> T withUnreadableObjectStoreConfiguration(Callable<T> assertion) {
         try (MockedStatic<UtilProperties> properties = mockStatic(UtilProperties.class, Answers.CALLS_REAL_METHODS)) {
-            // Only this one lookup is broken; everything else keeps its real behaviour, so the failure
-            // arises inside the provider's constructor exactly as an environmental fault would.
-            properties.when(() -> UtilProperties.getPropertyValue(RESOURCE, "content.store.s3.bucket", ""))
+            properties.when(() -> UtilProperties.getPropertyValue(RESOURCE, PROPERTY_S3_BUCKET, ""))
                     .thenThrow(new IllegalStateException("configuration store unreadable"));
             return assertion.call();
         } catch (Exception e) {
@@ -399,70 +510,18 @@ public final class ContentStoreFactoryTest {
     }
 
     /**
-     * Invokes the factory's private resolution seam.
+     * Builds the reply a compatible object store gives to a read, so the provider under test receives the
+     * response type the SDK really hands it rather than a stand-in.
      *
-     * <p>The seam declares a checked {@link GeneralException}, so reflection's wrapper is unwrapped
-     * and the refusal is rethrown as itself: a test asserting how a value is refused must see the
-     * factory's own exception, not an {@code InvocationTargetException} around it.
+     * <p>A fresh stream per call, because {@code openStream} is documented to hand back an independent
+     * stream positioned at the first byte however many times it is invoked.
      *
-     * @param configuredProvider the raw configured value to resolve; may be null
-     * @return the provider that value selects, or null for database storage
-     * @throws GeneralException if the configured value cannot be honoured, which is what the factory
-     *     raises for a value naming no provider and for a provider that could not be constructed
+     * @param content the bytes the store is to serve
+     * @return an SDK response stream over the supplied content
      */
-    private static ContentStore resolve(String configuredProvider) throws GeneralException {
-        try {
-            return (ContentStore) RESOLVE.invoke(null, configuredProvider);
-        } catch (IllegalAccessException e) {
-            throw new AssertionError("the resolution seam is not reachable", e);
-        } catch (InvocationTargetException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof GeneralException refused) {
-                throw refused;
-            }
-            if (cause instanceof RuntimeException runtime) {
-                throw runtime;
-            }
-            if (cause instanceof Error error) {
-                throw error;
-            }
-            throw new AssertionError("resolution failed in an unexpected way", cause);
-        }
-    }
-
-    /**
-     * @return the factory's live cache, so a test can see how many outcomes it holds
-     */
-    private static Map<?, ?> cachedOutcomes() throws ReflectiveOperationException {
-        Field field = ContentStoreFactory.class.getDeclaredField("RESOLUTIONS");
-        field.setAccessible(true);
-        return (Map<?, ?>) field.get(null);
-    }
-
-    /**
-     * @return the factory's private resolution seam
-     */
-    private static Method resolutionSeam() {
-        try {
-            Method seam = ContentStoreFactory.class.getDeclaredMethod("resolve", String.class);
-            seam.setAccessible(true);
-            return seam;
-        } catch (NoSuchMethodException e) {
-            throw new AssertionError("ContentStoreFactory.resolve(String) is the seam these tests drive", e);
-        }
-    }
-
-    /**
-     * Stands a caller-supplied client into a provider the factory built, leaving the provider's own
-     * ownership flag untouched so the factory still treats the client as its own to close.
-     *
-     * @param target the provider to inject into
-     * @param injected the client the provider is to hold
-     * @throws ReflectiveOperationException if the provider's client field cannot be reached
-     */
-    private static void injectClient(S3ContentStore target, S3Client injected) throws ReflectiveOperationException {
-        Field field = S3ContentStore.class.getDeclaredField("s3Client");
-        field.setAccessible(true);
-        field.set(target, injected);
+    private static ResponseInputStream<GetObjectResponse> storedObject(byte[] content) {
+        return new ResponseInputStream<>(
+                GetObjectResponse.builder().contentLength((long) content.length).build(),
+                AbortableInputStream.create(new ByteArrayInputStream(content)));
     }
 }

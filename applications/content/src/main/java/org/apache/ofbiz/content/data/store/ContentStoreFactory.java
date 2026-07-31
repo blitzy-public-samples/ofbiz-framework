@@ -233,6 +233,9 @@ public final class ContentStoreFactory {
     /** Stable code reported when content written locally could not be published to the store. */
     private static final String EVENT_PUBLISH_FAILED = "CONTENT-STORE-PUBLISH-FAILED";
 
+    /** Stable code reported when the store could not say whether it holds content for a key. */
+    private static final String EVENT_PROBE_FAILED = "CONTENT-STORE-PROBE-FAILED";
+
     private static final String SHUTDOWN_THREAD_NAME = "ofbiz-content-store-shutdown";
 
     private static final AtomicBoolean SHUTDOWN_HOOK_REGISTERED = new AtomicBoolean();
@@ -628,20 +631,27 @@ public final class ContentStoreFactory {
      * bytes published when the transaction commits. Either way the local file is removed once the
      * transaction completes, so nothing durable is left on the instance.
      *
-     * <p>{@code DataResourceWorker.getContentFile} deliberately does <em>not</em> call this method,
-     * and the comment at that seam records why: reconciling the provider against the worker's own
-     * resolution also carries the write direction, so a caller that writes through the returned file
-     * with no transaction to hang a publication on is still published on the next resolution, and it
-     * leaves every allow-list and boundary check where it has always been rather than moving them
-     * behind an early return. This method is the transaction-scoped alternative, for a caller that
-     * has a transaction and does not need those guards repeated.
+     * <p>This is what {@code DataResourceWorker.getContentFile} delegates to, and every allow-list and
+     * boundary check that seam applies is applied here too, by {@link #localFileFor}: the location is
+     * resolved through {@code FileUtil.getFile}, an absolute {@code LOCAL_FILE} location is required to
+     * be absolute and is checked against {@code content.data.local.file.allowed.paths}, an
+     * {@code OFBIZ_FILE} location against {@code content.data.ofbiz.file.allowed.paths}, and a
+     * {@code CONTEXT_FILE} location is confined to its context root before anything touches the file.
+     * Nothing is loosened by resolving through a provider.
      *
-     * <p>A local file that is already present is treated as the content of record and is not
-     * overwritten from the store, because within one transaction it is content that has been staged
-     * but not yet published - which is precisely the state
+     * <p>A local file that is already present and does <em>not</em> carry the resolution stamp holds
+     * content the store has not seen - which is precisely the state
      * {@code DataServices.createFileMethod} leaves behind after writing through
-     * {@code new File(objectInfo)}. Such a file is always published, whereas a file this method
-     * fetched is published only if it changed.
+     * {@code new File(objectInfo)} - so it is published rather than overwritten from the store. Every
+     * other resolution reads the store, because a local copy trusted merely because an earlier
+     * resolution fetched it goes stale the moment another instance writes to the same key and nothing
+     * invalidates it. That is the whole point of moving content off the instance: any instance behind
+     * the load balancer has to be able to answer with what the store holds now.
+     *
+     * <p>A provider whose own storage <em>is</em> the resolved file - a {@link LocalContentStore}
+     * whose {@link LocalContentStore#backingPath(String)} names it - is short-circuited entirely.
+     * Reconciling a file with itself would rewrite it on every read, churn the modification time any
+     * caching above it depends on, and cost a full copy for nothing.
      *
      * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
      * @param objectInfo the {@code DataResource.objectInfo} location
@@ -661,13 +671,136 @@ public final class ContentStoreFactory {
         }
         String key = storageKeyFor(dataResourceTypeId, objectInfo, contextRoot);
         File local = localFileFor(dataResourceTypeId, objectInfo, contextRoot);
-        boolean alreadyStaged = local.isFile();
-        if (!alreadyStaged) {
-            fetchInto(store, key, local, objectInfo);
+        if (backsTheSameFile(store, key, local)) {
+            // Nothing to materialise and nothing to publish: the provider's storage is this very file.
+            // An absent one is left to the caller, which reports absence in the shape it always has.
+            return local.isFile() ? local : null;
         }
-        registerOrWarn(new ContentFilePublication(key, local, alreadyStaged),
+        boolean unpublished = local.isFile() && local.lastModified() != STAGED_SENTINEL_MODIFIED;
+        if (!unpublished) {
+            if (!storeHolds(store, key)) {
+                throw absentContent(objectInfo, key);
+            }
+            fetchInto(store, key, local, objectInfo);
+            markResolved(local);
+        }
+        boolean registered = publishOnCommit(new ContentFilePublication(key, local, unpublished), key,
                 "content for " + ContentStoreUtil.reference(key));
+        if (unpublished && !registered) {
+            // There is no transaction to publish on, and this file holds content the store has never
+            // seen, so it goes now: the alternative is content that never leaves this instance's disk
+            // and is therefore invisible to every other instance behind the load balancer.
+            publish(key, local);
+            markResolved(local);
+        }
         return local;
+    }
+
+    /**
+     * Answers whether the active provider's own storage for a key is the resolved local file itself.
+     *
+     * <p>Only a {@link LocalContentStore} can be in that position, and it is the ordinary position of
+     * the filesystem provider on a deployment-relative location: both routes resolve to one file. Such
+     * a file must never be reconciled, because publishing it would copy it over itself on every read
+     * and any removal of the copy afterwards would remove the content.
+     *
+     * <p>Paths are compared normalised, and then - only if both are present - through
+     * {@link Files#isSameFile(Path, Path)}, so a symbolic link or a mount that reaches one file by two
+     * names is still recognised as one file rather than being reconciled with itself.
+     *
+     * @param store the active provider
+     * @param key the storage key being resolved
+     * @param local the local file the key resolved to
+     * @return {@code true} when the provider's storage for the key is that same file
+     * @throws GeneralException if the provider refuses to locate the key
+     */
+    private static boolean backsTheSameFile(ContentStore store, String key, File local) throws GeneralException {
+        if (!(store instanceof LocalContentStore)) {
+            return false;
+        }
+        Path backing = ((LocalContentStore) store).backingPath(key);
+        if (backing == null) {
+            return false;
+        }
+        Path backingPath = backing.toAbsolutePath().normalize();
+        Path localPath = local.toPath().toAbsolutePath().normalize();
+        if (backingPath.equals(localPath)) {
+            return true;
+        }
+        if (!Files.exists(backingPath) || !Files.exists(localPath)) {
+            return false;
+        }
+        try {
+            return Files.isSameFile(backingPath, localPath);
+        } catch (IOException e) {
+            // Treated as two different files, which is the safe direction: the content is reconciled
+            // through the store rather than assumed to be shared.
+            Debug.logWarning("Cannot tell whether " + ContentStoreUtil.reference(backingPath.toString())
+                    + " and " + ContentStoreUtil.reference(localPath.toString()) + " are one file: "
+                    + summarise(e) + ". They are treated as separate locations.", MODULE);
+            return false;
+        }
+    }
+
+    /**
+     * Asks the active provider whether it holds content for a key.
+     *
+     * <p>A probe rather than an attempted read, so that content held by neither the store nor the
+     * instance is reported absent from one cheap round trip instead of a failed transfer.
+     *
+     * @param store the active provider
+     * @param key the storage key to probe
+     * @return {@code true} when the provider holds content under that key
+     * @throws GeneralException if the provider cannot answer; the failure is summarised rather than
+     *     quoted, for the reason given on {@link #summarise(Throwable)}
+     */
+    private static boolean storeHolds(ContentStore store, String key) throws GeneralException {
+        try {
+            return store.exists(key);
+        } catch (IOException e) {
+            throw new GeneralException(EVENT_PROBE_FAILED + ": cannot determine whether content is stored for "
+                    + ContentStoreUtil.reference(key) + ": " + summarise(e));
+        }
+    }
+
+    /**
+     * Reports content that neither the store nor the instance holds.
+     *
+     * <p>The message is byte-for-byte the one the pre-existing local path produces, because
+     * {@code DataServices.createBinaryFileMethod} and {@code updateBinaryFileMethod} catch this
+     * exception and put its message into a service error. The reason the content was not found is
+     * attached as the cause, where a diagnostic reads it and a service error does not.
+     *
+     * @param objectInfo the location to name, so the report keeps its frozen shape
+     * @param key the storage key that was probed, for the attached reason
+     * @return the exception to throw, never null
+     */
+    private static FileNotFoundException absentContent(String objectInfo, String key) {
+        FileNotFoundException absent = new FileNotFoundException("No file found: " + objectInfo);
+        absent.initCause(new GeneralException("The active content storage provider holds no content under "
+                + ContentStoreUtil.reference(key) + ", and the instance holds no local copy of it"));
+        return absent;
+    }
+
+    /**
+     * Stamps a file this factory has just brought into step with the store.
+     *
+     * <p>The stamp is a modification time in 1970 that no write can reproduce, and it is what lets the
+     * next resolution tell an untouched copy from one a caller has written through: a write that keeps
+     * the byte count and lands inside a single filesystem timestamp tick would otherwise be
+     * indistinguishable from no write at all, and the granularity of that tick belongs to the
+     * filesystem rather than to anything this code may assume.
+     *
+     * @param local the file to stamp
+     */
+    private static void markResolved(File local) {
+        if (!local.setLastModified(STAGED_SENTINEL_MODIFIED)) {
+            // A filesystem that refuses the stamp leaves the comparison on the timestamp it did keep,
+            // which is the usual, weaker behaviour rather than a failure.
+            Debug.logWarning("Cannot stamp " + ContentStoreUtil.reference(local.getPath())
+                    + " as resolved, so a later write through it that keeps the byte count may not be"
+                    + " recognised. Detection falls back to the modification time the filesystem keeps.", MODULE);
+        }
     }
 
     /**
@@ -1342,13 +1475,9 @@ public final class ContentStoreFactory {
             this.key = key;
             this.staged = staged;
             this.alwaysPublish = alwaysPublish;
-            if (!alwaysPublish) {
-                // Backdating a freshly fetched file makes a write through it recognisable even when
-                // the write keeps the byte count identical and lands inside one filesystem timestamp
-                // tick. A filesystem that refuses the change simply leaves the comparison on the
-                // timestamp it did keep, which is the usual, weaker behaviour rather than a failure.
-                staged.setLastModified(STAGED_SENTINEL_MODIFIED);
-            }
+            // Purely observational: the file was already stamped by markResolved at the point it was
+            // brought into step with the store, so what is captured here is the state a later write
+            // through the file will be compared against.
             this.stagedLength = staged.length();
             this.stagedModified = staged.lastModified();
         }
@@ -1374,11 +1503,20 @@ public final class ContentStoreFactory {
                 throw new GeneralRuntimeException("Cannot publish content for " + ContentStoreUtil.reference(key)
                         + ", so the transaction is rolled back", e);
             }
+            // Back in step with the store, so the next resolution reads it as an untouched copy rather
+            // than publishing these same bytes again on every subsequent read.
+            markResolved(staged);
         }
 
         @Override
         public void afterCompletion(int status) {
-            discard(staged);
+            // Nothing is removed, deliberately. The file this covers is the location objectInfo names,
+            // and the frozen callers keep using it after the transaction completes: ContentWorker puts
+            // it into a render context that is read later, and CompanyHeader.groovy reads its bytes
+            // straight after resolving it. Removing it would make content that is present read as
+            // missing. What is left behind is not durable state either - it is a stamped copy of what
+            // the store holds, which any instance can fetch again and which the next resolution
+            // overwrites from the store.
         }
     }
 

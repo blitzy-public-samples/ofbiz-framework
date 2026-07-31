@@ -203,17 +203,20 @@ public final class DataResourceWorkerContentStoreSeamTests {
         File source = deploymentHome.resolve(OBJECT_INFO).toFile();
         writeLocally(source, STORED);
 
-        assertTrue(DataResourceWorker.storeContentFile(TYPE_OFBIZ_FILE, OBJECT_INFO, null, source),
+        // Explicit publication and removal belong to the storage package, not to the frozen worker: the worker's
+        // public API is unchanged by this refactor, so a caller that wants to move content deliberately asks the
+        // factory. The round trip asserted here is the same one, reached through the surface that owns it.
+        assertTrue(ContentStoreFactory.publishContentFile(TYPE_OFBIZ_FILE, OBJECT_INFO, null),
                 "publishing must report that the store acted");
         assertArrayEquals(STORED, client.stored(OBJECT_INFO), "the published content");
 
-        assertTrue(DataResourceWorker.removeContentFile(TYPE_OFBIZ_FILE, OBJECT_INFO, null),
-                "removal must report that the store acted");
+        String key = ContentStoreFactory.storageKeyFor(TYPE_OFBIZ_FILE, OBJECT_INFO, null);
+        ContentStore store = ContentStoreFactory.getContentStore();
+        store.delete(key);
         assertFalse(client.holds(OBJECT_INFO), "the object must be gone");
 
         // Idempotent, so replayed clean-up is safe: a removal that has already happened is not a failure.
-        assertTrue(DataResourceWorker.removeContentFile(TYPE_OFBIZ_FILE, OBJECT_INFO, null),
-                "a repeated removal must still succeed");
+        store.delete(key);
         assertEquals(2, client.deleteCalls(), "both removals must have reached the store");
     }
 
@@ -304,15 +307,15 @@ public final class DataResourceWorkerContentStoreSeamTests {
         // A traversal segment would let one resource address another resource's object, so it is refused
         // outright rather than normalised away and hoped about.
         assertThrows(GeneralException.class, () ->
-                DataResourceWorker.storeContentFile(TYPE_OFBIZ_FILE, "runtime/../../etc/shadow", null, source),
+                ContentStoreFactory.publishContentFile(TYPE_OFBIZ_FILE, "runtime/../../etc/shadow", null),
                 "a traversal segment must be refused");
         // A type whose content lives in the database has no storage key at all, so asking for one is a
         // programming error rather than something to guess at.
         assertThrows(GeneralException.class, () ->
-                DataResourceWorker.storeContentFile("ELECTRONIC_TEXT", OBJECT_INFO, null, source),
+                ContentStoreFactory.publishContentFile("ELECTRONIC_TEXT", OBJECT_INFO, null),
                 "a type that is not file backed must be refused");
         assertThrows(GeneralException.class, () ->
-                DataResourceWorker.removeContentFile(TYPE_OFBIZ_FILE, "", null),
+                ContentStoreFactory.storageKeyFor(TYPE_OFBIZ_FILE, "", null),
                 "an empty location must be refused");
         assertEquals(0, client.putCalls(), "nothing may reach the store for a location it must not accept");
         assertEquals(0, client.deleteCalls(), "and nothing may be removed from it either");
@@ -327,11 +330,11 @@ public final class DataResourceWorkerContentStoreSeamTests {
         // DataResource.objectInfo is persisted in both forms - the upload path helper hands back a leading
         // separator while the allow-list checks build a relative path - so both have to address one object.
         // If they did not, content written under one form would be invisible under the other.
-        DataResourceWorker.storeContentFile(TYPE_OFBIZ_FILE, "/" + OBJECT_INFO, null, source);
+        ContentStoreFactory.publishContentFile(TYPE_OFBIZ_FILE, "/" + OBJECT_INFO, null);
 
         assertArrayEquals(STORED, client.stored(OBJECT_INFO),
                 "a leading separator must be trimmed rather than becoming an empty first key segment");
-        assertTrue(DataResourceWorker.removeContentFile(TYPE_OFBIZ_FILE, OBJECT_INFO, null), "the relative form must reach it");
+        ContentStoreFactory.getContentStore().delete(ContentStoreFactory.storageKeyFor(TYPE_OFBIZ_FILE, OBJECT_INFO, null));
         assertFalse(client.holds(OBJECT_INFO), "and must remove the very same object");
     }
 
@@ -358,10 +361,9 @@ public final class DataResourceWorkerContentStoreSeamTests {
         assertEquals(lengthBefore, local.length(), "the local file's length must not have been touched");
         assertEquals(modifiedBefore, local.lastModified(), "nor its modification time");
         assertEquals(List.of(local.getName()), namesIn(local.toPath().getParent()), "nor may anything be left beside it");
-        assertFalse(DataResourceWorker.storeContentFile(TYPE_OFBIZ_FILE, OBJECT_INFO, null, local),
+        assertNull(ContentStoreFactory.getContentStore(), "database mode must resolve no provider at all");
+        assertFalse(ContentStoreFactory.publishContentFile(TYPE_OFBIZ_FILE, OBJECT_INFO, null),
                 "publishing must report that no store is configured");
-        assertFalse(DataResourceWorker.removeContentFile(TYPE_OFBIZ_FILE, OBJECT_INFO, null),
-                "removal must report that no store is configured");
     }
 
     @Test

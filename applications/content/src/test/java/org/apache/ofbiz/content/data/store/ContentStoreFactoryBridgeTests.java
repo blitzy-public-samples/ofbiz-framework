@@ -624,12 +624,29 @@ public final class ContentStoreFactoryBridgeTests {
         assertTrue(refused.getMessage().contains("rolled back"), refused.getMessage());
     }
 
+    /**
+     * Completing the transaction leaves the resolved file where the frozen callers expect to find it.
+     *
+     * <p>The file a resolution hands out is the location {@code DataResource.objectInfo} names, not a private
+     * staging file, and the frozen callers keep using it after the transaction that resolved it has completed:
+     * {@code ContentWorker} puts its path into a render context that FreeMarker reads later, and
+     * {@code CompanyHeader.groovy} reads its bytes straight after resolving it. Removing it on completion would
+     * make content that is present read as missing, occasionally and only under a committing transaction.
+     *
+     * <p>Statelessness is not weakened by leaving it. What remains is a stamped copy of what the store holds,
+     * which every other instance can fetch for itself, and every resolution re-reads the store and overwrites
+     * it - so no instance holds state another instance cannot reconstruct, and no copy is ever served stale.
+     * A genuine staging area is different and is still removed: see
+     * {@code publishingSendsTheStagedBytesToTheStoreAndRemovesTheLocalFile} and
+     * {@code everyUploadStagedInADirectoryIsPublishedUnderItsFlatKeyOnCommit}.
+     */
     @Test
-    public void aMaterialisedFileIsRemovedOnceTheTransactionCompletes() throws Exception {
+    public void aResolvedFileSurvivesTheTransactionThatResolvedIt() throws Exception {
         activateRecordingProvider();
         File staged = stagedFileHolding(STORED);
         contentPublication("runtime/uploads/10000.png", staged, false).afterCompletion(Status.STATUS_COMMITTED);
-        assertFalse(staged.exists(), "no instance may hold durable local state");
+        assertTrue(staged.isFile(), "the location objectInfo names must still be there once the transaction is done");
+        assertArrayEqualsBytes(STORED, readFully(staged), "and must still hold the content it was resolved with");
     }
 
     @Test
@@ -1279,6 +1296,14 @@ public final class ContentStoreFactoryBridgeTests {
      * @throws Exception if the publication cannot be constructed
      */
     private Synchronization contentPublication(String key, File staged, boolean alwaysPublish) throws Exception {
+        if (!alwaysPublish) {
+            // Production's precondition, reproduced because these tests construct the publication directly
+            // rather than through materialiseContentFile: a file brought into step with the store is stamped
+            // with the 1970 resolution time before any publication observes it, and that stamp is what makes
+            // a later write recognisable even when it keeps the byte count and lands inside one filesystem
+            // timestamp tick. The publication itself only observes; it no longer stamps.
+            assertTrue(staged.setLastModified(1000L), "the resolution stamp must be settable");
+        }
         Class<?> type = Class.forName(ContentStoreFactory.class.getName() + "$ContentFilePublication");
         Constructor<?> constructor = type.getDeclaredConstructor(String.class, File.class, boolean.class);
         constructor.setAccessible(true);
