@@ -67,11 +67,17 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  *     fleet is satisfied, otherwise {@code 503 SERVICE_UNAVAILABLE}. Two dimensions are measured, in
  *     this order:
  *     <ol>
- *     <li><em>Datasource.</em> The {@code SequenceValueItem} count must complete and be non-zero.
- *         {@code 503} therefore covers no delegator being available, the count failing, and the count
- *         coming back zero. The count and both of its failure rules mirror the {@code ping} service of
- *         {@code org.apache.ofbiz.common.CommonServices}, which treats a failed count and a zero count
- *         alike as a datasource failure.</li>
+ *     <li><em>Datasource.</em> The {@code SequenceValueItem} count must complete. {@code 503}
+ *         therefore covers no delegator being available and the count failing - including the
+ *         missing-relation failure a database with no schema applied produces - but NOT the count
+ *         coming back zero, which is a completed query against a reachable datasource and therefore
+ *         proof of the connectivity this dimension measures. The query is the one the {@code ping}
+ *         service of {@code org.apache.ofbiz.common.CommonServices} performs; ping's additional
+ *         non-zero rule is deliberately not adopted, because {@code SequenceValueItem} is filled on
+ *         demand by the sequencer rather than by a data load and a probe performs no write, so
+ *         requiring a row made a correctly provisioned fleet in front of a cold database permanently
+ *         unroutable. A zero count is logged as an advisory under its own event code instead. See
+ *         {@link #runReadinessCheck}.</li>
  *     <li><em>Cache coherence.</em> When - and only when - this instance's delegator has distributed
  *         cache clear enabled, the entity-cache invalidation transport must have a connected
  *         subscriber. A delegator with the flag off makes this dimension inert, which is why a
@@ -86,9 +92,13 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  *     exceeds the bound, or that arrives with the waiter slots full, is answered {@code 503} under its
  *     own event code.</li>
  * <li>Any other path - {@code 404 NOT_FOUND}, so a mis-configured probe fails visibly instead of
- *     reporting false health. Under the two exact url-patterns this class is mapped with, the
- *     container answers an unknown path before the request reaches here; the branch applies when it
- *     is mapped with a prefix pattern such as {@code /health/*}.</li>
+ *     reporting false health. Under the two exact url-patterns this class is mapped with, the request
+ *     never reaches here at all: the near miss is handled by whatever the hosting webapp does with an
+ *     unmapped path, which in webtools is the control servlet's redirect - {@code /health/bogus} and
+ *     {@code /health/LIVE} answer {@code 302} to {@code /webtools/control/main}. The branch below is
+ *     what keeps the contract honest if this class is ever mapped with a prefix pattern such as
+ *     {@code /health/*}, where an unmatched path WOULD arrive; answering it {@code 200} with an empty
+ *     body would be the dangerous outcome.</li>
  * <li>Any method other than {@code GET} or {@code HEAD} - {@code 405 METHOD_NOT_ALLOWED} with an
  *     {@code Allow} header.</li>
  * <li>Any request carrying an entity body - {@code 400 BAD_REQUEST}, decided from the headers
@@ -185,10 +195,12 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
     // The two probe paths, matched EXACTLY. ControlFilter's allowedPaths entry is necessarily a
     // prefix, because that filter matches its list with startsWith, but the exact comparison here is
     // what confines what this class actually answers to these two resources. Any near miss -
-    // /healthz, /health, /health/live/, /health/liveness - matches no url-pattern of this servlet, so
-    // the container answers it from its own default servlet with 404 and it never reaches a probe
-    // handler; the prefix in the allow-list exposes no other resource, since nothing else is mapped
-    // under /health.
+    // /healthz, /health, /health/live/, /health/liveness, /health/LIVE - matches no url-pattern of
+    // this servlet, so it never reaches a probe handler and is answered by whatever the hosting webapp
+    // does with an unmapped path. In webtools that is the control servlet's redirect: 302 to
+    // /webtools/control/main, verified for /health/bogus and for case variants. What matters for this
+    // class is that no near miss is answered 200: the prefix in the allow-list exposes no other
+    // resource, since nothing else is mapped under /health.
     private static final String PROBE_LIVE = "/health/live";
     private static final String PROBE_READY = "/health/ready";
 
@@ -274,14 +286,16 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
     private static final String REFERRER_POLICY_HEADER = "Referrer-Policy";
     private static final String REFERRER_POLICY_VALUE = "no-referrer-when-downgrade";
 
-    // Stable event codes. Each readiness verdict that is not 200 reports itself as one of these
+    // Stable event codes. Every readiness verdict that is not 200 reports itself as one of these
     // tokens, so a log consumer keys its alert off the token rather than off wording or an exception
-    // message. No qualifier is ever appended - not an SQL state, not an exception type, not a driver
-    // message - and the only thing that joins a token on the line is the suppressed-occurrence count
-    // from the rate limit below. The six causes are kept apart because they call for different
-    // operator action - restore the datasource, complete the schema-init execution and its data
-    // load, find out what is making the readiness check slow, find out what is sending far more
-    // simultaneous probes than a target group does, or restore the cache-invalidation transport.
+    // message. One of them - HEALTH-READINESS-SCHEMA-EMPTY - is an ADVISORY that is also emitted on a
+    // 200 verdict, because the state it describes is worth reporting without being a reason to hold an
+    // instance out of service; see runReadinessCheck. No qualifier is ever appended - not an SQL state,
+    // not an exception type, not a driver message - and the only thing that joins a token on the line is
+    // the suppressed-occurrence count from the rate limit below. The six causes are kept apart because
+    // they call for different operator action - restore the datasource, find out why no sequenced write
+    // has happened yet, find out what is making the readiness check slow, find out what is sending far
+    // more simultaneous probes than a target group does, or restore the cache-invalidation transport.
     private static final String EVENT_READINESS_UNAVAILABLE = "HEALTH-READINESS-DATASOURCE-UNAVAILABLE";
     private static final String EVENT_READINESS_SCHEMA_EMPTY = "HEALTH-READINESS-SCHEMA-EMPTY";
     private static final String EVENT_READINESS_SHED = "HEALTH-READINESS-PROBE-SHED";
@@ -294,8 +308,8 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
     private static final String EVENT_READINESS_CHECK_TIMEOUT = "HEALTH-READINESS-CHECK-TIMEOUT";
     // An instance whose delegator requires distributed cache clear but which has no connected
     // subscriber on the invalidation transport. Kept apart from all of the above because it is the one
-    // code that says the DATASOURCE is fine: the count completed and was non-zero, and it is the
-    // fleet-coherence dependency that is missing. The operator action is correspondingly different -
+    // code that says the DATASOURCE is fine: the count completed, and it is the fleet-coherence
+    // dependency that is missing. The operator action is correspondingly different -
     // restore the message broker, or supply the transport configuration and the broker client jar the
     // entry point requires when OFBIZ_DISTRIBUTED_CACHE_CLEAR is enabled - and it is emitted while the
     // instance is being held out of service, which is the state it describes.
@@ -884,18 +898,27 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
      * default org.apache.ofbiz group present in every deployment. The service itself is not invoked,
      * so no dispatcher, service engine or localisation is dragged into what has to stay a cheap probe.
      *
-     * Both of ping's failure rules are adopted, not only its query, because the Agent Action Plan
-     * specifies this endpoint as "mirroring the ping service's SequenceValueItem count check" (AAP
-     * section 0.4.1): a count that fails is ping's CommonPingDatasourceCannotConnect case, and a
-     * count that returns zero is its CommonPingDatasourceInvalidCount case - "if (count != 0L)" at
-     * CommonServices.java line 495. Both mean "not ready" here. A count that returns non-zero is what
-     * this endpoint reports ready on: it shows that the delegator resolved, the datasource answered and
-     * the query path returned a row count. A count that returns zero, and a count that throws, are both
-     * reported not ready; neither outcome is evidence of anything beyond itself. The state a zero count
-     * most often indicates is a schema no data load has populated - any data load populates this entity,
-     * since the sequencer writes it - and reporting 200 then would attach an instance backed by an
-     * unpopulated schema to the load-balancer target group, turning a deployment-ordering mistake into
-     * user-visible failures instead of a visibly unhealthy target that never receives traffic.
+     * Ping's QUERY is adopted; only one of its two failure rules is. What this dimension measures is
+     * connectivity, which is exactly how the Agent Action Plan specifies it - "readiness (delegator/DB
+     * connectivity -> 200/503)" (AAP section 0.4.1), naming ping's count check as "the database-
+     * connectivity model for the readiness probe" (AAP section 0.2.1). A count that THROWS is ping's
+     * CommonPingDatasourceCannotConnect case and means not ready here too: the delegator could not be
+     * resolved, the datasource could not be reached, the pool was exhausted, or the relation does not
+     * exist because no schema has been applied. A count that COMPLETES is the connectivity proof, and
+     * the number it returns is not part of it - a successful count of zero demonstrates the same
+     * reachable datasource and the same working query path that a count of a thousand does.
+     *
+     * Ping's second rule - "if (count != 0L)", CommonServices.java line 495, which reports
+     * CommonPingDatasourceInvalidCount for a zero count - is deliberately NOT adopted, because ping is
+     * an interactive administrative diagnostic and this is a load-balancer target-group probe (AAP
+     * section 0.1.1, Goal 5). SequenceValueItem is filled ON DEMAND by the sequencer, not by the data
+     * load: a database initialised with OFBIZ_DATA_LOAD=seed or none holds zero rows in it until
+     * something performs the first sequenced write. Probes create no session and perform no write, so
+     * treating zero as "not ready" made a correctly provisioned fleet in front of a cold database
+     * unroutable forever - the only thing that could satisfy the predicate was traffic, and traffic only
+     * arrives once the predicate is satisfied. A zero count is therefore logged as an advisory under its
+     * own event code and the check continues; an unprovisioned schema is still reported not ready, but
+     * by the rule that catches it for what it is - the count failing on a relation that does not exist.
      *
      * The second dimension is cache coherence, and it is measured only after the datasource has
      * answered - both because the delegator the first dimension resolves is what says whether the
@@ -941,15 +964,18 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
                 logRateLimitedWarning(EVENT_READINESS_UNAVAILABLE, READINESS_LOG_LAST_AT, READINESS_LOG_SUPPRESSED);
                 return false;
             }
-            // The count itself decides the verdict, exactly as CommonServices.ping decides it.
+            // Completing the count is the verdict for this dimension. The value it returns is not:
+            // see the discussion above of why a zero count is an advisory here and not a failure.
             long rows = delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator,
                     delegator.getModelReader().getModelEntity(READINESS_ENTITY), null, null, null);
             if (rows == 0L) {
-                // Reachable but empty: reported under its own code because the operator action it
-                // calls for - complete the schema-init execution and its data load - differs from
-                // the one an unreachable datasource calls for.
+                // Reachable, and the table is there, but no sequence bank has been allocated in it
+                // yet. Reported under its own code because the operator action it suggests - drive or
+                // wait for the first sequenced write, or load demo data - differs from the one an
+                // unreachable datasource calls for, and because a fleet that never leaves this state
+                // is worth investigating. It does NOT decide the verdict: the count completed, which
+                // is the connectivity this dimension measures, so the check goes on to the next one.
                 logRateLimitedWarning(EVENT_READINESS_SCHEMA_EMPTY, READINESS_EMPTY_LOG_LAST_AT, READINESS_EMPTY_LOG_SUPPRESSED);
-                return false;
             }
             // Second dimension. The datasource has answered, so what remains is whether this instance
             // is fit to be one member of a coherent fleet - see isCacheTransportReady, which is inert

@@ -445,7 +445,7 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void readyHeadReturnsUpWhenTheEntityCountIsNotZero() throws Exception {
+    public void readyHeadReturnsUpWhenTheEntityCountCompletes() throws Exception {
         givenProbePath("/health", "/ready");
         givenMethod("HEAD");
         Delegator delegator = delegatorCountingRows(1L);
@@ -459,7 +459,7 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void readyGetReturnsDownWhenTheReachableDatabaseReportsZeroRows() throws Exception {
+    public void readyGetReturnsUpWhenTheReachableDatabaseReportsZeroRows() throws Exception {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(0L);
 
@@ -468,9 +468,15 @@ public final class HealthCheckServletTests {
 
             servlet.service(request, response);
         }
-        // A reachable but unpopulated schema is "not ready", exactly as the ping service reports
-        // CommonPingDatasourceInvalidCount for a zero count.
-        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
+        // The count COMPLETED, which is the database connectivity this dimension measures, so the
+        // instance is ready. The value is not part of the verdict: SequenceValueItem is filled on
+        // demand by the sequencer rather than by a data load, and a probe creates no session and
+        // performs no write, so requiring a row would hold a correctly initialised instance in front of
+        // a cold database out of service forever - the only thing able to fill the table is the traffic
+        // that readiness is what admits. This is the one rule readiness does not take from the ping
+        // service, which reports CommonPingDatasourceInvalidCount for a zero count as an interactive
+        // diagnostic rather than as a target-group verdict.
+        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
     }
 
     @Test
@@ -751,11 +757,14 @@ public final class HealthCheckServletTests {
         // verdict for the whole length of the step - which no window here bounds.
         long step = readinessConstant("READINESS_VERDICT_GRACE_NANOS") * 10L;
         givenEstablishedVerdict(true, -step);
-        // Meanwhile the datasource has stopped being ready.
+        // Meanwhile the datasource has stopped being ready. Expressed as a count that FAILS, because
+        // that is what "no longer ready" means for this dimension: a count that completes - with any
+        // value, zero included - is a reachable datasource and would be reported ready.
         Delegator delegator = mock(Delegator.class);
         ModelEntity modelEntity = givenReadinessModel(delegator);
         GenericHelper helper = delegator.getEntityHelper(READINESS_ENTITY);
-        when(helper.findCountByCondition(delegator, modelEntity, null, null, null)).thenReturn(0L);
+        when(helper.findCountByCondition(delegator, modelEntity, null, null, null))
+                .thenThrow(new GenericEntityException("datasource unreachable"));
 
         try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
@@ -767,7 +776,7 @@ public final class HealthCheckServletTests {
             // whole difference: repeating it would have reported this instance ready for as long as the
             // clock step lasted, and a load balancer would have kept sending it traffic.
             verify(helper).findCountByCondition(delegator, modelEntity, null, null, null);
-            debug.verify(() -> Debug.logWarning(eq(EMPTY_EVENT_CODE), anyString()));
+            debug.verify(() -> Debug.logWarning(eq(EVENT_CODE), anyString()));
         }
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
         // And what it was replaced with is dated now, not in the future, so one step cannot poison the
@@ -2264,7 +2273,8 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void anUnpopulatedSchemaIsReportedUnderItsOwnCode() throws Exception {
+    public void anUnpopulatedSchemaIsReportedUnderItsOwnCodeWithoutHoldingTheInstanceOutOfService()
+            throws Exception {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(0L);
 
@@ -2276,13 +2286,15 @@ public final class HealthCheckServletTests {
 
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
             debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
-            // The operator action differs from an outage - finish the schema-init execution and its
-            // data load - so the condition may not be reported as a datasource failure.
+            // The operator question differs from an outage - why has no sequenced write reached this
+            // database - so the condition may not be reported as a datasource failure.
             assertEquals(EMPTY_EVENT_CODE, lines.getValue(), "a reachable but empty schema needs its own code");
         }
         assertWindowStillOpen("READINESS_LOG_LAST_AT",
                 "an empty schema must not consume the rate-limit window an unavailable datasource needs");
-        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
+        // Advisory, not a verdict. The count completed, so the datasource dimension is satisfied and the
+        // instance is routable; the line is what tells an operator the sequence table is still empty.
+        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
     }
 
     @Test
@@ -2495,8 +2507,8 @@ public final class HealthCheckServletTests {
 
     @Test
     public void anAbsentTransportIsReportedUnderItsOwnStableEventCodeAndNothingElse() throws Exception {
-        // The datasource is fine here - the count completed and was non-zero - so reporting this under
-        // the datasource code would send an operator to the wrong system. Nothing beyond the code may
+        // The datasource is fine here - the count completed - so reporting this under the datasource
+        // code would send an operator to the wrong system. Nothing beyond the code may
         // be written either: the path is anonymous and polled.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(7L);
@@ -2546,7 +2558,12 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void anUnpopulatedSchemaIsReportedBeforeTheCoherenceDimension() throws Exception {
+    public void anUnpopulatedSchemaDoesNotMaskTheCoherenceDimension() throws Exception {
+        // The empty sequence table is an advisory, so it cannot stand in for a verdict - and it must not
+        // stop the second dimension from being measured either. Before the datasource dimension was
+        // corrected to assert only that the count completes, this combination reported the empty schema
+        // and returned, which left an instance that genuinely could not participate in fleet cache
+        // coherence diagnosed as "empty schema" and sent the operator to the wrong subsystem.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(0L);
         LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of());
@@ -2559,10 +2576,12 @@ public final class HealthCheckServletTests {
             servlet.service(request, response);
 
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
-            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()));
-            assertEquals(List.of(EMPTY_EVENT_CODE), lines.getAllValues(),
-                    "an unpopulated schema is reported as such, not as a missing transport");
+            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(2));
+            assertEquals(List.of(EMPTY_EVENT_CODE, TRANSPORT_EVENT_CODE), lines.getAllValues(),
+                    "the advisory is emitted first and the dimension that actually decided the verdict "
+                            + "is emitted after it, in the order the two dimensions are measured");
         }
+        // And the verdict comes from the transport, which is the dimension that failed.
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
 

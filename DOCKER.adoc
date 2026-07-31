@@ -363,13 +363,21 @@ rather than restarted when a readiness dependency is lost.
 
 Readiness has two dimensions, checked in this order:
 
-. *Datasource* - the entity engine can count `+SequenceValueItem+` and
-the count is non-zero. This is the same check the framework's own
-`+ping+` service makes, so readiness agrees with `+ping+` by
-construction. A failure means the database cannot be reached, or the
-schema carries no sequence rows yet - see
-`+HEALTH-READINESS-SCHEMA-EMPTY+` below, which is the one readiness
-failure a correctly configured deployment can legitimately start out in.
+. *Datasource* - the entity engine can *complete* a count of
+`+SequenceValueItem+`. This is the query the framework's own `+ping+`
+service makes, and completing it is the database connectivity readiness
+measures. The value the count returns is not part of the verdict: a
+completed count of zero rows is the same proof of a reachable datasource
+and a working query path as a count of a thousand, so it is reported ready
+and logged as an advisory under `+HEALTH-READINESS-SCHEMA-EMPTY+` below.
+A failure means the database cannot be reached at all - no delegator, an
+unreachable server, an exhausted connection pool - or that no schema has
+been applied to it, which the count reports by failing on a relation that
+does not exist. `+ping+` additionally treats a zero count as a failure;
+readiness deliberately does not, because `+SequenceValueItem+` is filled
+on demand by the sequencer rather than by a data load and a probe performs
+no write, so requiring a row would leave a correctly initialised fleet in
+front of a cold database permanently unroutable.
 . *Cache coherence* - when `+OFBIZ_DISTRIBUTED_CACHE_CLEAR=true+`, the
 instance's invalidation subscriber is connected to the broker. This
 dimension is *inert* on a delegator that does not enable distributed cache
@@ -545,9 +553,9 @@ at any interval, since they share one check instead of competing for the
 datasource. `+/webtools/health/live+` performs no database access at all
 and can likewise be polled at any rate.
 
-A readiness failure is logged once per minute per instance as a stable
-event code, with the occurrences suppressed in between counted into the
-next line. A count still outstanding when the condition stops is written
+A readiness failure - and the one advisory below that is not a failure -
+is logged once per minute per instance as a stable event code, with the
+occurrences suppressed in between counted into the next line. A count still outstanding when the condition stops is written
 out by the next readiness probe once that minute has elapsed, so the
 tail of a burst - and a burst that ends inside its own minute - is
 accounted for rather than lost. There are six codes, each with its own
@@ -557,13 +565,16 @@ another or report another's occurrences as its own:
 * `+HEALTH-READINESS-DATASOURCE-UNAVAILABLE+` - the datasource could not
   be reached, or the count did not complete. The database needs
   attention;
-* `+HEALTH-READINESS-SCHEMA-EMPTY+` - the datasource answered but
-  `+SequenceValueItem+` is empty. Check this first when a freshly
-  initialised fleet never becomes ready, and read _An empty sequence
-  table_ below before treating it as a fault: the table is filled on
-  demand rather than by the data load, so a database that was
-  initialised with `+OFBIZ_DATA_LOAD=seed+` or `+none+` reports this code
-  until something performs its first sequenced write;
+* `+HEALTH-READINESS-SCHEMA-EMPTY+` - an *advisory*, not a failure: the
+  count completed, so the instance is reported *ready*, but
+  `+SequenceValueItem+` held no rows. It is the one code that can appear
+  on a `+200+` verdict. The table is filled on demand by the sequencer
+  rather than by the data load, so a database initialised with
+  `+OFBIZ_DATA_LOAD=seed+` or `+none+` reports it until something performs
+  the first sequenced write - see _An empty sequence table_ below. Nothing
+  needs doing about it while it is only the first few minutes of a fleet's
+  life; investigate it if it persists, since it says no sequenced write has
+  reached this database at all;
 * `+HEALTH-READINESS-CACHE-TRANSPORT-UNAVAILABLE+` - the datasource is
   fine and the instance requires cache coherence, but no invalidation
   subscriber is connected: no dispatcher has been published yet, no
@@ -608,36 +619,42 @@ depends on which data tier was loaded, not on whether the load succeeded:
 
 * `+OFBIZ_DATA_LOAD=demo+` populates the table during the import,
   because the demo data drives event-condition-actions that do create
-  records with sequenced identifiers. Readiness is `+200+` from the first
-  probe;
-* `+OFBIZ_DATA_LOAD=seed+` and `+none+` leave it *empty*. The schema is
-  complete and the seed data is present, and readiness is still `+503+`
-  under `+HEALTH-READINESS-SCHEMA-EMPTY+` until something performs the
-  first sequenced write. One ordinary request is enough - serving a page
-  records a `+Visit+`, whose identifier is sequenced - after which every
-  instance sharing that database reports `+200+` on its next check, with
-  no restart, because the row lives in the database rather than in an
-  instance.
+  records with sequenced identifiers;
+* `+OFBIZ_DATA_LOAD=seed+` and `+none+` leave it *empty*, on a schema that
+  is complete and seed data that is present.
 
-This is the framework's own `+ping+` semantics rather than anything the
-container adds, and readiness deliberately keeps them so that the two
-never disagree. It does mean a `+seed+`-loaded fleet has to be brought
-into service before a target group will route to it. Pick whichever of
-these suits the deployment:
+*Readiness is `+200+` in both cases.* What the datasource dimension
+measures is whether the count completes, and a completed count of zero
+rows proves the same reachable database and the same working query path as
+any other number, so a `+seed+`-loaded fleet is routable from its first
+probe and needs no manual pre-warming. The empty table is reported as an
+advisory - `+HEALTH-READINESS-SCHEMA-EMPTY+`, once a minute per instance -
+and nothing else. It clears by itself as soon as anything performs a
+sequenced write; one ordinary request is enough, since serving a page
+records a `+Visit+` whose identifier is sequenced, after which every
+instance sharing that database stops logging it, with no restart, because
+the row lives in the database rather than in an instance.
 
-* load `+demo+` data in the initialization step, on a deployment where
-  demo data is wanted anyway;
-* let the first sequenced write happen deliberately - one authenticated
-  request against `+/webtools+`, or any service call that creates a
-  record - before the instances are registered with the target group;
-* register the instances with a target group that tolerates an initial
-  unhealthy period long enough to cover that first write, which is the
-  usual arrangement in any case.
+This is the one place readiness deliberately departs from the framework's
+`+ping+` service, whose query it otherwise shares. `+ping+` is an
+interactive administrative diagnostic and reports a zero count as
+`+CommonPingDatasourceInvalidCount+`; a target-group probe cannot adopt
+that rule, because probes create no session and perform no write, so an
+instance held out of service for an empty sequence table could never
+receive the traffic that is the only thing able to fill it. If the
+advisory is unwanted at all, load `+demo+` data in the initialization step
+or let one sequenced write happen before the instances are registered.
 
-Do not work around it by pointing the target group at
-`+/webtools/health/live+`: liveness answers `+200+` while the datasource
-is unreachable, which is exactly the situation a target group must not
-route into.
+A database with *no schema applied* is a different matter and is still
+reported `+503+`: the count fails on a relation that does not exist, which
+is `+HEALTH-READINESS-DATASOURCE-UNAVAILABLE+`. Run the schema
+initialization step described under _Database_ before starting a serving
+instance.
+
+Never point a target group at `+/webtools/health/live+` in place of the
+readiness path: liveness answers `+200+` while the datasource is
+unreachable, which is exactly the situation a target group must not route
+into.
 
 ===== Running more than one instance
 
@@ -1332,10 +1349,38 @@ variables.
 To use the embedded H2 database, ensure all database related
 environment variables are unset.
 
+"Unset" means unset, not empty. `+OFBIZ_POSTGRES_HOST+` is the only
+variable that selects the managed database, so leaving it out while
+supplying any other `+OFBIZ_POSTGRES_*+` variable is a contradiction -
+the database name, user, password and TLS settings would all be ignored
+and the container would serve traffic from an embedded H2 file on its own
+volume, invisible to every other instance and destroyed with the
+instance. The entry point therefore refuses to pass over that
+combination:
+
+* in the `+dev+` profile it prints a `+WARNING+` naming every variable
+  that will have no effect and continues on the embedded database, so the
+  local workflow of leaving a database block in a compose file with the
+  host commented out still works;
+* in the `+prod+` profile it fails the start, because an instance that
+  serves real traffic must not fall back to an embedded database;
+* an `+OFBIZ_POSTGRES_*+` variable supplied with an *empty* value fails
+  the start in *either* profile, and the error names each offending
+  variable. An empty value is what an unresolved secret reference or an
+  unrendered template leaves behind, so it is never read as a request for
+  the default in the tables below. Without that rule an empty
+  `+OFBIZ_POSTGRES_OFBIZ_DB+` became the literal default `+ofbiz+` and
+  the only symptom was the driver's own
+  `+database "ofbiz" does not exist+` much later, from inside the entity
+  engine.
+
 ===== PostgreSQL
 
 To use a Postgres database set the `+OFBIZ_POSTGRES_HOST+` environment
-variable.
+variable. It is the trigger: when it is set the managed datasources are
+rendered from the variables below, and when it is unset none of them has
+any effect - see _H2_ above for what the entry point does with that
+combination.
 
 [width="100%",cols="34%,33%,33%",options="header",]
 |===

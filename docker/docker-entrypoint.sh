@@ -207,6 +207,16 @@
 # 'db.example.internal:5432', is refused, because a port that arrives inside the host string bypasses
 # the range check below and lands in the URI unvalidated. Supply the port in OFBIZ_POSTGRES_PORT.
 # An IPv6 literal has to be bracketed, as in '[fd00::1]', which is what the JDBC URI grammar requires.
+# OFBIZ_POSTGRES_HOST is the ONLY variable that selects the managed database, so a configuration that
+# supplies any other OFBIZ_POSTGRES_ variable and leaves this one unset is contradictory and is reported
+# rather than ignored: a WARNING naming every ignored variable in the dev profile, and a hard failure in
+# the prod profile, where an instance serving real traffic must not fall back to the embedded database.
+# Unset EVERY OFBIZ_POSTGRES_ variable to use the embedded database.
+# No OFBIZ_POSTGRES_ variable may be supplied as an EMPTY value, this one included. An empty value is
+# what an unresolved secret reference or an unrendered template leaves behind, so it is refused by name
+# instead of being replaced by the default listed above - which would otherwise point the container at a
+# different database and fail much later, inside the entity engine, with the driver's own message.
+# Default: <empty> - no managed database, so the embedded H2 database is used.
 #
 # OFBIZ_POSTGRES_PORT
 # The TCP port of the PostgreSQL host, rendered as the port component of all three managed JDBC URIs.
@@ -982,6 +992,47 @@ ENTITY_ENGINE_OVERRIDE="config/entityengine.xml"
 # invalidation messages, and it carries no distributed-cache-clear-enabled attribute to substitute.
 CACHE_CLEAR_DELEGATORS=(default default-no-eca)
 
+# Every managed-database variable OTHER than the OFBIZ_POSTGRES_HOST that selects the mode.
+#
+# Each of these describes a PostgreSQL connection and has no meaning without one: a database name, a
+# user, a password, a TLS setting, a network deadline or an initialisation identity. Supplying any of
+# them is therefore evidence that a managed database was intended, which is what
+# require_consistent_database_selection needs in order to tell "no managed database was asked for" apart
+# from "a managed database was asked for and the host is missing". The two are indistinguishable from
+# OFBIZ_POSTGRES_HOST alone, and the second silently started the embedded database on a fleet configured
+# for PostgreSQL.
+#
+# OFBIZ_DB_POOL_*, OFBIZ_DB_FLEET_SIZE and OFBIZ_DB_MAX_CONNECTIONS are deliberately absent. They size
+# and audit a pool rather than describe a connection, ofbiz_setup_env defaults the pool bounds on every
+# start, and a container that sets only a pool size has expressed no intent about which database it
+# talks to.
+MANAGED_DATABASE_VARIABLES=(
+  OFBIZ_POSTGRES_PORT
+  OFBIZ_POSTGRES_OFBIZ_DB
+  OFBIZ_POSTGRES_OFBIZ_USER
+  OFBIZ_POSTGRES_OFBIZ_PASSWORD
+  OFBIZ_POSTGRES_OLAP_DB
+  OFBIZ_POSTGRES_OLAP_USER
+  OFBIZ_POSTGRES_OLAP_PASSWORD
+  OFBIZ_POSTGRES_TENANT_DB
+  OFBIZ_POSTGRES_TENANT_USER
+  OFBIZ_POSTGRES_TENANT_PASSWORD
+  OFBIZ_POSTGRES_SSLMODE
+  OFBIZ_POSTGRES_SSLROOTCERT
+  OFBIZ_POSTGRES_CONNECT_TIMEOUT
+  OFBIZ_POSTGRES_SOCKET_TIMEOUT
+  OFBIZ_POSTGRES_LOGIN_TIMEOUT
+  OFBIZ_POSTGRES_CANCEL_TIMEOUT
+  OFBIZ_POSTGRES_QUERY_TIMEOUT
+  OFBIZ_POSTGRES_TCP_KEEPALIVE
+  OFBIZ_POSTGRES_OFBIZ_INIT_USER
+  OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD
+  OFBIZ_POSTGRES_OLAP_INIT_USER
+  OFBIZ_POSTGRES_OLAP_INIT_PASSWORD
+  OFBIZ_POSTGRES_TENANT_INIT_USER
+  OFBIZ_POSTGRES_TENANT_INIT_PASSWORD
+)
+
 # The service engine configuration, in the CLASSPATH PRECEDENCE order the service engine resolves it:
 # serviceengine.xml is read as a FLAT class path resource (ResourceLoader.readXmlDocument goes through
 # UtilURL.fromResource), and the generated start script puts /ofbiz/config FIRST on the class path, so a
@@ -1588,6 +1639,19 @@ SUPPLIED_VARIABLES=()
 # from the array at all.
 SUPPLIED_VARIABLES_RECORDED="false"
 
+# The names the operator supplied as an EMPTY value, recorded in the same snapshot and kept apart from
+# the array above.
+#
+# "Set to nothing" and "not set at all" are different instructions and the difference is not recoverable
+# later: ofbiz_setup_env resolves both with the '${VAR:-default}' form, so the moment it has run a blank
+# OFBIZ_POSTGRES_OFBIZ_DB is indistinguishable from an absent one - both read as the literal default
+# 'ofbiz'. An orchestrator that renders a variable from a secret or a config map that turned out to be
+# empty therefore produced a container that silently connected somewhere else, and the only symptom was
+# the driver's own 'database "ofbiz" does not exist' once the entity engine started. A value that was
+# supplied and is empty is a templating accident, never a request for this script's default, so it is
+# recorded here and reported by name.
+SUPPLIED_BLANK_VARIABLES=()
+
 # The variables OFBIZ_SKIP_INIT genuinely makes ineffective. They configure the work it skips - the
 # administrative user and the data load - and nothing else does. Every other runtime-applied variable
 # is still rendered on that path, so reporting the whole supplied set as ignored would be false.
@@ -1621,6 +1685,31 @@ variable_was_supplied() {
     printf '%s\n' "${SUPPLIED_VARIABLES[@]}" | grep --quiet --line-regexp --fixed-strings "$variableName"
   else
     [ -n "${!variableName:-}" ]
+  fi
+}
+
+###############################################################################
+# Report whether the OPERATOR supplied a variable AS AN EMPTY VALUE.
+#
+# The counterpart of variable_was_supplied, and the question ofbiz_setup_env destroys: '${VAR:-default}'
+# treats a blank value and an absent one identically, so after it has run nothing can tell them apart.
+# The snapshot separates them, which is what lets a blank value be rejected by name instead of quietly
+# becoming this script's default.
+#
+# When the snapshot has not been taken the environment is still the operator's input, so the question is
+# answered directly with the '+' form, which distinguishes "declared" from "non-empty". Under 'set -x'
+# neither branch expands a value, so both remain safe for a credential's name.
+# $1 - variable name
+variable_was_supplied_blank() {
+  local variableName="$1"
+  if [ "$SUPPLIED_VARIABLES_RECORDED" = "true" ]; then
+    if [ "${#SUPPLIED_BLANK_VARIABLES[@]}" -eq 0 ]; then
+      return 1
+    fi
+    printf '%s\n' "${SUPPLIED_BLANK_VARIABLES[@]}" \
+      | grep --quiet --line-regexp --fixed-strings "$variableName"
+  else
+    [ -n "${!variableName+set}" ] && [ -z "${!variableName}" ]
   fi
 }
 
@@ -8103,6 +8192,97 @@ write_state_record() {
 }
 
 ###############################################################################
+# Refuse a database configuration that contradicts itself, before anything is rendered from it.
+#
+# resolve_desired_database_mode decides between the managed database and the embedded one from
+# OFBIZ_POSTGRES_HOST alone, which is the documented trigger and stays the trigger. What that single
+# question cannot express is the difference between the two ways of not setting it:
+#
+#   - a container that configured no database at all, which is the zero-configuration local and demo
+#     start, and must go on booting on the embedded H2 database with no message of any kind;
+#   - a container that configured a managed database and is MISSING THE HOST, which is a deployment
+#     whose database name, user, password and TLS settings were all supplied and all silently ignored.
+#
+# The second case is the one this function exists for. Unaddressed it produced a container that reported
+# itself live to a load balancer, served real traffic, and wrote every row into an embedded H2 file on
+# its own ephemeral volume - so the data was invisible to the rest of the fleet and was destroyed with
+# the instance - while the managed database it was configured for stayed empty. Nothing in the log said
+# so, because from the entry point's point of view nothing had gone wrong.
+#
+# Three rules, in the order a misconfiguration is most likely to be understood:
+#
+#   1. Any managed-database variable that was SUPPLIED AS AN EMPTY VALUE is fatal, named individually.
+#      This includes OFBIZ_POSTGRES_HOST itself, so 'OFBIZ_POSTGRES_HOST=' can never be read as "use the
+#      embedded database": an empty value is what an unresolved secret reference or an unrendered
+#      template leaves behind, never an instruction. Without this rule ofbiz_setup_env's '${VAR:-default}'
+#      resolution replaced the blank with a published default - 'ofbiz', 'ofbizolap', 'ofbiztenant' - and
+#      the first sign of trouble was the driver's own 'database "ofbiz" does not exist' from inside the
+#      entity engine, long past the point where the entry point could say which variable was at fault.
+#   2. Managed-database variables supplied WITHOUT a host are fatal in the prod profile. A deployment
+#      that serves real traffic may not silently fall back to a single-instance embedded database, and
+#      the fail-fast posture the profile already applies to the required secrets is the same posture
+#      here.
+#   3. The same combination in the dev profile is a WARNING that names every variable that will be
+#      ignored, and the start continues on the embedded database. Refusing it would break the local
+#      workflow of leaving a database block in a compose file with the host commented out, which is a
+#      legitimate thing to do while developing - but it must not be silent.
+#
+# Only NAMES are ever printed, never values, because six of these variables are credentials. The
+# names come from the snapshot record_supplied_variables took before any default was applied, so a
+# value this script defaulted is never mistaken for one the operator supplied - which is what makes rule
+# 2 safe to apply to a variable such as OFBIZ_POSTGRES_PORT that also has a default.
+require_consistent_database_selection() {
+  local variableName
+  local blank=''
+  local supplied=''
+  local hostSupplied='false'
+
+  # Tracing is suspended for the whole of the questioning, and every answer is reduced to a NAME before it
+  # is restored. Until record_supplied_variables has taken its snapshot - which is the state this function
+  # is in when it is driven directly by a test - variable_was_supplied and variable_was_supplied_blank
+  # answer by expanding the variable itself, and six of the names below hold a database password. A traced
+  # shell echoes the expanded arguments of every command it runs, so asking the question under 'set -x'
+  # would publish those passwords to the container log. Deciding afterwards, from the accumulated names
+  # alone, keeps the branch and the message traceable without any value ever being expanded while tracing.
+  hide_secrets
+  for variableName in OFBIZ_POSTGRES_HOST "${MANAGED_DATABASE_VARIABLES[@]}"; do
+    if variable_was_supplied_blank "$variableName"; then
+      blank="$blank $variableName"
+    fi
+  done
+  if variable_was_supplied OFBIZ_POSTGRES_HOST; then
+    hostSupplied='true'
+  fi
+  for variableName in "${MANAGED_DATABASE_VARIABLES[@]}"; do
+    if variable_was_supplied "$variableName"; then
+      supplied="$supplied $variableName"
+    fi
+  done
+  restore_trace
+
+  if [ -n "$blank" ]; then
+    config_fatal "These database variables were supplied with an empty value:$blank. An empty value is not the same as an unset one - it is what an unresolved secret reference or an unrendered template leaves behind - so it is refused rather than replaced by a default that would point this container at a different database. Supply a value for each name listed, or remove the variable entirely to leave the setting to its default. Unset every OFBIZ_POSTGRES_ variable to use the embedded database. See DOCKER.adoc."
+  fi
+
+  # A host was supplied, so the managed mode is unambiguous and there is nothing to reconcile.
+  if [ "$hostSupplied" = 'true' ]; then
+    return 0
+  fi
+
+  # The zero-configuration start: no managed-database variable at all. Silence is the correct answer -
+  # this is the documented local and demo path.
+  if [ -z "$supplied" ]; then
+    return 0
+  fi
+
+  if [ "$OFBIZ_PROFILE" = 'prod' ]; then
+    config_fatal "OFBIZ_POSTGRES_HOST is not set, but these database variables were supplied:$supplied. OFBIZ_POSTGRES_HOST is what selects the managed database, so without it every one of those settings is ignored and this container would serve traffic from an embedded H2 database on its own volume - invisible to every other instance and destroyed with this one. Set OFBIZ_POSTGRES_HOST to the database host, or unset the variables listed to use the embedded database deliberately. See DOCKER.adoc."
+  fi
+
+  printf '%s\n' "WARNING: OFBIZ_POSTGRES_HOST is not set, so no managed database is configured and this container will use the embedded H2 database on its own runtime volume. These variables were supplied and will have no effect:$supplied. Set OFBIZ_POSTGRES_HOST to use the managed database. This combination is refused outright in the prod profile, because an instance that serves real traffic must not fall back to an embedded database." >&2
+}
+
+###############################################################################
 # Render the OFBiz database configuration.
 #
 # The configuration is reconstructed on every container start rather than once behind a marker file, so
@@ -8124,6 +8304,12 @@ write_state_record() {
 # lib-extra volume, where it would take class path precedence over the bundled one.
 configure_database() {
   local desiredMode
+
+  # Establish that the database configuration says ONE thing before any of it is acted on. See
+  # require_consistent_database_selection: OFBIZ_POSTGRES_HOST alone cannot tell a container that wants
+  # the embedded database apart from one that wants PostgreSQL and is missing the host.
+  require_consistent_database_selection
+
   desiredMode=$(resolve_desired_database_mode)
 
   case "$desiredMode" in
@@ -8507,6 +8693,12 @@ record_supplied_variables() {
   for variableName in "${RUNTIME_APPLIED_VARIABLES[@]}"; do
     if [ -n "${!variableName:-}" ]; then
       SUPPLIED_VARIABLES+=("$variableName")
+    # A name that is DECLARED and empty is recorded separately rather than dropped. The '+' form asks
+    # only whether the name exists, so this is the one point in the start up at which "set to nothing"
+    # is still distinguishable from "not set": ofbiz_setup_env runs next and resolves both to the same
+    # default. See SUPPLIED_BLANK_VARIABLES.
+    elif [ -n "${!variableName+set}" ]; then
+      SUPPLIED_BLANK_VARIABLES+=("$variableName")
     fi
   done
   SUPPLIED_VARIABLES_RECORDED="true"

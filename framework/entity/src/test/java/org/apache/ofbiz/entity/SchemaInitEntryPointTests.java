@@ -341,7 +341,9 @@ public final class SchemaInitEntryPointTests {
             entry("the object store's two credentials",
                     "SECRET_ENVIRONMENT_VARIABLES#OFBIZ_S3_.*"),
             entry("the two signing keys",
-                    "SECRET_ENVIRONMENT_VARIABLES#OFBIZ_(LOGIN_SECRET|JWT_TOKEN)_KEY"));
+                    "SECRET_ENVIRONMENT_VARIABLES#OFBIZ_(LOGIN_SECRET|JWT_TOKEN)_KEY"),
+            entry("because six of these variables are credentials",
+                    "MANAGED_DATABASE_VARIABLES#OFBIZ_POSTGRES_.*PASSWORD"));
 
     /**
      * The one place the entry point counts variables without describing an inventory.
@@ -1929,6 +1931,147 @@ public final class SchemaInitEntryPointTests {
         // The committed development default is what the embedded source declares, so it has to survive.
         assertEquals("localh2", delegatorMapping(root, "default").get("org.apache.ofbiz"),
                 "the embedded render must not repoint the default delegator at anything");
+    }
+
+    /**
+     * A managed-database configuration that is missing only its host is reported rather than silently started
+     * on the embedded database.
+     *
+     * <p>{@code OFBIZ_POSTGRES_HOST} is the trigger, and it stays the trigger, so on its own it cannot tell a
+     * container that configured no database from one that configured a managed database and lost the host to an
+     * unrendered template. The second produced an instance that reported itself live to a load balancer and
+     * wrote every row into an embedded H2 file on its own volume - invisible to the rest of the fleet and
+     * destroyed with the instance - while the managed database it was configured for stayed empty, and nothing
+     * in the log said so.</p>
+     *
+     * <p>Both profiles are driven here because the answer differs by design: {@code dev} warns and continues,
+     * so the local workflow of commenting the host out of a compose file survives, and {@code prod} refuses,
+     * because an instance serving real traffic must not fall back to an embedded database. Either way the
+     * ignored variables are named, and no value is printed - eight of them are credentials.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void aManagedConfigurationMissingOnlyItsHostIsReportedInsteadOfStartingTheEmbeddedDatabase(
+            @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Map<String, String> development = managedDatabaseEnvironment();
+        development.remove("OFBIZ_POSTGRES_HOST");
+        Path warned = prepareSandbox(Files.createTempDirectory(tempDir, "host-missing-dev"));
+        EntryPointRun devRun = runInSandbox(tempDir, warned, CONFIGURE_DATABASE_BODY, development);
+
+        assertEquals(0, devRun.getExitCode(),
+                "the development profile must continue on the embedded database, output was:\n" + devRun.getOutput());
+        assertTrue(devRun.getOutput().contains("WARNING: OFBIZ_POSTGRES_HOST is not set"),
+                "the ignored managed-database configuration must be reported, output was:\n" + devRun.getOutput());
+        for (String ignored : List.of("OFBIZ_POSTGRES_OFBIZ_DB", "OFBIZ_POSTGRES_OFBIZ_USER",
+                "OFBIZ_POSTGRES_OFBIZ_PASSWORD", "OFBIZ_POSTGRES_SSLMODE")) {
+            assertTrue(devRun.getOutput().contains(ignored),
+                    ignored + " will have no effect and must be named, output was:\n" + devRun.getOutput());
+        }
+        for (String secret : List.of(OFBIZ_PASSWORD, OLAP_PASSWORD, TENANT_PASSWORD)) {
+            assertFalse(devRun.getOutput().contains(secret),
+                    "a report about a credential must name it and never quote it");
+        }
+        assertFalse(Files.exists(warned.resolve(RENDERED_OVERRIDE)),
+                "a start with no managed database must render no override");
+
+        Map<String, String> production = managedDatabaseEnvironment();
+        production.remove("OFBIZ_POSTGRES_HOST");
+        production.put("OFBIZ_PROFILE", "prod");
+        Path refused = prepareSandbox(Files.createTempDirectory(tempDir, "host-missing-prod"));
+        EntryPointRun prodRun = runInSandbox(tempDir, refused, CONFIGURE_DATABASE_BODY, production);
+
+        assertNotEquals(0, prodRun.getExitCode(),
+                "the deployed profile must refuse the contradiction, output was:\n" + prodRun.getOutput());
+        assertTrue(prodRun.getOutput().contains("ERROR: OFBIZ_POSTGRES_HOST is not set"),
+                "the refusal must say which variable is missing, output was:\n" + prodRun.getOutput());
+        assertFalse(prodRun.getOutput().contains(COMPLETED),
+                "the refusal must stop before the render, output was:\n" + prodRun.getOutput());
+        assertFalse(Files.exists(refused.resolve(RENDERED_OVERRIDE)),
+                "a refused start must leave no configuration behind");
+    }
+
+    /**
+     * A managed-database variable supplied as an EMPTY value is refused by name, in either profile.
+     *
+     * <p>An empty value is what an unresolved secret reference or an unrendered template leaves behind, never an
+     * instruction, but {@code ofbiz_setup_env} resolves it with {@code ${VAR:-default}} - so an empty
+     * {@code OFBIZ_POSTGRES_OFBIZ_DB} became the published default {@code ofbiz} and the first sign of trouble
+     * was the driver's own {@code database "ofbiz" does not exist} from inside the entity engine, by which
+     * point the entry point could no longer say which variable was at fault. An empty
+     * {@code OFBIZ_POSTGRES_HOST} was worse still: it selected the embedded database outright, exactly as if
+     * nothing had been configured.</p>
+     *
+     * <p>Both are asserted, because they fail for the same reason and only one of them is a value the trigger
+     * itself reads.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void aDatabaseVariableSuppliedAsAnEmptyValueIsRefusedByNameRatherThanDefaulted(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Map<String, String> blankHost = managedDatabaseEnvironment();
+        blankHost.put("OFBIZ_POSTGRES_HOST", "");
+        Path hostSandbox = prepareSandbox(Files.createTempDirectory(tempDir, "blank-host"));
+        EntryPointRun hostRun = runInSandbox(tempDir, hostSandbox, CONFIGURE_DATABASE_BODY, blankHost);
+
+        assertNotEquals(0, hostRun.getExitCode(),
+                "an empty host must not be read as a request for the embedded database, output was:\n"
+                        + hostRun.getOutput());
+        assertTrue(hostRun.getOutput().contains("ERROR:") && hostRun.getOutput().contains("OFBIZ_POSTGRES_HOST"),
+                "the refusal must name the empty variable, output was:\n" + hostRun.getOutput());
+        assertFalse(Files.exists(hostSandbox.resolve(RENDERED_OVERRIDE)),
+                "a refused start must leave no configuration behind");
+
+        Map<String, String> blankDatabase = managedDatabaseEnvironment();
+        blankDatabase.put("OFBIZ_POSTGRES_OFBIZ_DB", "");
+        Path databaseSandbox = prepareSandbox(Files.createTempDirectory(tempDir, "blank-database"));
+        EntryPointRun databaseRun = runInSandbox(tempDir, databaseSandbox, CONFIGURE_DATABASE_BODY, blankDatabase);
+
+        assertNotEquals(0, databaseRun.getExitCode(),
+                "an empty database name must be refused, output was:\n" + databaseRun.getOutput());
+        assertTrue(databaseRun.getOutput().contains("ERROR:")
+                        && databaseRun.getOutput().contains("OFBIZ_POSTGRES_OFBIZ_DB"),
+                "the refusal must name the empty variable rather than the default it would have taken,"
+                        + " output was:\n" + databaseRun.getOutput());
+        assertFalse(Files.exists(databaseSandbox.resolve(RENDERED_OVERRIDE)),
+                "a refused start must leave no configuration behind");
+    }
+
+    /**
+     * Sizing the connection pool without configuring a database is not a contradiction and stays silent.
+     *
+     * <p>The consistency check is deliberately confined to the {@code OFBIZ_POSTGRES_} names, which describe a
+     * connection and have no meaning without one. {@code OFBIZ_DB_POOL_MIN} and {@code OFBIZ_DB_POOL_MAX} size a
+     * pool that both database modes use and are defaulted on every start, so a container that sets only a pool
+     * bound has expressed no intent about which database it talks to - and warning about it would make the
+     * report noise on exactly the local starts that are correct.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void sizingThePoolWithoutConfiguringADatabaseIsNotReportedAsAContradiction(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_DB_POOL_MIN", POOL_MIN, "OFBIZ_DB_POOL_MAX", POOL_MAX, "OFBIZ_PROFILE", "dev"));
+
+        assertEquals(0, run.getExitCode(), "the start must succeed, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains(COMPLETED),
+                "configure_database must return, output was:\n" + run.getOutput());
+        assertFalse(run.getOutput().contains("OFBIZ_POSTGRES_HOST is not set"),
+                "a pool bound is not evidence of managed-database intent, output was:\n" + run.getOutput());
+        assertFalse(Files.exists(sandbox.resolve(RENDERED_OVERRIDE)),
+                "an unconfigured container must keep reading the committed configuration, with no override");
     }
 
     /**

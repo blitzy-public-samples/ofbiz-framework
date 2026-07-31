@@ -74,10 +74,13 @@ under the License.
          anonymous passage to every /health* spelling, not only to the two probes. None is needed
          either: the filter above short-circuits the chain before ControlFilter ever sees a probe.
 
-         Liveness always returns 200. Readiness returns 200 only when the entity engine counts
-         SequenceValueItem and the count is non-zero, and 503 otherwise - an unreachable datasource, a
-         count that did not complete, and a reachable datasource whose schema is still empty are all
-         "not ready". See the health and readiness endpoint section of DOCKER.adoc. -->
+         Liveness always returns 200. Readiness returns 200 when the entity engine can COMPLETE a count
+         of SequenceValueItem - whatever that count returns - and 503 otherwise: no delegator, or a
+         count that did not complete, which is what an unreachable datasource and a database with no
+         schema applied both produce. A completed count of zero rows is a reachable datasource and is
+         reported ready, with an advisory log line, because SequenceValueItem is filled on demand by the
+         sequencer and a probe performs no write. See the health and readiness endpoint section of
+         DOCKER.adoc. -->
     <filter>
         <display-name>HealthCheckFilter</display-name>
         <filter-name>HealthCheckFilter</filter-name>
@@ -160,8 +163,12 @@ under the License.
          including why the same class is also registered as the first filter, is documented with the
          HealthCheckFilter declaration above. Carrying both url-patterns in a single mapping element
          has been legal since Servlet 2.5 and this descriptor declares 4.0, so each of the two roles is
-         mapped exactly once. Any other path under /health/ returns 404 rather than a misleading
-         200. -->
+         mapped exactly once. Because both patterns are EXACT, no other path under /health/ reaches the
+         servlet at all: a near miss such as /health/bogus or /health/LIVE matches nothing here and is
+         answered by this webapp's ordinary handling of an unmapped path, which is the control servlet's
+         302 redirect to /webtools/control/main. What matters for a probe is that no near miss is ever
+         answered 200; the servlet's own 404 branch covers the case of it being mapped with a prefix
+         pattern instead. -->
     <servlet>
         <description>Health and readiness check servlet for load balancer probes</description>
         <display-name>HealthCheckServlet</display-name>
