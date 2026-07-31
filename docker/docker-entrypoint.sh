@@ -60,20 +60,22 @@
 #
 #
 # OFBIZ_PROFILE
-# REQUIRED. Selects how strictly the deployment secrets and credentials below are enforced. There is
-# deliberately NO default: the profile decides whether an absent secret aborts the start or is
-# replaced by a generated value, and whether the published demo admin password is accepted, so a
-# deployment that simply forgot to set it must not be handed the permissive setting silently. An
-# empty, unset or unrecognised value is a fatal misconfiguration, refused before any other work.
+# Selects how strictly the deployment secrets and credentials below are enforced. An unset or empty
+# value resolves to 'dev' - the behaviour this image has always had with no configuration at all - and
+# the assumed profile is reported as a NOTICE on stderr, so the permissive setting is never applied
+# silently. An unrecognised or whitespace-only value is a fatal misconfiguration, refused before any
+# other work: guessing which profile such a value meant is the one mistake this gate exists to prevent.
+# 'prod' is never assumed; it has to be asked for.
 # - dev:  a secret that was not supplied is replaced by a cryptographically random value generated
 #         for this container and kept in /ofbiz/runtime/container_state/generated_secrets so that it
 #         stays stable across restarts, and the published demo admin password is accepted. This keeps
-#         an unconfigured local or demo container working with no configuration beyond this one
-#         variable. NEVER use it for a deployment that serves real traffic.
+#         an unconfigured local or demo container working with no configuration at all. NEVER use it
+#         for a deployment that serves real traffic.
 # - prod: every secret must be supplied, must be strong, and must not be a value published in this
 #         repository; otherwise the container refuses to start. A deployment that silently ran on a
 #         generated or published value would be indistinguishable from one with no secret at all.
-# Default: none - must be set to dev or prod.
+# Values: dev, prod
+# Default: dev, reported as a NOTICE whenever it is assumed
 #
 # OFBIZ_ADMIN_USER
 # The username of the OFBIZ admin user.
@@ -132,6 +134,9 @@
 # operator-supplied code that this script cannot vet, it may enable tracing itself - the example hook
 # in docker/examples/postgres-demo/after-config-applied.d does exactly that - and a traced expansion or
 # a crash dump that prints the environment would publish every value to the container log.
+# A name on this list is exported for the duration of that one hook and demoted again as soon as it
+# returns, so both an executable and a sourced hook - and anything either of them runs - see exactly the
+# values named here, for no longer than the hook, and the OFBiz process itself still sees none of them.
 # Only names from this set are accepted, and an unrecognised name is a fatal misconfiguration rather
 # than a silent no-op: OFBIZ_ADMIN_PASSWORD, OFBIZ_ADMIN_KEY, OFBIZ_LOGIN_SECRET_KEY,
 # OFBIZ_JWT_TOKEN_KEY, OFBIZ_POSTGRES_OFBIZ_PASSWORD, OFBIZ_POSTGRES_OLAP_PASSWORD,
@@ -262,10 +267,19 @@
 # Default: verify-full
 #
 # OFBIZ_POSTGRES_SSLROOTCERT
-# Absolute path, inside the container, of the PEM or DER encoded root certificate that the server
-# certificate must chain to. Rendered as the sslrootcert connection parameter of all three managed
-# datasources. Mount the certificate read-only; it is not a secret, but a deployment that cannot read
-# it cannot verify the server.
+# Path, inside the container, of the PEM or DER encoded root certificate that the server certificate
+# must chain to. Rendered as the sslrootcert connection parameter of all three managed datasources.
+# Mount the certificate read-only; it is not a secret, but a deployment that cannot read it cannot
+# verify the server.
+# Only the characters a POSIX path needs are accepted - letters, digits, '/', '.', '_' and '-' - because
+# the value lands in the URI query string, where '&' would start another connection parameter, '?' or
+# '#' would truncate the URI and whitespace would break the XML attribute. Nothing else about the path
+# is checked here: it is not required to be absolute and it is not required to exist yet, because the
+# certificate is usually mounted by the orchestrator and this validation runs before the driver is ever
+# asked for a connection. A relative path is therefore accepted and is resolved by pgJDBC against the
+# JVM's working directory, which is /ofbiz in this image. Prefer an absolute path anyway - it stays
+# correct if the working directory ever changes - and note that a path the driver cannot read surfaces
+# as a connection failure at first use, not as a start-up error.
 # Default: <empty> (pgJDBC falls back to ${user.home}/.postgresql/root.crt)
 #
 # Two facts about the client side are worth stating here, because both are easy to assume the other
@@ -302,6 +316,15 @@
 # still being finite. It is what lets the readiness probe's count eventually return when a datasource
 # has stopped answering, and what lets a pooled connection to a failed-over server be discovered.
 # Range 5-86400. Default: 60.
+#
+# Those two ranges are not independent, and this is the one cross-constraint among the deadlines:
+# OFBIZ_POSTGRES_CONNECT_TIMEOUT must not exceed OFBIZ_POSTGRES_SOCKET_TIMEOUT, because pgJDBC applies
+# socketTimeout to the reads of the start-up handshake as well, so the shorter of the two is what really
+# ends a connection attempt. A connect deadline above the socket deadline is refused rather than
+# silently reconciled - see require_postgres_jdbc_parameters - so with the deadlines at their defaults
+# the reachable values are 1-60 for the connect timeout and 10-86400 for the socket timeout. Raising
+# the connect deadline beyond 60, or lowering the socket deadline below 10, means setting both
+# variables as a pair; the full 1-300 and 5-86400 ranges are only reachable together.
 #
 # OFBIZ_POSTGRES_LOGIN_TIMEOUT bounds the establishment of a connection as a whole - TLS handshake and
 # authentication included - which the connect timeout alone does not cover. Range 1-600. Default: 30.
@@ -547,8 +570,20 @@
 # container must stop applying. The render is always derived from the committed file rather than
 # from the previous render, which is what makes withdrawing a variable return the instance to the
 # committed database storage instead of leaving object storage in force.
-# Default: database (the committed value; when no variable in this group is set, no override file is
-#          written at all and the checkout's own content.properties is used unchanged)
+# Default: database, the committed value. Note what that means on disk, because ofbiz_setup_env gives
+#          this variable and OFBIZ_S3_PATH_STYLE the values the committed content.properties already
+#          carries - it has to, because the render substitutes both whatever the backend - and a
+#          defaulted value must not be mistaken for a configured one. What decides whether anything is
+#          written is therefore what the OPERATOR supplied, which record_supplied_variables captures
+#          BEFORE those defaults are applied: a zero-configuration start supplies none of the group,
+#          writes NO config/content.properties at all, and leaves the checkout's own file to apply.
+#          Supplying any one of the group - OFBIZ_CONTENT_STORE_PROVIDER=database included - renders
+#          the whole file instead, always derived from the committed copy rather than from the previous
+#          render, so the override that lands for the database default is byte-identical to the
+#          committed file and the effective configuration is still the checkout's own. /ofbiz/config
+#          outlives the container, so an override left by an earlier start that DID configure an object
+#          store is never left in force either way: the start that supplies something replaces it with
+#          that render, and the start that supplies nothing removes it.
 #
 # OFBIZ_S3_BUCKET
 # Bucket that holds the content. Required when OFBIZ_CONTENT_STORE_PROVIDER=s3, and validated against
@@ -1191,10 +1226,26 @@ CONTENT_STORE_DEFAULT_PROVIDER='database'
 # here. A bucket name must be 3 to 63 characters of lower case letters, digits, '.' and '-', beginning
 # and ending with a letter or digit; a region identifier is lower case letters, digits and '-'. Both are
 # checked so that a typo is reported at start up instead of surfacing later as a failed upload.
+# The bucket bounds are the stores' own. The region bounds are this script's: S3ContentStore requires
+# only that a region be non-blank and no store publishes a maximum, so the bound here is a shape check
+# that catches an empty or obviously wrong value - an endpoint or a whole URL pasted into the region
+# variable - while leaving room for an identifier a private store may legitimately use. 32 characters is
+# that room with a wide margin: the longest identifier any store publishes is well under 20.
+#
+# 32 is also the bound this image has always enforced. render_content_store_configuration used to apply
+# its own inline expression, '^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$', which is exactly 2 to 32 characters,
+# and it runs on every start that selects the object store - so 32 was the effective maximum even while
+# this constant said 64. The two rules are now one, expressed here, with the accepted set unchanged and
+# the diagnostic corrected: a value that is too long is reported as too long instead of as containing a
+# character that is not allowed.
+#
+# These four constants are the single source of both rules. require_object_store_bucket and
+# require_object_store_region are the only validators that apply them, and both the early resolver and
+# the render delegate to those rather than restating the bounds.
 S3_BUCKET_MIN_LENGTH=3
 S3_BUCKET_MAX_LENGTH=63
 S3_REGION_MIN_LENGTH=2
-S3_REGION_MAX_LENGTH=64
+S3_REGION_MAX_LENGTH=32
 
 # Pristine start.properties shipped with the distribution, and the package qualified override that
 # Config.java resolves ahead of it through the class loader. The override MUST keep the
@@ -1274,7 +1325,8 @@ POSTGRES_SSL_MODES=(disable allow prefer require verify-ca verify-full)
 POSTGRES_SSL_PROD_MODES=(verify-full)
 POSTGRES_SSL_DEFAULT_MODE='verify-full'
 
-# The profiles this script accepts. There is no default: see require_profile.
+# The profiles this script accepts. An unset or empty value resolves to the first of them and the
+# assumption is announced; anything else present has to be one of them: see require_profile.
 OFBIZ_PROFILES=(dev prod)
 
 # Admin password rules for the prod profile. The admin user holds every OFBiz permission, so the
@@ -1783,21 +1835,37 @@ require_enum() {
 }
 
 ###############################################################################
-# Require an explicitly declared deployment profile.
+# Resolve the deployment profile, defaulting to development and reporting that it did.
 #
-# OFBIZ_PROFILE has NO default. Defaulting it to 'dev' would make the single most consequential security
-# decision this script takes - whether an absent secret aborts the start or is quietly replaced by a
-# generated value, whether a weak or published credential is accepted, whether a non-verifying database
-# TLS mode is allowed - depend on a variable being ABSENT. A deployment manifest that never mentioned the
-# profile, or that lost it in a templating mistake, therefore got the permissive setting and reported
-# nothing at all. Failing closed costs one variable and removes the whole class of mistake.
+# The profile makes the single most consequential security decision this script takes - whether an
+# absent secret aborts the start or is replaced by a generated value, whether a weak or published
+# credential is accepted, whether a non-verifying database TLS mode is allowed - so an unset value must
+# never be settled SILENTLY. It is settled LOUDLY instead: an unset or empty variable resolves to 'dev',
+# the profile whose behaviour is exactly what this image did before the deployment settings existed
+# (generated per-container key material, the published demo admin password accepted, embedded H2), and a
+# NOTICE naming the assumed profile is written to stderr on every such start. That keeps the container's
+# zero-configuration contract - 'docker run ofbiz-docker' with no environment at all still boots and
+# serves, which is what the local and demo paths rely on - while removing the silence that made the
+# earlier default dangerous.
+#
+# Requiring the variable instead was tried and is worse: it turned every existing docker run, Compose
+# file and CI job that had never heard of the profile into a start-up failure, and a deployment cannot
+# be made safer by refusing to run the development container. The security property that matters is that
+# a PRODUCTION deployment can never be reached by accident, and that is not weakened here: 'prod' has to
+# be asked for explicitly, every strength, presence and TLS rule keyed on it is untouched, and nothing
+# about 'dev' is inferred from a value the operator did not supply - it is stated in the log.
+#
+# A value that is present but is not one of the two profiles - including a whitespace-only value, which
+# is a templating accident rather than an absent setting - remains fatal. Guessing which profile such a
+# value meant is exactly the mistake this function exists to prevent.
 #
 # Called first from _main, before any other work and on every path including the one that skips data
 # initialisation, so no rendering, secret resolution or credential check can ever run against an
 # unresolved profile.
 require_profile() {
   if [ -z "${OFBIZ_PROFILE:-}" ]; then
-    config_fatal "OFBIZ_PROFILE must be set to one of: ${OFBIZ_PROFILES[*]}. There is no default, because the profile decides whether a missing or weak secret aborts the start; set OFBIZ_PROFILE=dev for a local or demo container and OFBIZ_PROFILE=prod for any deployment that serves real traffic."
+    OFBIZ_PROFILE='dev'
+    printf '%s\n' "NOTICE: OFBIZ_PROFILE was not set, so the '$OFBIZ_PROFILE' profile is assumed: any secret that is not supplied is generated for this container, the published demo admin password is accepted, and the container boots on the embedded database. That is the local and demo behaviour. Set OFBIZ_PROFILE=prod for any deployment that serves real traffic - it requires every secret to be supplied through the environment and refuses a weak or published value." >&2
   fi
   require_enum OFBIZ_PROFILE "$OFBIZ_PROFILE" "${OFBIZ_PROFILES[@]}"
 }
@@ -3126,8 +3194,23 @@ render_config_from() {
   local source="$2"
   shift 2
   local temporary
-  mkdir --parents "$(dirname "$destination")"
-  temporary=$(mktemp "$destination.XXXXXXXX")
+  local directory
+  directory=$(dirname "$destination")
+
+  # WRITABILITY, ESTABLISHED BEFORE ANYTHING IS WRITTEN. /ofbiz/config has to be writable on every start,
+  # including a start with OFBIZ_SKIP_INIT: that flag skips the data initialization and nothing else, so
+  # the configuration is still rendered - which is exactly the expectation an operator who mounts the
+  # volume read-only does not have. Left unguarded, mkdir and mktemp abort the script through 'set -e'
+  # with their own message ("mktemp: failed to create file via template ...: Read-only file system") and
+  # no ERROR line anywhere, so a log filtered for this script's failures shows nothing at all and the one
+  # thing that has to be said - which directory, and why it must be writable - is never said. Their
+  # messages are suppressed and replaced with that, once, naming the directory and the remedy.
+  if ! mkdir --parents "$directory" 2>/dev/null; then
+    config_fatal "Cannot create the configuration directory $directory, which is where $destination has to be rendered. The container renders its configuration into /ofbiz/config on every start - OFBIZ_SKIP_INIT skips the data initialization and nothing else - so that directory must be writable by the container user. Mount the volume without the read-only flag, and make sure it is writable by uid 1000."
+  fi
+  if ! temporary=$(mktemp "$destination.XXXXXXXX" 2>/dev/null); then
+    config_fatal "Cannot write to the configuration directory $directory, so $destination cannot be rendered from $source. The most likely cause is that /ofbiz/config is mounted read-only. The container renders its configuration there on every start - OFBIZ_SKIP_INIT skips the data initialization and nothing else - so the volume must be writable by the container user. Mount it without the read-only flag, and make sure it is writable by uid 1000."
+  fi
   # The staging file is created beside the destination, which is on a persistent volume, and the
   # rendered output routinely contains the JWT signing key, the admin shared secret or a database
   # password. It is therefore tracked before sed writes to it so that a signal delivered mid-render
@@ -3170,6 +3253,36 @@ render_config_from() {
     rm --force "$temporary"
     config_fatal "Rendered $destination still contains unsubstituted placeholder(s): $residualTokens. The template $source expects a substitution this entry point does not perform, so the rendered configuration would be interpreted with those placeholders as literal attribute values."
   fi
+
+  # Report a replacement that discards content, and only such a replacement.
+  #
+  # /ofbiz/config is a declared volume, so the destination may already hold a file this container did not
+  # write: an operator's hand edit, or the render of an earlier start with different variables. Publishing
+  # over it is the correct behaviour - the render is derived from the pristine source, which is what makes
+  # a restart idempotent and a rotated secret take effect - but doing it silently means an operator who
+  # edited /ofbiz/config/entityengine.xml to re-enable startup DDL, or to change a datasource, sees no
+  # sign that the file OFBiz reads is not the file they edited. Naming the file once turns "my change did
+  # nothing and nothing said so" into a log line that points at the render and at the variables behind it.
+  #
+  # cmp decides, so the notice appears only when the bytes really differ: an ordinary restart renders the
+  # same output from the same source and stays silent, which keeps the idempotent path quiet and keeps
+  # this from becoming a line operators learn to ignore. Nothing from either file is printed - both
+  # routinely contain a database password, the JWT signing key or the admin shared secret - so the notice
+  # carries the path and the reason and nothing else.
+  # Scoped to the overrides under config/, the same boundary discard_untrustworthy_render draws, because
+  # only there does "the file already held something else" mean an operator's edit was discarded. The
+  # renders whose destination is a source-tree file - start.properties, which is rendered from itself so
+  # that bin/ofbiz can authenticate a shutdown against the same shared secret, and the catalina descriptor,
+  # which OFBiz reads at its fixed path - replace their own previous output BY DESIGN on every start, and
+  # in the dev profile with a freshly generated secret each time. Reporting those would print a notice on
+  # every start about a file nobody edited, which is precisely how a warning becomes noise.
+  case "$destination" in
+  config/*)
+    if [ -f "$destination" ] && ! cmp --quiet "$destination" "$temporary"; then
+      printf '%s\n' "NOTICE: $destination already existed with different content and has been replaced by the render of $source. Any edit made directly to $destination is discarded on every start: the render is always derived from the pristine source, so configure the deployment through the documented environment variables, or bind-mount a template over $source. See DOCKER.adoc." >&2
+    fi
+    ;;
+  esac
 
   mv --force "$temporary" "$destination"
   unregister_secret_temp_file "$temporary"
@@ -3723,7 +3836,8 @@ ofbiz_setup_env() {
   # OFBIZ_PROFILE is NOT resolved here. It decides whether an absent secret is fatal or is replaced by
   # a generated value, so it must be settled before any code that consults it can run - including the
   # code on the path that skips data initialisation. require_profile, called as the first statement of
-  # _main, owns it, and there is no default: see require_profile for why.
+  # _main, owns it: it defaults an unset value to 'dev' and reports that it did, and it refuses a value
+  # that is neither profile. See require_profile for why the default is announced rather than silent.
 
   case "$OFBIZ_DATA_LOAD" in
   none | seed | demo) ;;
@@ -4132,9 +4246,26 @@ run_hook_scrubbed() {
 
   local -A ofbizHookSavedValues=()
   local -A ofbizHookSavedExported=()
+  local -a ofbizHookGranted=()
   local ofbizHookName ofbizHookDeclaration ofbizHookAttributes
   for ofbizHookName in "${SECRET_ENVIRONMENT_VARIABLES[@]}"; do
     if hook_secret_is_allowed "$ofbizHookName"; then
+      # AN ALLOWLISTED NAME IS LEFT IN PLACE - BUT 'IN PLACE' IS NOT 'IN THE HOOK'S ENVIRONMENT'.
+      # capture_secret_environment demotes every secret with 'export -n' before the first fork, which
+      # keeps the value in this shell and takes it out of the environment block that children inherit. A
+      # SOURCED hook runs in this shell and therefore still sees it, but an EXECUTED hook is a child and
+      # sees nothing - so the allowlist was a silent no-op for exactly the hook kind whose environment it
+      # names, promising an explicit, auditable grant and delivering an empty variable. The export
+      # attribute is restored here and removed again the moment the hook returns, so the grant is real,
+      # lasts no longer than the hook, and never reaches the JVM exec'd at the end of the start up. It is
+      # applied in both modes so that the two hook kinds behave identically, including for a command a
+      # sourced hook itself spawns, which is what the pre-scrub behaviour gave either kind.
+      if [ -n "${!ofbizHookName+set}" ]; then
+        # '${name?}' is the indirect-export form: it expands to the variable NAME and fails if the loop
+        # variable were somehow unset, which is also what tells a linter the indirection is deliberate.
+        export "${ofbizHookName?}"
+        ofbizHookGranted+=("$ofbizHookName")
+      fi
       continue
     fi
     if [ -n "${!ofbizHookName+set}" ]; then
@@ -4173,6 +4304,13 @@ run_hook_scrubbed() {
     else
       declare -g "$ofbizHookName=${ofbizHookSavedValues[$ofbizHookName]}"
     fi
+  done
+
+  # The grant ends with the hook that was granted it. 'export -n' keeps the value and removes only the
+  # export attribute, which is precisely the state capture_secret_environment left the variable in, so a
+  # later hook with a different allowlist - and the exec'd JVM - are unaffected by this one.
+  for ofbizHookName in "${ofbizHookGranted[@]}"; do
+    export -n "${ofbizHookName?}"
   done
 
   restore_trace
@@ -4915,6 +5053,51 @@ load_admin_user() {
     return 0
   fi
 
+  # ADVISORY ONLY, and deliberately so: nothing below this block changes, and neither does the exit
+  # status. OFBIZ_DATA_LOAD=none means this start loaded no seed data, and the administrative user
+  # cannot be created without it - framework/resources/templates/AdminUserLoginData.xml puts the new
+  # login in SecurityGroup 'SUPER', which is seed data - so on a database that has never been seeded the
+  # loader child aborts on a referential integrity violation naming USER_SECGRP_GRP and the start exits
+  # non-zero. That failure is pre-existing and correct for the mistake it usually catches, so it is left
+  # exactly as it is. What was missing was any indication of WHY: the operator saw a bare Java stack
+  # trace from the child process and not one line from this script. This prints the explanation first.
+  #
+  # Whether the database really lacks the seed data cannot be decided here - answering it would mean
+  # querying the database, a JVM start this script has no reason to spend - so the message is worded as
+  # the conditional it is and names the database this container is actually pointed at, which is what
+  # tells the two cases apart: a fresh embedded database is certainly empty, whereas a managed one may
+  # already have been seeded by the one-shot schema-init job or by another instance of the fleet.
+  #
+  # Suppressed as soon as there is evidence that the seed data exists, and the evidence is chosen with
+  # care:
+  #   * SCHEMA_APPLYING_LOAD_RAN, set by load_data, covers a load performed by THIS run.
+  #   * The admin_loaded marker covers every earlier start on this state volume. A file exists at that
+  #     path only after an administrative-user load COMPLETED - begin_container_marker removes it and
+  #     complete_container_marker re-creates it - and that load can only have succeeded on a seeded
+  #     database, so its mere presence settles the question. It also covers the demo image, whose build
+  #     writes both markers in write_initial_container_state. Testing it as a file rather than through
+  #     container_marker_is_complete is deliberate: the marker at this point is known NOT to match this
+  #     run's credential (that was tested above and is how a rotated admin password reaches the
+  #     database), and calling the helper again purely to probe would print its mismatch explanation a
+  #     second time.
+  #   * The data_loaded marker is NOT usable here even though it looks like the obvious candidate:
+  #     load_data completes it with 'load=none' on this very path before this function is reached, so by
+  #     now it always exists and always records "nothing was loaded".
+  # The advisory is likewise unreachable in schema-init mode and under OFBIZ_SKIP_INIT, because neither
+  # of those paths calls this function at all.
+  if [ "$OFBIZ_DATA_LOAD" = 'none' ] && [ "$SCHEMA_APPLYING_LOAD_RAN" != 'true' ] && [ ! -f "$CONTAINER_ADMIN_LOADED" ]; then
+    local advisoryDatabase
+    case "$(resolve_desired_database_mode)" in
+    managed)
+      advisoryDatabase="The managed database at $OFBIZ_POSTGRES_HOST may already have been seeded - by the one-shot OFBIZ_SCHEMA_INIT job followed by a seed load, by another instance of the fleet, or by a restore - and if it has then the load below simply succeeds and this warning can be disregarded."
+      ;;
+    *)
+      advisoryDatabase="No managed database is configured, so this container uses the embedded database on the same runtime volume as that marker: on a fresh volume it is certainly empty, and this start will fail."
+      ;;
+    esac
+    printf '%s\n' "WARNING: OFBIZ_DATA_LOAD=none, so this start loaded no data, and no earlier start on this state volume completed an administrative-user load either ($CONTAINER_ADMIN_LOADED is absent), so nothing here shows that the database has ever been seeded. The administrative user is loaded next and it needs the seed data to be there already: the login is placed in SecurityGroup 'SUPER', which is seed data, so against a database that has never been seeded the loader fails with a referential integrity violation on USER_SECGRP_GRP and this start exits non-zero. $advisoryDatabase There are two supported ways to avoid the failure. Set OFBIZ_DATA_LOAD=seed so that this start loads the seed data itself. Or set OFBIZ_SKIP_INIT=true when the database was populated elsewhere, which skips both the data load and this administrative user. See DOCKER.adoc." >&2
+  fi
+
   begin_container_marker "$CONTAINER_ADMIN_LOADED"
 
   # The admin password, its salt and the resulting hash are secrets. Tracing is suspended for the
@@ -5288,8 +5471,38 @@ write_property_substitution() {
 # $1 - rendered file
 discard_untrustworthy_render() {
   case "$1" in
-    config/*) rm --force "$1" ;;
+    # rm's own stderr is discarded and its status ignored on purpose. Every caller invokes config_fatal
+    # immediately afterwards, and that message - which names the file, the check that failed and the
+    # consequence - is the one the operator has to see. 'set -e' is in force, so an rm that cannot unlink
+    # the file (a read-only config mount, a directory owned by another uid) would end the script HERE,
+    # replacing that message with a bare, unprefixed "rm: cannot remove ...: Permission denied". The start
+    # still fails either way; this keeps it failing with the diagnostic that was written for it.
+    config/*) rm --force "$1" 2>/dev/null || true ;;
   esac
+}
+
+###############################################################################
+# Refuse a verification whose subject has VANISHED, and name the one thing that realistically does it.
+#
+# Every check below reads a file this start has just rendered, so its absence is not a configuration
+# error - it is a concurrent one. Two containers started at the same moment against the same
+# /ofbiz/config volume render the same paths, and when either of them rejects its own render
+# discard_untrustworthy_render deletes the override so that a file it has just declared untrustworthy
+# cannot be left behind on a volume that takes class path precedence. That delete removes the other
+# start's file too, in between its own check and its own read.
+#
+# Unguarded, the two failure modes are both undiagnosable. 'sed' has no file to read, so it aborts the
+# script through 'set -e' with its own "can't read config/security.properties: No such file or
+# directory" and an exit status of 2 - no ERROR line at all, and nothing in a log filtered for this
+# script's failures. 'grep' is worse than silent: it returns 2, the callers treat that as "the property
+# is not declared", and the operator is told the anchor is missing from a distribution file that is
+# perfectly intact. Both are replaced by this one message, which names the file, the cause and the
+# remedy, so whichever verification notices first says the same thing.
+# $1 - the rendered file a verification is about to read
+require_rendered_file_present() {
+  if [ ! -f "$1" ]; then
+    config_fatal "$1 disappeared between being rendered and being verified. Its content is not the problem: the most likely cause is a second container starting at the same time against the same /ofbiz/config volume, because a start that rejects its own render deletes that override - and with a shared volume it deletes this one. Start one container at a time against a shared configuration volume, or give each instance its own; then start again."
+  fi
 }
 
 ###############################################################################
@@ -5304,6 +5517,7 @@ discard_untrustworthy_render() {
 # source-tree file is left in place - see discard_untrustworthy_render.
 # $1 - rendered file, $2 - property name as a basic regular expression, $3 - source file
 require_rendered_declaration() {
+  require_rendered_file_present "$1"
   if ! grep --quiet "^$2=." "$1"; then
     discard_untrustworthy_render "$1"
     config_fatal "Rendered $1 does not declare a value for the property matched by '$2'. The anchor for it is missing from $3."
@@ -5351,17 +5565,48 @@ require_rendered_property_value() {
   local intended="$4"
   local declarations rendered
 
+  # Presence and readability are established before the count is taken, and they are kept apart from each
+  # other and from a wrong number of declarations, because all three are different mistakes with different
+  # fixes and the message has to say which one happened. A file that is ABSENT is a concurrent start, not a
+  # configuration error - require_rendered_file_present owns that diagnostic and is checked first, because
+  # '-r' is false for a missing file too and would otherwise report a permission problem for it. A file
+  # that is present but UNREADABLE is a permission or mount problem with the config directory.
+  # Both have to be settled before the count, because 'grep --count' prints nothing at all when it cannot
+  # open the file and the '|| true' that keeps 'set -e' from ending the script here also swallows that
+  # distinction: the count interpolated into the message below was then EMPTY, producing "declares the
+  # property matched by 'x'  times", which names no number and does not say that the file could not be
+  # read. The count is defaulted to 0 as well, so that the message can never again be published with a
+  # hole in it.
+  require_rendered_file_present "$renderedFile"
+  if [ ! -r "$renderedFile" ]; then
+    discard_untrustworthy_render "$renderedFile"
+    config_fatal "Rendered $renderedFile cannot be read back, so the value supplied in $name cannot be verified. The file was written by this start up, so this is a permission or mount problem with the config directory rather than a configuration error."
+  fi
+
   declarations=$(grep --count "^$property=" "$renderedFile" || true)
+  declarations=${declarations:-0}
   if [ "$declarations" != "1" ]; then
     discard_untrustworthy_render "$renderedFile"
     config_fatal "Rendered $renderedFile declares the property matched by '$property' $declarations times; exactly one declaration is required, because java.util.Properties would silently use the last one."
   fi
 
-  rendered=$(sed --quiet "s|^$property=||p" "$renderedFile")
+  # Guarded as well as pre-checked, because the check above and this read are two separate operations and
+  # a concurrent start can delete the file in between them. sed's own failure would otherwise end the
+  # script with exit status 2 and no ERROR line, which is the one outcome an operator cannot act on.
+  if ! rendered=$(sed --quiet "s|^$property=||p" "$renderedFile" 2>/dev/null); then
+    require_rendered_file_present "$renderedFile"
+    config_fatal "Could not read back the rendered $renderedFile to verify the value supplied in $name."
+  fi
   rendered=$(printf '%s' "$rendered" | sed 's,\\\\,\\,g')
   if [ "$rendered" != "$intended" ]; then
     discard_untrustworthy_render "$renderedFile"
-    config_fatal "Rendered $renderedFile does not read back the value supplied in $name. java.util.Properties would give the application a different value from the one that was validated, so the deployment would run on an unintended secret."
+    # Worded for every value this function verifies, not only the secrets. It also checks the object-store
+    # bucket, region, endpoint, addressing style and key prefix, and the content URL prefix, none of which
+    # is a secret - so calling the outcome "an unintended secret" described the wrong risk for most
+    # callers and invited an operator to look for a credential problem that is not there. The risk that is
+    # common to all of them is stated instead: the application would run on a value other than the one
+    # that was validated. Neither value is printed, here or anywhere else in this function.
+    config_fatal "Rendered $renderedFile does not read back the value supplied in $name. java.util.Properties would give the application a different value from the one that was validated, so the deployment would run on a value this start up never checked - a wrong secret, or a wrong storage or URL setting, depending on which variable this is."
   fi
   restore_trace
 }
@@ -5378,6 +5623,7 @@ require_rendered_property_value() {
 # grep is used in quiet mode, so no value is ever echoed.
 # $1 - rendered file, $2 - property name as a basic regular expression, $3 - source file
 require_rendered_property() {
+  require_rendered_file_present "$1"
   if ! grep --quiet "^$2=" "$1"; then
     config_fatal "Rendered $1 does not declare the property matched by '$2' at all. The anchor for it has been renamed or removed from $3, so any value supplied for it was discarded."
   fi
@@ -5535,6 +5781,11 @@ require_single_production_container() {
   local productionCount testCount
   productionCount=$(grep --count "$CATALINA_PRODUCTION_CONTAINER" "$descriptor" || true)
   testCount=$(grep --count "$CATALINA_TEST_CONTAINER" "$descriptor" || true)
+  # Defaulted because grep prints nothing when it cannot open the descriptor: an empty count would be
+  # interpolated into the message below as a hole, and the '-gt' comparison on the test count would abort
+  # with a bare 'integer expression expected' instead of naming the file.
+  productionCount=${productionCount:-0}
+  testCount=${testCount:-0}
 
   if [ "$productionCount" != 1 ]; then
     config_fatal "$descriptor declares the '$CATALINA_PRODUCTION_CONTAINER' container $productionCount times; exactly one is required, because the edits applied here identify it by position."
@@ -5628,6 +5879,9 @@ render_ajp_connector_address() {
   # start up instead of being served.
   local addressCount
   addressCount=$(catalina_ajp_connector_block | grep --count "^[[:blank:]]*$addressAnchor" || true)
+  # Defaulted for the same reason as the container counts above: an unreadable descriptor would otherwise
+  # put an empty string where the messages below state a number.
+  addressCount=${addressCount:-0}
   if [ -n "$OFBIZ_ENABLE_AJP_PORT" ] && [ "$addressCount" != 1 ]; then
     config_fatal "The AJP connector of the '$CATALINA_PRODUCTION_CONTAINER' block in $descriptor declares its bind address $addressCount times after applying OFBIZ_ENABLE_AJP_PORT; exactly one is required."
   fi
@@ -5740,7 +5994,11 @@ render_content_store_configuration() {
   if [ "$configured" = "false" ]; then
     restore_trace
     if [ -e "$CONTENT_PROPERTIES_OVERRIDE" ]; then
-      rm --force "$CONTENT_PROPERTIES_OVERRIDE"
+      # Status and stderr both discarded, for the reason given at the identical construction in
+      # remove_entity_engine_override: under 'set -e' an rm that cannot unlink the file ends the script on
+      # the rm, printing a bare unprefixed "rm: cannot remove ..." instead of the ERROR-prefixed message
+      # written for this case. The existence check immediately below owns the diagnostic and the failure.
+      rm --force "$CONTENT_PROPERTIES_OVERRIDE" 2>/dev/null || true
       if [ -e "$CONTENT_PROPERTIES_OVERRIDE" ]; then
         config_fatal "No object-store variable is set but $CONTENT_PROPERTIES_OVERRIDE could not be removed. It would keep shadowing the committed content.properties with a storage backend this deployment no longer asks for."
       fi
@@ -5806,11 +6064,17 @@ render_content_store_configuration() {
     reject_leading_whitespace OFBIZ_S3_BUCKET "$bucket"
     require_s3_bucket_name OFBIZ_S3_BUCKET "$bucket"
 
-    reject_unsafe_value OFBIZ_S3_REGION "$region"
     reject_leading_whitespace OFBIZ_S3_REGION "$region"
-    if ! printf '%s' "$region" | grep --quiet --extended-regexp '^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$'; then
-      config_fatal "OFBIZ_S3_REGION is not a region identifier. Use lower case letters, digits and hyphens, for example us-east-1 or eu-west-2."
-    fi
+    # Delegated to the same validator resolve_content_store_configuration uses, exactly as the bucket
+    # above delegates to require_s3_bucket_name and the endpoint below to require_object_store_endpoint.
+    # It used to
+    # apply an inline regular expression here instead - '^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$' - and that
+    # expression disagreed with S3_REGION_MIN_LENGTH/S3_REGION_MAX_LENGTH about the maximum length while
+    # reporting every rejection, length included, as a character-set mistake. So a 33 character region
+    # was refused by a message listing the characters that are allowed when every character in it was
+    # allowed and only the length was not. One validator now owns the whole rule - the same accepted set,
+    # a length failure reported as a length failure - and the two layers cannot drift apart again.
+    require_object_store_region OFBIZ_S3_REGION "$region"
 
     if [ -n "$endpointAllowlist" ]; then
       reject_unsafe_value OFBIZ_S3_ENDPOINT_ALLOWLIST "$endpointAllowlist"
@@ -5959,7 +6223,7 @@ render_content_store_configuration() {
   # about the backend is a disagreement about where durable content is written. Empty means the resolver
   # did not run, which is how this render is driven in isolation.
   if [ -n "${RESOLVED_CONTENT_STORE_PROVIDER:-}" ] && [ "$RESOLVED_CONTENT_STORE_PROVIDER" != "$provider" ]; then
-    rm --force "$CONTENT_PROPERTIES_OVERRIDE"
+    discard_untrustworthy_render "$CONTENT_PROPERTIES_OVERRIDE"
     config_fatal "The object-store configuration resolved at start up selected the $RESOLVED_CONTENT_STORE_PROVIDER storage backend, but the render selected $provider. Two validations of the same environment disagree, so which backend content would be written to is not established."
   fi
 
@@ -5997,7 +6261,9 @@ render_content_url_configuration() {
 
   if [ -z "$urlPrefix" ]; then
     if [ -e "$URL_PROPERTIES_OVERRIDE" ]; then
-      rm --force "$URL_PROPERTIES_OVERRIDE"
+      # Status and stderr discarded so the existence check below owns the diagnostic, exactly as in
+      # remove_entity_engine_override and the content.properties removal above.
+      rm --force "$URL_PROPERTIES_OVERRIDE" 2>/dev/null || true
       if [ -e "$URL_PROPERTIES_OVERRIDE" ]; then
         config_fatal "OFBIZ_CONTENT_URL_PREFIX is not set but $URL_PROPERTIES_OVERRIDE could not be removed. It would keep shadowing the shipped url.properties with a prefix this deployment no longer asks for."
       fi
@@ -6122,8 +6388,14 @@ require_object_store_region() {
   if [ -z "$value" ]; then
     config_fatal "$name must be set when OFBIZ_CONTENT_STORE_PROVIDER=s3. There is no default region; use us-east-1 for a store that has no regions."
   fi
+  # The length is checked before the character set, and the message says so, because a value that is too
+  # long is usually a different mistake from one containing a character that is not allowed - a whole URL
+  # or an endpoint pasted into the region variable, rather than a typo - and a message about which
+  # characters are permitted is actively misleading when every character in the value is permitted. The
+  # observed length is reported for the same reason require_s3_bucket_name reports it: it turns "not
+  # accepted" into a fact the operator can act on without counting.
   if [ "${#value}" -lt "$S3_REGION_MIN_LENGTH" ] || [ "${#value}" -gt "$S3_REGION_MAX_LENGTH" ]; then
-    config_fatal "$name must be between $S3_REGION_MIN_LENGTH and $S3_REGION_MAX_LENGTH characters long."
+    config_fatal "$name must be between $S3_REGION_MIN_LENGTH and $S3_REGION_MAX_LENGTH characters long. Its length is ${#value}. A region identifier is short - us-east-1 is 9 characters - so an over-long value is usually an endpoint or a whole URL supplied to the wrong variable."
   fi
   case "$value" in
   *[!a-z0-9-]*)
@@ -6405,9 +6677,20 @@ resolve_content_store_configuration() {
   fi
 
   reject_unsafe_value OFBIZ_CONTENT_STORE_PROVIDER "$provider"
-  # Lower cased before the comparison because ContentStoreFactory compares case-insensitively, so
-  # accepting 'S3' here is what keeps this script from refusing a value OFBiz would have honoured.
-  provider=$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')
+  # Compared exactly as supplied, and this is the FIRST thing checked about the object store, because the
+  # provider is what decides whether any of the variables below are even read.
+  #
+  # This used to lower case the value first, on the reasoning that ContentStoreFactory resolves the
+  # property case-insensitively so 'S3' is a value OFBiz would have honoured. The reasoning did not hold
+  # end to end: render_content_store_configuration validates the same variable against the same
+  # vocabulary case-SENSITIVELY, so a mis-cased provider was accepted here and then refused there - and
+  # because this resolver goes on to validate the s3-dependent variables, the operator's first error
+  # named OFBIZ_S3_BUCKET, a variable that was not the mistake, for a run that could never have started.
+  # Being strict here instead makes the first diagnostic name the variable that is actually wrong and
+  # lists the values that are accepted, and it leaves the outcome of a mis-cased value exactly as it was:
+  # refused. One documented spelling - the lower case one in DOCKER.adoc and in the AAP - is validated
+  # identically by both layers, which is also what lets the two of them be compared as plain strings
+  # where they cross-check each other after the render.
   require_enum OFBIZ_CONTENT_STORE_PROVIDER "$provider" "${CONTENT_STORE_PROVIDERS[@]}"
   RESOLVED_CONTENT_STORE_PROVIDER="$provider"
 
@@ -6540,12 +6823,15 @@ require_rendered_content_store_declarations() {
 
   local declarations
   declarations=$(grep --count '^content\.store\.provider=' "$CONTENT_PROPERTIES_OVERRIDE" || true)
+  # grep prints nothing when it cannot open the file, and the '|| true' above cannot tell that apart from
+  # a genuine zero, so the count is defaulted rather than interpolated into the message as an empty string.
+  declarations=${declarations:-0}
   if [ "$declarations" != '1' ]; then
-    rm --force "$CONTENT_PROPERTIES_OVERRIDE"
+    discard_untrustworthy_render "$CONTENT_PROPERTIES_OVERRIDE"
     config_fatal "Rendered $CONTENT_PROPERTIES_OVERRIDE declares content.store.provider $declarations times instead of once. java.util.Properties would honour the last one, so the selected storage backend would not be the one this script validated."
   fi
   if ! grep --quiet "^content\.store\.provider=$provider\$" "$CONTENT_PROPERTIES_OVERRIDE"; then
-    rm --force "$CONTENT_PROPERTIES_OVERRIDE"
+    discard_untrustworthy_render "$CONTENT_PROPERTIES_OVERRIDE"
     config_fatal "Rendered $CONTENT_PROPERTIES_OVERRIDE does not select the $provider storage provider. The substitution did not take effect, so content would be stored somewhere other than where this deployment asked for it."
   fi
 }
@@ -6978,7 +7264,7 @@ require_rendered_transport_declarations() {
   local count
   count=$(count_active_service_messenger "$SERVICE_ENGINE_OVERRIDE")
   if [ "$count" != "1" ]; then
-    rm --force "$SERVICE_ENGINE_OVERRIDE"
+    discard_untrustworthy_render "$SERVICE_ENGINE_OVERRIDE"
     config_fatal "The rendered $SERVICE_ENGINE_OVERRIDE declares $count active jms-service elements named $JMS_SERVICE_NAME but exactly one is required. The render has been discarded."
   fi
 
@@ -7001,19 +7287,19 @@ require_rendered_transport_declarations() {
     esac
     actual=$(xml_attribute_value "$serverTag" "$attribute")
     if [ "$actual" != "$expected" ]; then
-      rm --force "$SERVICE_ENGINE_OVERRIDE"
+      discard_untrustworthy_render "$SERVICE_ENGINE_OVERRIDE"
       config_fatal "The rendered $SERVICE_ENGINE_OVERRIDE declares $attribute=\"$actual\" on its server element but \"$expected\" was required. The render has been discarded."
     fi
   done
 
   if ! grep --quiet --fixed-strings "$RENDERED_TRANSPORT_MARKER" "$SERVICE_ENGINE_OVERRIDE"; then
-    rm --force "$SERVICE_ENGINE_OVERRIDE"
+    discard_untrustworthy_render "$SERVICE_ENGINE_OVERRIDE"
     config_fatal "The rendered $SERVICE_ENGINE_OVERRIDE does not carry the generated-file marker, so a later start could not tell it apart from configuration authored by an operator and would refuse to replace it. The render has been discarded."
   fi
 
   if [ "$RESOLVED_JMS_CREDENTIAL_SOURCE" = 'configured' ] \
     && ! grep --quiet --extended-regexp '[[:space:]]password="' "$SERVICE_ENGINE_OVERRIDE"; then
-    rm --force "$SERVICE_ENGINE_OVERRIDE"
+    discard_untrustworthy_render "$SERVICE_ENGINE_OVERRIDE"
     config_fatal "OFBIZ_JMS_USERNAME and OFBIZ_JMS_PASSWORD were supplied but the rendered $SERVICE_ENGINE_OVERRIDE carries no password attribute, so the instance would connect to the broker anonymously. The render has been discarded."
   fi
 
@@ -7049,7 +7335,7 @@ require_rendered_jndi_server() {
   local tag
   tag=$(jndi_server_element "$JNDI_SERVERS_OVERRIDE" "$JNDI_SERVER_NAME")
   if [ -z "$tag" ]; then
-    rm --force "$JNDI_SERVERS_OVERRIDE"
+    discard_untrustworthy_render "$JNDI_SERVERS_OVERRIDE"
     config_fatal "The rendered $JNDI_SERVERS_OVERRIDE declares no active jndi-server named $JNDI_SERVER_NAME, so the jms-service would name a server that does not exist and JNDIContextFactory would refuse to build a context for it. The render has been discarded."
   fi
 
@@ -7072,7 +7358,7 @@ require_rendered_jndi_server() {
     esac
     actual=$(xml_attribute_value "$tag" "$attribute")
     if [ "$actual" != "$expected" ]; then
-      rm --force "$JNDI_SERVERS_OVERRIDE"
+      discard_untrustworthy_render "$JNDI_SERVERS_OVERRIDE"
       config_fatal "The rendered $JNDI_SERVERS_OVERRIDE declares $attribute=\"$actual\" on jndi-server $JNDI_SERVER_NAME but \"$expected\" was required. The render has been discarded."
     fi
   done
@@ -7082,19 +7368,19 @@ require_rendered_jndi_server() {
   rendered=$(count_jndi_servers "$JNDI_SERVERS_OVERRIDE")
   original=$(count_jndi_servers "$JNDI_SERVERS_SOURCE")
   if [ "$rendered" != "$((original + 1))" ]; then
-    rm --force "$JNDI_SERVERS_OVERRIDE"
+    discard_untrustworthy_render "$JNDI_SERVERS_OVERRIDE"
     config_fatal "The rendered $JNDI_SERVERS_OVERRIDE declares $rendered active jndi-server elements but $((original + 1)) were required - the $original in $JNDI_SERVERS_SOURCE plus the one this script adds. The override replaces the committed file rather than adding to it, so a server lost here is lost from the deployment. The render has been discarded."
   fi
 
   local defaultTag
   defaultTag=$(jndi_server_element "$JNDI_SERVERS_OVERRIDE" "$JNDI_SERVER_DEFAULT_NAME")
   if [ -z "$defaultTag" ] || [ -n "$(xml_attribute_value "$defaultTag" 'context-provider-url')" ]; then
-    rm --force "$JNDI_SERVERS_OVERRIDE"
+    discard_untrustworthy_render "$JNDI_SERVERS_OVERRIDE"
     config_fatal "The rendered $JNDI_SERVERS_OVERRIDE must keep declaring the jndi-server named $JNDI_SERVER_DEFAULT_NAME with no context-provider-url, because entityengine.xml's user-transaction-jndi and transaction-manager-jndi both name it and it is the parameterless entry that falls back to the JVM-wide context. The render has been discarded."
   fi
 
   if ! grep --quiet --fixed-strings "$RENDERED_TRANSPORT_MARKER" "$JNDI_SERVERS_OVERRIDE"; then
-    rm --force "$JNDI_SERVERS_OVERRIDE"
+    discard_untrustworthy_render "$JNDI_SERVERS_OVERRIDE"
     config_fatal "The rendered $JNDI_SERVERS_OVERRIDE does not carry the generated-file marker, so a later start could not tell it apart from configuration authored by an operator and would refuse to replace it. The render has been discarded."
   fi
 }
@@ -7610,7 +7896,15 @@ remove_entity_engine_override() {
   fi
 
   printf '%s\n' "No managed database and no cross-instance cache invalidation are configured: removing the entity engine override left by an earlier start so the committed configuration takes effect."
-  rm --force "$ENTITY_ENGINE_OVERRIDE"
+  # rm's own diagnostic is discarded, and its status is explicitly ignored, so that the failure is
+  # reported by the existence check below and by nothing else. 'set -e' is in force, so an unguarded rm
+  # that cannot unlink the file - a read-only mount, or a config directory owned by another uid - killed
+  # the script on the rm itself, after printing a bare "rm: cannot remove ...: Permission denied" that
+  # carries no ERROR prefix, does not name the consequence and never reached the config_fatal written for
+  # exactly this case. The outcome is unchanged: the start still fails, fail-closed, because the check
+  # below still sees the file. Only the diagnostic changes, from a raw shell error to the one line that
+  # says which file, why it matters and where to look.
+  rm --force "$ENTITY_ENGINE_OVERRIDE" 2>/dev/null || true
 
   if [ -e "$ENTITY_ENGINE_OVERRIDE" ]; then
     config_fatal "Could not remove the stale $ENTITY_ENGINE_OVERRIDE. It precedes ofbiz.jar on the class path, so starting would use its database configuration instead of the committed one. Check the permissions of the mounted config directory."
@@ -7665,7 +7959,11 @@ database_desired_state_fingerprint() {
   local desiredMode="$1"
 
   printf '%s\n' "$DESIRED_STATE_RECORD_VERSION"
-  printf 'profile=%s\n' "${OFBIZ_PROFILE:-dev}"
+  # require_profile has already resolved OFBIZ_PROFILE to exactly 'dev' or 'prod' - it defaults an unset
+  # value to 'dev' and reports that it did - so this is always set by the time the fingerprint is taken.
+  # Reading it directly rather than defaulting again keeps the record from ever attributing a start to a
+  # profile it did not run under.
+  printf 'profile=%s\n' "$OFBIZ_PROFILE"
   printf 'database-mode=%s\n' "$desiredMode"
   printf 'schema-init=%s\n' "${RESOLVED_SCHEMA_INIT:-false}"
   printf 'distributed-cache-clear=%s\n' "${RESOLVED_DISTRIBUTED_CACHE_CLEAR:-false}"
@@ -7933,6 +8231,58 @@ restore_serving_mode_after_schema_init() {
 }
 
 ###############################################################################
+# Report whether the mounted configuration, rather than the environment, supplies a required secret.
+#
+# Only ever true on the OFBIZ_SKIP_INIT path, which is the one case where this container may not be the
+# one that was given the secrets: the deployment is allowed to have provisioned the key material into
+# /ofbiz/config on an earlier start, or from another container, and to supply neither variable to this
+# one. DOCKER.adoc documents that shape as supported, and the renderers implement it - but the aggregate
+# presence gate ran before them and refused the start up first, which made the documented path
+# unreachable and left a correctly provisioned prod container unable to boot.
+#
+# The conditions below are deliberately the SAME ones the renderers apply, so this gate can never accept
+# a shape the renderer would then refuse (or the reverse):
+#  - render_admin_key_configuration keeps a provisioned ofbiz.admin.key when OFBIZ_ADMIN_KEY is empty and
+#    the admin key override declares the property;
+#  - render_security_configuration keeps the provisioned signing keys only when BOTH variables are empty
+#    and BOTH properties are declared - both or neither - because a half-provisioned pair would otherwise
+#    leave one key kept and the other freshly generated, and a generated login key cannot decrypt
+#    material the provisioned one encrypted.
+# Presence is all that is established here. Whether what the file declares is actually usable - long
+# enough, not the published 'NA' default - is proven by require_preprovisioned_runtime_configuration
+# after the rendering, which is also where it is reported per property.
+#
+# Tracing is suspended for the whole function, and the result is returned as an exit status through a
+# single exit point, for the reason set out on validate_required_secrets: each '[ -z "$OFBIZ_..." ]' is
+# expanded before it runs, so under 'set -x' the test would echo the value it was only meant to measure.
+# $1 - the environment variable a required secret would normally arrive in
+preprovisioned_declaration_supplies() {
+  hide_secrets
+  local supplied=1
+
+  if [ "${RESOLVED_SKIP_INIT:-}" = 'true' ]; then
+    case "$1" in
+      OFBIZ_ADMIN_KEY)
+        if [ -z "$OFBIZ_ADMIN_KEY" ] \
+          && config_declares_property "$ADMIN_KEY_OVERRIDE" 'ofbiz\.admin\.key'; then
+          supplied=0
+        fi
+        ;;
+      OFBIZ_LOGIN_SECRET_KEY | OFBIZ_JWT_TOKEN_KEY)
+        if [ -z "$OFBIZ_LOGIN_SECRET_KEY" ] && [ -z "$OFBIZ_JWT_TOKEN_KEY" ] \
+          && config_declares_property "$SECURITY_PROPERTIES_OVERRIDE" 'login\.secret_key_string' \
+          && config_declares_property "$SECURITY_PROPERTIES_OVERRIDE" 'security\.token\.key'; then
+          supplied=0
+        fi
+        ;;
+    esac
+  fi
+
+  restore_trace
+  return "$supplied"
+}
+
+###############################################################################
 # Report EVERY required secret that has not been supplied, in one message, before any of them is used.
 #
 # Resolving each secret where it is needed would abort on the first missing one, so an operator bringing
@@ -7947,10 +8297,19 @@ restore_serving_mode_after_schema_init() {
 #  - the three managed database passwords are required in BOTH profiles whenever OFBIZ_POSTGRES_HOST is
 #    set, because they have no defaults left to fall back to.
 #
-# The presence tests run inside a secret-handling region. The script only ever looks at whether a value
-# is empty, but 'set -x' echoes each command with its arguments ALREADY expanded, so under OFBIZ_TRACE
-# the emptiness test itself would print the supplied secret to stderr. Tracing is therefore suspended
-# for the tests and resumed before the report, which names variables only.
+# Required is not the same as "in the environment". On the OFBIZ_SKIP_INIT path a deployment secret may
+# have been provisioned into /ofbiz/config instead, and the renderers accept it from there, so this gate
+# accepts it from there too - see preprovisioned_declaration_supplies, which holds the conditions both
+# sides share. The managed database passwords have no such second source: they are substituted into the
+# entity engine configuration by configure_database and are only ever read from the environment.
+#
+# The presence tests run inside a secret-handling region. Nothing here prints a value and nothing assigns
+# one, but the test that decides whether a variable is empty still READS it, and 'set -x' echoes each
+# command with its arguments ALREADY expanded, so under OFBIZ_TRACE - or an inherited SHELLOPTS=xtrace -
+# '[ -z "${!name}" ]' would publish the secret itself to stderr, which in a container is the retained log
+# stream. Tracing is therefore suspended for the tests and resumed before the report, which names
+# variables only; config_fatal suspends it again on its own, so the abort path stays covered whichever way
+# it is reached.
 validate_required_secrets() {
   local missing=''
   local name
@@ -7958,9 +8317,15 @@ validate_required_secrets() {
   hide_secrets
   if [ "$OFBIZ_PROFILE" = 'prod' ]; then
     for name in OFBIZ_ADMIN_KEY OFBIZ_LOGIN_SECRET_KEY OFBIZ_JWT_TOKEN_KEY; do
-      if [ -z "${!name}" ]; then
-        missing="$missing $name"
+      if [ -n "${!name}" ]; then
+        continue
       fi
+      # Not in the environment. Accepted anyway if the mounted configuration declares it and the
+      # renderer would keep that value, which is the OFBIZ_SKIP_INIT case and only that case.
+      if preprovisioned_declaration_supplies "$name"; then
+        continue
+      fi
+      missing="$missing $name"
     done
   fi
 
@@ -7975,28 +8340,40 @@ validate_required_secrets() {
   restore_trace
 
   if [ -n "$missing" ]; then
-    config_fatal "The following required secret(s) were not supplied through the environment:$missing. OFBIZ_PROFILE=$OFBIZ_PROFILE requires every one of them; supply them all and start again."
+    # The remedy differs by path, so the message does too: without OFBIZ_SKIP_INIT the environment is the
+    # only source there is, while with it the mounted configuration is a second one for the three
+    # deployment secrets - and naming a source that does not apply is as unhelpful as naming none.
+    local remedy='Supply every one of them through its environment variable and start again.'
+    if [ "${RESOLVED_SKIP_INIT:-}" = 'true' ]; then
+      remedy="Supply every one of them through its environment variable, or - because OFBIZ_SKIP_INIT is set - let the configuration this container mounts declare it: ofbiz.admin.key in $ADMIN_KEY_OVERRIDE for OFBIZ_ADMIN_KEY, and BOTH login.secret_key_string AND security.token.key in $SECURITY_PROPERTIES_OVERRIDE for OFBIZ_LOGIN_SECRET_KEY and OFBIZ_JWT_TOKEN_KEY, which are accepted from the file only together so that a half-provisioned pair cannot leave one key kept and the other generated. The managed database passwords are never read from the configuration and must always come from the environment. See DOCKER.adoc."
+    fi
+    config_fatal "The following required secret(s) were not supplied:$missing. OFBIZ_PROFILE=$OFBIZ_PROFILE requires every one of them. $remedy"
   fi
 }
 
 ###############################################################################
 # The fail-closed path for a container started with OFBIZ_SKIP_INIT.
 #
-# OFBIZ_SKIP_INIT means "the configuration has already been provisioned, do not touch it", so it skips
-# ofbiz_setup_env, configure_database and apply_configuration - and with them every secret check this
-# script performs. A prod container could therefore be started with no admin key, no signing keys and no
-# database password anywhere, and would come up serving traffic with whatever the image happens to
-# contain: a blank login.secret_key_string and security.token.key, and an admin key of 'NA'.
+# OFBIZ_SKIP_INIT skips the one-off DATA initialization - the seed/demo load and the admin user load -
+# and nothing else. ofbiz_setup_env, configure_database and apply_configuration all still run, so the
+# configuration is still rendered on this path; _main says so in as many words when it takes the branch.
+# What the flag does change is WHERE the key material comes from: with no secret in the environment the
+# renderers keep the value the mounted config/ override already declares instead of substituting a new
+# one, and a value that is kept never passes through resolve_secret. Nothing else would then test it, so
+# a prod container could be started with no admin key and no signing keys anywhere and come up serving
+# traffic on whatever the volume happens to carry - a blank login.secret_key_string and
+# security.token.key, and an admin key of Config.java's published 'NA' default.
 #
-# Skipping the RENDERING is legitimate; skipping the VALIDATION is not. Each required secret is
+# Skipping the DATA INITIALIZATION is legitimate; skipping the VALIDATION is not. Each required secret is
 # therefore accepted from either source - the environment, or the externally provisioned configuration
 # file that was mounted in its place - and the start up is refused only when neither supplies it. Only
 # the presence of a non-empty declaration is tested; no value is read out of the file or printed.
 #
-# The tests run inside a secret-handling region for the same reason as in validate_required_secrets:
-# 'set -x' expands its arguments before echoing them, so under OFBIZ_TRACE '[ -z "$OFBIZ_ADMIN_KEY" ]'
-# would publish the key itself. The grep against the provisioned file matches on the property NAME and
-# never captures the value, and the report below names variables only.
+# The tests run inside a secret-handling region for the same reason as in validate_required_secrets: each
+# '[ -z "$OFBIZ_..." ]' below is expanded before it runs, so under OFBIZ_TRACE - or an inherited
+# SHELLOPTS=xtrace - the test itself would echo the value it was only meant to measure. grep runs in quiet
+# mode and is pointed at a file rather than handed a value, so it publishes nothing either way, and the
+# report below names variables only.
 validate_externally_provisioned_secrets() {
   local missing=''
 
@@ -8170,8 +8547,26 @@ config_declares_property() {
 declared_property_value() {
   hide_secrets
   local value
-  value=$(sed --quiet "s|^$2=||p" "$1" | tail --lines=1)
+
+  # Both guards exist because the file was proven to declare this property by a SEPARATE earlier call to
+  # config_declares_property, and a concurrent start on a shared /ofbiz/config volume can delete it in
+  # between (see require_rendered_file_present). sed's own stderr is suppressed for the same reason it is
+  # replaced there: unread, it is the only thing an operator would see.
+  #
+  # An empty result is the second half of that race and has to be refused too, not returned. It cannot
+  # happen otherwise - config_declares_property requires a character after the '=' - and returning it
+  # would hand a renderer an empty signing key, which java.util.Properties delivers to the application as
+  # a declared empty value rather than an absent one.
+  #
+  # config_fatal runs here inside the caller's command substitution, so its exit ends this subshell; the
+  # callers are plain assignments, which take that status and abort the start through 'set -e' after the
+  # ERROR has been printed. No caller may capture this value in a context that discards the status.
+  require_rendered_file_present "$1"
+  value=$(sed --quiet "s|^$2=||p" "$1" 2>/dev/null | tail --lines=1)
   value=${value%%$'\r'*}
+  if [ -z "$value" ]; then
+    config_fatal "$1 no longer declares a value for the property matched by '$2', although it did when this start checked a moment ago. The most likely cause is a second container starting at the same time against the same /ofbiz/config volume. Start one container at a time against a shared configuration volume, or give each instance its own; then start again."
+  fi
   printf '%s' "$value"
   restore_trace
 }
@@ -8257,18 +8652,23 @@ preprovisioned_secret_is_usable() {
 ###############################################################################
 # Pre-flight for OFBIZ_SKIP_INIT.
 #
-# OFBIZ_SKIP_INIT tells this script to touch nothing: no configuration is rendered, no data is loaded
-# and no admin user is created. That contract is kept - an operator who mounts a fully pre-provisioned
-# /ofbiz/config, possibly read-only, relies on it - but it must not become a way to serve production
-# traffic with no secrets at all. Skipping the rendering skips the fail-fast that goes with it, so
-# without this pre-flight 'OFBIZ_PROFILE=prod OFBIZ_SKIP_INIT=1' started a fleet whose admin shared
-# secret was Config.java's published "NA" default and whose JWT and login keys were whatever the image
-# happened to carry - values baked in at build time and therefore identical for every instance of that
-# image and readable by anyone who can pull it.
+# OFBIZ_SKIP_INIT tells this script to skip the DATA initialization: no data is loaded and no admin user
+# is created. It does NOT stop the configuration being rendered - /ofbiz/config is written on every start,
+# which is why that directory always has to be writable - so what the flag really changes here is WHERE
+# the key material comes from: with it set, the renderers keep whatever the mounted configuration already
+# declares instead of resolving a value out of the environment.
+#
+# That is a legitimate shape, and an operator who provisions the volume once and then starts a fleet from
+# it relies on it. What it must not become is a way to serve production traffic with no secrets at all.
+# Keeping a provisioned value bypasses resolve_secret, and with it the strength tests an environment
+# value has to pass, so without this pre-flight 'OFBIZ_PROFILE=prod OFBIZ_SKIP_INIT=1' started a fleet
+# whose admin shared secret was Config.java's published "NA" default and whose JWT and login keys were
+# whatever the image happened to carry - values baked in at build time and therefore identical for every
+# instance of that image and readable by anyone who can pull it.
 #
 # The requirement is therefore shifted from the environment to the result: in the prod profile the
-# override files that the skipped rendering would have written must ALREADY declare a usable value for
-# each required secret. Only the /ofbiz/config overrides count. They are the copies that take class
+# override files the renderers KEPT rather than rewrote must ALREADY declare a usable value for each
+# required secret. Only the /ofbiz/config overrides count. They are the copies that take class
 # path precedence, they are on a declared volume the operator provisions, and accepting the source-tree
 # copies instead would accept exactly the image-baked keys this check exists to reject.
 #
@@ -8411,8 +8811,9 @@ _main() {
 
   # FIRST, before any other work at all. The profile decides whether a missing, weak or published
   # credential aborts the start, so nothing that consults it may run until it has been resolved and
-  # validated - and it has no default, so an unset value is refused here rather than silently becoming
-  # the permissive setting.
+  # validated. An unset value resolves to the development profile and says so on stderr, which keeps the
+  # zero-configuration start working without settling that decision silently; a value that is neither
+  # profile is refused here.
   require_profile
 
   # Checked unconditionally, because a driver jar left in lib-extra takes class path precedence over the
@@ -8485,13 +8886,18 @@ _main() {
     # on the environment, because on this path the key material may legitimately have been provisioned
     # by an earlier start or by another container rather than supplied to this one.
     require_preprovisioned_runtime_configuration
-    # Nothing above has checked that this container HAS the secrets it needs when the rendering was
-    # skipped on a volume another container provisioned. Skipping the RENDERING is the point of
-    # OFBIZ_SKIP_INIT; skipping the VALIDATION would let a prod container serve traffic with the
-    # image's blank signing keys and an admin key of 'NA'. The check accepts each value from either
-    # the environment or the provisioned configuration file, and is limited to the prod profile so
-    # that a developer's skip-init container keeps working exactly as before.
-    if [ "${OFBIZ_PROFILE:-dev}" = 'prod' ]; then
+    # Nothing above has checked that this container HAS the secrets it needs when the renderers kept a
+    # value a previous start left on this volume instead of substituting one of its own. Keeping that
+    # value is the point of OFBIZ_SKIP_INIT; skipping the VALIDATION of it would let a prod container
+    # serve traffic with the image's blank signing keys and an admin key of 'NA'. Nothing else tests a
+    # kept value, because only a substituted one goes through resolve_secret. The check accepts each
+    # value from either the environment or the provisioned configuration file, and is limited to the
+    # prod profile so that a developer's skip-init container keeps working exactly as before.
+    # OFBIZ_PROFILE is read directly rather than with a ':-dev' fallback: require_profile has already
+    # resolved it to exactly 'dev' or 'prod' - defaulting an unset value to 'dev' and reporting that it
+    # did - so a fallback here would only restate that default in a second place, where it could drift
+    # away from the one require_profile applies.
+    if [ "$OFBIZ_PROFILE" = 'prod' ]; then
       validate_externally_provisioned_secrets
     fi
   elif [ "$RESOLVED_SCHEMA_INIT" = "true" ]; then

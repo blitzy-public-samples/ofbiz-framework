@@ -31,11 +31,14 @@ This will start an instance of the ofbiz-docker container, publish port
 8443 to localhost, load the OFBiz demo data, and then run the OFBiz
 server.
 
-`+OFBIZ_PROFILE+` is required and has no default. `+dev+` is the profile
-for a local container like this one: it generates the signing keys it
-needs and keeps the published demo admin password. Use
-`+OFBIZ_PROFILE=prod+` for anything serving real traffic, which requires
-every secret to be supplied - see _Secrets_ below.
+`+OFBIZ_PROFILE=dev+` is the profile for a local container like this one:
+it generates the signing keys it needs and keeps the published demo admin
+password. It is also what an unset `+OFBIZ_PROFILE+` resolves to, so
+`+docker run ofbiz-docker+` with no environment variables at all still
+boots on the embedded database; the container reports the assumed profile
+as a `+NOTICE+` on start up. Use `+OFBIZ_PROFILE=prod+` for anything
+serving real traffic, which is never assumed and which requires every
+secret to be supplied - see _Secrets_ below.
 
 Once start up completes, you can access OFBIZ at
 https://localhost:8443/partymgr
@@ -130,17 +133,21 @@ authoritative description.
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default value |Description
-|OFBIZ_PROFILE |_none - required_ |Selects the deployment profile,
-either _dev_ or _prod_. *There is no default*: an unset, empty or
-unrecognised value aborts the start up before any other work is done.
-The profile decides how a missing, weak or published credential is
-handled - see the _Secrets_ and _Database passwords_ sections below - so
-a manifest that simply forgot to set it must not be given the permissive
-setting silently. Use `+OFBIZ_PROFILE=dev+` for a local or demo
-container and `+OFBIZ_PROFILE=prod+` for anything serving real traffic.
-The profile never changes which components, webapps or services are
-loaded, so a container behaves identically in both profiles once the
-secrets are in place.
+|OFBIZ_PROFILE |dev |Selects the deployment profile, either _dev_ or
+_prod_. An unset or empty value resolves to _dev_ - the behaviour this
+image has always had with no configuration at all - and the assumed
+profile is reported as a `+NOTICE+` on start up, so the permissive
+setting is never applied silently. An unrecognised or whitespace-only
+value aborts the start up before any other work is done, because
+guessing which profile such a value meant is the one mistake this gate
+exists to prevent. _prod_ is never assumed; it has to be asked for. The
+profile decides how a missing, weak or published credential is handled -
+see the _Secrets_ and _Database passwords_ sections below. Use
+`+OFBIZ_PROFILE=dev+` for a local or demo container and
+`+OFBIZ_PROFILE=prod+` for anything serving real traffic. The profile
+never changes which components, webapps or services are loaded, so a
+container behaves identically in both profiles once the secrets are in
+place.
 
 |OFBIZ_SKIP_INIT |false |Skips the one-off *data* initialisation - the
 seed/demo data load, the admin user load and the data-load hooks - for a
@@ -203,6 +210,19 @@ rejected password is never echoed to the container log.
 |OFBIZ_DATA_LOAD |seed |Determine what type of data loading is required.
 _none_: No data loading is performed. _seed_: Seed data is loaded.
 _demo_: Demo data is loaded.
+`+none+` does *not* skip the administrative user, and the administrative
+user cannot be created on a database that has never been seeded: the
+login is placed in the `+SUPER+` security group, which is seed data, so
+the loader fails with a referential integrity violation on
+`+USER_SECGRP_GRP+` and the start exits non-zero. The entry point prints
+a warning naming this before the load is attempted. Use
+`+OFBIZ_DATA_LOAD=seed+` for the first start against an empty database,
+and `+OFBIZ_SKIP_INIT=true+` for an instance whose database was
+populated elsewhere - by the one-shot `+OFBIZ_SCHEMA_INIT+` job followed
+by a seed load, by another instance, or by a restore - which skips both
+the data load and the administrative user. `+OFBIZ_DATA_LOAD=none+` on
+its own is for a start that must load nothing at all into a database
+that is already populated *and* already has its administrative user.
 
 |OFBIZ_HOST | |Specify the hostname used to access OFBiz. If empty then
 the default value of host-headers-allowed from
@@ -1060,8 +1080,12 @@ only the `+ofbiz+` user can read, and are reused on every restart of that
 container. They are per container, so they are unsuitable for a
 multi-instance deployment.
 
-`+OFBIZ_PROFILE+` itself has no default; an unset value aborts the start
-up rather than selecting `+dev+`.
+An unset `+OFBIZ_PROFILE+` selects `+dev+`, and the container writes a
+`+NOTICE+` naming the assumed profile so that the choice appears in the
+log rather than being made silently. A value that is neither `+dev+` nor
+`+prod+` - including one that is only whitespace - aborts the start up,
+and `+prod+` is never assumed: a deployment that serves real traffic has
+to name it.
 
 Generated key material never outlives its usefulness:
 
@@ -1080,13 +1104,15 @@ one value would make a compromise of the token key a compromise of the
 stored material as well.
 
 The same rules apply to a value that is *pre-provisioned* rather than
-rendered. With `+OFBIZ_SKIP_INIT+` set there is no rendering to validate
-anything, so in the `+prod+` profile the container reads what
-`+/ofbiz/config+` declares for each of the three properties and applies
-exactly the tests above to it. A file that merely declares the property
-is not enough: `+ofbiz.admin.key=NA+`, a one character login key or a
-JWT key shorter than 64 characters is refused just as the equivalent
-environment value would be. The report names the property, the file and
+supplied to this start. With `+OFBIZ_SKIP_INIT+` set and no secret in the
+environment the rendering *keeps* what `+/ofbiz/config+` already declares
+instead of substituting a new value, and a kept value never passes through
+the strength tests a supplied one does, so in the `+prod+` profile the
+container reads what `+/ofbiz/config+` declares for each of the three
+properties and applies exactly the tests above to it. A file that merely
+declares the property is not enough: `+ofbiz.admin.key=NA+`, a one
+character login key or a JWT key shorter than 64 characters is refused
+just as the equivalent environment value would be. The report names the property, the file and
 the environment variable that would normally have supplied it, together
 with the reason, and never the value. Where a property is declared more
 than once the *last* declaration is the one judged, because that is the
@@ -1385,7 +1411,10 @@ asked for. See _Transport security_ below.
 PEM or DER encoded root certificate that the database server's
 certificate must chain to, rendered as the `+sslrootcert+` connection
 parameter of all three managed datasources. Letters, digits, `+/+`,
-`+.+`, `+_+` and `+-+` only. See _Transport security_ below.
+`+.+`, `+_+` and `+-+` only; nothing else is required of the path, so a
+relative one is accepted and pgJDBC resolves it against the container's
+`+/ofbiz+` working directory. Prefer an absolute path. See _Transport
+security_ below.
 
 |OFBIZ_DB_POOL_MIN |2 |Minimum size of the JDBC connection pool of each
 of the three managed datasources. An integer between 1 and 10000 that
@@ -1417,13 +1446,18 @@ integer between 1 and 1000.
 _Connection pools_ below.
 
 |OFBIZ_POSTGRES_CONNECT_TIMEOUT |10 |Seconds pgJDBC waits to establish a
-TCP connection to the server. An integer between 1 and 300. See
-_Connection deadlines_ below.
+TCP connection to the server. An integer between 1 and 300 that *must not
+exceed* `+OFBIZ_POSTGRES_SOCKET_TIMEOUT+`, so with that variable at its
+default of 60 the reachable values are 1 to 60; going higher means raising
+the socket deadline in the same run. See _Connection deadlines_ below.
 
 |OFBIZ_POSTGRES_SOCKET_TIMEOUT |60 |Seconds pgJDBC waits for a reply on
 an established connection before failing the statement and closing the
-socket. An integer between 5 and 86400. Set it above the slowest
-legitimate query, and see _Connection deadlines_ below.
+socket. An integer between 5 and 86400 that *must not be below*
+`+OFBIZ_POSTGRES_CONNECT_TIMEOUT+`, so with that variable at its default
+of 10 the reachable values are 10 to 86400; going lower means lowering the
+connect deadline in the same run. Set it above the slowest legitimate
+query, and see _Connection deadlines_ below.
 
 |OFBIZ_POSTGRES_LOGIN_TIMEOUT |30 |Seconds pgJDBC allows for the whole
 connect-and-authenticate handshake, which covers TLS negotiation and
@@ -1876,6 +1910,27 @@ committed values bound each of those waits:
   detect a connection that was severed without a FIN, which is what an
   idle-connection timeout in a NAT gateway or load balancer does.
 
+The connect and socket deadlines are the one pair whose ranges are *not*
+independent: `+OFBIZ_POSTGRES_CONNECT_TIMEOUT+` must not exceed
+`+OFBIZ_POSTGRES_SOCKET_TIMEOUT+`, and the container refuses to start when
+it does, naming both values. The reason is that pgJDBC applies
+`+socketTimeout+` to the reads of the start-up handshake as well, so
+whichever of the two is smaller is what actually ends a connection
+attempt: a connect deadline above the socket deadline is not the deadline
+that would be in force, and it is refused rather than quietly reconciled.
+
+In practice that means the two published ranges are reachable in full only
+together. With the other variable left at its default, the usable values
+are 1 to 60 seconds for `+OFBIZ_POSTGRES_CONNECT_TIMEOUT+` (the socket
+default is 60) and 10 to 86400 seconds for
+`+OFBIZ_POSTGRES_SOCKET_TIMEOUT+` (the connect default is 10). To use the
+extremes - a 300 second connect deadline, or a 5 second socket deadline -
+set both variables in the same run, for example
+`+-e OFBIZ_POSTGRES_CONNECT_TIMEOUT=300 -e OFBIZ_POSTGRES_SOCKET_TIMEOUT=86400+`
+for a very patient connect, or
+`+-e OFBIZ_POSTGRES_SOCKET_TIMEOUT=5 -e OFBIZ_POSTGRES_CONNECT_TIMEOUT=1+`
+for a very impatient one. No other deadline constrains another.
+
 `+OFBIZ_POSTGRES_QUERY_TIMEOUT+` is separate and defaults to `+0+`, no
 driver-imposed limit, which preserves the committed behaviour: it is a
 per-statement ceiling applied by the driver to statements that set none of
@@ -2148,12 +2203,19 @@ in sight.
 Values are validated before anything is written, so a mistake is reported
 at start up rather than at the first upload an end user attempts:
 
-* The provider must be one of the three names above.
+* The provider must be one of the three names above, spelled in lower
+case. A mis-cased value such as `+S3+` is refused, naming the variable
+and listing the three accepted names, before any other object-store
+setting is examined.
 * `+OFBIZ_S3_BUCKET+` must satisfy the S3 bucket naming rules - 3 to 63
 characters, lower case letters, digits, hyphens and dots, beginning and
 ending with a letter or digit, no adjacent dots and not shaped like an
 IPv4 address.
-* `+OFBIZ_S3_REGION+` must look like a region identifier.
+* `+OFBIZ_S3_REGION+` must look like a region identifier: 2 to 32
+characters of lower case letters, digits and hyphens, beginning and
+ending with a letter or a digit. The length is checked first and reported
+as a length, so an endpoint pasted into this variable by mistake is named
+as such.
 * `+OFBIZ_S3_ENDPOINT+` must be an absolute `+http://+` or `+https://+`
 URI with a host and without a query string, a fragment or embedded user
 information. Credentials belong in the two credential variables, which

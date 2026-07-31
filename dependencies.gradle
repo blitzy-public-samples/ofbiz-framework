@@ -60,6 +60,16 @@ dependencies {
     implementation 'org.apache.tika:tika-parsers:3.3.1'
     implementation 'org.apache.tika:tika-parser-pdf-module:3.3.1'
     implementation 'org.apache.cxf:cxf-rt-frontend-jaxrs:4.2.0'
+    // Keep the whole embedded Tomcat set on ONE version: catalina-ha drags in tomcat-catalina, -coyote,
+    // -util and -juli transitively, so a split version here silently mixes servlet container internals.
+    // Deliberately pinned at 10.1.56: the dependency inventory for the container/cloud-readiness work
+    // carries the org.apache.tomcat set as unchanged, and a servlet container upgrade is a change in its
+    // own right - it needs its own regression run - rather than something to fold into this scope.
+    // For the record, 10.1.57 does fix CVE-2026-59083 (RewriteValve URL decoding) and CVE-2026-59084
+    // (EncryptInterceptor configuration documentation), both rated low by the Tomcat security team, but
+    // neither component exists in this deployment: no RewriteValve is installed and no rewrite.config is
+    // shipped, and CatalinaContainer builds its cluster channel with no EncryptInterceptor attached, so
+    // neither trigger path is reachable. Revisit this pin if either component is ever enabled.
     implementation 'org.apache.tomcat:tomcat-catalina-ha:10.1.56' // Remember to change the version number (10 now) in javadoc block if needed.
     implementation 'org.apache.tomcat:tomcat-jasper:10.1.56'
     implementation 'org.apache.axis2:axis2-kernel:1.8.2'

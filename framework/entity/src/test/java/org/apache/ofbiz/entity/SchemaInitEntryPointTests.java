@@ -91,8 +91,9 @@ import org.xml.sax.SAXParseException;
  * contacted and no network is used.</li>
  * <li>{@code OFBIZ_PROFILE} is supplied by the driver as {@code dev} unless a case names it, because the
  * functions under test read it and are normally reached after {@code require_profile} has resolved it. The
- * script itself has no default, and the cases that establish that use {@code runWithoutProfileDefault}, which omits
- * the driver's assignment entirely.</li>
+ * script resolves the same default itself, announcing it on stderr; the cases that exercise the script's own
+ * resolution - rather than the driver's - use {@code runWithoutProfileDefault}, which omits the driver's
+ * assignment entirely.</li>
  * <li>Where a run has to establish that a command WOULD have been invoked - the data loader, the serving
  * command - a shell function of the same name records its arguments instead of executing. No data loader and
  * no Entity Engine therefore run: what a case observes is the invocation that would have happened, not its
@@ -696,36 +697,54 @@ public final class SchemaInitEntryPointTests {
      */
 
     /**
-     * A container that does not name its deployment profile does not start.
+     * A container that does not name its deployment profile starts in the development profile and says so.
      *
-     * <p>A default of {@code dev} would make the most consequential security decision in this script - whether
-     * an absent secret aborts the start or is replaced by a generated value, whether the published demo admin
-     * password is accepted, whether a non-verifying database TLS mode is allowed - depend on a variable being
-     * ABSENT. A deployment manifest that never mentioned the profile, or that lost it to a templating mistake,
-     * would then get the permissive setting and report nothing at all. An empty value is refused as well,
-     * because that is what an unresolved template expansion produces.</p>
+     * <p>The zero-configuration start is a requirement rather than a convenience: an unmodified checkout given
+     * no environment at all has to boot on the embedded database exactly as it did before this work, so that a
+     * developer can still build and run locally with no secrets configured and no external service. An entry
+     * point that refused to start until a profile was named removed that path entirely, so {@code
+     * require_profile} resolves an absent {@code OFBIZ_PROFILE} - or an empty one, which is what an unresolved
+     * template expansion leaves behind - to {@code dev} and continues.</p>
+     *
+     * <p>What must not come back with that default is silence. The concern that motivated requiring the
+     * variable is real: whether an absent secret aborts the start or is replaced by a generated value, whether
+     * the published demo admin password is accepted, and whether a non-verifying database TLS mode is allowed
+     * all follow from the profile, so a deployment manifest that never mentioned it, or that lost it to a
+     * templating mistake, must not receive the permissive setting quietly. The resolution is a notice on
+     * stderr that names the profile it assumed, states what that profile permits, and points at {@code prod}.
+     * Both halves are asserted here: the start SUCCEEDS, and the notice is emitted.</p>
+     *
+     * <p>Every value that is neither empty nor one of the two spellings is still refused, whitespace included,
+     * because a profile the script cannot recognise cannot be resolved to either policy.</p>
      *
      * @param tempDir a per-test sandbox; nothing outside it is written
      * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
      */
     @Test
-    public void aContainerThatDoesNotNameItsProfileIsRefusedInsteadOfDefaultingToThePermissiveOne(
+    public void aContainerThatDoesNotNameItsProfileStartsInDevelopmentAndSaysSo(
             @TempDir Path tempDir) throws Exception {
         assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
         Path sandbox = prepareSandbox(tempDir);
 
-        EntryPointRun absent = runWithoutProfileDefault(tempDir, sandbox, MAIN_BODY, Map.of(),
-                List.of("/bin/echo", SERVING_MARKER));
-        assertNotEquals(0, absent.getExitCode(),
-                "an unset OFBIZ_PROFILE must abort the start, output was:\n" + absent.getOutput());
-        assertTrue(absent.getOutput().contains("OFBIZ_PROFILE"),
-                "the failure must name the variable, output was:\n" + absent.getOutput());
-        assertFalse(absent.getOutput().contains(SERVING_MARKER),
-                "an unprofiled container must never reach the serving command, output was:\n" + absent.getOutput());
-        assertFalse(absent.getOutput().contains("STAGE "),
-                "the profile must be settled before any stage runs, output was:\n" + absent.getOutput());
+        // Unset and empty are the same case: both resolve to dev, both announce it, and both go on to start.
+        for (Map<String, String> unprofiled : List.of(Map.<String, String>of(), Map.of("OFBIZ_PROFILE", ""))) {
+            EntryPointRun absent = runWithoutProfileDefault(tempDir, sandbox, MAIN_BODY, unprofiled,
+                    List.of("/bin/echo", SERVING_MARKER));
+            assertEquals(0, absent.getExitCode(),
+                    "an unprofiled container must start, output was:\n" + absent.getOutput());
+            assertTrue(absent.getOutput().contains(SERVING_MARKER),
+                    "an unprofiled container must reach the serving command, output was:\n" + absent.getOutput());
+            assertTrue(absent.getOutput().contains("NOTICE:"),
+                    "the assumed profile must be announced, output was:\n" + absent.getOutput());
+            assertTrue(absent.getOutput().contains("OFBIZ_PROFILE"),
+                    "the notice must name the variable, output was:\n" + absent.getOutput());
+            assertTrue(absent.getOutput().contains("'dev'"),
+                    "the notice must name the profile it assumed, output was:\n" + absent.getOutput());
+            assertTrue(absent.getOutput().contains("OFBIZ_PROFILE=prod"),
+                    "the notice must point at the deployed profile, output was:\n" + absent.getOutput());
+        }
 
-        for (String value : List.of("", " ", "development", "production", "PROD", "Dev", "test", "staging")) {
+        for (String value : List.of(" ", "development", "production", "PROD", "Dev", "test", "staging")) {
             EntryPointRun run = runWithoutProfileDefault(tempDir, sandbox, MAIN_BODY,
                     Map.of("OFBIZ_PROFILE", value), List.of("/bin/echo", SERVING_MARKER));
             assertNotEquals(0, run.getExitCode(),
@@ -3615,9 +3634,10 @@ public final class SchemaInitEntryPointTests {
     }
 
     /**
-     * Runs a body WITHOUT the harness supplying a profile, so that the script's own refusal of an unnamed
-     * profile is what the run demonstrates. Every other harness overload defaults the profile, because the
-     * functions they exercise are normally reached after it has been resolved.
+     * Runs a body WITHOUT the harness supplying a profile, so that the script's own handling of an unnamed
+     * profile is what the run demonstrates - the announced {@code dev} default for an absent or empty value,
+     * and the refusal of a value that is neither profile. Every other harness overload defaults the profile,
+     * because the functions they exercise are normally reached after it has been resolved.
      *
      * @param workDir where the generated library and driver scripts are written
      * @param sandbox the directory the script treats as the OFBiz home
@@ -3646,7 +3666,7 @@ public final class SchemaInitEntryPointTests {
      * @param environment the {@code OFBIZ_*} variables to supply
      * @param arguments positional arguments for the driver, which {@code _main} would exec
      * @param defaultProfile whether the driver supplies {@code dev} when no profile was given; {@code false}
-     *        leaves the profile unresolved so the script's own refusal can be observed
+     *        leaves the profile unresolved so the script's own handling of it can be observed
      * @return the exit code and combined output of the run
      */
     private static EntryPointRun runInSandbox(Path workDir, Path sandbox, String body,
