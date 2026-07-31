@@ -124,15 +124,23 @@ import org.apache.ofbiz.base.util.GeneralException;
  * is likewise not a provider's business; it is the storage-aware bridge on
  * {@link ContentStoreFactory}, which an implementation of this interface neither sees nor needs.
  *
- * <p><strong>Which operations the Content component reaches.</strong> Through the bridge, the
- * component's own file-resolution seam reaches {@link #get(String)} when it materialises stored
- * content as a local file, {@link #openStream(String)} when it renders content straight to a
- * response, and {@link #put(String, byte[])} when a staged write or upload is published as the
- * transaction commits - which together cover reading, rendering, uploading, creating and updating
- * file-backed content.
+ * <p><strong>Which operations the Content component reaches.</strong> Every integrated path uses the
+ * streaming pair and the measurements beside it, never the bounded convenience forms: the component's
+ * file-resolution seam reaches {@link #openStream(String)} when it renders content straight to a
+ * response and when it materialises stored content as a local file, {@link #size(String)} when it
+ * declares a length beside a stream, {@link #exists(String)} when it decides which side of the seam
+ * holds the content, and {@link #put(String, InputStream, long)} when a staged write or upload is
+ * published as the transaction commits - which together cover reading, rendering, uploading, creating
+ * and updating file-backed content. Content that an uploader chose the size of therefore never becomes
+ * an allocation of that size, and no ceiling applies to it.
  *
- * <p>{@link #exists(String)} and {@link #delete(String)} complete the storage contract, and every
- * provider implements and is tested against both, but no Content component path invokes them.
+ * <p>{@link #get(String)} and {@link #put(String, byte[])} are consequently reached by no integrated
+ * path at all. They remain part of the contract, and every provider implements and is tested against
+ * both, because they are the natural shape for a caller that already holds - or genuinely wants - the
+ * whole content in memory; that is exactly why they are the forms that carry the in-memory ceilings.
+ *
+ * <p>{@link #delete(String)} completes the storage contract, and every provider implements and is
+ * tested against it, but no Content component path invokes it.
  * That is not an omission in this package: OFBiz removes a file-backed data resource with the
  * {@code removeDataResource} service, which is declared {@code engine="entity-auto"} with
  * {@code invoke="delete"} and therefore removes the {@code DataResource} row alone. No OFBiz code

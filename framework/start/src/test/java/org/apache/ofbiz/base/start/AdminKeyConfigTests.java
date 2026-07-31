@@ -134,9 +134,7 @@ public final class AdminKeyConfigTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The shipped properties file
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -180,9 +178,7 @@ public final class AdminKeyConfigTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Config resolution
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -210,9 +206,7 @@ public final class AdminKeyConfigTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The stop script must land on the same effective key
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -224,9 +218,9 @@ public final class AdminKeyConfigTests {
 
         StopScriptRun run = runStopScript(tempDir, repositoryRoot().resolve(START_PROPERTIES), null);
 
-        // The regression this whole class exists for: the script used to derive an EMPTY key from the
-        // commented anchor while the server was listening for "NA", so AdminServerContainer rejected
-        // every SHUTDOWN and the container never stopped cleanly.
+        // The regression this whole class exists for: deriving the key from the commented anchor yields an
+        // EMPTY key while the server listens for "NA", so AdminServerContainer would reject every SHUTDOWN
+        // and the container would never stop cleanly.
         assertEquals(0, run.getExitCode(), "stop script exit code, output was:\n" + run.getOutput());
         assertEquals(config.getAdminKey() + SHUTDOWN_SUFFIX, run.getPayload(), "bytes sent to the admin socket");
         assertEquals("telnet://localhost:" + config.getAdminPort(), run.getCurlArguments(), "admin socket address");
@@ -309,6 +303,39 @@ public final class AdminKeyConfigTests {
         assertNull(run.getPayload(), "nothing may be sent to the admin socket when resolution failed");
     }
 
+    /**
+     * The loop the entry point's withdrawal is driven by, in place of a hand written {@code unset} per name.
+     */
+    private static final String WITHDRAWAL_LOOP =
+            "for variableName in \"${RUNTIME_APPLIED_VARIABLES[@]}\" \"${CONTAINER_CONTROL_VARIABLES[@]}\"; do";
+
+    /**
+     * Whether the entry point withdraws {@code variable} from the environment before it execs the server.
+     *
+     * <p>The withdrawal is driven by the two declared inventories rather than by one hand written
+     * {@code unset} per name, so what has to be present is the variable's DECLARATION plus the loop that
+     * consumes both arrays. Asserting on a literal {@code unset OFBIZ_X} would hold only while the list
+     * stayed hand written, which is the drift the loop exists to remove - two names were once missed by
+     * exactly that list. The behaviour itself is exercised end to end by
+     * {@code SchemaInitEntryPointTests}, which plants every declared name and drives the real function.</p>
+     *
+     * @param entryPoint the entry point's text
+     * @param variable the environment variable that must not survive into the served JVM
+     * @return true when the variable is declared by an inventory the withdrawal loop consumes
+     */
+    private static boolean withdrawnBeforeExec(String entryPoint, String variable) {
+        boolean declared = false;
+        for (String inventory : List.of("RUNTIME_APPLIED_VARIABLES=(", "CONTAINER_CONTROL_VARIABLES=(")) {
+            int at = entryPoint.indexOf(inventory);
+            int end = at < 0 ? -1 : entryPoint.indexOf("\n)", at);
+            if (end < 0) {
+                continue;
+            }
+            declared = declared || List.of(entryPoint.substring(at, end).split("\\s+")).contains(variable);
+        }
+        return declared && entryPoint.contains(WITHDRAWAL_LOOP) && entryPoint.contains("unset \"$variableName\"");
+    }
+
     @Test
     public void entryPointInjectsTheKeyIntoAProtectedFileAndNeverOntoACommandLine() throws IOException {
         String executable = executableLinesOf(repositoryRoot().resolve(ENTRY_POINT));
@@ -322,7 +349,7 @@ public final class AdminKeyConfigTests {
                 "the entry point must write the package qualified override so that Config resolves it");
         assertFalse(executable.contains("config/start.properties"),
                 "a flat config/start.properties shadows nothing and must not be written");
-        assertTrue(executable.contains("unset OFBIZ_ADMIN_KEY"),
+        assertTrue(withdrawnBeforeExec(executable, "OFBIZ_ADMIN_KEY"),
                 "the injected key must be removed from the environment OFBiz inherits");
         assertTrue(executable.contains("capture_secret_environment"),
                 "the injected key must be moved out of the exported environment before any child process runs");
@@ -411,8 +438,8 @@ public final class AdminKeyConfigTests {
                 "AdminServerContainer splits on the first ':', so a key containing one could never authenticate");
         assertFalse(first.getOutput().contains(generated), "the generated key leaked into the output");
 
-        // Stability matters: the key used to be generated once per image, so regenerating it on every
-        // restart would be a behaviour change that breaks an in-flight shutdown request.
+        // Stability matters: a key regenerated on every restart would be a behaviour change that breaks an
+        // in-flight shutdown request.
         renderAdminKeyConfiguration(tempDir, sandbox, Map.of());
         assertEquals(generated, loadProperties(override).getProperty(ADMIN_KEY_PROPERTY),
                 "a generated key must stay stable for the life of the container state directory");
@@ -593,8 +620,8 @@ public final class AdminKeyConfigTests {
      * an operator-facing diagnostic, so it must be safe to switch on in the environment where diagnostics
      * are actually needed.</p>
      *
-     * <p>The whole {@code _main} prologue is executed, not the one function, because that is what proves
-     * the guarantee end to end: the snapshot, the defaulting, and the advisory that prints the collected
+     * <p>The whole {@code _main} prologue is executed, not the one function, because that is what exercises
+     * the rule end to end: the snapshot, the defaulting, and the advisory that prints the collected
      * names all run with tracing on, and the assertion is that the names appear and the values do not.</p>
      *
      * @param tempDir a per-test temporary directory
@@ -633,6 +660,62 @@ public final class AdminKeyConfigTests {
         }
         assertTrue(run.getOutput().contains("OFBIZ_ADMIN_KEY"),
                 "the NAMES are the point of the snapshot and must still be reported, output was:\n" + run.getOutput());
+    }
+
+    /**
+     * Neither secret validator may publish a secret while deciding whether it was supplied.
+     *
+     * <p>{@code validate_required_secrets} and {@code validate_externally_provisioned_secrets} report the
+     * whole missing set in one message, so both walk the supplied secrets testing only whether each is
+     * empty - {@code [ -z "${!name}" ]} and {@code [ -z "$OFBIZ_ADMIN_KEY" ]}. Neither reads a value, but
+     * {@code set -x} echoes a command with its arguments ALREADY expanded, so under {@code OFBIZ_TRACE}
+     * the emptiness test itself wrote the admin key, both signing keys and all three managed database
+     * passwords to the container log. Presence testing is therefore not exempt from the secret regions:
+     * the expansion is the disclosure, whatever the test does with the result.</p>
+     *
+     * <p>Both validators run in one case, under a supplied set that satisfies both, so the assertion is
+     * that they complete without publishing anything. The traced-output control matters as much as the
+     * secret assertions: without it a case in which tracing silently failed to switch on would pass while
+     * proving nothing, so the run is required to have traced at least one command.</p>
+     *
+     * @param tempDir a per-test temporary directory
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    @Test
+    public void entryPointNeverTracesASecretWhileValidatingThatItWasSupplied(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSkipInitSandbox(Files.createTempDirectory(tempDir, "validate"),
+                USABLE_ADMIN_KEY, USABLE_SIGNING_KEY, USABLE_SIGNING_KEY);
+        Map<String, String> environment = new LinkedHashMap<>();
+        environment.put("OFBIZ_TRACE", "1");
+        environment.put("OFBIZ_PROFILE", "prod");
+        // Set so that the managed database passwords are required, and therefore tested, in this run.
+        environment.put("OFBIZ_POSTGRES_HOST", "db.example.invalid");
+        environment.put("OFBIZ_ADMIN_KEY", "validated-admin-key-3Hs8Wp");
+        environment.put("OFBIZ_LOGIN_SECRET_KEY", "validated-login-key-6Bn4Kz");
+        environment.put("OFBIZ_JWT_TOKEN_KEY", "validated-jwt-key-9Fd2Qm");
+        environment.put("OFBIZ_POSTGRES_OFBIZ_PASSWORD", "validated-main-password-5Tv7Rj");
+        environment.put("OFBIZ_POSTGRES_OLAP_PASSWORD", "validated-olap-password-8Cy1Ln");
+        environment.put("OFBIZ_POSTGRES_TENANT_PASSWORD", "validated-tenant-password-2Gk6Xa");
+
+        EntryPointRun run = runEntryPoint(tempDir, sandbox, environment,
+                "validate_required_secrets\nvalidate_externally_provisioned_secrets");
+
+        assertEquals(0, run.getExitCode(),
+                "a fully supplied prod secret set must satisfy both validators, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains("+ "),
+                "the case did not trace anything, so it cannot prove that tracing is safe; output was:\n"
+                        + run.getOutput());
+        for (Map.Entry<String, String> supplied : environment.entrySet()) {
+            if (!supplied.getKey().endsWith("KEY") && !supplied.getKey().endsWith("PASSWORD")) {
+                continue;
+            }
+            assertFalse(run.getOutput().contains(supplied.getValue()),
+                    supplied.getKey() + " leaked its VALUE into the traced output, which in a container is the log"
+                            + " stream. A presence test expands the secret before it runs, so both validators have to"
+                            + " suspend tracing around it. Output was:\n" + run.getOutput());
+        }
     }
 
     /**
@@ -723,9 +806,7 @@ public final class AdminKeyConfigTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**

@@ -31,8 +31,12 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import jakarta.servlet.Filter;
+import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletContext;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletRequest;
+import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -55,9 +59,10 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  * <p>Status-code contract:
  *
  * <ul>
- * <li>{@code /health/live} - always {@code 200 OK} once the servlet container is up. No delegator
- *     lookup, no database access and no session access, so it still answers while the datasource is
- *     unavailable. A load balancer uses it to decide whether an instance has to be replaced.</li>
+ * <li>{@code /health/live} - {@code 200 OK} for every request that satisfies the method and body
+ *     rules below, once the servlet container is up. No delegator lookup, no database access and no
+ *     session access, so it still answers while the datasource is unavailable. A load balancer uses
+ *     it to decide whether an instance has to be replaced.</li>
  * <li>{@code /health/ready} - {@code 200 OK} when every readiness dimension this instance owes the
  *     fleet is satisfied, otherwise {@code 503 SERVICE_UNAVAILABLE}. Two dimensions are measured, in
  *     this order:
@@ -74,11 +79,12 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  *         instance without that transport must be taken out of service rather than left serving.</li>
  *     </ol>
  *     A load balancer uses the endpoint to decide whether to route traffic to an instance. Exactly one
- *     readiness check runs at a time and its verdict is shared: overlapping probes are answered from
- *     that check or from the most recent verdict, so probe concurrency never manufactures a
- *     {@code DOWN} answer for a healthy instance - see the verdict cache below. The check itself is
- *     bounded by its own deadline, so no probe can occupy a container request thread for as long as a
- *     connection borrow or a socket read might take.</li>
+ *     readiness check runs at a time and its verdict is shared: an overlapping probe is answered from
+ *     that check or from the most recent verdict rather than by starting a second one - see the verdict
+ *     cache below. A probe's wait for a running check is bounded, so it does not occupy a container
+ *     request thread for as long as a connection borrow or a socket read might take; a probe that
+ *     exceeds the bound, or that arrives with the waiter slots full, is answered {@code 503} under its
+ *     own event code.</li>
  * <li>Any other path - {@code 404 NOT_FOUND}, so a mis-configured probe fails visibly instead of
  *     reporting false health. Under the two exact url-patterns this class is mapped with, the
  *     container answers an unknown path before the request reaches here; the branch applies when it
@@ -86,44 +92,68 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  * <li>Any method other than {@code GET} or {@code HEAD} - {@code 405 METHOD_NOT_ALLOWED} with an
  *     {@code Allow} header.</li>
  * <li>Any request carrying an entity body - {@code 400 BAD_REQUEST}, decided from the headers
- *     alone so that not one byte of the body is ever read.</li>
+ *     alone, so this class reads no part of the body.</li>
  * </ul>
  *
  * <p>Every readiness dependency failure - a delegator lookup that throws, a null delegator, a
  * {@code GenericEntityException} from the count, an unchecked failure such as an exhausted connection
  * pool, or a cache-invalidation transport with no connected subscriber - is converted inside the
- * check's single protected block into the same fixed {@code 503} document. Nothing propagates out of
- * the probe, so the container can never render an error page or an exception report on these
- * unauthenticated paths. Each response body is a small fixed JSON document
- * ({@code application/json}, UTF-8) with no variable part, marked non-cacheable so that no
- * intermediary can serve a stale verdict. The {@code 503} document names no dimension, because a
- * probe client acts on the status code and which dimension failed is an internal detail that belongs
- * in the log - under its own event code - and not in an answer to an anonymous caller.
+ * check's single protected block into the same fixed {@code 503} document. That block catches
+ * {@code GenericEntityException} and {@code RuntimeException}, which is what keeps a dependency
+ * failure from reaching the container's error-page machinery on these unauthenticated paths; an
+ * {@code Error}, and an {@code IOException} raised while the response is being written, lie outside
+ * it. Each response body is a small fixed JSON document ({@code application/json}, UTF-8) with no
+ * variable part, marked non-cacheable so that an intermediary does not serve a stale verdict. The
+ * {@code 503} document names no dimension, because a probe client acts on the status code and which
+ * dimension failed belongs in the log - under its own event code - rather than in an answer to an
+ * anonymous caller.
  *
- * <p>Because the paths are anonymous and polled continuously, the probe writes no internal detail
- * anywhere: no throwable, no stack, no SQL, no connection string and no row count reach the log.
- * What is logged is a stable event code and the number of occurrences suppressed since the previous
- * line, at most one line per code per minute; a count left outstanding when the events stop is
- * written by the next readiness probe once that minute has elapsed, so nothing is lost.
+ * <p>Because the paths are anonymous and polled continuously, this class writes no internal detail of
+ * its own: it passes no throwable, stack, SQL, connection string or row count to {@link Debug}. What
+ * it logs is a stable event code and the number of occurrences suppressed since the previous line, at
+ * most one line per code per minute. What the entity engine or the connection pool logs about the same
+ * failure from its own tier is that tier's behaviour, not this class's. A count left outstanding when
+ * the events stop is written by the next readiness probe once that minute has elapsed.
  *
  * <h2>How the probes are reached anonymously</h2>
  *
- * <p>This is a plain servlet. A deployment descriptor maps it on the two probe paths and adds
- * {@code /health} to the {@code allowedPaths} of {@code ControlFilter}, which is the same mechanism
- * the pre-existing {@code /ping.txt} entry uses; {@code ControlFilter} matches that list with
- * {@code startsWith}, so one entry covers both probes. Without it a probe would be redirected to
- * {@code /control/main} and a load-balancer target group would read the {@code 302} as an unhealthy
- * target. The probes stay off {@code /control/*}, so no base permission applies to them, and this
- * class performs no login, no permission check, no session access and no service-engine invocation
- * of its own.
+ * <p>The class is registered twice in a deployment descriptor, as a {@link Filter} on the two exact
+ * probe paths and as a servlet on the same two paths, and the {@code filter-mapping} is declared
+ * FIRST so that the container builds the chain with it ahead of every other filter.
  *
- * <p>Being a servlet, a probe traverses the webapp's filter chain. Two consequences are worth
- * knowing, and neither is introduced by this class: {@code ControlFilter} and {@code ContextFilter}
- * both call {@code getSession()} unconditionally, so a probe mints an {@code HttpSession} that a
- * load balancer never returns, and {@code ContextFilter} hands the request to
- * {@code WebAppUtil.setAttributesFromRequestBody} before a servlet method is dispatched. This class
- * limits its own exposure to the second: it refuses any request that merely announces a body, from
- * the {@code Content-Length} and {@code Transfer-Encoding} headers, without reading a byte of it.
+ * <p>The filter registration is what makes the anonymous probe surface safe. {@link #doFilter} answers
+ * a probe and does not call {@code chain.doFilter}, so no other filter is entered for a probe request.
+ * That matters for two concrete reasons, both of them properties of the pre-existing chain rather than
+ * of this class:
+ *
+ * <ul>
+ * <li>{@code ControlFilter} and {@code ContextFilter} both call {@code getSession()} unconditionally,
+ *     so a probe that reached them would mint an {@code HttpSession} and a {@code JSESSIONID} that a
+ *     load-balancer target group does not return, together with the session listeners and the expiry
+ *     bookkeeping behind them, once per probe of every instance.</li>
+ * <li>{@code ContextFilter} hands the request to {@code WebAppUtil.setAttributesFromRequestBody},
+ *     which reads an {@code application/json} body of ANY size into a String and then into a Map
+ *     before a servlet method is dispatched. Terminating the chain first means an anonymous caller
+ *     cannot reach that parser through these paths at all. This class additionally refuses any request
+ *     that merely announces a body, from the {@code Content-Length} and {@code Transfer-Encoding}
+ *     headers, without reading a byte of it, so what is left unread is bounded by the connector -
+ *     Tomcat's default {@code maxSwallowSize} discards at most 2MB and then closes the
+ *     connection.</li>
+ * </ul>
+ *
+ * <p>A request whose path is not exactly one of the two probe paths is passed down the chain
+ * untouched, so the filter cannot affect anything else in the webapp. The probe paths are deliberately
+ * NOT added to {@code ControlFilter}'s {@code allowedPaths}: that filter matches its list with
+ * {@code startsWith}, so a {@code /health} entry would grant anonymous passage to every
+ * {@code /health*} spelling rather than to the two probes, and none is needed because the chain is
+ * short-circuited before {@code ControlFilter} is reached.
+ *
+ * <p>The servlet registration is kept as well. It is what makes the container resolve these two paths
+ * to this component rather than to its own default servlet, it keeps the probes off {@code /control/*}
+ * and therefore outside the OFBTOOLS and WEBTOOLS base permissions, and it is the role a webapp that
+ * maps the servlet alone still gets. Both roles apply the same method gate and the same handler, so
+ * the answer does not depend on which one served it. This class performs no login, no permission
+ * check, no session access and no service-engine invocation in either role.
  *
  * <p>Every field is a private constant or a thread-safe counter, so the single instance the
  * container creates is safe to serve concurrently.
@@ -132,13 +162,10 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  *
  * <p>Every interval this class measures - the verdict's age, the wait for a running check, that
  * check's own deadline and each event's rate-limit window - is measured with {@link System#nanoTime()}
- * and compared as a difference of two readings. Nothing here uses the wall clock, because nothing
- * here needs to know what time it is; it needs to know how much time has passed, and the wall clock
- * does not answer that question reliably. A time daemon stepping the clock, a leap-second smear or a
- * virtual machine resuming from a snapshot moves {@code System.currentTimeMillis()} in either
- * direction, and it does so most readily during the kind of incident readiness exists to report:
- * backwards, every window looks freshly claimed and every verdict looks new, so failures go
- * unreported and a stale verdict is honoured indefinitely; forwards, every bound expires at once.
+ * and compared as a difference of two readings, never with the wall clock. A time daemon stepping the
+ * clock, a leap-second smear or a virtual machine resuming from a snapshot moves
+ * {@code System.currentTimeMillis()} in either direction: backwards, every window would look freshly
+ * claimed and every verdict new; forwards, every bound would expire at once.
  *
  * <p>The class is inert until a webapp deployment descriptor maps it - no thread, no delegator and no
  * datasource access happens before the first probe is served. The {@code webapp} component declares
@@ -151,7 +178,7 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  * delegator lookup - least of all while an unreachable datasource is the condition being reported.
  */
 @SuppressWarnings("serial")
-public class HealthCheckServlet extends HttpServlet {
+public class HealthCheckServlet extends HttpServlet implements Filter {
 
     private static final String MODULE = HealthCheckServlet.class.getName();
 
@@ -275,25 +302,19 @@ public class HealthCheckServlet extends HttpServlet {
     private static final String EVENT_READINESS_CACHE_TRANSPORT_UNAVAILABLE = "HEALTH-READINESS-CACHE-TRANSPORT-UNAVAILABLE";
 
     // Rate limit for those events. An outage makes every probe of every load-balancer target fail at
-    // the polling interval, so an unthrottled line per failure turns the readiness endpoint into a
-    // log amplifier exactly when the log matters most. One line per minute per JVM is emitted per
-    // code, and the occurrences suppressed in between are counted onto the next line for that code -
-    // or, if the condition stops occurring, flushed by the next readiness probe once the window has
-    // elapsed (see flushSuppressedEvents), so the tail of a burst is quantified rather than lost.
+    // the polling interval, so one line per minute per JVM is emitted per code, and the occurrences
+    // suppressed in between are counted onto the next line for that code - or, if the condition stops
+    // occurring, flushed by the next readiness probe once the window has elapsed (see
+    // flushSuppressedEvents), so the tail of a burst is quantified rather than lost.
     //
-    // The interval is shared, but each code owns its own window and its own suppressed count. That
-    // separation is the point of having separate codes: a probe that could not obtain a verdict must
-    // not consume the window an unavailable datasource needs - the two coincide precisely, since a
-    // datasource that has stopped answering is what makes a check slow enough to be waited on - and no
-    // code may report another's occurrences as its own.
+    // The interval is shared, but each code owns its own window and its own suppressed count, so no
+    // code reports another's occurrences as its own.
     //
     // Every window below holds a System.nanoTime() reading rather than an epoch millisecond, because
-    // it is only ever used to measure an ELAPSED interval, and nanoTime is the only clock in the
-    // platform guaranteed not to jump: a wall-clock step from a time daemon, a leap-second smear or a
-    // virtual machine resuming from a snapshot can move currentTimeMillis in either direction, which
-    // would either silence these events for as long as the step or defeat the rate limit entirely.
-    // nanoTime's origin is arbitrary and may be negative, so an "unclaimed" window cannot be spelled
-    // as zero; it is seeded a whole interval in the past instead - see unclaimedWindow.
+    // it is only ever used to measure an ELAPSED interval and a wall-clock step would either silence
+    // these events for as long as the step or defeat the rate limit entirely. A nanoTime origin is
+    // arbitrary and may be negative, so an "unclaimed" window cannot be spelled as zero; it is seeded
+    // a whole interval earlier instead - see unclaimedWindow.
     private static final long READINESS_LOG_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1L);
     private static final AtomicLong READINESS_LOG_LAST_AT = new AtomicLong(unclaimedWindow());
     private static final AtomicLong READINESS_LOG_SUPPRESSED = new AtomicLong(0L);
@@ -316,151 +337,95 @@ public class HealthCheckServlet extends HttpServlet {
 
     // The most recent readiness verdict and the permit that lets exactly one probe establish it.
     //
-    // WHY THE VERDICT IS SHARED. A readiness query is not guaranteed to be quick: it borrows a pooled
-    // connection, and when the pool is exhausted DBCP blocks the caller for up to the datasource's
-    // pool-sleeptime, which DBCPConnectionFactory passes to setMaxWaitMillis and which the engine's
-    // own default leaves at five minutes. Readiness is polled continuously by every load-balancer
-    // target, and probes arrive whether or not the previous one answered, so letting every probe issue
-    // its own query lets an exhausted pool park one container thread per probe for that whole stretch
-    // until the instance has no request threads left for real traffic - having been asked nothing more
-    // than "are you ready". The managed-datasource definitions shorten that borrow wait, but this
-    // class does not rely on them doing so: the check is separately bounded here, see
-    // READINESS_CHECK_DEADLINE_MILLIS.
+    // A readiness query is not quick in the case that matters: it borrows a pooled connection, and an
+    // exhausted pool blocks the borrower for the datasource's pool-sleeptime, which
+    // DBCPConnectionFactory passes to setMaxWaitMillis and which the engine's own default leaves at
+    // five minutes. Readiness is polled continuously by every load-balancer target, and probes arrive
+    // whether or not the previous one answered, so a query per probe would park one container thread
+    // per probe for that stretch. The verdict is therefore shared: at most one check runs at a time,
+    // and every other probe is answered from that check or from the most recent verdict rather than
+    // being refused and answered not-ready.
     //
-    // Bounding the number of probes that may answer, which is what an admission counter does, cures
-    // that by manufacturing a failure verdict for the probes it refuses. That is the wrong trade: a
-    // multi-Availability-Zone target group is probed by one node per zone simultaneously, so from the
-    // third simultaneous prober onwards a healthy instance answers some probes DOWN and is drained.
-    // Sharing the verdict cures it without ever fabricating one, because the answer a shed probe
-    // needs is already being computed by the probe that got through.
-    //
-    // WHY SHARING THE VERDICT IS NOT ENOUGH ON ITS OWN. Coalescing the database work bounds how many
-    // probes touch the datasource - one - but on its own it does not bound how many CONTAINER THREADS
-    // readiness may occupy. A probe that arrives with no verdict to stand on waits for the running
-    // check (path 4 in isInstanceReady), and while the wait is short and holds no pooled
-    // connection, an unlimited number of probes may be inside it at once: an anonymous flood of a few
-    // thousand concurrent requests to /health/ready is then enough to hold every connector thread for
-    // the duration of the wait and starve real traffic, without a single database query being issued.
-    // That is the availability defect READINESS_MAX_WAITERS closes.
-    //
-    // READINESS_WAITERS bounds the waiters and nothing else. Only the path that has nothing to answer
-    // from is bounded, so the admission-counter trade above is not reintroduced wholesale: a probe over
-    // the bound re-reads the shared verdict, without blocking, and answers with it when one exists, so
-    // an instance that has completed a check within the grace window cannot be reported not-ready by
-    // any number of simultaneous probes. Only a probe that finds no verdict at all is answered
-    // not-ready, under its own event code. Readiness therefore holds at most READINESS_MAX_WAITERS
-    // threads for at most READINESS_CHECK_WAIT_NANOS each however hard the endpoint is flooded, and
-    // every probe beyond that is answered in constant time with no wait, no permit and no datasource
-    // access.
-    //
-    // The residue of the trade is real and is what sizes the bound: a probe refused a slot while NO
-    // verdict exists is answered not-ready without the datasource having said so. That state is a
-    // JVM's first probes and the interval between a verdict ageing out and the next check publishing,
-    // so the bound has to be far enough above legitimate probe concurrency that such a burst never
-    // reaches it - see READINESS_MAX_WAITERS, where that requirement, not the thread pool, is what
-    // fixes the number.
+    // READINESS_WAITERS bounds one thing only - how many probes may WAIT for a running check. Sharing
+    // the verdict coalesces the database work to one count, but on its own it does not bound how many
+    // container threads probes with no verdict to stand on may occupy inside that wait. A probe over
+    // the bound re-reads the shared verdict without blocking and answers with it when one exists; only
+    // a probe that finds no verdict at all is answered not-ready, under its own event code. Readiness
+    // therefore holds at most READINESS_MAX_WAITERS threads for at most READINESS_CHECK_WAIT_NANOS
+    // each however hard the endpoint is flooded, and every probe beyond that is answered in constant
+    // time with no wait, no permit and no datasource access.
     private static final AtomicLong READINESS_WAITERS = new AtomicLong(0L);
 
-    // How many probes may wait for a running check at the same time.
-    //
-    // SIZING IS A TRADE, AND ITS LOWER BOUND IS THE BINDING ONE. A probe refused a slot is answered
-    // from the shared verdict whenever one exists, so the bound is invisible to an instance that has
-    // completed a check within the grace window. The one state in which it is visible is a probe that
-    // arrives with NO verdict at all: at a JVM's very first probes, and in the brief interval between a
-    // verdict ageing out and the next check publishing. In that state the probes that fit in the waiter
-    // set are answered by the check they waited for, and any beyond it are answered not-ready - which
-    // is a verdict probe concurrency produced rather than the datasource, exactly the failure mode the
-    // shared verdict exists to prevent. The bound must therefore stay above the largest burst that can
-    // legitimately coincide with that state, or a cold start under normal polling would report a
-    // perfectly healthy instance not ready.
-    //
-    // WHAT THAT MAKES IT. A target group polls with one request per health-check node per interval, and
-    // a load balancer uses several nodes per Availability Zone, so a multi-zone deployment produces
-    // something of the order of ten simultaneous probes; a container orchestrator's own liveness and
-    // readiness probes and an operator's curl add a few more. Thirty-two leaves roughly threefold
-    // headroom over that, so no burst normal operation produces can reach it - and a cold start, which
-    // is precisely when several target groups and the orchestrator all probe an instance that has no
-    // verdict yet, is answered entirely by the check they share.
-    //
-    // AND WHY IT IS STILL A BOUND WORTH HAVING. Tomcat's maxThreads defaults to 200. Thirty-two waiters
-    // holding a thread for at most READINESS_CHECK_WAIT_NANOS is around a sixth of that pool for half
-    // a second, against an unbounded flood's ability to hold the whole pool for half a second per probe
-    // indefinitely. It is the ratio that matters, not the absolute number: whatever rate probes arrive
-    // at, readiness occupies at most this many threads, so real traffic always has the rest.
+    // How many probes may wait for a running check at the same time. The bound is visible only to a
+    // probe that arrives with NO verdict - a JVM's very first probes, and the brief interval between a
+    // verdict ageing out and the next check publishing - because every other probe is answered from
+    // the shared verdict. It has to stay above the largest burst that can legitimately coincide with
+    // that state, or a cold start under normal polling would answer a healthy instance not-ready: a
+    // multi-zone target group polled by several health-check nodes per zone, plus a container
+    // orchestrator's own liveness and readiness probes and an operator's curl, is of the order of ten
+    // simultaneous probes, so thirty-two leaves roughly threefold headroom. Against Tomcat's default
+    // maxThreads of 200, thirty-two waiters holding a thread for at most READINESS_CHECK_WAIT_NANOS is
+    // a bounded fraction of the pool whatever rate probes arrive at.
     private static final int READINESS_MAX_WAITERS = 32;
+
+    // READINESS_CHECK_RUNNING is the one-permit gate: the probe that wins it has the count issued, the
+    // others do not touch the datasource at all, and the verdict it publishes answers them. The permit
+    // is released by the CHECK, in its own finally, and never by the probe that started it - a probe
+    // that stops waiting for a slow check must not thereby licence the next probe to start a second
+    // concurrent count against a datasource that is evidently already struggling. The check owns the
+    // permit for as long as it runs and the abandoning probe answers from the fallbacks instead - see
+    // runBoundedReadinessCheck.
     //
-    // HOW IT IS SHARED. READINESS_CHECK_RUNNING is a one-permit gate: the probe that wins it has the
-    // count issued while the others do not touch the datasource at all. That is a STRICTER bound than
-    // an admission counter of two - at most one count can be inside the entity engine at any instant -
-    // and the verdict it publishes then answers every probe that asked. See isInstanceReady for
-    // the ways a probe is answered.
-    //
-    // The permit is released by the CHECK, in its own finally, and never by the probe that started it.
-    // That is what keeps the bound honest once the check itself is bounded: a probe that stops waiting
-    // for a slow check must not thereby licence the next probe to start a second concurrent count
-    // against a datasource that is evidently already struggling. The check therefore owns the permit
-    // for as long as it runs, however long that turns out to be, and the abandoning probe answers from
-    // the fallbacks instead - see runBoundedReadinessCheck.
-    //
-    // READINESS_VERDICT holds the verdict and the reading it was established at as ONE immutable
-    // value behind ONE atomic reference, so the two can never be read torn and no lock is needed. A
-    // null reference means no verdict has been established yet. It is a reference rather than a packed
-    // word because the instant is now a System.nanoTime() reading, whose origin is arbitrary and may
-    // be negative, so neither the sign nor zero is available to carry anything else.
+    // READINESS_VERDICT holds the verdict and the reading it was established at as ONE immutable value
+    // behind ONE atomic reference, so the two cannot be read torn and no lock is needed. A null
+    // reference means no verdict has been established yet. It is a reference rather than a packed word
+    // because the instant is a System.nanoTime() reading, whose origin is arbitrary and may be
+    // negative, so neither the sign nor zero is available to carry anything else.
     private static final AtomicReference<Verdict> READINESS_VERDICT = new AtomicReference<>(null);
     private static final AtomicLong READINESS_CHECK_RUNNING = new AtomicLong(0L);
 
     // How long a verdict answers a probe on its own, and how long it still answers one that could not
     // run a check of its own.
     //
-    // FRESH is deliberately shorter than any load-balancer health-check interval, so a probe schedule
-    // of the usual shape still measures the datasource on every round and readiness stays a live
-    // signal rather than a cached one. It only takes effect for probes that overlap - exactly the
-    // case that used to be shed - where it collapses a burst onto one query.
+    // FRESH is one second: a probe that finds a verdict younger than this answers from it, so probes
+    // that overlap collapse onto one count rather than each issuing their own.
     //
-    // GRACE is the window in which a verdict still stands for a probe that arrived while another
-    // probe's check was already running. It bounds how long a not-yet-refuted verdict may be repeated:
-    // a check that fails publishes its own verdict within milliseconds, so GRACE is only reached when
-    // a check is unusually slow or blocked on a borrow, and readiness then turns not-ready once GRACE
-    // past the last established verdict has elapsed - well inside the two-to-three consecutive
-    // failures a target group needs before it drains a target.
+    // GRACE is five seconds: past FRESH, a verdict still answers a probe that arrived while another
+    // probe's check was already running, which bounds how long a not-yet-refuted verdict may be
+    // repeated. A check that fails publishes its own verdict within milliseconds, so GRACE is reached
+    // only when a check is unusually slow or blocked on a borrow, and readiness turns not-ready once
+    // GRACE past the last established verdict has elapsed.
     private static final long READINESS_VERDICT_FRESH_NANOS = TimeUnit.SECONDS.toNanos(1L);
     private static final long READINESS_VERDICT_GRACE_NANOS = TimeUnit.SECONDS.toNanos(5L);
 
-    // How long a probe waits for a check that is already running, and how often it looks.
-    //
-    // This is the cold-start path: the very first probes of a JVM, and any probe arriving after GRACE
-    // has elapsed, have no verdict to fall back on, so they wait for the running check instead of
-    // guessing. The wait is bounded and the waiting probe holds no pooled connection and issues no
-    // query, so an unreachable datasource can occupy a probe thread for at most this long - three
-    // orders of magnitude below the five-minute borrow the bound above was introduced to prevent.
+    // How long a probe waits for a check that is already running, and how often it looks. A probe with
+    // no verdict to fall back on - a JVM's first probes, and any probe arriving after GRACE has
+    // elapsed - waits for the running check rather than starting one of its own. The wait is bounded
+    // and the waiting probe holds no pooled connection and issues no query.
     private static final long READINESS_CHECK_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(500L);
     private static final long READINESS_CHECK_POLL_MILLIS = 5L;
 
-    // How long the probe that won the permit waits for the count itself.
+    // How long the probe that won the permit waits for the count itself. Everything above bounds how
+    // long a probe waits for SOMEBODY ELSE's check; this bounds the check, which is the part that can
+    // block: it borrows a pooled connection, and an exhausted pool parks the borrower for the
+    // datasource's configured borrow wait, while the socket underneath it carries only whatever
+    // deadlines the JDBC URI does. Left unbounded, the winning probe holds a container request thread
+    // for that entire stretch, so the load balancer's own probe timeout expires first and readiness is
+    // decided by the balancer giving up rather than by anything this instance reported. The
+    // managed-datasource definitions shorten the borrow wait and add explicit socket and connect
+    // deadlines, but a probe applies its own deadline rather than depending on datasource
+    // configuration to stay bounded.
     //
-    // WHY THIS EXISTS AT ALL. Everything above bounds how long a probe waits for SOMEBODY ELSE's
-    // check. It does not bound the check, and the check is the part that can block: it borrows a
-    // pooled connection, and an exhausted pool parks the borrower for the datasource's configured
-    // borrow wait, while the socket underneath it has only whatever deadlines the JDBC URI carries.
-    // Left unbounded, the winning probe holds a container request thread for that entire stretch, so
-    // the load balancer's own probe timeout expires first and readiness is decided by the balancer
-    // giving up rather than by anything this instance reported. The managed-datasource definitions
-    // shorten the borrow wait and add explicit socket and connect deadlines, but a probe must not
-    // depend on datasource configuration to stay bounded, so it applies its own deadline as well.
+    // The count runs on a small dedicated executor and the probe waits on the Future for at most this
+    // long. The count is NOT interrupted when the wait expires: interrupting a thread inside a JDBC
+    // borrow or a socket read rarely stops it and can leave a pooled connection in an indeterminate
+    // state, and the reading it eventually produces is a real measurement worth publishing. It keeps
+    // the permit until it finishes, so nothing starts a second count, and the probe that stopped
+    // waiting answers from the fallbacks instead.
     //
-    // HOW IT IS APPLIED. The count runs on a small dedicated executor and the probe waits on the
-    // Future for at most this long - the platform's own cancellable, bounded wait. The count is NOT
-    // interrupted when the wait expires: interrupting a thread inside a JDBC borrow or a socket read
-    // rarely stops it and can leave a pooled connection in an indeterminate state, and the reading it
-    // eventually produces is a real measurement worth publishing. It keeps the permit until it
-    // finishes, so nothing starts a second count, and the probe that stopped waiting answers from the
-    // fallbacks instead.
-    //
-    // WHY IT IS THIS LONG. It has to be shorter than the load balancer's probe timeout for the
-    // deadline to be this instance's rather than the balancer's; two seconds sits comfortably under
-    // the two-to-six seconds those timeouts are usually set to, is two orders of magnitude below the
-    // borrow wait it is guarding against, and is far longer than a healthy count needs.
+    // Two seconds is shorter than the probe timeouts load balancers are usually configured with, so
+    // the deadline is this instance's rather than the balancer's; it is two orders of magnitude below
+    // the borrow wait it guards against and far longer than a healthy count needs.
     private static final long READINESS_CHECK_DEADLINE_DEFAULT_MILLIS = 2000L;
     // The narrowest and widest deadline accepted from configuration. Below the floor a healthy count
     // on a loaded instance would be abandoned routinely, turning the fallbacks into the normal path.
@@ -489,30 +454,74 @@ public class HealthCheckServlet extends HttpServlet {
     private static final AtomicReference<ExecutorService> CHECK_EXECUTOR_OVERRIDE = new AtomicReference<>(null);
 
     /*
-     * Method gate. Everything this endpoint serves is a GET or a HEAD, and every other method is
-     * refused here before HttpServlet's dispatch can reach one of its own defaults, which are all
-     * unusable for a probe endpoint: doTrace echoes the received request headers straight back to an
-     * anonymous caller, doPost, doPut and the rest answer through sendError, which hands the response
-     * to the container error-page machinery and would replace the compact JSON document with an HTML
-     * page, and a method HttpServlet does not dispatch at all - PATCH and PROPFIND among them - would
-     * otherwise be answered 501 by that same error-page machinery rather than 405.
-     *
-     * Refusing here rather than in each doXxx override keeps one rule in one place and makes the
-     * refusal uniform for every method, named or not. The request is then handed to super.service(),
-     * which performs the ordinary dispatch to doGet and doHead below, so those two remain the entry
-     * points that serve a probe.
+     * The servlet entry point: the method gate, then HttpServlet's ordinary dispatch to doGet and
+     * doHead below. Gating here rather than in each doXxx override makes the refusal uniform for every
+     * method, named or not - see methodRefused for why none of HttpServlet's own defaults may be
+     * reached.
      */
     @Override
     protected void service(HttpServletRequest request, HttpServletResponse response)
             throws IOException, ServletException {
-        if (!ALLOWED_METHODS.contains(request.getMethod())) {
-            // 405 has to carry Allow per the HTTP specification, and it also tells a mis-configured
-            // target group what to switch to.
-            response.setHeader(ALLOW_HEADER, ALLOW_VALUE);
-            writeResponse(response, HttpServletResponse.SC_METHOD_NOT_ALLOWED, BODY_UNKNOWN);
+        if (methodRefused(request, response)) {
             return;
         }
         super.service(request, response);
+    }
+
+    /*
+     * Answers a probe from the FIRST position in the webapp's filter chain, ahead of every filter that
+     * would create a session or parse the request body, and passes everything else straight through.
+     *
+     * The path is compared exactly, with isProbePath, so a request this filter's mapping happens to
+     * cover but that is not one of the two probes continues down the chain untouched rather than being
+     * answered here. A non-HTTP request is passed through for the same reason: this filter has nothing
+     * to say about it.
+     *
+     * Answering here means chain.doFilter is not called, which is what keeps ControlFilter and
+     * ContextFilter out of a probe - see the class comment for what each of them would otherwise do to
+     * every probe of every instance. The method gate and the handler are the same ones the servlet role
+     * uses, so the two registrations cannot answer the same request differently.
+     */
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+        if (!(request instanceof HttpServletRequest) || !(response instanceof HttpServletResponse)) {
+            chain.doFilter(request, response);
+            return;
+        }
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        String path = resolveProbePath(httpRequest);
+        if (!isProbePath(path)) {
+            chain.doFilter(request, response);
+            return;
+        }
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        if (methodRefused(httpRequest, httpResponse)) {
+            return;
+        }
+        handleProbe(httpRequest, httpResponse, path);
+    }
+
+    /*
+     * The method gate, shared by both registrations so one rule is enforced from one implementation.
+     *
+     * Everything this endpoint serves is a GET or a HEAD. Refusing every other method here keeps
+     * HttpServlet's own defaults out of reach, and they are all unusable for a probe endpoint: doTrace
+     * echoes the received request headers straight back to an anonymous caller, doPost, doPut and the
+     * rest answer through sendError, which hands the response to the container error-page machinery and
+     * would replace the compact JSON document with an HTML page, and a method HttpServlet does not
+     * dispatch at all - PATCH and PROPFIND among them - would otherwise be answered 501 by that same
+     * machinery rather than 405.
+     */
+    private static boolean methodRefused(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        if (ALLOWED_METHODS.contains(request.getMethod())) {
+            return false;
+        }
+        // 405 has to carry Allow per the HTTP specification, and it also tells a mis-configured
+        // target group what to switch to.
+        response.setHeader(ALLOW_HEADER, ALLOW_VALUE);
+        writeResponse(response, HttpServletResponse.SC_METHOD_NOT_ALLOWED, BODY_UNKNOWN);
+        return true;
     }
 
     /*
@@ -562,8 +571,6 @@ public class HealthCheckServlet extends HttpServlet {
             } else {
                 writeResponse(response, HttpServletResponse.SC_SERVICE_UNAVAILABLE, BODY_READY_DOWN);
             }
-            // Written after the verdict, so accounting for what the rate limit held back never delays
-            // the answer a load balancer is waiting for - see flushSuppressedEvents.
             flushSuppressedEvents();
         } else {
             // An unmapped path fails visibly instead of reporting a false 200, which would let a
@@ -643,59 +650,33 @@ public class HealthCheckServlet extends HttpServlet {
      * runReadinessCheck for what is measured and READINESS_VERDICT for why the verdict is shared
      * rather than measured per probe.
      *
-     * A probe is answered in one of four ways, in this order:
+     * The order below is: a verdict younger than READINESS_VERDICT_FRESH_NANOS, then the one permitted
+     * check, then a verdict still within READINESS_VERDICT_GRACE_NANOS, then a bounded wait for the
+     * running check, then a constant-time answer once the waiter bound is reached. Every path is
+     * bounded - the verdict paths touch nothing, the wait by READINESS_CHECK_WAIT_NANOS, the check by
+     * READINESS_CHECK_DEADLINE_MILLIS - so no path parks a container request thread on a connection
+     * borrow or a socket read.
      *
-     *   1. from a verdict younger than READINESS_VERDICT_FRESH_NANOS, touching nothing at all;
-     *   2. by having the check run, if it wins the one permit, and publishing what it found - within its
-     *      own bounded deadline, see runBoundedReadinessCheck;
-     *   3. from a verdict younger than READINESS_VERDICT_GRACE_NANOS, when a check is already running or
-     *      is still running past its deadline, and has not refuted that verdict yet;
-     *   4. by waiting a bounded time for the running check to publish, if it is one of at most
-     *      READINESS_MAX_WAITERS probes doing so - see awaitRunningCheck;
-     *   5. immediately, without waiting at all, once that bound is reached - see answerWithoutWaiting.
-     *
-     * The first four answer with a verdict a completed check actually produced. Probe concurrency alone
-     * can therefore never turn a healthy instance into a not-ready one, which is what an admission
-     * counter that answered "not ready" for the probes it refused did: a load-balancer target group
-     * probed by one node per Availability Zone routinely has three or more probes in flight at once,
-     * so the refusals landed in normal operation and drained healthy targets.
-     *
-     * The fifth is what bounds thread occupancy, and it is deliberately NOT such an admission counter:
-     * it still answers from the shared verdict whenever one exists, and answers not-ready only when no
-     * verdict exists to answer from - a state in which nothing has established that the instance can
-     * serve. Reaching it at all needs several times the simultaneous probes a target group and a
-     * container orchestrator produce together; see READINESS_MAX_WAITERS for why that headroom is what
-     * keeps this path from behaving like the admission counter, and why the bound is sized by it.
-     *
-     * Exactly three answers are not backed by a completed check - a check that outran its own deadline
-     * with no verdict standing, the fourth waiting in vain, and the fifth finding no verdict to answer
-     * from - and each is reported under its own event code, so an operator can tell all three apart
-     * from a datasource that reported a failure, and from one another.
-     *
-     * EVERY path out of this method is bounded, which is the property that matters for a probe: the
-     * fresh and grace paths return without touching anything, the wait is bounded by
-     * READINESS_CHECK_WAIT_NANOS, and the check itself is bounded by READINESS_CHECK_DEADLINE_MILLIS.
-     * No path can park a container request thread on a connection borrow or a socket read.
+     * Three of those answers are not backed by a completed check: a check that outran its deadline with
+     * no verdict standing, a wait that ended without one being published, and a probe that found no
+     * verdict once the waiter bound was reached. Each is reported under its own event code, so an
+     * operator can tell them apart from a datasource that reported a failure, and from one another.
      *
      * A verdict is at most READINESS_VERDICT_FRESH_NANOS old on a path that has a check available and
-     * at most READINESS_VERDICT_GRACE_NANOS old on one that does not, so readiness remains a live
-     * signal in both directions and for every dimension: a datasource or a cache-invalidation
-     * transport that fails is reported not-ready on the next check, and one that recovers is reported
-     * ready again just as quickly, with no restart. That is what makes this a fail-closed state an
-     * instance leaves by itself once the dependency comes back, rather than a latch an operator has to
-     * reset.
+     * at most READINESS_VERDICT_GRACE_NANOS old on one that does not, so a dependency that fails is
+     * reported not-ready on the next check and one that recovers is reported ready again as quickly,
+     * with no restart: an instance leaves this state by itself rather than needing an operator to reset
+     * a latch.
      */
     private static boolean isInstanceReady(HttpServletRequest request) {
-        // 1. A verdict this recent answers on its own. Nothing is touched: no permit, no delegator, no
-        //    datasource. This is what a burst of overlapping probes normally lands on.
         Boolean fresh = establishedVerdict(READINESS_VERDICT_FRESH_NANOS);
         if (fresh != null) {
             return fresh;
         }
-        // 2. Otherwise one probe - and only one - has the check run and publishes what it found. The
-        //    context is read HERE, on the request thread, because the check runs on another thread and
-        //    a request object must not be touched from one: the ServletContext is the long-lived,
-        //    thread-safe object the check actually needs.
+        // One probe - and only one - has the check run and publishes what it found. The context is read
+        // HERE, on the request thread, because the check runs on another thread and a request object
+        // must not be touched from one; the ServletContext is the long-lived, thread-safe object the
+        // check actually needs.
         if (READINESS_CHECK_RUNNING.compareAndSet(0L, 1L)) {
             ServletContext context = probeContext(request);
             if (context == null) {
@@ -721,16 +702,16 @@ public class HealthCheckServlet extends HttpServlet {
                     READINESS_TIMEOUT_LOG_SUPPRESSED);
             return false;
         }
-        // 3. A check is already running and this probe has a verdict that has not been refuted yet, so
-        //    it repeats it rather than inventing a failure the datasource has not reported.
+        // A check is already running: repeat a verdict it has not refuted yet rather than inventing a
+        // failure the datasource has not reported.
         Boolean established = establishedVerdict(READINESS_VERDICT_GRACE_NANOS);
         if (established != null) {
             return established;
         }
-        // 4. Nothing to stand on - the running check is the only answer there is, so wait for it, but
-        //    only as one of a bounded set of waiters. The slot is released in a finally so that a
-        //    thread the container interrupts or an exception unwinding through here cannot leak one and
-        //    shrink the set for the life of the JVM.
+        // Nothing to stand on - the running check is the only answer there is, so wait for it as one of
+        // a bounded set of waiters. The slot is released in a finally so that a thread the container
+        // interrupts, or an exception unwinding through here, cannot leak one and shrink the set for
+        // the life of the JVM.
         if (claimWaiterSlot()) {
             try {
                 return awaitRunningCheck();
@@ -738,9 +719,9 @@ public class HealthCheckServlet extends HttpServlet {
                 READINESS_WAITERS.decrementAndGet();
             }
         }
-        // 5. The waiter set is full, so this probe is answered in constant time instead of occupying a
-        //    container thread. See READINESS_WAITERS for why this bound exists and why it does not
-        //    reintroduce the admission counter the shared verdict replaced.
+        // The waiter set is full, so this probe is answered in constant time instead of occupying a
+        // container thread. See READINESS_WAITERS for why the bound exists and why a probe over it is
+        // still answered from the shared verdict whenever one exists.
         return answerWithoutWaiting();
     }
 
@@ -776,8 +757,8 @@ public class HealthCheckServlet extends HttpServlet {
      * reasons. It is genuinely a new read: the running check may have published in the interval between
      * the grace-window read in isInstanceReady and this point, and a verdict that exists is always a
      * better answer than one this method would have to invent. And answering from it is what keeps this
-     * path from behaving like the admission counter the shared verdict was introduced to replace - a
-     * flood arriving at a healthy instance is answered with that instance's real, recent verdict.
+     * path from behaving like an admission counter, which the shared verdict exists to avoid - a flood
+     * arriving at a healthy instance is answered with that instance's real, recent verdict.
      *
      * Only a probe that finds no verdict at all is answered not-ready, and that is the honest answer
      * rather than a fabricated one: no verdict means no readiness check has completed in this JVM
@@ -825,30 +806,28 @@ public class HealthCheckServlet extends HttpServlet {
      * the check produced one in time, and null when it did not - "still running", which is not a
      * verdict and is why the return type is a boxed Boolean.
      *
-     * OWNERSHIP OF THE PERMIT. The submitted task releases the permit in its own finally, so the permit
-     * tracks the CHECK rather than the probe that started it. That is the whole point: when this method
-     * returns null the count is still in flight, and the next probe must not be allowed to start a
-     * second one against a datasource that is already failing to answer the first. The permit is
-     * released here only when the task never started - a submission the executor refuses - because
-     * then there is no check to release it later, and leaving it held would wedge readiness on the
-     * fallbacks for the life of the JVM.
+     * The submitted task releases the permit in its own finally, so the permit tracks the CHECK rather
+     * than the probe that started it: when this method returns null the count is still in flight, and
+     * the next probe must not start a second one against a datasource that is already failing to
+     * answer the first. The permit is released here only when the task never started - a submission the
+     * executor refuses - because then there is no check to release it later, and leaving it held would
+     * wedge readiness on the fallbacks for the life of the JVM.
      *
-     * NOT CANCELLED ON TIMEOUT. cancel(true) would interrupt a thread that is almost certainly inside
-     * a connection borrow or a socket read, where interruption is usually ineffective and can leave a
-     * pooled connection unusable, and it would discard a genuine measurement that is about to arrive.
-     * The task is therefore left to finish and publish; the executor's single thread means at most one
-     * such task can ever be outstanding, so nothing accumulates.
+     * The task is not cancelled when the wait expires. cancel(true) would interrupt a thread that is
+     * almost certainly inside a connection borrow or a socket read, where interruption is usually
+     * ineffective and can leave a pooled connection unusable, and it would discard a genuine
+     * measurement that is about to arrive. The task is left to finish and publish; the executor's
+     * single thread means at most one such task is ever outstanding.
      *
-     * FAIL-CLOSED. A refused submission and a task that threw are both answered not-ready under the
-     * datasource event code, so no failure of this mechanism can report a healthy instance.
+     * A refused submission and a task that threw are both answered not-ready under the datasource
+     * event code, so a failure of this mechanism does not report a healthy instance.
      *
-     * WHAT A PERMANENTLY WEDGED DATASOURCE LOOKS LIKE. If a count never returns, the permit is never
-     * released and no further count is ever started. Readiness then answers from the grace window
-     * until it expires and not-ready afterwards, which is the correct report for an instance whose
-     * datasource has stopped answering - and it costs no request thread beyond the bounded wait, which
-     * is the property the whole arrangement exists to guarantee. The managed-datasource definitions
-     * carry an explicit socket deadline so that such a count does eventually return and readiness can
-     * recover without a restart; this class stays bounded and truthful either way.
+     * If a count never returns, the permit is never released and no further count is started. Readiness
+     * then answers from the grace window until it expires and not-ready afterwards, which is the
+     * correct report for an instance whose datasource has stopped answering, and it costs no request
+     * thread beyond the bounded wait. The managed-datasource definitions carry an explicit socket
+     * deadline so that such a count does eventually return and readiness can recover without a
+     * restart.
      */
     private static Boolean runBoundedReadinessCheck(ServletContext context) {
         Future<Boolean> pending;
@@ -900,31 +879,32 @@ public class HealthCheckServlet extends HttpServlet {
      * probe put a deadline on it - see runBoundedReadinessCheck. Everything it needs is therefore
      * passed in as a long-lived, thread-safe object: the ServletContext, never the request.
      *
-     * WHAT IS CHECKED. The check the "ping" service performs (CommonServices.ping in
+     * The check is the one the "ping" service performs (CommonServices.ping in
      * framework/common, lines 479-501): count SequenceValueItem, a framework-tier entity of the
      * default org.apache.ofbiz group present in every deployment. The service itself is not invoked,
      * so no dispatcher, service engine or localisation is dragged into what has to stay a cheap probe.
      *
-     * BOTH of ping's failure rules are adopted, not only its query, because the Agent Action Plan
+     * Both of ping's failure rules are adopted, not only its query, because the Agent Action Plan
      * specifies this endpoint as "mirroring the ping service's SequenceValueItem count check" (AAP
      * section 0.4.1): a count that fails is ping's CommonPingDatasourceCannotConnect case, and a
      * count that returns zero is its CommonPingDatasourceInvalidCount case - "if (count != 0L)" at
-     * CommonServices.java line 495. Both mean "not ready" here. A non-zero count proves the delegator,
-     * the datasource, the connection pool, the SequenceValueItem table and the whole query path
-     * usable; a zero count says the schema holds no sequence rows at all, so the instance has not been
-     * through the schema-init execution and its data load. Reporting 200 in that state would attach an
-     * instance backed by an unpopulated schema to the load-balancer target group and turn a
-     * deployment-ordering mistake into user-visible failures instead of a visibly unhealthy target
-     * that never receives traffic. Any data load populates the entity, since the sequencer writes it.
+     * CommonServices.java line 495. Both mean "not ready" here. A count that returns non-zero is what
+     * this endpoint reports ready on: it shows that the delegator resolved, the datasource answered and
+     * the query path returned a row count. A count that returns zero, and a count that throws, are both
+     * reported not ready; neither outcome is evidence of anything beyond itself. The state a zero count
+     * most often indicates is a schema no data load has populated - any data load populates this entity,
+     * since the sequencer writes it - and reporting 200 then would attach an instance backed by an
+     * unpopulated schema to the load-balancer target group, turning a deployment-ordering mistake into
+     * user-visible failures instead of a visibly unhealthy target that never receives traffic.
      *
-     * THE SECOND DIMENSION is cache coherence, and it is measured only after the datasource has
+     * The second dimension is cache coherence, and it is measured only after the datasource has
      * answered - both because the delegator the first dimension resolves is what says whether the
      * second applies at all, and because ordering them this way keeps the more urgent operator signal
      * first: an instance that cannot reach its datasource has a bigger problem than one that cannot
      * reach a message broker, and it should not be reported under the broker's event code. See
      * isCacheTransportReady.
      *
-     * HOW IT IS ISSUED. The count goes through the entity helper that owns the entity's group rather
+     * The count goes through the entity helper that owns the entity's group rather
      * than through EntityQuery. Both end in the same GenericDAO.selectCountByCondition, so the same
      * SELECT COUNT runs against the same entity, but EntityQuery routes through
      * GenericDelegator.findCountByCondition, which logs the throwable together with its stack trace
@@ -951,9 +931,8 @@ public class HealthCheckServlet extends HttpServlet {
      *
      * The context is taken from the request rather than from getServletContext(). That is the same
      * object for a request dispatched into this webapp, and reading it from the request rather than
-     * from the ServletConfig keeps the check static and this class entirely free of per-instance
-     * state, so no initialisation order has to be relied on and both entry points share one
-     * implementation.
+     * from the ServletConfig keeps the check static and free of instance state, so no initialisation
+     * order has to be relied on and both entry points share one implementation.
      */
     private static boolean runReadinessCheck(ServletContext context) {
         try {
@@ -997,55 +976,52 @@ public class HealthCheckServlet extends HttpServlet {
     /*
      * Reports whether this instance is fit to serve as one member of a cache-coherent fleet.
      *
-     * WHY READINESS OWNS THIS AT ALL. When a delegator has distributed cache clear enabled, every
-     * entity write it performs calls EntityCacheServices, which dispatches the distributedClearCacheLine
-     * services asynchronously. Those services are declared engine="jms" location="serviceMessenger"
-     * and none of them declares require-new-transaction, so ServiceDispatcher.runAsync does not
-     * suspend the caller's transaction. If no jms-service named serviceMessenger is active,
-     * JmsServiceEngine.run dereferences a null service element; runAsync catches the throwable and
-     * calls TransactionUtil.rollback, which - because it did not begin the transaction - marks the
-     * CALLER's transaction rollback-only. EntityCacheServices catches only GenericServiceException
-     * and logs it, and cannot undo that mark. So an instance in that state does not merely serve
-     * stale caches: it rolls back the very writes it was asked to perform, once per write, with a
-     * stack trace each time. Nothing in the write path fails loudly enough to stop it, which is why
-     * the load balancer has to be the thing that stops it - by being told this instance is not ready.
+     * When a delegator has distributed cache clear enabled, every entity write it performs calls
+     * EntityCacheServices, which dispatches the distributedClearCacheLine services asynchronously.
+     * Those services are declared engine="jms" location="serviceMessenger" and none of them declares
+     * require-new-transaction, so ServiceDispatcher.runAsync does not suspend the caller's transaction.
+     * If no jms-service named serviceMessenger is active, JmsServiceEngine.run dereferences a null
+     * service element; runAsync catches the throwable and calls TransactionUtil.rollback, which -
+     * because it did not begin the transaction - marks the CALLER's transaction rollback-only.
+     * EntityCacheServices catches only GenericServiceException and logs it, and cannot undo that mark.
+     * So an instance in that state does not merely serve stale caches: it rolls back the very writes it
+     * was asked to perform, once per write, with a stack trace each time. Nothing in the write path
+     * fails loudly enough to stop it, which is why the load balancer has to be the thing that stops it,
+     * by being told this instance is not ready.
      *
-     * INERT UNLESS THE FLEET NEEDS IT. Delegator.useDistributedCacheClear() is the per-delegator
-     * distributed-cache-clear-enabled attribute, read straight off the already-parsed delegator
-     * configuration: no I/O, no logging and nothing to throw. It is false in the committed
-     * configuration, so a single-node or local H2 deployment never enters the rest of this method and
-     * its readiness verdict is exactly what it was before this dimension existed.
+     * The dimension is inert unless the fleet needs it. Delegator.useDistributedCacheClear() is the
+     * per-delegator distributed-cache-clear-enabled attribute, read straight off the already-parsed
+     * delegator configuration: no I/O, no logging and nothing to throw. It is false in the committed
+     * configuration, so a single-node or local H2 deployment does not enter the rest of this method and
+     * its readiness verdict is what it was before this dimension existed.
      *
-     * WHAT IS OBSERVED, AND WHY IT IS FREE. The dispatcher is read from the ServletContext attribute
-     * ContextFilter.init() publishes, never through WebAppUtil.getDispatcher, which BUILDS one when the
-     * attribute is absent. Its JmsListenerFactory - a plain field read on ServiceDispatcher, null when
-     * service.properties disables JMS - holds the subscribers, and getJMSListeners() hands back a copy
-     * of that map, so iterating it costs no lock and no network call. isConnected() is a plain field
-     * read on each listener. The whole dimension is therefore an in-process observation: it adds no
-     * socket, no broker round trip and no measurable time to a check that is already bounded, which is
-     * what makes it safe to run on a path a load balancer polls every few seconds.
+     * The dispatcher is read from the ServletContext attribute ContextFilter.init() publishes, never
+     * through WebAppUtil.getDispatcher, which BUILDS one when the attribute is absent. Its
+     * JmsListenerFactory - a plain field read on ServiceDispatcher, null when service.properties
+     * disables JMS - holds the subscribers, and getJMSListeners() hands back a copy of that map, so
+     * iterating it costs no lock and no network call. isConnected() is a plain field read on each
+     * listener. The whole dimension is an in-process observation: it adds no socket and no broker round
+     * trip to a check that is already bounded.
      *
-     * WHY THAT SIGNAL IS THE RIGHT ONE. It is strictly stronger than a TCP probe of the broker.
-     * JmsTopicListener.load() reports connected only after the JNDI initial context is built, the
-     * connection factory and the topic are looked up, a connection and a session are created, a
-     * subscriber is registered and the connection is started - so a connected subscriber proves the
-     * broker is reachable, the credentials are accepted and the topic exists, which is exactly what
-     * the SENDING half needs too. It is also self-healing in both directions and needs no state of its
-     * own: JmsListenerFactory registers each listener in its map BEFORE calling load(), so a listener
-     * that could not connect is present and reports false; AbstractJmsListener.onException sets the
-     * flag false the moment the broker drops and then retries refresh() every ten seconds, so the flag
-     * returns to true by itself when the broker comes back and the instance rejoins the target group
-     * with no restart and no operator action.
+     * The connected flag reports more than a TCP probe of the broker would. JmsTopicListener.load()
+     * sets it only after the JNDI initial context is built, the connection factory and the topic are
+     * looked up, a connection and a session are created, a subscriber is registered and the connection
+     * is started, so a connected subscriber indicates the broker was reachable, the credentials were
+     * accepted and the topic resolved - the same prerequisites the SENDING half needs. It is also
+     * self-healing in both directions and needs no state of its own: JmsListenerFactory registers each
+     * listener in its map BEFORE calling load(), so a listener that could not connect is present and
+     * reports false; AbstractJmsListener.onException sets the flag false the moment the broker drops
+     * and then retries refresh() every ten seconds, so the flag returns to true by itself when the
+     * broker comes back and the instance rejoins the target group with no restart and no operator
+     * action.
      *
-     * FAIL-CLOSED, INCLUDING DURING START-UP. An absent dispatcher attribute, a null listener factory,
-     * an empty subscriber map and a single disconnected subscriber all report not ready. The empty map
-     * is deliberate and covers two states that must both hold traffic off: the listener factory's
-     * loader thread has not completed its first pass yet, and the configuration declares no
-     * jms-service with listen="true" at all. Neither is a fleet member that can be trusted with a
-     * write, and reporting 200 in either would be the silent failure this exists to prevent. Every
-     * one of them is transient by construction - the loader retries, and the entry point refuses to
-     * start an instance with the flag set and no transport configured - so this cannot wedge a
-     * correctly configured deployment.
+     * The method is fail-closed, including during start-up. An absent dispatcher attribute, a null
+     * listener factory, an empty subscriber map and a single disconnected subscriber all report not
+     * ready. The empty map is deliberate and covers two states that must both hold traffic off: the
+     * listener factory's loader thread has not completed its first pass yet, and the configuration
+     * declares no jms-service with listen="true" at all. Neither is a fleet member that can be trusted
+     * with a write. Both are transient by construction - the loader retries, and the entry point
+     * refuses to start an instance with the flag set and no transport configured.
      *
      * The result is not logged here; the caller emits the one rate-limited event code, so a broker
      * outage across a whole fleet costs one line per minute per JVM rather than one per probe.
@@ -1079,11 +1055,9 @@ public class HealthCheckServlet extends HttpServlet {
      * is none that recent - "no answer available", which is not the same as a not-ready answer and is
      * why the return type is a boxed Boolean.
      *
-     * The age is a difference of two System.nanoTime() readings, so it measures elapsed time and
-     * nothing else: it cannot be distorted by a wall-clock step, and the subtraction stays correct
-     * across the counter's wraparound. A negative age is therefore unreachable from a monotonic
-     * source; it is still refused, because a verdict of unknowable age must not be honoured and one
-     * extra check is the entire cost of saying so.
+     * The age is a difference of two System.nanoTime() readings, so it measures elapsed time and stays
+     * correct across the counter's wraparound. A negative age is unreachable from a monotonic source
+     * and is refused anyway, because a verdict of unknowable age must not be honoured.
      */
     private static Boolean establishedVerdict(long windowNanos) {
         Verdict verdict = READINESS_VERDICT.get();
@@ -1113,10 +1087,9 @@ public class HealthCheckServlet extends HttpServlet {
      * A readiness verdict together with the monotonic reading at which it was established.
      *
      * Immutable and published through a single AtomicReference, which is what makes the pair
-     * indivisible: the previous encoding packed both into one long and could do so only because an
-     * epoch millisecond is always positive, leaving the sign free to carry the verdict. A
+     * indivisible. It is a value of its own rather than two halves packed into one long because a
      * System.nanoTime() reading has an arbitrary origin and may be negative or zero, so neither the
-     * sign nor zero is available and the pair has to be a value of its own.
+     * sign nor zero is available to carry the verdict.
      */
     private record Verdict(boolean ready, long establishedAtNanos) {
     }
@@ -1125,41 +1098,29 @@ public class HealthCheckServlet extends HttpServlet {
      * Waits for the check another probe is running and answers with its verdict.
      *
      * Only a probe with nothing to fall back on gets here, and only while holding one of the
-     * READINESS_MAX_WAITERS slots its caller claimed: a JVM's first probes, and any probe that arrives
-     * once the grace window past the last verdict has elapsed. It holds no connection and issues no
-     * query - it is waiting on a check that is already in flight - and it gives up after a wait bounded
-     * on the MONOTONIC clock, so a datasource that has stopped answering costs a probe thread that wait
-     * and nothing more, whatever the wall clock does meanwhile. Because the number of threads that may
-     * be in here at once is bounded as well, the total thread occupancy readiness can reach is
-     * READINESS_MAX_WAITERS multiplied by READINESS_CHECK_WAIT_NANOS, whatever rate probes arrive at.
+     * READINESS_MAX_WAITERS slots its caller claimed. It holds no connection and issues no query - it
+     * is waiting on a check already in flight - and it gives up after a wait bounded on the MONOTONIC
+     * clock, so readiness occupies at most READINESS_MAX_WAITERS threads for at most
+     * READINESS_CHECK_WAIT_NANOS each, whatever rate probes arrive at.
      *
-     * Giving up is the one case that answers not-ready without the datasource having said so, and it
-     * is reported under its own event code precisely so that it stays distinguishable from a
-     * datasource that failed: it means a readiness check was still running and no verdict was recent
-     * enough to repeat, which calls for looking at what is making the check slow.
+     * Giving up is the one case that answers not-ready without the datasource having said so, and it is
+     * reported under its own event code so that it stays distinguishable from a datasource that failed:
+     * it means a check was still running and no verdict was recent enough to repeat.
      */
     private static boolean awaitRunningCheck() {
         // The bound is measured on the MONOTONIC clock rather than on the wall clock, and is expressed
         // as "elapsed since start" rather than as an instant to compare against, because that form
-        // stays correct across the nanoTime counter's wraparound.
+        // stays correct across the nanoTime counter's wraparound. This is the only thing that limits
+        // how long a probe thread stays in this method, and a wall-clock step would falsify the bound
+        // both ways: forwards, the wait would end at once and a cold-start probe would report not-ready
+        // without having given the running check its 500 milliseconds; backwards, the bound would
+        // recede and the loop would keep polling until the clock caught up, occupying a probe thread
+        // for the length of the step and doing so for every probe in flight.
         //
-        // This is the only thing that limits how long a probe thread stays in this method, and
-        // System.currentTimeMillis is a reading of the wall clock rather than a measure of elapsed
-        // time: a time daemon steps it in either direction - an NTP correction, a container resuming
-        // on a host whose clock has moved on, an operator setting the date - and a step falsifies the
-        // bound both ways. Forwards, the wait ends immediately and a cold-start probe reports
-        // not-ready without having given the running check its 500 milliseconds. Backwards, and this
-        // is the damaging one, the bound recedes and the loop keeps polling until the wall clock
-        // catches up, so a step of a minute occupies a probe thread for a minute - exactly the
-        // unbounded occupancy the bound exists to prevent, multiplied by every probe in flight.
-        //
-        // System.nanoTime bears no relation to wall-clock time and is monotonic, so the wait stays
-        // 500 milliseconds whatever happens to the clock.
-        //
-        // The verdict a check publishes is timed on that same clock: Verdict carries a nanoTime
-        // reading in establishedAtNanos rather than an epoch millisecond, and establishedVerdict
-        // discards a verdict whose computed age comes out negative, so no part of this path depends
-        // on the wall clock at all.
+        // The verdict a check publishes is timed on that same clock: Verdict carries a nanoTime reading
+        // in establishedAtNanos rather than an epoch millisecond, and establishedVerdict discards a
+        // verdict whose computed age comes out negative, so no part of this path depends on the wall
+        // clock.
         long startedAt = System.nanoTime();
         while (true) {
             Boolean published = establishedVerdict(READINESS_VERDICT_FRESH_NANOS);
@@ -1220,18 +1181,15 @@ public class HealthCheckServlet extends HttpServlet {
     }
 
     /*
-     * Emits one warning for the given event code per READINESS_LOG_INTERVAL_NANOS, and appends the
-     * number of occurrences suppressed since the previous line so an outage - or a stretch in which no
-     * verdict could be obtained - is quantified rather than silently dropped. Occurrences suppressed
-     * after the last line of a burst are written by flushSuppressedEvents instead.
+     * Emits one warning for the given event code per READINESS_LOG_INTERVAL_NANOS. Occurrences inside
+     * that interval are counted instead, and the count is appended to the next line for the same code;
+     * occurrences left outstanding after the last line of a burst are written by flushSuppressedEvents.
      *
-     * The line carries the stable code and that count, and nothing else. It is emitted at warning
-     * level rather than as an error with a stack trace, because a readiness dip during start-up or a
-     * rolling deployment is expected and must not read as a fault.
-     *
-     * The window and the counter are passed in rather than read from a single pair of fields, so
-     * every event code is rate limited independently of the others: one code can neither silence
-     * another nor claim its suppressed occurrences.
+     * The window and the counter are passed in rather than read from a single pair of fields, so every
+     * event code is rate limited independently of the others: one code can neither silence another nor
+     * claim its suppressed occurrences. The line carries the stable code and that count and nothing
+     * else, at warning level rather than as an error with a stack trace, because a readiness dip during
+     * start-up or a rolling deployment is expected and must not read as a fault.
      */
     private static void logRateLimitedWarning(String eventCode, AtomicLong window, AtomicLong suppressed) {
         if (claimWindow(window)) {
@@ -1249,10 +1207,12 @@ public class HealthCheckServlet extends HttpServlet {
      * Without this the suppressed count is only ever carried by the NEXT occurrence of the same code,
      * so the moment the events stop - which is what recovery looks like - everything suppressed since
      * the last line is lost, and the tail of a burst is exactly the part an operator counts. Readiness
-     * is polled continuously, which is what makes calling this from a readiness probe enough: the
-     * outstanding count reaches the log within one probe interval of the window elapsing, whether or
-     * not the condition that produced it ever occurs again, and without this class owning a timer, a
-     * background thread or any per-instance state.
+     * is polled continuously, which is what makes calling this from a readiness probe the cheapest place
+     * to do it: a later readiness probe flushes the outstanding count once the window has elapsed,
+     * whether or not the condition that produced it ever occurs again. The flush is therefore driven by
+     * the next probe rather than by a clock - if probing stops, the outstanding count stays unwritten -
+     * which is the trade for this class owning no timer and no background thread. The windows and
+     * counters it does own are static and JVM-local; it holds no instance state.
      *
      * The rate limit is not weakened. Each code still claims its own window through the same
      * compare-and-set, so at most one line per code per interval is written, and a code with nothing
@@ -1269,11 +1229,6 @@ public class HealthCheckServlet extends HttpServlet {
                 READINESS_TRANSPORT_LOG_SUPPRESSED);
     }
 
-    /*
-     * Flushes one code's suppressed count. The counter is read before the window is claimed so a code
-     * with nothing outstanding never consumes its own window, and the count is re-tested after the
-     * claim because a concurrent occurrence may have taken it in between.
-     */
     private static void flushSuppressed(String eventCode, AtomicLong window, AtomicLong suppressed) {
         if (suppressed.get() > 0L && claimWindow(window)) {
             long missed = suppressed.getAndSet(0L);
@@ -1283,10 +1238,6 @@ public class HealthCheckServlet extends HttpServlet {
         }
     }
 
-    /*
-     * The one form in which a suppressed count is reported, so a log consumer parses a single shape no
-     * matter whether the count arrived on a later occurrence or on a flush.
-     */
     private static String suppressedLine(String eventCode, long missed) {
         return eventCode + " (" + missed + " further occurrences suppressed)";
     }
@@ -1298,10 +1249,10 @@ public class HealthCheckServlet extends HttpServlet {
      * exactly one of them wins the window and the losers are told so, which is why the caller can
      * treat a false result as "another thread is already handling this interval".
      *
-     * The readings are monotonic, so the interval this enforces is a real elapsed minute. On the wall
-     * clock it was not: a backwards step made every window look freshly claimed and silenced these
-     * events for the length of the step, and a forwards step reopened all of them at once - both
-     * during exactly the kind of incident that also disturbs a host's clock.
+     * The readings are monotonic, so the interval this enforces is a real elapsed minute. A wall-clock
+     * reading would not be: a backwards step would make every window look freshly claimed and silence
+     * these events for the length of the step, and a forwards step would reopen all of them at once -
+     * both during exactly the kind of incident that also disturbs a host's clock.
      */
     private static boolean claimWindow(AtomicLong window) {
         long now = System.nanoTime();
@@ -1369,8 +1320,8 @@ public class HealthCheckServlet extends HttpServlet {
      *
      * A DAEMON thread, so a check still blocked inside a connection borrow can never hold the JVM
      * open at shutdown; the executor is intentionally never shut down, because there is no lifecycle
-     * hook this class can hang one on - it is mapped by a deployment descriptor and owns no
-     * per-instance state - and a single daemon thread costs nothing to leave to the JVM's exit.
+     * hook this class can hang one on - it is mapped by a deployment descriptor and holds no instance
+     * state - and a single daemon thread costs nothing to leave to the JVM's exit.
      *
      * Created LAZILY, through the holder idiom rather than a lock, so that the class stays inert until
      * a readiness probe is actually served: the class comment promises that merely adding this class

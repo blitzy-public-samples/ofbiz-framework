@@ -92,11 +92,25 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          triggered the invalidation.
          docker/docker-entrypoint.sh therefore treats the transport as part of enabling the flag: whenever the flag
          resolves to true it renders an active serviceMessenger into /ofbiz/config/serviceengine.xml from the
-         OFBIZ_JMS_* variables, schema validates it, reads every attribute back out of the installed file, asserts
-         that exactly one serviceMessenger is active, and pre-flights the provider by resolving the jndi-server,
-         looking up the connection factory, opening a topic connection, looking up the topic and creating a
-         publisher on it. Nothing is published, so delivery, subscribers and cache coherence are not verified. Any
-         failure aborts the start up under both OFBIZ_PROFILE=dev and OFBIZ_PROFILE=prod. DOCKER.adoc carries the
+         OFBIZ_JMS_* variables, reads every attribute back out of the installed file and compares it with what was
+         requested, asserts that exactly one serviceMessenger is active, and requires that the rendered
+         jndi.properties declares the connection factory and topic names while leaving the two JVM-wide keys
+         java.naming.factory.initial and java.naming.provider.url exactly as shipped. It then requires three
+         pieces of start up evidence: the active element declares listen="true", so this instance subscribes
+         rather than only publishing; the initial-context-factory class named by the jndi-server resolves on the
+         class path, which is where an absent /ofbiz/lib-extra client library is caught by name; and at least one
+         host and port in the provider URL accepts a TCP connection within a bounded deadline.
+         WHAT THAT DOES NOT ESTABLISH, and why none of it may be read as proof of cache coherence: no JNDI context
+         is created, the connection factory and topic names are checked only for being DECLARED and are never
+         looked up, no credentials are authenticated, no subscriber or publisher is constructed, and nothing is
+         published - so delivery between instances is not verified at start up. The three checks are necessary
+         conditions, not sufficient ones. A live lookup is not available to this path at all: dependencies.gradle
+         bundles only the JMS API, the provider's client library is deployment specific and supplied by the
+         operator, so there is nothing to perform the lookup with when the configuration is rendered. Coherence is
+         established by running two instances and observing an invalidation arrive, for which DOCKER.adoc carries
+         the procedure; while an instance runs, its subscriber's own connection state is the second readiness
+         dimension of /webtools/health/ready, which is where a broker that goes away is reported. Any failure of
+         the three aborts the start up under both OFBIZ_PROFILE=dev and OFBIZ_PROFILE=prod. DOCKER.adoc carries the
          operator procedure for supplying the provider client library and the JNDI settings. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
@@ -558,10 +572,11 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          OFBIZ_POSTGRES_SSLMODE. A non-container installation that points a delegator at these definitions against
          an ordinary local PostgreSQL, which ships with ssl=off, therefore edits the URI in its own copy of this
          file, the same copy it must already extend with the jdbc-password.localpostgres* property described
-         above, since these definitions deliberately carry no password. The server side is the stronger lever
-         either way: a hostssl rule in pg_hba.conf, or rds.force_ssl on a managed instance, refuses an
-         unencrypted client outright and cannot be forgotten the way a per-client setting can, so a deployment
-         that must guarantee encryption sets both. Note also that pgJDBC ignores libpq's PGSSLMODE and
+         above, since these definitions deliberately carry no password. The two levers cover different things
+         and neither substitutes for the other: a hostssl rule in pg_hba.conf, or rds.force_ssl on a managed
+         instance, makes the SERVER refuse an unencrypted client and cannot be forgotten the way a per-client
+         setting can, while the client sslmode is what decides whether this instance verifies the server's
+         certificate and hostname. A deployment that requires encrypted, verified connections sets both. Note also that pgJDBC ignores libpq's PGSSLMODE and
          PGSSLROOTCERT environment variables, so neither the mode nor the trusted root can be supplied that
          way. A deployment that needs pgJDBC TLS properties this file does not parameterise supplies its own
          override instead: mount an entityengine.xml under /ofbiz/config and leave OFBIZ_POSTGRES_HOST unset,

@@ -53,21 +53,21 @@ import org.junit.jupiter.params.provider.ValueSource;
  * Executable contract of the entry point's signing-key path - the renderer that puts the login and
  * JWT signing keys into {@code /ofbiz/config/security.properties} at container start.
  *
- * <p>WHY THIS EXISTS. Both keys used to be generated into the source tree while the distribution was
+ * <p>Both keys used to be generated into the source tree while the distribution was
  * being built, which baked a live signing key into the distribution tarball and into a layer of every
  * published image. They are now resolved from the environment on each start and written only into a
  * mode 0600 file on a container-local volume, with the repository shipping both anchors blank. That
- * moves the entire guarantee into {@code render_security_configuration} and the helpers it calls, so
- * asserting the shape of the shell source proves nothing: the behaviour that matters is what the
+ * moves the entire behaviour into {@code render_security_configuration} and the helpers it calls, so
+ * asserting the shape of the shell source establishes nothing: the behaviour that matters is what the
  * script actually does when a key is absent, unusable, or supplied.
  *
- * <p>HOW IT IS TESTED. The real {@code docker/docker-entrypoint.sh} is sourced as a library with its
+ * <p>The real {@code docker/docker-entrypoint.sh} is sourced as a library with its
  * trailing {@code _main "$@"} line removed, so the one function under test can be driven as a black
  * box without starting OFBiz, against a throwaway sandbox that stands in for {@code /ofbiz}. Nothing
  * is reimplemented and nothing is stubbed: the assertions below read the file the production script
  * wrote, its POSIX mode, and everything the script printed.
  *
- * <p>THREE PROPERTIES ARE ASSERTED THROUGHOUT. That a production deployment cannot start without a
+ * <p>Three properties are asserted throughout: that a production deployment cannot start without a
  * usable key (fail-closed); that a key which could never sign is refused rather than accepted
  * (validation); and that no key value - supplied, generated or rejected - is ever echoed to the
  * container log or written to any file other than the mode 0600 configuration (non-disclosure).
@@ -126,9 +126,7 @@ public final class SigningKeyRenderingTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Fail-closed: production may not start on a key it does not have
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "prod without {0} must not start")
@@ -177,9 +175,7 @@ public final class SigningKeyRenderingTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Validation: a key that could never sign is refused, and never echoed
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "a signing key that {0} is rejected")
@@ -249,9 +245,7 @@ public final class SigningKeyRenderingTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Supplied keys: rendered verbatim, into one protected file and nowhere else
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -357,9 +351,7 @@ public final class SigningKeyRenderingTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Canonicalization: what java.util.Properties gives the application, not what the shell validated
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
@@ -420,7 +412,7 @@ public final class SigningKeyRenderingTests {
     /**
      * The render is refused when the property it produced would not read back as the key that was validated.
      *
-     * <p>{@code require_rendered_declaration} proves a value is PRESENT; this proves it is the RIGHT one, which
+     * <p>{@code require_rendered_declaration} asserts a value is PRESENT; this asserts it is the RIGHT one, which
      * is the half a presence check cannot see. {@code java.util.Properties} takes the LAST declaration of a
      * duplicated key, so a source file that carries the anchor twice - a merge, a hand edit, a patch applied
      * twice - renders both lines, and the application then reads whichever one happens to be last. Here the
@@ -492,9 +484,7 @@ public final class SigningKeyRenderingTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The development profile: zero configuration, still no secret in the tree
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -584,9 +574,7 @@ public final class SigningKeyRenderingTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Key lifecycle: a key that has been replaced must not be able to come back
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
@@ -633,8 +621,8 @@ public final class SigningKeyRenderingTests {
         assertEquals(LOGIN_KEY, loadProperties(sandbox.resolve(SECURITY_OVERRIDE)).getProperty(LOGIN_KEY_PROPERTY),
                 "the supplied key must be the one in force");
 
-        // The rollback that used to revive the retired key. A fresh value is generated instead, so the retired
-        // one can never sign or decrypt anything again.
+        // The rollback path, driven by omitting the variable. A fresh value is generated instead, so the
+        // retired one is not put back in force.
         RendererRun omitted = renderSecurityConfiguration(tempDir, sandbox, Map.of("OFBIZ_PROFILE", "dev"));
         assertEquals(0, omitted.exitCode(), "dev must still start, output was:\n" + omitted.output());
         assertNotEquals(retiredLoginKey,
@@ -700,9 +688,7 @@ public final class SigningKeyRenderingTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The allowed host header, which shares this render
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -750,9 +736,7 @@ public final class SigningKeyRenderingTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The anchors the render depends on
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "a missing {0} anchor fails the render closed")
@@ -785,9 +769,7 @@ public final class SigningKeyRenderingTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**

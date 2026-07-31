@@ -40,7 +40,6 @@ import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.GeneralException;
 import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.base.util.UtilValidate;
-import org.apache.ofbiz.entity.Delegator;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
@@ -75,15 +74,15 @@ import software.amazon.awssdk.utils.AttributeMap;
  * <p>This is the provider selected when the {@code content.store.provider} property of the {@code content}
  * resource is set to {@code s3}. It adapts the AWS SDK for Java <strong>v2</strong> {@link S3Client} to the
  * SPI so that the bytes behind file-backed {@code DataResource} content, and behind user uploads, live in an
- * object store instead of on instance-local disk. An instance of the application then holds no durable local
- * state of its own and is freely replaceable, which is what makes a load-balanced, multi-instance deployment
- * safe.
+ * object store instead of on instance-local disk. Content written by one instance is therefore readable by
+ * every other instance, and no instance holds content that its replacement could not reach.
  *
- * <p><strong>Amazon S3 or any S3-compatible store.</strong> The client is built with {@code endpointOverride}
+ * <p><strong>Amazon S3 or an S3-compatible store.</strong> The client is built with {@code endpointOverride}
  * and {@code forcePathStyle}, and that pair is what lets one provider address Amazon S3 as well as a non-AWS
- * S3-compatible store such as MinIO or Ceph. Leave {@code content.store.s3.endpoint} blank for Amazon S3, or
- * point it at the compatible store's endpoint - usually together with {@code content.store.s3.path.style=true},
- * because such stores commonly do not offer virtual-host-style addressing.
+ * store that serves the same API, such as MinIO or Ceph. Leave {@code content.store.s3.endpoint} blank to keep
+ * the endpoint the SDK resolves, or point it at the other store's endpoint - usually together with
+ * {@code content.store.s3.path.style=true}, since such a store commonly offers no virtual-host-style
+ * addressing.
  *
  * <p><strong>Every wait is bounded, and repeated failure stops being retried.</strong> A request thread that
  * reaches an object store must not be able to wait indefinitely, and a store that is down must not be given a
@@ -110,7 +109,7 @@ import software.amazon.awssdk.utils.AttributeMap;
  * single further failure re-opens the breaker immediately, so a store that is still down costs one probe per
  * window rather than one probe per request.
  *
- * <p><strong>Configuration.</strong> Every property is read from the {@code content} resource. The ten below
+ * <p><strong>Configuration.</strong> Every property is read from the {@code content} resource. The nine below
  * describe the store, and all of them are committed blank, or {@code false}, so that no credential and nothing
  * environment-specific lives in the repository or in the container image; {@code docker/docker-entrypoint.sh}
  * injects the deployed values from the environment, having first validated each one - the bucket against the S3
@@ -131,7 +130,6 @@ import software.amazon.awssdk.utils.AttributeMap;
  *   <li>{@code content.store.s3.access.key.id} - the access key id, for {@code static}</li>
  *   <li>{@code content.store.s3.secret.access.key} - the secret access key, for {@code static}</li>
  *   <li>{@code content.store.s3.path.style} - {@code true} to force path-style addressing</li>
- *   <li>{@code content.store.s3.key.prefix} - the key prefix new uploads are placed under</li>
  * </ul>
  *
  * <p><strong>Credential resolution is explicit, never inferred.</strong>
@@ -141,13 +139,13 @@ import software.amazon.awssdk.utils.AttributeMap;
  * the other, credentials alongside {@code default-chain} - is refused with a
  * {@link ContentStoreConfigurationException}.
  *
- * <p>Inferring the mode from whether both credentials happen to be present, which is what this provider used
- * to do, is the defect that made the rule necessary. A typo in one of the two credential property names, or a
- * secret whose injection silently failed, left one credential blank; the provider then quietly authenticated
- * with the ambient credential chain instead - the EC2 instance role, the ECS task role, a shared profile - and
- * the deployment ran with <em>a different identity from the one it was configured with</em>, typically a
- * broader one, with nothing at all reported. Making the mode explicit means the same accident is a startup
- * refusal naming the property that is wrong.
+ * <p>Inferring the mode from whether both credentials happen to be present is what makes that rule
+ * necessary. A typo in one of the two credential property names, or a secret whose injection silently failed,
+ * leaves one credential blank; an inferring provider then quietly authenticates with the ambient credential
+ * chain instead - an instance role, a task role, a shared profile - and the deployment runs with <em>a
+ * different identity from the one it was configured with</em>, typically a broader one, with nothing at all
+ * reported. Naming the mode explicitly turns the same accident into a startup refusal that names the property
+ * that is wrong.
  *
  * <p><strong>Absence is narrow.</strong> Only an unambiguous object-not-found signal is reported as absence.
  * A bare HTTP 404 is not enough on its own - it is equally what a deleted bucket, a mis-routed endpoint or a
@@ -171,9 +169,10 @@ import software.amazon.awssdk.utils.AttributeMap;
  *
  * <p><strong>Inert unless selected.</strong> {@code database} is the committed default of
  * {@code content.store.provider}; in that mode the pre-existing {@code DataResource} database-storage path is
- * used unchanged, this class is never instantiated and the AWS SDK is never touched. Nothing here runs from a
- * static initialiser, and the client itself is created only on first use, so even loading the class resolves
- * no credential and opens no connection.
+ * used unchanged and this class is never instantiated, so no AWS SDK class is loaded on that path either -
+ * {@link ContentStoreFactory} names this class only in its {@code s3} branch. Nothing here runs from a static
+ * initialiser, and the client itself is created only on first use, so even loading the class resolves no
+ * credential and opens no connection.
  *
  * <p><strong>Where requests may go.</strong> An endpoint override decides which host every byte of this
  * deployment's content is sent to, and the SDK will faithfully address whatever it is given - including a
@@ -194,6 +193,16 @@ import software.amazon.awssdk.utils.AttributeMap;
  * A key is never composed into a message or a log line as itself - it can carry the name a user gave an
  * uploaded file, and with it a person's name or a case reference - so every diagnostic identifies content by
  * the opaque, one-way reference produced by {@code ContentStoreUtil}.
+ *
+ * <p><strong>This provider deliberately answers no upload location.</strong> It is not a
+ * {@code ContentUploadLocation}, because that capability has to return a location in the shape
+ * {@code DataResource.objectInfo} persists - a writable path on the local filesystem that the Content
+ * component's frozen write services open a {@code FileOutputStream} on. A bucket has no such path, and a key
+ * prefix is not one: handed back as an upload location it would be written to as a relative directory beside
+ * the process working directory, which is neither absolute where {@code LOCAL_FILE} requires it to be nor
+ * ever published to this store. An upload bound for an object store is therefore staged on local disk by
+ * {@code ContentStoreFactory.uploadStagingPath} and published to this provider when the transaction commits;
+ * see the storage-aware bridge on that class.
  *
  * <p><strong>Whole-content reads are bounded.</strong> {@link #get(String)} materialises an object in the
  * heap, so it refuses an object larger than {@code content.store.max.get.bytes} (32 MiB by default) or than
@@ -216,7 +225,7 @@ import software.amazon.awssdk.utils.AttributeMap;
  * lazily created client, which is published under the instance lock, and the breaker counters, which are
  * atomic. One instance is therefore shared safely by many request threads, as the SPI requires.
  */
-public final class S3ContentStore implements ContentStore, ContentUploadLocation {
+public final class S3ContentStore implements ContentStore {
 
     private static final String MODULE = S3ContentStore.class.getName();
 
@@ -229,7 +238,6 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
     private static final String ACCESS_KEY_ID_PROPERTY = "content.store.s3.access.key.id";
     private static final String SECRET_ACCESS_KEY_PROPERTY = "content.store.s3.secret.access.key";
     private static final String PATH_STYLE_PROPERTY = "content.store.s3.path.style";
-    private static final String KEY_PREFIX_PROPERTY = "content.store.s3.key.prefix";
     private static final String CONNECT_TIMEOUT_PROPERTY = "content.store.s3.connect.timeout.millis";
     private static final String READ_TIMEOUT_PROPERTY = "content.store.s3.read.timeout.millis";
     private static final String CALL_TIMEOUT_PROPERTY = "content.store.s3.call.timeout.millis";
@@ -238,7 +246,6 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
     private static final String BREAKER_THRESHOLD_PROPERTY = "content.store.s3.breaker.failure.threshold";
     private static final String BREAKER_RESET_PROPERTY = "content.store.s3.breaker.reset.millis";
 
-    /** The resource every {@code content.store.*} property this provider reads is declared in. */
     private static final String PROPERTY_RESOURCE = ContentStoreSupport.PROPERTY_RESOURCE;
 
     /** Authenticate with the access key id and secret access key held in configuration. */
@@ -247,10 +254,10 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
     /** Authenticate with whatever the AWS default credential provider chain resolves. */
     private static final String CREDENTIALS_DEFAULT_CHAIN = "default-chain";
 
-    /** Reported in place of an endpoint when none is overridden, so a log line never shows a blank value. */
+    /** Stands in for an unset endpoint, so a diagnostic never shows a blank value. */
     private static final String AMAZON_S3_ENDPOINT = "amazon-s3-default";
 
-    /** Status an object store returns for a key that resolves to nothing - and for several other conditions. */
+    /** An absent key, and also several conditions that are not about the key at all. */
     private static final int HTTP_NOT_FOUND = 404;
 
     /**
@@ -272,9 +279,6 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
      * store failure. Matched against the lower-cased reported text, and never reproduced anywhere.
      */
     private static final List<String> OBJECT_ABSENCE_PHRASES = List.of("not found", "no such key", "nosuchkey");
-
-    /** The key prefix new uploads are placed under when the property yields nothing. */
-    private static final String DEFAULT_KEY_PREFIX = "content/uploads";
 
     private static final long DEFAULT_CONNECT_TIMEOUT_MILLIS = 5000L;
     private static final long DEFAULT_READ_TIMEOUT_MILLIS = 30000L;
@@ -368,20 +372,18 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
     /**
      * Creates the provider from the {@code content.store.*} properties of the {@code content} resource.
      *
-     * <p>Only configuration is read here: no AWS SDK type is touched, no credential is resolved and no
-     * connection is opened, so selecting this provider can neither fail with an SDK error nor slow component
+     * <p>Configuration is all that is read here: no client is built, no credential is resolved and no
+     * connection is opened, so selecting this provider can neither fail with a store error nor slow component
      * start-up. Configuration that is absent or unusable is reported from the storage operations as a
      * {@link GeneralException}, which is precisely how the SPI documents an incomplete provider
      * configuration. That also keeps this constructor free of checked exceptions, so the provider can be
      * selected with a plain {@code new S3ContentStore()}.
      */
     public S3ContentStore() {
-        // A three-argument UtilProperties lookup self-defaults on a blank value as well as on an absent key,
-        // so the committed blank values arrive here as the empty string. Every configured value is normalised
-        // once, here, rather than at each point of use: that makes this provider's view of its configuration
-        // independent of how the lookup happens to treat surrounding whitespace, and it means a value holding
-        // nothing but whitespace is treated as absent everywhere instead of being sent to the store as a blank
-        // bucket, region or endpoint.
+        // The three-argument lookup self-defaults on a blank value as well as on an absent key, and every
+        // value is normalised once here rather than at each point of use, so a value holding nothing but
+        // whitespace counts as absent everywhere instead of reaching the store as a blank bucket, region or
+        // endpoint.
         this.bucket = trimmedOrEmpty(UtilProperties.getPropertyValue(PROPERTY_RESOURCE, BUCKET_PROPERTY, ""));
         this.region = trimmedOrEmpty(UtilProperties.getPropertyValue(PROPERTY_RESOURCE, REGION_PROPERTY, ""));
         this.endpoint = trimmedOrEmpty(UtilProperties.getPropertyValue(PROPERTY_RESOURCE, ENDPOINT_PROPERTY, ""));
@@ -407,14 +409,11 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
     /**
      * Package-private test seam: builds a provider around an already-constructed client and bucket.
      *
-     * <p>It exists so that this provider's own logic - key and content validation, the mapping of an absent
-     * object onto {@link FileNotFoundException}, the classification of an ambiguous 404, the breaker and the
-     * idempotence of {@link #delete(String)} - can be unit-tested against a mocked {@link S3Client} from the
-     * sibling {@code src/test/java} tree, which shares this package. Without the seam a test would have to
-     * supply real AWS configuration, resolve real credentials and reach a real endpoint, none of which
-     * belongs in a unit test. Production code must use the public configuration-driven constructor instead;
-     * the remaining configuration is deliberately left blank here because the supplied client already
-     * embodies it.
+     * <p>It reaches this provider's own logic - key and content validation, the mapping of an absent object
+     * onto {@link FileNotFoundException}, the classification of an ambiguous 404, the breaker and the
+     * idempotence of {@link #delete(String)} - without real AWS configuration, real credentials or a real
+     * endpoint. Package-private, so production selection goes through the configuration-driven constructor.
+     * The remaining configuration is left blank because the supplied client already embodies it.
      *
      * @param s3Client the client every storage operation is issued through; must not be null
      * @param bucket the bucket every storage operation addresses; must be neither null nor empty
@@ -721,33 +720,6 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
         if (closing != null) {
             closing.close();
         }
-    }
-
-    /**
-     * Returns the key prefix new uploads are placed under.
-     *
-     * <p>Both requested forms yield the same value, and deliberately so: an object key has no notion of being
-     * absolute or relative, so the distinction that {@code DataResource.objectInfo} persists for filesystem
-     * content has no counterpart here. The prefix carries no leading separator, because an S3 key beginning
-     * with {@code /} names an object whose first path segment is empty.
-     *
-     * @param delegator the delegator, unused: the prefix is deployment configuration rather than a system
-     *     property an administrator overrides per tenant
-     * @param absolute unused, for the reason given above
-     * @return the key prefix new uploads are placed under, never null and never empty
-     */
-    @Override
-    public String uploadPath(Delegator delegator, boolean absolute) {
-        String configured = UtilProperties.getPropertyValue(PROPERTY_RESOURCE, KEY_PREFIX_PROPERTY,
-                DEFAULT_KEY_PREFIX);
-        String prefix = UtilValidate.isEmpty(configured) ? DEFAULT_KEY_PREFIX : configured.trim();
-        while (prefix.startsWith("/")) {
-            prefix = prefix.substring(1);
-        }
-        while (prefix.endsWith("/")) {
-            prefix = prefix.substring(0, prefix.length() - 1);
-        }
-        return prefix.isEmpty() ? DEFAULT_KEY_PREFIX : prefix;
     }
 
     /**
@@ -1108,7 +1080,7 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
                     + "] of resource [" + PROPERTY_RESOURCE + "] is not configured");
         }
         boolean staticCredentials = requireCredentialMode();
-        // A blank endpoint keeps Amazon S3's own endpoint; any other value targets a compatible store, and it
+        // A blank endpoint keeps the endpoint the SDK resolves; a non-blank value overrides it. The override
         // is validated HERE - before the SDK is asked for anything and before any log line is built from it -
         // so neither a malformed value nor one carrying a credential can reach either.
         URI endpointOverride = requirePermittedEndpoint();
@@ -1131,8 +1103,8 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
                 builder = builder.credentialsProvider(
                         StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKeyId, secretAccessKey)));
             } else {
-                // The deployment asked for the ambient chain explicitly, so defer to the instance role,
-                // container credentials, shared profile or process environment that it resolves. A
+                // The deployment asked for the ambient chain explicitly, so defer to whatever that chain
+                // resolves - an instance role, container credentials, a shared profile and so on. A
                 // half-configured pair was already refused, so nothing is being substituted silently here.
                 // The chain is requested through its builder because the shorter create() is deprecated in
                 // this SDK line, and this file has to stay free of deprecation warnings under -Xlint:all.
@@ -1142,10 +1114,10 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
             // Addressing configuration only, and none of it in a form that can carry a secret. The bucket is
             // an opaque reference, because a bucket name identifies the deployment's storage. The endpoint is
             // reduced to the scheme, host and port that identify the store: it has been validated by this
-            // point, so it provably carries no user information, no path, no query and no fragment, and a
-            // REFUSED endpoint is reported the other way round - as an opaque reference - precisely because
-            // that value has not been validated. The credential source is a closed-enum name rather than any
-            // credential value, so no access key id and no secret access key can reach the log. A built client
+            // point, so it carries no user information, no path, no query and no fragment, and a REFUSED
+            // endpoint is reported the other way round - as an opaque reference - precisely because that value
+            // has not been validated. The credential source is reported as a closed-enum name, so this line
+            // states which identity was selected and never a credential value. A built client
             // has proved nothing about the store itself, so this reports the configuration it was built from -
             // including the deadlines and the attempt ceiling, which are the numbers an unexplained stall is
             // measured against - rather than any claim about reachability.
@@ -1159,9 +1131,14 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
                     + "], max-attempts [" + boundedMaxAttempts() + "]", MODULE);
             return client;
         } catch (IllegalArgumentException e) {
+            // Not chained, for the same reason as the SDK failure below: the SDK's own validation message
+            // quotes the value it rejected, and GeneralException.getMessage() composes a nested message into
+            // its own, so attaching it would republish a configured region or endpoint through every reader.
+            // Every value reaching the builder is bounded and validated above, so this branch is defence in
+            // depth rather than a path a deployment can configure its way into.
             throw new GeneralException("Content store provider [s3] could not be configured for bucket "
                     + ContentStoreUtil.reference(bucket) + ": a configured region, endpoint or deadline value is"
-                    + " not valid", e);
+                    + " not valid [" + e.getClass().getSimpleName() + "]");
         } catch (SdkException e) {
             // The SDK failure is not chained: see storeFailure for why an object-store diagnostic is never
             // attached to anything this class throws.
@@ -1178,8 +1155,8 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
      * agree with it. That is the whole point: the identity a deployment authenticates as decides what it is
      * allowed to read and write, so it must be stated rather than deduced from whether a value happens to be
      * present. Each refused combination below is a real accident with a silent outcome - a mistyped property
-     * name, an injection that failed, a credential left behind after switching to an instance role - and every
-     * one of them used to end in the ambient chain being used instead, with no error at all.
+     * name, an injection that failed, a credential left behind after switching to an instance role - and any
+     * of them would otherwise end in the ambient chain being authenticated as instead, with no error at all.
      *
      * @return {@code true} for static credentials, {@code false} for the AWS default credential chain
      * @throws GeneralException as a {@link ContentStoreConfigurationException} if the mode is absent or
@@ -1199,7 +1176,7 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
                         + CREDENTIALS_PROVIDER_PROPERTY + "=" + CREDENTIALS_DEFAULT_CHAIN + "] to authenticate"
                         + " with the ambient credential chain instead");
             }
-            // Refuses a one-sided pair, which is the accident that used to authenticate as the ambient identity
+            // Refuses a one-sided pair, which would otherwise authenticate as the ambient identity
             requireCredentialPair(accessKeyId, secretAccessKey);
             return true;
         }
@@ -1555,7 +1532,7 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
      * naming the store an instance actually attached to is what an operator needs in order to confirm it. This
      * is the only form in which any part of the configured endpoint reaches a log line.
      *
-     * <p>Package-private so that the store package's own tests can prove exactly that.
+     * <p>Package-private so that the store package's own tests can assert exactly that.
      *
      * @param endpointOverride the validated endpoint, or null when Amazon S3's own endpoint applies
      * @return a value safe to log, which identifies the store without reproducing the configured value
@@ -1629,11 +1606,11 @@ public final class S3ContentStore implements ContentStore, ContentUploadLocation
      * <p><strong>The SDK exception is neither chained nor quoted.</strong> An error reply from an object store
      * is composed by the remote end and can echo the request that produced it - the bucket, the object key, the
      * endpoint, request headers, and the identity that signed the request - and an S3-compatible store on the
-     * other end of an endpoint override is free to put anything at all in it. Chaining that exception, which is
-     * what this method used to do, put all of it into every stack trace: into OFBiz's own logs, into any log
-     * aggregator they are shipped to, and into whatever a user-facing error page or service fault chose to
-     * render. The exception was retained precisely so the message need not repeat sensitive text, which quietly
-     * achieved the opposite - the cause is the part that gets printed.
+     * other end of an endpoint override is free to put anything at all in it. Chaining that exception would put
+     * all of it into every stack trace: into OFBiz's own logs, into any log aggregator they are shipped to, and
+     * into whatever a user-facing error page or service fault chose to render. Retaining the exception so that
+     * this message need not repeat sensitive text achieves the opposite, because the cause is the part that
+     * gets printed.
      *
      * <p>What survives is only what is stable, useful and generated locally or by the transport rather than by
      * the remote end's prose: the HTTP status code, the request and extended request identifiers a store issues

@@ -77,7 +77,7 @@ import org.xml.sax.SAXParseException;
  *
  * <p>Where a value's MEANING matters as much as its text, the real DOM element is additionally handed to the
  * production parser ({@link Datasource} and {@link DelegatorElement}, whose package-private constructors this
- * test can reach because it lives in their package). That is what proves claims such as "an absent
+ * test can reach because it lives in their package). That is what establishes claims such as "an absent
  * {@code check-on-start} defaults to true, so the literal {@code false} is required" and "no extra attribute is
  * needed for the cache-clear plumbing" - the two places where reading the XML alone would be misleading.
  * Neither constructor touches static state, so no global configuration is initialised and nothing leaks between
@@ -85,7 +85,7 @@ import org.xml.sax.SAXParseException;
  * static singleton off the classpath.
  *
  * <p>No test here opens a database connection or needs a credential of any kind. One test does drive the
- * production credential resolver, but only to prove that it FAILS: the managed datasources commit no password,
+ * production credential resolver, but only to establish that it FAILS: the managed datasources commit no password,
  * and the lookup they name is deliberately absent from {@code passwords.properties}, so resolving it throws
  * instead of handing back a value that is published in this repository.
  */
@@ -97,6 +97,7 @@ public final class EntityEngineConfigContractTests {
     private static final String DEPENDENCY_MANIFEST = "dependencies.gradle";
     private static final String POSTGRES_TEMPLATE = "docker/templates/postgres-entityengine.xml";
     private static final String PASSWORDS_PROPERTIES = "framework/base/config/passwords.properties";
+    private static final String ENTRY_POINT = "docker/docker-entrypoint.sh";
 
     private static final String OFBIZ_GROUP = "org.apache.ofbiz";
     private static final String OLAP_GROUP = "org.apache.ofbiz.olap";
@@ -195,6 +196,33 @@ public final class EntityEngineConfigContractTests {
     private static final Pattern XML_COMMENT = Pattern.compile("<!--.*?-->", Pattern.DOTALL);
 
     /**
+     * Sentences quoted from prose that was removed from these two files because each promised an assurance the
+     * container does not provide: that the entry point schema-validates the rendered configuration, that it
+     * re-counts the placeholder census, and that start up pre-flights the JMS provider by looking up the
+     * connection factory and creating a publisher on the topic. None of the three is performed anywhere in
+     * {@code docker/docker-entrypoint.sh}, which is a shell script whose only JVM launch on those paths is a
+     * {@code javap} class resolution.
+     *
+     * <p>A fragment is banned rather than its subject, and that is deliberate. The corrected prose discusses all
+     * three subjects at length in the negative, so banning "schema validation" or "census" outright would forbid
+     * the accurate sentence along with the false one. An assurance that is genuinely implemented later will not
+     * be described in these words, so an entry is removed from this list only as a deliberate act, in the same
+     * change as the implementation that earns it.</p>
+     */
+    private static final List<String> UNPERFORMED_ASSURANCES = List.of(
+            "schema validates it",
+            "the result validates against",
+            "refuses to render a template whose census differs",
+            "pre-flights the provider",
+            "looking up the connection factory",
+            "opening a topic connection",
+            "creating a publisher");
+
+    /** Anything that would let the entry point itself validate XML against a schema. */
+    private static final Pattern SCHEMA_VALIDATOR_LAUNCH =
+            Pattern.compile("xmllint|SchemaFactory|javax\\.xml\\.validation|--schema[ =]");
+
+    /**
      * Every placeholder of the render template, with a value of the same shape the entry point substitutes:
      * validated host, port and database names, a TLS query string, the network deadlines, the normalised boolean of
      * an init-mode start up, and the default pool bounds and borrow wait. Nothing here is a credential of any
@@ -290,9 +318,7 @@ public final class EntityEngineConfigContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Delegators: the immutable names, all nine group maps, and the cache attributes
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -403,9 +429,7 @@ public final class EntityEngineConfigContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Datasources: the whole inventory, and the two DDL tuples that decide who may issue DDL
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -469,9 +493,7 @@ public final class EntityEngineConfigContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Managed credentials: nothing authenticable is committed, and the datasource fails closed
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -611,9 +633,7 @@ public final class EntityEngineConfigContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Bounded network and pool waits: every wait whose absent default is "forever" is stated
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -654,8 +674,8 @@ public final class EntityEngineConfigContractTests {
 
             // pool-sleeptime is the borrow wait, and DBCPConnectionFactory maps it onto setMaxWaitMillis. It is
             // stated rather than left absent because InlineJdbc reads an absent value as five minutes, which is
-            // longer than any load-balancer health-check timeout and longer than most HTTP client timeouts - so an
-            // exhausted pool used to be reported as a hung instance instead of as pool exhaustion.
+            // longer than the health-check and HTTP client timeouts such deployments are normally configured
+            // with - so an exhausted pool would be reported as a hung instance instead of as pool exhaustion.
             assertEquals(REQUIRED_POOL_WAIT_MILLIS, pool.getPoolSleeptime(), name + " borrow wait");
 
             // A validation query with idle validation is what stops the pool handing out a connection that died
@@ -850,9 +870,7 @@ public final class EntityEngineConfigContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
-     * The deployed-profile render template: the same guarantees, expressed as placeholders
-     * ---------------------------------------------------------------------------------------------
+     * The deployed-profile render template: the same requirements, expressed as placeholders
      */
 
     @Test
@@ -914,8 +932,8 @@ public final class EntityEngineConfigContractTests {
                 "the deployed profile must declare the same three immutable delegator names");
 
         // The production parser resolves the mapping, not a text match: this is the assertion that would fail if
-        // the template ever repointed "test" at the managed datasources again. It used to do exactly that, which
-        // meant running gradlew testIntegration inside a container wrote ext-test data into the production
+        // the template ever repointed "test" at the managed datasources again. A template that did that would
+        // mean running gradlew testIntegration inside a container writes ext-test data into the production
         // database - integration tests must never need a managed database, a credential or a network.
         DelegatorElement test = new DelegatorElement(delegators.get("test"));
         assertEquals("localh2", test.getGroupDataSource(OFBIZ_GROUP), "test -> " + OFBIZ_GROUP);
@@ -1033,9 +1051,37 @@ public final class EntityEngineConfigContractTests {
     }
 
     @Test
+    public void neitherEntityConfigurationPromisesAnAssuranceTheContainerDoesNotPerform() throws Exception {
+        List<String> offending = new ArrayList<>();
+        for (String file : List.of(ENTITY_ENGINE_XML, POSTGRES_TEMPLATE)) {
+            String text = flattenProse(Files.readString(repositoryRoot().resolve(file)));
+            for (String promise : UNPERFORMED_ASSURANCES) {
+                if (text.contains(promise)) {
+                    offending.add(file + ": " + promise);
+                }
+            }
+        }
+
+        // A comment that promises an assurance nothing performs is worse than no comment, because an operator
+        // reads it as a guarantee and stops looking for the check themselves.
+        assertEquals(List.of(), offending, "these files must promise no assurance that " + ENTRY_POINT
+                + " does not perform; the corrected prose states each of those subjects in the negative instead");
+
+        // The fact that makes the corrected prose true, asserted rather than assumed. Should a validator ever be
+        // added here, the sentence in the template attributing XSD validity to a build-time gate stops being
+        // true, and this is what forces that sentence to be rewritten rather than left to rot.
+        String entryPoint = Files.readString(repositoryRoot().resolve(ENTRY_POINT));
+        assertFalse(SCHEMA_VALIDATOR_LAUNCH.matcher(entryPoint).find(),
+                ENTRY_POINT + " now launches an XML schema validator, so the build-time-gate wording in "
+                        + POSTGRES_TEMPLATE + " no longer holds and must be corrected");
+    }
+
+    @Test
     public void theRenderTemplateSubstitutesToASchemaValidConfigurationWithNoPlaceholderLeftBehind() throws Exception {
-        // Substituting with the same shape of values the entry point uses, then validating, proves the template is
-        // not merely well-formed but still a legal entity-config once rendered - the state OFBiz actually reads.
+        // Substituting with the same shape of values the entry point uses, then validating, establishes that the template is
+        // not merely well-formed but still a legal entity-config once rendered - the state OFBiz actually reads. The raw
+        // template cannot be validated in its place: its boolean and integer attributes hold placeholders, which are not
+        // legal values for those types, so only the rendered form can be checked against the schema.
         String rendered = Files.readString(repositoryRoot().resolve(POSTGRES_TEMPLATE));
         for (Map.Entry<String, String> substitution : TEMPLATE_SUBSTITUTIONS.entrySet()) {
             rendered = rendered.replace(substitution.getKey(), substitution.getValue());
@@ -1090,9 +1136,7 @@ public final class EntityEngineConfigContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Per-dialect field-type mappings: an immutable interface
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -1121,9 +1165,7 @@ public final class EntityEngineConfigContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Schema validity
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -1132,14 +1174,12 @@ public final class EntityEngineConfigContractTests {
 
         // jdbc-username is a REQUIRED attribute of inline-jdbc while jdbc-password is OPTIONAL, which is exactly
         // why the managed definitions could drop the committed password and keep the username placeholder. Schema
-        // validity is what proves that asymmetry is still being honoured after the externalization work.
+        // validity is what shows that asymmetry is still being honoured after the externalization work.
         assertEquals(List.of(), validateAgainstEntityConfigSchema(config), "schema validation problems");
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The JDBC driver behind those datasources must actually be supplied
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -1177,9 +1217,7 @@ public final class EntityEngineConfigContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
@@ -1386,6 +1424,30 @@ public final class EntityEngineConfigContractTests {
                 continue;
             }
         }
+    }
+
+    /**
+     * Collapses a file to a single line so that a banned sentence is still found where the prose wraps it across
+     * several lines. Indentation and the leading hyphen of an XML comment continuation are stripped, then every
+     * whitespace run becomes one space.
+     *
+     * <p>Without this, a substring search silently misses the very promises it exists to catch. The census promise
+     * wrapped between "refuses to render a" and "template whose census differs from the contract", so it was
+     * invisible to a plain {@code contains} while sitting in the file in full.</p>
+     */
+    private static String flattenProse(String text) {
+        StringBuilder flat = new StringBuilder();
+        for (String line : text.split("\n", -1)) {
+            String trimmed = line.strip();
+            if (trimmed.startsWith("-")) {
+                trimmed = trimmed.substring(1).strip();
+            }
+            if (flat.length() > 0) {
+                flat.append(' ');
+            }
+            flat.append(trimmed);
+        }
+        return flat.toString().replaceAll("\\s+", " ");
     }
 
     private static Path repositoryRoot() {

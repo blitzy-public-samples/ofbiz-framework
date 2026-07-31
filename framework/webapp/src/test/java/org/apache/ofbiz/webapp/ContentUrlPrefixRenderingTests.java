@@ -45,7 +45,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  * Executable contract of the entry point's content-URL-prefix renderer - the step that writes
  * {@code OFBIZ_CONTENT_URL_PREFIX} into {@code /ofbiz/config/url.properties} at container start.
  *
- * <p>WHY THIS EXISTS. {@code content.url.prefix.secure} and {@code content.url.prefix.standard} are the
+ * <p>{@code content.url.prefix.secure} and {@code content.url.prefix.standard} are the
  * origin OFBiz puts in front of every generated content URL, so they decide where a browser fetches
  * every image, style sheet and download from. The entry point validates the supplied value and then
  * substitutes it into a properties file, and validation happens on the shell's copy while the
@@ -56,7 +56,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  * the whole deployment's content at the wrong origin - and nothing notices, because every individual
  * page still renders.
  *
- * <p>HOW IT IS TESTED. The real {@code docker/docker-entrypoint.sh} is sourced as a library with its
+ * <p>The real {@code docker/docker-entrypoint.sh} is sourced as a library with its
  * trailing {@code _main "$@"} line removed, so {@code render_content_url_configuration} can be driven
  * as a black box without starting OFBiz, against a throwaway sandbox that stands in for {@code /ofbiz}.
  * Nothing is reimplemented and nothing is stubbed: every assertion below reads the file the production
@@ -180,7 +180,7 @@ public final class ContentUrlPrefixRenderingTests {
     }
 
     /**
-     * The read-back has to prove more than "a value is present". A source file carrying a second
+     * The read-back has to establish more than "a value is present". A source file carrying a second
      * declaration of either anchor - a stray line left by a merge, or a local edit - would be rendered
      * with the substitution applied to both, but the read-back counts the declarations and refuses,
      * because a duplicate is the shape in which a NON-substituted leftover would silently win.

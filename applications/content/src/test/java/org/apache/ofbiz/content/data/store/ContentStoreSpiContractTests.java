@@ -44,7 +44,7 @@ import org.junit.jupiter.api.Test;
  * S3-compatible object store instead of the local disk. Because it is an SPI, its VALUE is entirely in its
  * shape: every provider implements it, and the pre-existing call sites in {@code DataResourceWorker} keep
  * compiling only as long as the declared checked exceptions stay exactly what those call sites already catch.
- * Compilation alone proves the interface is legal Java; it does not protect any of that.
+ * Compilation alone establishes only that the interface is legal Java; it does not protect any of that.
  *
  * <p>So this test pins the shape by reflection - the eight operations with their exact parameter and return
  * types, the exact declared exceptions in their declared order, and the deliberate absence of anything else.
@@ -62,7 +62,7 @@ import org.junit.jupiter.api.Test;
  * </ul>
  *
  * <p>Nothing here instantiates or mocks a {@code ContentStore}: a mock returning its own configured value
- * proves nothing about a provider. Provider BEHAVIOUR is covered separately by
+ * says nothing about a provider. Provider BEHAVIOUR is covered separately by
  * {@link ContentStoreBehaviourContract}, executed against an implementation that performs real I/O.
  */
 public final class ContentStoreSpiContractTests {

@@ -45,7 +45,7 @@ import org.junit.jupiter.api.io.TempDir;
  * {@link FileSystemContentStore}, and adds the expectations that are specific to it.
  *
  * <p>{@link TempDirContentStoreBehaviourTests} runs the same contract against a reference implementation, which
- * proves the contract is satisfiable; this class proves the shipped provider actually satisfies it. That
+ * shows the contract is satisfiable; this class asserts the shipped provider satisfies it. That
  * distinction matters because the provider does considerably more than the reference does - it stages writes and
  * moves them into place, it applies the deployment's file allow list, and it confines every resolved location
  * canonically - and each of those is a place where a provider can pass a compiler and still misbehave.

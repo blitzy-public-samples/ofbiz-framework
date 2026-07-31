@@ -47,6 +47,7 @@ import org.apache.ofbiz.base.util.UtilProperties;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
@@ -54,7 +55,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  * advertised {@code OFBIZ_CONTENT_STORE_PROVIDER} / {@code OFBIZ_S3_*} environment variables into the
  * {@code content.store.*} properties that {@link ContentStoreFactory} and {@link S3ContentStore} read.
  *
- * <p>WHY THIS EXISTS. Those variables were advertised as the configuration surface of the object
+ * <p>Those variables were advertised as the configuration surface of the object
  * store while nothing whatsoever consumed them. The classes in this package read these properties of the
  * {@code content} resource; the container entry point rendered none of them and removed none of the
  * variables from the environment. The result was worse than an unimplemented feature: a deployment that
@@ -64,14 +65,14 @@ import org.junit.jupiter.params.provider.ValueSource;
  * {@code /proc/<pid>/environ} by anything sharing the PID namespace and inherited by every hook and child
  * process.
  *
- * <p>HOW IT IS TESTED. The real {@code docker/docker-entrypoint.sh} is sourced as a library with its
+ * <p>The real {@code docker/docker-entrypoint.sh} is sourced as a library with its
  * trailing {@code _main "$@"} line removed, so {@code render_content_store_configuration} can be driven
  * as a black box without starting OFBiz or contacting an object store, against a throwaway sandbox that
  * stands in for {@code /ofbiz}. Nothing is reimplemented and nothing is stubbed: every assertion reads
  * the file the production script wrote, parsed by the same {@link Properties} the application uses, and
  * every rejection case asserts on the script's own refusal.
  *
- * <p>WHAT IS DELIBERATELY NOT ASSERTED. No test here contacts an object store or constructs an
+ * <p>No test here contacts an object store or constructs an
  * {@code S3Client}: the round trip against a real S3-compatible store is a deployment gate, and the
  * client's own behaviour is covered by {@link S3ContentStoreTests}. This suite covers only the boundary
  * between the container's environment and the property file - which is exactly where the defect was.
@@ -108,7 +109,6 @@ public final class ContentStoreRenderingTests {
     private static final String ACCESS_KEY_PROPERTY = "content.store.s3.access.key.id";
     private static final String SECRET_KEY_PROPERTY = "content.store.s3.secret.access.key";
     private static final String PATH_STYLE_PROPERTY = "content.store.s3.path.style";
-    private static final String KEY_PREFIX_PROPERTY = "content.store.s3.key.prefix";
 
     private static final String PROVIDER_VARIABLE = "OFBIZ_CONTENT_STORE_PROVIDER";
     private static final String BUCKET_VARIABLE = "OFBIZ_S3_BUCKET";
@@ -120,7 +120,6 @@ public final class ContentStoreRenderingTests {
     private static final String ACCESS_KEY_VARIABLE = "OFBIZ_S3_ACCESS_KEY_ID";
     private static final String SECRET_KEY_VARIABLE = "OFBIZ_S3_SECRET_ACCESS_KEY";
     private static final String PATH_STYLE_VARIABLE = "OFBIZ_S3_PATH_STYLE";
-    private static final String KEY_PREFIX_VARIABLE = "OFBIZ_S3_KEY_PREFIX";
 
     /** The mode that authenticates with the two credential properties. */
     private static final String CREDENTIALS_STATIC = "static";
@@ -135,23 +134,22 @@ public final class ContentStoreRenderingTests {
     private static final String ENDPOINT = "https://" + ENDPOINT_HOST + ":9000";
 
     /**
-     * The eleven variables the renderer reads, paired with the eleven properties it writes, in order.
+     * The ten variables the renderer reads, paired with the ten properties it writes, in order.
      *
      * <p>These are the entry point's own {@code CONTENT_STORE_VARIABLES} and
      * {@code CONTENT_STORE_PROPERTIES} arrays, which it indexes together, so the two lists here are kept
      * in the same order and at the same length. Leaving one out would silently narrow every loop below -
      * the anchor census, the documented-and-withdrawn census and the no-duplicate-declaration census
-     * would all stop covering it, which is exactly how {@code content.store.s3.key.prefix} went
-     * unasserted after it was added.
+     * would all stop covering it. {@link #theRenderedVariablesAreExactlyTheOnesTheEntryPointDeclares}
+     * therefore reads both arrays out of the script and compares them with these lists, so neither a
+     * name added on one side nor a name removed from it can leave this file behind.
      */
     private static final List<String> STORE_VARIABLES = List.of(PROVIDER_VARIABLE, BUCKET_VARIABLE,
             REGION_VARIABLE, ENDPOINT_VARIABLE, ALLOWLIST_VARIABLE, PLAINTEXT_VARIABLE,
-            CREDENTIALS_MODE_VARIABLE, ACCESS_KEY_VARIABLE, SECRET_KEY_VARIABLE, PATH_STYLE_VARIABLE,
-            KEY_PREFIX_VARIABLE);
+            CREDENTIALS_MODE_VARIABLE, ACCESS_KEY_VARIABLE, SECRET_KEY_VARIABLE, PATH_STYLE_VARIABLE);
     private static final List<String> STORE_PROPERTIES = List.of(PROVIDER_PROPERTY, BUCKET_PROPERTY,
             REGION_PROPERTY, ENDPOINT_PROPERTY, ALLOWLIST_PROPERTY, PLAINTEXT_PROPERTY,
-            CREDENTIALS_MODE_PROPERTY, ACCESS_KEY_PROPERTY, SECRET_KEY_PROPERTY, PATH_STYLE_PROPERTY,
-            KEY_PREFIX_PROPERTY);
+            CREDENTIALS_MODE_PROPERTY, ACCESS_KEY_PROPERTY, SECRET_KEY_PROPERTY, PATH_STYLE_PROPERTY);
 
     /**
      * The committed source must still declare each rendered property exactly once.
@@ -177,18 +175,101 @@ public final class ContentStoreRenderingTests {
     }
 
     /**
+     * This suite's variable and property lists are exactly the entry point's own two arrays.
+     *
+     * <p>Every census below - the anchor contract, the documented-and-withdrawn check, the round trip and
+     * the no-duplicate-declaration check - iterates {@link #STORE_VARIABLES} and {@link #STORE_PROPERTIES}.
+     * A name added to the script and not to them would therefore be covered by nothing at all, and a name
+     * removed from the script and left here would be asserted about a setting that no longer exists. Both
+     * mistakes are silent, and the first one has already happened once in this file's history. So the two
+     * arrays are read out of the production script and compared, index by index, with the two lists here:
+     * this file cannot fall out of step with the script without failing the build beside it.
+     *
+     * <p>The arrays are parsed rather than sourced, because sourcing the script to read them would drag in
+     * the whole start up. A bash array literal spanning its own lines is unambiguous enough to read
+     * directly: everything between {@code NAME=(} at the start of a line and the closing {@code )} on a
+     * line of its own, split on whitespace.
+     *
+     * @throws IOException if the entry point cannot be read, which fails the test
+     */
+    @Test
+    public void theRenderedVariablesAreExactlyTheOnesTheEntryPointDeclares() throws IOException {
+        String entryPoint = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
+
+        assertEquals(STORE_VARIABLES, arrayLiteral(entryPoint, "CONTENT_STORE_VARIABLES"),
+                "CONTENT_STORE_VARIABLES in " + ENTRY_POINT + " and STORE_VARIABLES here must be the same "
+                        + "names in the same order: every census in this suite iterates the list here, so a "
+                        + "variable present only in the script is asserted about by nothing");
+        assertEquals(STORE_PROPERTIES, arrayLiteral(entryPoint, "CONTENT_STORE_PROPERTIES"),
+                "CONTENT_STORE_PROPERTIES in " + ENTRY_POINT + " and STORE_PROPERTIES here must be the same "
+                        + "properties in the same order: the script indexes its two arrays together, so the "
+                        + "pairing only holds if both lists here match both arrays there");
+    }
+
+    /**
+     * Reads a multi-line bash array literal out of the entry point.
+     *
+     * @param entryPoint the whole text of the script
+     * @param name the array's name, declared as {@code name=(} at the start of a line
+     * @return the array's elements in declaration order
+     */
+    private static List<String> arrayLiteral(String entryPoint, String name) {
+        int open = entryPoint.indexOf("\n" + name + "=(\n");
+        assertTrue(open >= 0, ENTRY_POINT + " must declare the array " + name + " with one element per line");
+        int start = open + name.length() + 4;
+        int close = entryPoint.indexOf("\n)\n", start);
+        assertTrue(close > start, name + " in " + ENTRY_POINT + " must be closed by a ')' on a line of its own");
+        return Stream.of(entryPoint.substring(start, close).split("\\s+"))
+                .filter(element -> !element.isEmpty())
+                .collect(Collectors.toList());
+    }
+
+    /**
      * Every advertised variable is documented in the entry point and removed from the environment it exec's.
      *
      * <p>Both halves are what the defect was. The variables were advertised in the specification while
      * the entry point neither rendered nor removed a single one of them, so a deployment that supplied a
      * secret access key got database storage AND a live credential left in {@code /proc/<pid>/environ} for
-     * the life of the instance. This is a static check of the script's own text - the behaviour of the unset
-     * block is exercised end to end by {@code SchemaInitEntryPointTests} - and it exists so that adding an
+     * the life of the instance. This is a static check of the script's own text - the behaviour of the
+     * withdrawal is exercised end to end by {@code SchemaInitEntryPointTests} - and it exists so that adding an
      * further variable without documenting it, or without withdrawing it from the environment, fails the
      * build next to the file that has to be corrected.
      *
      * @throws IOException if the entry point cannot be read, which fails the test
      */
+    /**
+     * The loop the entry point's withdrawal is driven by, in place of a hand written {@code unset} per name.
+     */
+    private static final String WITHDRAWAL_LOOP =
+            "for variableName in \"${RUNTIME_APPLIED_VARIABLES[@]}\" \"${CONTAINER_CONTROL_VARIABLES[@]}\"; do";
+
+    /**
+     * Whether the entry point withdraws {@code variable} from the environment before it execs the server.
+     *
+     * <p>The withdrawal is driven by the two declared inventories rather than by one hand written
+     * {@code unset} per name, so what has to be present is the variable's DECLARATION plus the loop that
+     * consumes both arrays. Asserting on a literal {@code unset OFBIZ_X} would hold only while the list
+     * stayed hand written, which is the drift the loop exists to remove - two names were once missed by
+     * exactly that list. The behaviour itself is exercised end to end by
+     * {@code SchemaInitEntryPointTests}, which plants every declared name and drives the real function.</p>
+     *
+     * @param entryPoint the entry point's text
+     * @param variable the environment variable that must not survive into the served JVM
+     * @return true when the variable is declared by an inventory the withdrawal loop consumes
+     */
+    private static boolean withdrawnBeforeExec(String entryPoint, String variable) {
+        boolean declared = false;
+        for (String inventory : List.of("RUNTIME_APPLIED_VARIABLES=(", "CONTAINER_CONTROL_VARIABLES=(")) {
+            int at = entryPoint.indexOf(inventory);
+            int end = at < 0 ? -1 : entryPoint.indexOf("\n)", at);
+            if (end < 0) {
+                continue;
+            }
+            declared = declared || List.of(entryPoint.substring(at, end).split("\\s+")).contains(variable);
+        }
+        return declared && entryPoint.contains(WITHDRAWAL_LOOP) && entryPoint.contains("unset \"$variableName\"");
+    }
+
     @Test
     public void everyAdvertisedVariableIsDocumentedAndWithdrawnFromTheEnvironmentBeforeTheServerStarts()
             throws IOException {
@@ -202,8 +283,7 @@ public final class ContentStoreRenderingTests {
                             || entryPoint.contains("\n# " + variable + "\n"),
                     variable + " must be documented in the environment-variable header of " + ENTRY_POINT
                             + ": an undocumented variable is one an operator cannot know to supply");
-            assertTrue(entryPoint.contains("unset " + variable + System.lineSeparator())
-                            || entryPoint.contains("unset " + variable + "\n"),
+            assertTrue(withdrawnBeforeExec(entryPoint, variable),
                     variable + " must be removed from the environment before OFBiz is exec'd. It has already "
                             + "been rendered into a mode 0600 file, and an environment variable is readable "
                             + "through /proc/<pid>/environ for the whole life of the instance");
@@ -213,7 +293,7 @@ public final class ContentStoreRenderingTests {
     /**
      * With no object-store variable set at all, nothing is rendered.
      *
-     * <p>That is the whole backward-compatibility guarantee of this change: an unconfigured container has no
+     * <p>That is the whole backward-compatibility property of this change: an unconfigured container has no
      * override file in play and therefore uses the committed {@code content.properties}, which selects
      * database storage. Writing an override unconditionally would be the failure mode to avoid - a
      * container that had never been told anything about object storage would then be running on a file
@@ -357,6 +437,41 @@ public final class ContentStoreRenderingTests {
         assertFalse(run.output().contains(secretKey),
                 "the secret access key must never reach the container log, not even with OFBIZ_TRACE set. "
                         + "Output:\n" + run.output());
+    }
+
+    /**
+     * The credential must not escape through the census that only asks whether anything was configured.
+     *
+     * <p>The renderer first decides whether any object-store variable is set at all, by walking the whole
+     * variable list and testing each one for emptiness. That census reaches the two credential names, and
+     * {@code set -x} echoes a test with its arguments already expanded, so the emptiness test itself
+     * publishes the credential unless the secret region is opened BEFORE the census rather than after it.
+     *
+     * <p>The provider variable is deliberately left unset here. It is first in the list, so a run that sets
+     * it stops the walk on its own name and never reaches a credential - which is exactly why this case
+     * supplies nothing but the credential and the trace switch.
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void theCredentialIsNeverEchoedWhileDecidingWhetherAnythingWasConfigured(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+
+        String secretKey = "aCensusOnlySecretAccessKeyValue0123456789";
+        Map<String, String> environment = new LinkedHashMap<>();
+        environment.put(SECRET_KEY_VARIABLE, secretKey);
+        environment.put("OFBIZ_TRACE", "1");
+
+        RendererRun run = render(tempDir, sandbox, environment);
+
+        assertTrue(run.output().contains("+ "),
+                "the case did not trace anything, so it cannot prove the census is safe. Output:\n" + run.output());
+        assertFalse(run.output().contains(secretKey),
+                "the secret access key was published by the census that only wanted to know whether any "
+                        + "object-store variable was set. Output:\n" + run.output());
     }
 
     /**
@@ -746,9 +861,9 @@ public final class ContentStoreRenderingTests {
     /**
      * The identity the deployment authenticates as has to be named, and never inferred.
      *
-     * <p>This is the defect, stated as a test. {@link S3ContentStore} used to select a static credential when
-     * both credential properties happened to be present and the ambient AWS credential chain otherwise, so a
-     * typo in one variable name, or a secret store that injected only one of the two, moved the deployment
+     * <p>This is the defect, stated as a test. A resolver that selected a static credential when both
+     * credential properties happened to be present and the ambient AWS credential chain otherwise would let a
+     * typo in one variable name, or a secret store that delivered one of the two, silently change which
      * onto a different identity - with different permissions, against a different account - and reported
      * nothing at all. Both an absent mode and an unrecognised one are refused, so the choice cannot be made
      * by accident.
@@ -778,8 +893,8 @@ public final class ContentStoreRenderingTests {
     /**
      * A credential set that contradicts the named identity source is refused, in either direction.
      *
-     * <p>Half a static credential used to select the ambient chain silently; a credential left behind after
-     * switching to an instance role used to be ignored silently. Both are the same class of defect - the
+     * <p>Half a static credential must not select the ambient chain silently, and a credential left behind
+     * after switching to an instance role must not be ignored silently. Both are the same class of defect - the
      * deployment runs as an identity nobody chose - so both abort the start, and the refusal names the
      * variable that has to change.
      *
@@ -857,9 +972,9 @@ public final class ContentStoreRenderingTests {
      * An addressing style that is not clearly a boolean aborts the start.
      *
      * <p>Path-style addressing is what most S3-compatible stores require and what Amazon S3 does not, so
-     * getting it wrong makes every request fail. A value the shell cannot read as a boolean would previously
-     * have been rendered verbatim for the provider to parse as {@code false}, quietly selecting the opposite
-     * of what the manifest says whenever the manifest says something like {@code yes} or {@code on}.
+     * getting it wrong makes every request fail. Rendering a value the shell cannot read as a boolean verbatim
+     * would leave the provider to parse it as {@code false}, quietly selecting the opposite of what the
+     * manifest says whenever the manifest says something like {@code yes} or {@code on}.
      *
      * @param invalid a value that is not recognisably a boolean
      * @param tempDir a per-test sandbox; nothing outside it is written
@@ -1111,6 +1226,121 @@ public final class ContentStoreRenderingTests {
     }
 
     /**
+     * Every endpoint rule refuses on the resolve route as well as on the render route.
+     *
+     * <p>The entry point checks the endpoint at two points in a start, and it does so deliberately: the
+     * renderer checks it while substituting it into {@code config/content.properties}, and the resolver
+     * checks it again on every start, including the starts that render nothing at all. Two check points is
+     * the design; two different rule sets was the defect. The route that always runs was the one missing
+     * the rules that matter most - the instance-metadata refusal, the allowlist, and the refusal of a
+     * plaintext endpoint in the deployed profile - so an endpoint that the renderer would have refused was
+     * accepted whenever the renderer was not reached.
+     *
+     * <p>Each case here offers one unacceptable endpoint and requires the same refusal from both routes,
+     * identified by a fragment that only the intended rule produces. That is what stops the rules drifting
+     * apart again: a rule deleted from one route, or added to only one, fails here.
+     *
+     * @param endpoint the endpoint to offer
+     * @param allowlist the hosts the deployment declares, or {@code NONE} to declare none
+     * @param profile the profile to run under
+     * @param refusal a fragment of the diagnostic only the intended rule produces
+     * @param tempDir a per-test sandbox
+     * @throws Exception if the shell could not be run at all
+     */
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+        "https://169.254.169.254 | 169.254.169.254 | dev | points at the cloud instance metadata service",
+        "https://objects.example.internal:9000 | someone.else.example.internal | dev | is not listed in "
+                + "OFBIZ_S3_ENDPOINT_ALLOWLIST",
+        "https://objects.example.internal:9000 | NONE | dev | OFBIZ_S3_ENDPOINT_ALLOWLIST is required when",
+        "http://objects.example.internal:9000 | objects.example.internal | prod | must use https:// when "
+                + "OFBIZ_PROFILE=prod",
+        "https://objects.example.internal:70000 | objects.example.internal | dev | the port component of "
+                + "OFBIZ_S3_ENDPOINT",
+        "https://objects_example.internal | objects.example.internal | dev | must name a host as letters",
+        "https://[fd00::1 | objects.example.internal | dev | has an unterminated IPv6 literal",
+    })
+    void everyEndpointRuleRefusesOnTheResolveRouteAsWellAsTheRenderRoute(String endpoint, String allowlist,
+            String profile, String refusal, @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "bash is required to drive the entry point");
+        for (String route : List.of("render", "resolve")) {
+            Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, route));
+            Map<String, String> environment = staticCredentialEnvironment();
+            environment.put(ENDPOINT_VARIABLE, endpoint);
+            if (!"NONE".equals(allowlist)) {
+                environment.put(ALLOWLIST_VARIABLE, allowlist);
+            }
+            environment.put("OFBIZ_PROFILE", profile);
+
+            RendererRun run = "render".equals(route)
+                    ? render(tempDir, sandbox, environment)
+                    : resolve(tempDir, sandbox, environment);
+
+            assertRefused(run, sandbox, ENDPOINT_VARIABLE,
+                    "the " + route + " route must refuse " + endpoint);
+            assertTrue(run.output().contains(refusal),
+                    "the " + route + " route refused " + endpoint + ", but not for the reason this case is "
+                            + "about: it must report \"" + refusal + "\". Output:\n" + run.output());
+        }
+    }
+
+    /**
+     * A start that supplies no object-store variable renders no override, even though the entry point has
+     * given the provider a value by the time the renderer runs.
+     *
+     * <p>The renderer's "nothing is configured" branch can only be reached if the census behind it asks what
+     * the <em>operator</em> supplied. {@code ofbiz_setup_env} gives {@code OFBIZ_CONTENT_STORE_PROVIDER} and
+     * {@code OFBIZ_S3_PATH_STYLE} a value on every start, so a census that merely tested whether those
+     * variables held anything answered "configured" for every container that ever ran, and the branch was
+     * unreachable from a real start. This case reproduces that defaulting exactly - the two assignments are
+     * read back out of the entry point first, so the reproduction cannot drift from what the container
+     * really does - and then requires the branch to be taken regardless.
+     *
+     * <p>A stale override is planted first, because the consequence is not only that nothing new is written.
+     * {@code /ofbiz/config} outlives the container, so the branch also has to remove an override left by an
+     * earlier start that did configure the object store; a start that could not reach the branch would
+     * instead rewrite that file from the entry point's own default and leave it shadowing the committed
+     * {@code content.properties} for good.
+     *
+     * @param tempDir a per-test sandbox
+     * @throws Exception if the shell could not be run at all
+     */
+    @Test
+    void aStartSupplyingNoObjectStoreVariableRendersNoOverrideDespiteTheAppliedDefaults(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "bash is required to drive the entry point");
+        String entryPoint = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
+        String defaultedProvider = "OFBIZ_CONTENT_STORE_PROVIDER=${OFBIZ_CONTENT_STORE_PROVIDER:-database}";
+        String defaultedPathStyle = "OFBIZ_S3_PATH_STYLE=${OFBIZ_S3_PATH_STYLE:-false}";
+        assertTrue(entryPoint.contains(defaultedProvider),
+                "the entry point must still default the provider on every start, or this case no longer "
+                        + "reproduces the condition the census has to see through");
+        assertTrue(entryPoint.contains(defaultedPathStyle),
+                "the entry point must still default path-style addressing on every start, for the same "
+                        + "reason");
+
+        Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "defaulted"));
+        Path override = sandbox.resolve(CONTENT_OVERRIDE);
+        Files.createDirectories(override.getParent());
+        Files.writeString(override, "content.store.provider=s3\n", StandardCharsets.UTF_8);
+
+        RendererRun run = drive(tempDir, sandbox, Map.of(), "record_supplied_variables\n"
+                + defaultedProvider + "\n"
+                + defaultedPathStyle + "\n"
+                + "render_content_store_configuration");
+
+        assertEquals(0, run.exitCode(),
+                "a start that configures no object store must not be refused. Output:\n" + run.output());
+        assertFalse(Files.exists(override),
+                "the census must ask what the operator supplied rather than what currently holds a value: an "
+                        + "override rewritten from the entry point's own default would shadow the committed "
+                        + "content.properties on every start. Output:\n" + run.output());
+        assertTrue(run.output().contains("removed the stale"),
+                "the removal must be reported, so an operator can see why the override went away. Output:\n"
+                        + run.output());
+    }
+
+    /**
      * Renders one provider's configuration through the shell, publishes what it wrote, and asks the factory.
      *
      * @param tempDir a per-test sandbox
@@ -1265,10 +1495,6 @@ public final class ContentStoreRenderingTests {
     /**
      * Runs the real entry point's object-store renderer as a black box against a sandbox.
      *
-     * <p>Every inherited {@code OFBIZ_*} variable is removed from the child environment first, so a value
-     * exported into the build cannot decide a case, and {@code OFBIZ_PROFILE} defaults to {@code dev} exactly
-     * as the cases that do not care about the profile need it to.
-     *
      * @param workDir a per-test temporary directory for the generated driver scripts
      * @param sandbox the directory the renderer treats as the OFBiz home
      * @param environment the variables to supply
@@ -1277,12 +1503,51 @@ public final class ContentStoreRenderingTests {
      */
     private static RendererRun render(Path workDir, Path sandbox, Map<String, String> environment)
             throws Exception {
+        return drive(workDir, sandbox, environment, "render_content_store_configuration");
+    }
+
+    /**
+     * Runs the real entry point's object-store resolver as a black box against a sandbox.
+     *
+     * <p>The resolver is the half of the entry point that reads the object-store environment on every
+     * container start, including the starts on which nothing is rendered. It is therefore the route a rule
+     * has to hold on if it is to hold at all, and driving it through the same shape as {@link #render} is
+     * what lets one case require the same refusal from both.
+     *
+     * @param workDir a per-test temporary directory for the generated driver scripts
+     * @param sandbox the directory the resolver treats as the OFBiz home
+     * @param environment the variables to supply
+     * @return the exit code and the combined output of the run
+     * @throws Exception if the shell could not be run at all
+     */
+    private static RendererRun resolve(Path workDir, Path sandbox, Map<String, String> environment)
+            throws Exception {
+        return drive(workDir, sandbox, environment, "resolve_content_store_configuration");
+    }
+
+    /**
+     * Runs a fragment of the real entry point as a black box against a sandbox, with the entry point
+     * sourced as a library so the fragment is the genuine shipped code.
+     *
+     * <p>Every inherited {@code OFBIZ_*} variable is removed from the child environment first, so a value
+     * exported into the build cannot decide a case, and {@code OFBIZ_PROFILE} defaults to {@code dev} exactly
+     * as the cases that do not care about the profile need it to.
+     *
+     * @param workDir a per-test temporary directory for the generated driver scripts
+     * @param sandbox the directory the fragment treats as the OFBiz home
+     * @param environment the variables to supply
+     * @param body the shell to run once the entry point is sourced and the sandbox entered
+     * @return the exit code and the combined output of the run
+     * @throws Exception if the shell could not be run at all
+     */
+    private static RendererRun drive(Path workDir, Path sandbox, Map<String, String> environment,
+            String body) throws Exception {
         Path driver = Files.createTempFile(workDir, "entrypoint-driver", ".sh");
         Files.writeString(driver, "#!/usr/bin/env bash\n"
                 + ". " + shellQuote(entryPointLibrary(workDir)) + "\n"
                 + "OFBIZ_PROFILE=\"${OFBIZ_PROFILE:-dev}\"\n"
                 + "cd " + shellQuote(sandbox) + " || exit 1\n"
-                + "render_content_store_configuration\n", StandardCharsets.UTF_8);
+                + body + "\n", StandardCharsets.UTF_8);
 
         ProcessBuilder builder = new ProcessBuilder("bash", driver.toString());
         builder.directory(sandbox.toFile());
@@ -1293,7 +1558,7 @@ public final class ContentStoreRenderingTests {
 
         Process process = builder.start();
         String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertTrue(process.waitFor(120, TimeUnit.SECONDS), "the entry point renderer did not terminate");
+        assertTrue(process.waitFor(120, TimeUnit.SECONDS), "the entry point fragment did not terminate");
         return new RendererRun(process.exitValue(), output);
     }
 

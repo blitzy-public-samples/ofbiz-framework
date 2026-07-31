@@ -25,6 +25,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import static java.util.Map.entry;
+
 import java.io.IOException;
 import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
@@ -36,6 +38,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -88,12 +91,13 @@ import org.xml.sax.SAXParseException;
  * contacted and no network is used.</li>
  * <li>{@code OFBIZ_PROFILE} is supplied by the driver as {@code dev} unless a case names it, because the
  * functions under test read it and are normally reached after {@code require_profile} has resolved it. The
- * script itself has no default, and the cases that prove that use {@code runWithoutProfileDefault}, which omits
+ * script itself has no default, and the cases that establish that use {@code runWithoutProfileDefault}, which omits
  * the driver's assignment entirely.</li>
- * <li>Where a run has to prove that a command WOULD have been invoked - the data loader, the serving command -
- * a shell function of the same name records its arguments instead of executing. Bash resolves a function whose
- * name contains a slash ahead of the path, which is what lets {@code /ofbiz/bin/ofbiz} be intercepted without
- * creating anything outside the sandbox.</li>
+ * <li>Where a run has to establish that a command WOULD have been invoked - the data loader, the serving
+ * command - a shell function of the same name records its arguments instead of executing. No data loader and
+ * no Entity Engine therefore run: what a case observes is the invocation that would have happened, not its
+ * effect on a database. Bash resolves a function whose name contains a slash ahead of the path, which is what
+ * lets {@code /ofbiz/bin/ofbiz} be intercepted without creating anything outside the sandbox.</li>
  * <li>Every {@code OFBIZ_*} variable is removed from the child environment before each run, so a value set on
  * the developer's machine or the build agent cannot decide the outcome of a case.</li>
  * </ul>
@@ -263,10 +267,107 @@ public final class SchemaInitEntryPointTests {
     private static final String POOL_MIN = "7";
     private static final String POOL_MAX = "77";
 
+    /** The desired-state record the render writes, relative to the sandbox. */
+    private static final String DB_CONFIG_APPLIED_MARKER = "state/db_config_applied";
+
+    /** The first line of a record written before the fields the current format carries existed. */
+    private static final String EARLIER_RECORD_VERSION = "version=1";
+
+    /**
+     * One alternative value for every non-secret input the managed render substitutes.
+     *
+     * <p>Each is valid - the render has to succeed for the case to mean anything - and each differs from what
+     * {@link #managedDatabaseEnvironment} supplies, so applying it produces a configuration that genuinely
+     * differs from the baseline. That is what makes the coverage assertion non-vacuous: a field the record
+     * omits shows up as a rendered difference the record failed to notice, which is exactly the defect this
+     * table exists to catch.</p>
+     */
+    private static final Map<String, String> NON_SECRET_RENDER_INPUTS = Map.ofEntries(
+            entry("OFBIZ_POSTGRES_HOST", "other-db.example.internal"),
+            entry("OFBIZ_POSTGRES_PORT", "65431"),
+            entry("OFBIZ_POSTGRES_OFBIZ_DB", OFBIZ_DATABASE + "two"),
+            entry("OFBIZ_POSTGRES_OLAP_DB", OLAP_DATABASE + "two"),
+            entry("OFBIZ_POSTGRES_TENANT_DB", TENANT_DATABASE + "two"),
+            entry("OFBIZ_POSTGRES_OFBIZ_USER", OFBIZ_USER + "two"),
+            entry("OFBIZ_POSTGRES_OLAP_USER", OLAP_USER + "two"),
+            entry("OFBIZ_POSTGRES_TENANT_USER", TENANT_USER + "two"),
+            entry("OFBIZ_POSTGRES_SSLMODE", "require"),
+            entry("OFBIZ_POSTGRES_SSLROOTCERT", "/etc/ssl/certs/pg-other-root.crt"),
+            entry("OFBIZ_POSTGRES_CONNECT_TIMEOUT", "9"),
+            entry("OFBIZ_POSTGRES_SOCKET_TIMEOUT", "61"),
+            entry("OFBIZ_POSTGRES_LOGIN_TIMEOUT", "31"),
+            entry("OFBIZ_POSTGRES_CANCEL_TIMEOUT", "11"),
+            entry("OFBIZ_POSTGRES_QUERY_TIMEOUT", "45"),
+            entry("OFBIZ_POSTGRES_TCP_KEEPALIVE", "false"),
+            entry("OFBIZ_DB_POOL_MIN", "8"),
+            entry("OFBIZ_DB_POOL_MAX", "78"),
+            entry("OFBIZ_DB_POOL_WAIT", "20001"),
+            entry("OFBIZ_DB_POOL_TEST_ON_BORROW", "true"),
+            entry("OFBIZ_SCHEMA_INIT", "true"),
+            entry("OFBIZ_DISTRIBUTED_CACHE_CLEAR", "true"),
+            entry("OFBIZ_PROFILE", "prod"));
+
+    /**
+     * Every count the entry point's prose states about a list it declares, and which members that count.
+     *
+     * <p>A comment that says "the six variables" is a claim about an array a few hundred lines away, and a
+     * shell comment cannot compute it. Registering the claim here is what makes the restatement a CHECKED
+     * property instead of a promise: the count is derived from the array and compared with the word the prose
+     * uses, so changing the array without the comment fails, and rewording the comment without registering the
+     * new wording fails too.</p>
+     *
+     * <p>The value is the declaring array, optionally followed by {@code #} and a pattern the members that are
+     * being counted must match - which is how "the nine OFBIZ_S3_* variables" is checked against the nine
+     * object-store names inside a ten-name array.</p>
+     */
+    private static final Map<String, String> STATED_LIST_SIZES = Map.ofEntries(
+            entry("These six variables are what actually remove the privilege from the serving path.",
+                    "POSTGRES_INIT_IDENTITY_VARIABLES"),
+            entry("The six variables that carry the schema-initialisation database identity.",
+                    "POSTGRES_INIT_IDENTITY_VARIABLES"),
+            entry("The six init variables are supplied together or not at all.",
+                    "POSTGRES_INIT_IDENTITY_VARIABLES"),
+            entry("The ten variables that carry the object-store configuration",
+                    "CONTENT_STORE_VARIABLES"),
+            entry("The ten OFBIZ_CONTENT_STORE_PROVIDER / OFBIZ_S3_* variables are what Objective 3 advertises",
+                    "CONTENT_STORE_VARIABLES"),
+            entry("This and the nine OFBIZ_S3_* variables below",
+                    "CONTENT_STORE_VARIABLES#OFBIZ_S3_.*"),
+            entry("all ten are then removed from the environment before the OFBiz JVM is exec'd",
+                    "CONTENT_STORE_VARIABLES"),
+            entry("the six database passwords",
+                    "SECRET_ENVIRONMENT_VARIABLES#OFBIZ_POSTGRES_.*_PASSWORD"),
+            entry("the object store's two credentials",
+                    "SECRET_ENVIRONMENT_VARIABLES#OFBIZ_S3_.*"),
+            entry("the two signing keys",
+                    "SECRET_ENVIRONMENT_VARIABLES#OFBIZ_(LOGIN_SECRET|JWT_TOKEN)_KEY"));
+
+    /**
+     * The one place the entry point counts variables without describing an inventory.
+     *
+     * <p>It counts two shell globals declared beside each other, which the reader can see in the same comment.
+     * Named explicitly rather than pattern-excluded, so it cannot become a way to leave a real inventory claim
+     * unchecked, and asserted to be present, so it cannot quietly rot into a stale exclusion.</p>
+     */
+    private static final String LOCAL_VARIABLE_COUNT =
+            "Two variables rather than one because they are consulted at different points";
+
+    /** The claim about the SDK's own variables, whose count is of names the same sentence lists. */
+    private static final String SDK_VARIABLES_CLAIM = "SIX AWS_ PREFIXED NAMES ARE DELIBERATELY NOT TOUCHED";
+
+    /** How far past that claim its enumeration reaches. The prose holds no other {@code AWS_} name. */
+    private static final int SDK_CLAIM_ENUMERATION_LENGTH = 200;
+
+    /** The number words the entry point's prose uses, which is as far as any count in it goes. */
+    private static final Map<String, Integer> NUMBER_WORDS = Map.ofEntries(
+            entry("two", 2), entry("three", 3), entry("four", 4), entry("five", 5), entry("six", 6),
+            entry("seven", 7), entry("eight", 8), entry("nine", 9), entry("ten", 10), entry("eleven", 11),
+            entry("twelve", 12), entry("thirteen", 13), entry("fourteen", 14));
+
     /** Where the loader stub records what it was asked to load, relative to the sandbox. */
     private static final String LOADER_INVOCATIONS = "loader-invocations.txt";
 
-    /** The schema-only load: a reader no component declares, so a delegator is created and not one row is read. */
+    /** The schema-only load: a reader no component declares, so a delegator is created and no reader row is read. */
     private static final String SCHEMA_ONLY_LOAD = "--load-data readers=none";
 
     /** The two data-load selections that read rows, exactly as {@code load_data} invokes them. */
@@ -295,6 +396,30 @@ public final class SchemaInitEntryPointTests {
             + "configure_database\n"
             + "printf 'CONFIGURE_DATABASE_RETURNED\\n'\n";
 
+    /**
+     * Reports the {@code OFBIZ_} names in the environment either side of the real withdrawal.
+     *
+     * <p>{@code env} is a child process, so what it lists is what the entry point would hand to the server it
+     * execs. Only names are printed; a value is never echoed, so the fixture cannot itself republish one.</p>
+     *
+     * <p>Tracing is turned off first because {@code OFBIZ_TRACE} has to be PRESENT for its own withdrawal to be
+     * exercised, and any non-empty value turns tracing on as the script is sourced - which would interleave the
+     * trace of these very commands with the two name listings they produce. What tracing does and does not
+     * publish is asserted by the cases that are about tracing; this one is about the environment.</p>
+     */
+    private static final String WITHDRAWAL_BODY =
+            "set +x\n"
+            + "printf 'BEFORE-BEGIN\\n'\n"
+            + "env | sed --quiet 's/^\\(OFBIZ_[A-Z0-9_]*\\)=.*/\\1/p' | sort\n"
+            + "printf 'BEFORE-END\\n'\n"
+            + "withdraw_container_configuration\n"
+            + "printf 'AFTER-BEGIN\\n'\n"
+            + "env | sed --quiet 's/^\\(OFBIZ_[A-Z0-9_]*\\)=.*/\\1/p' | sort\n"
+            + "printf 'AFTER-END\\n'\n"
+            + "printf 'ENVIRONMENT-BEGIN\\n'\n"
+            + "env\n"
+            + "printf 'ENVIRONMENT-END\\n'\n";
+
     /** Marks a run that reached the end of its driver, so a silent early exit is distinguishable from success. */
     private static final String COMPLETED = "CONFIGURE_DATABASE_RETURNED";
 
@@ -320,9 +445,7 @@ public final class SchemaInitEntryPointTests {
             NO_TRANSPORT_CHECK + CONFIGURE_DATABASE_BODY;
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * resolve_entity_engine_flags: the decision that changes what the whole container does
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
@@ -472,8 +595,8 @@ public final class SchemaInitEntryPointTests {
     /**
      * {@code OFBIZ_SKIP_INIT} is parsed as a boolean, so a value that SAYS "do not skip" cannot skip.
      *
-     * <p>The flag used to be tested with {@code [ -z "$OFBIZ_SKIP_INIT" ]}, which made every non-empty value
-     * truthy: {@code OFBIZ_SKIP_INIT=false}, {@code no} and {@code 0} all skipped the initialisation, the exact
+     * <p>Testing the flag with {@code [ -z "$OFBIZ_SKIP_INIT" ]} would make every non-empty value truthy:
+     * {@code OFBIZ_SKIP_INIT=false}, {@code no} and {@code 0} would all skip the initialisation, the exact
      * opposite of what the value says, and silently. Both halves are asserted here - the negative spellings
      * resolve to "do not skip", and a value that is not a boolean at all stops the container rather than being
      * interpreted as consent - because a deployment cannot tell the difference from the outside.</p>
@@ -523,11 +646,11 @@ public final class SchemaInitEntryPointTests {
     /**
      * Skipping the initialisation skips the DATA population only. Everything security relevant still runs.
      *
-     * <p>{@code OFBIZ_SKIP_INIT} used to wrap the whole of {@code _main}'s body, so a restarted container - the
-     * case the flag exists for - skipped the secret resolution and every configuration render along with the
-     * data load. It then served traffic on whatever happened to be left in {@code /ofbiz/config}: the committed
-     * placeholder configuration with no key material at all on a fresh volume, or an earlier image's rendered
-     * keys on a reused one, and in neither case was a single credential validated. The render is idempotent and
+     * <p>If {@code OFBIZ_SKIP_INIT} wrapped the whole of {@code _main}'s body, a restarted container - the case
+     * the flag exists for - would skip the secret resolution and every configuration render along with the data
+     * load, and would then serve traffic on whatever happened to be left in {@code /ofbiz/config}: the
+     * committed placeholder configuration with no key material at all on a fresh volume, or a previous image's
+     * rendered keys on a reused one, with no credential validated in either case. The render is idempotent and
      * always derives from the pristine source, so running it on this path is both safe and the only way a
      * rotated secret can take effect on restart.</p>
      *
@@ -569,20 +692,18 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * require_profile: the decision every other decision in the script depends on
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
      * A container that does not name its deployment profile does not start.
      *
-     * <p>{@code OFBIZ_PROFILE} used to default to {@code dev}, which made the most consequential security
-     * decision in this script - whether an absent secret aborts the start or is replaced by a generated value,
-     * whether the published demo admin password is accepted, whether a non-verifying database TLS mode is
-     * allowed - depend on a variable being ABSENT. A deployment manifest that never mentioned the profile, or
-     * that lost it to a templating mistake, therefore got the permissive setting and reported nothing at all.
-     * An empty value is refused as well, because that is what an unresolved template expansion produces.</p>
+     * <p>A default of {@code dev} would make the most consequential security decision in this script - whether
+     * an absent secret aborts the start or is replaced by a generated value, whether the published demo admin
+     * password is accepted, whether a non-verifying database TLS mode is allowed - depend on a variable being
+     * ABSENT. A deployment manifest that never mentioned the profile, or that lost it to a templating mistake,
+     * would then get the permissive setting and report nothing at all. An empty value is refused as well,
+     * because that is what an unresolved template expansion produces.</p>
      *
      * @param tempDir a per-test sandbox; nothing outside it is written
      * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
@@ -687,9 +808,7 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * render_database_configuration: the deployed-profile configuration the fleet actually reads
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
@@ -719,7 +838,7 @@ public final class SchemaInitEntryPointTests {
 
         Map<String, String> environment = managedDatabaseEnvironment();
         // Asked for explicitly so that the cache-clear placeholder is substituted with the value that is NOT
-        // the resolver's default, which is what proves it was substituted rather than merely left alone.
+        // the resolver's default, which is what tells a substituted value apart from one merely left alone.
         environment.put("OFBIZ_DISTRIBUTED_CACHE_CLEAR", "true");
 
         EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_WITHOUT_TRANSPORT_BODY, environment);
@@ -799,7 +918,7 @@ public final class SchemaInitEntryPointTests {
                 "the password must round-trip through sed and the XML attribute unchanged");
         assertEquals(hostileUser, inlineJdbc.getAttribute("jdbc-username"),
                 "the user name must round-trip through sed and the XML attribute unchanged");
-        // The document parsed, so nothing escaped its attribute; this additionally proves the escaping did not
+        // The document parsed, so nothing escaped its attribute; this additionally shows the escaping did not
         // corrupt the structure around it, which is the failure a hostile value is aiming for.
         assertEquals(List.of(), validateAgainstEntityConfigSchema(rendered),
                 "the rendered configuration must remain valid against the entity-config grammar");
@@ -932,9 +1051,7 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The post-render validators: the fail-closed half of every claim above
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
@@ -1068,6 +1185,72 @@ public final class SchemaInitEntryPointTests {
         assertNotEquals(0, wrongMode.getExitCode(),
                 "a run-mode render must not satisfy an init-mode check, output was:\n" + wrongMode.getOutput());
         assertFalse(Files.exists(mismatched.resolve(RENDERED_OVERRIDE)),
+                "a refused render must not be left where the class path would find it");
+    }
+
+    /**
+     * A managed datasource left on startup DDL is refused even when the file's <em>totals</em> are still
+     * correct, which is the one shape a count of the literals cannot see.
+     *
+     * <p>An aggregate check answers "how many datasources carry the requested literal", and that question has
+     * the same answer whether the attribute is where it belongs or has moved: lose
+     * {@code add-missing-on-start="false"} from a managed datasource and gain it on an embedded one and the
+     * total is unchanged. The tamper below does exactly that, and it is not a contrived edit - it is what a
+     * template whose {@code @ADD_MISSING_ON_START@} placeholder was dropped from one datasource while another
+     * was hard-coded looks like after rendering.</p>
+     *
+     * <p>What that costs in production is the whole point of Objective 4: {@code localpostgres} is the
+     * datasource the business data model lives in, and {@code Datasource} reads the attribute as
+     * {@code "true".equals(value)}, so every instance of the fleet would issue CREATE and ALTER against the
+     * shared database on every start - the DDL the serving fleet is required not to perform, and the privilege
+     * it is required not to hold.</p>
+     *
+     * <p>The totals are asserted to still agree <em>before</em> the validator is run. Without that assertion
+     * this case would not distinguish a per-datasource check from a counting one, because a tamper that also
+     * broke the totals would be refused by either.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void aManagedDatasourceLeftOnStartupDdlIsRefusedEvenWhenTheFileTotalsStillAgree(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = renderedFixture(tempDir);
+        Path rendered = sandbox.resolve(RENDERED_OVERRIDE);
+        String disabled = ADD_MISSING_ON_START + "=\"false\"";
+        String enabled = ADD_MISSING_ON_START + "=\"true\"";
+
+        // The embedded datasource gains the disabled literal first, then the managed one loses it. In this order
+        // each rewrite lands on the datasource it is meant for: the first embedded declaration is the earliest
+        // holder of the enabled literal, and the first managed one is then the earliest holder of the disabled
+        // one, because the template declares all three managed datasources before any embedded datasource.
+        tamperRenderedConfiguration(sandbox, enabled, disabled);
+        tamperRenderedConfiguration(sandbox, disabled, enabled);
+
+        String text = Files.readString(rendered, StandardCharsets.UTF_8);
+        int managed = occurrences(text, "field-type-name=\"postgres\"");
+        assertEquals(MANAGED_DATASOURCES.size(), managed, "the fixture must declare every managed datasource");
+        assertEquals(managed, occurrences(text, CHECK_ON_START + "=\"false\""),
+                "the tamper must leave the count of disabled schema checks agreeing with the managed count");
+        assertEquals(managed, occurrences(text, disabled), "the tamper must leave the count of disabled"
+                + " add-missing flags agreeing with the managed count: if it did not, a validator that merely"
+                + " counted the literals would refuse this file too and this case would prove nothing");
+        assertTrue(managedDatasourceAttributes(text, MANAGED_DATASOURCES.get(0)).contains(enabled),
+                "the tamper must have left " + MANAGED_DATASOURCES.get(0) + " on startup DDL, or the file this"
+                        + " case hands the validator is not defective at all");
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox,
+                "require_rendered_schema_ddl_mode " + RENDERED_OVERRIDE + " false\n", Map.of());
+
+        assertNotEquals(0, run.getExitCode(), "a managed datasource left on startup DDL must be refused however"
+                + " the rest of the file counts up, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains(MANAGED_DATASOURCES.get(0)), "the failure must name the datasource"
+                + " that is wrong, because that is what an operator has to correct, output was:\n"
+                + run.getOutput());
+        assertTrue(run.getOutput().contains(ADD_MISSING_ON_START), "the failure must name the attribute that is"
+                + " wrong, output was:\n" + run.getOutput());
+        assertFalse(Files.exists(rendered),
                 "a refused render must not be left where the class path would find it");
     }
 
@@ -1246,15 +1429,13 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * require_postgres_ssl_parameters: what the deployed profile will accept as a verified connection
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
      * The deployed profile requires the one TLS mode that authenticates the server it is talking to.
      *
-     * <p>{@code verify-ca} used to be accepted here, and it is the mode that looks safe and is not: pgJDBC
+     * <p>{@code verify-ca} is refused, because it is the mode that looks safe and is not: pgJDBC
      * checks that the certificate chains to a trusted root but does NOT check that the certificate belongs to
      * the host that was asked for. A managed cloud database service issues every tenant a certificate from one
      * shared certification authority, so under {@code verify-ca} any other tenant's endpoint satisfies the
@@ -1314,21 +1495,19 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * require_admin_password: the credential that holds every OFBiz permission
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
      * The deployed profile will not create the fully privileged admin user with a password it was not given, or
      * with one that is published in this repository, or with one that is trivially guessable.
      *
-     * <p>The variable used to default to {@code ofbiz} in EVERY profile, which had two consequences a
-     * deployment could not see from the outside: a manifest that simply never set it created an account holding
-     * every OFBiz permission whose password is printed in this repository's own documentation, and a manifest
-     * copied from the demo instructions - {@code OFBIZ_ADMIN_PASSWORD=ofbiz} - was accepted verbatim in
-     * production. Both are refused now. The dev default is asserted as well, because it is what keeps the demo
-     * image usable with no configuration at all and removing it would be a functional regression.</p>
+     * <p>A default of {@code ofbiz} in EVERY profile would have two consequences a deployment could not see
+     * from the outside: a manifest that simply never set it would create an account holding every OFBiz
+     * permission whose password is printed in this repository's own documentation, and a manifest copied from
+     * the demo instructions - {@code OFBIZ_ADMIN_PASSWORD=ofbiz} - would be accepted verbatim in production.
+     * Both are refused. The dev default is asserted as well, because it is what keeps the demo image usable
+     * with no configuration at all and removing it would be a functional regression.</p>
      *
      * @param tempDir a per-test sandbox; nothing outside it is written
      * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
@@ -1381,22 +1560,20 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * run_init_hooks: operator supplied code, running while every secret is still in the environment
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
      * An initialisation hook cannot see a deployment secret, and cannot turn shell tracing on for the rest of
      * the start up.
      *
-     * <p>A hook is arbitrary operator-supplied code that this script cannot vet, and it used to run with every
-     * secret exported and with this shell's tracing in force. Two leaks followed. A SOURCED hook runs in this
-     * shell, so with {@code OFBIZ_TRACE} set its own commands were traced by this shell and any expansion of a
-     * secret inside it was written verbatim to the container log. And a hook may enable tracing ITSELF - the
-     * example hook shipped in {@code docker/examples/postgres-demo/after-config-applied.d} literally runs
-     * {@code set -x} - which, because it is sourced, survived its return and then traced this script's own
-     * secret handling from that point on.</p>
+     * <p>A hook is arbitrary operator-supplied code that this script cannot vet, and running it with every
+     * secret exported and with this shell's tracing in force would leak in two ways. A SOURCED hook runs in
+     * this shell, so with {@code OFBIZ_TRACE} set its own commands would be traced by this shell and any
+     * expansion of a secret inside it written verbatim to the container log. And a hook may enable tracing
+     * ITSELF - the example hook shipped in {@code docker/examples/postgres-demo/after-config-applied.d}
+     * literally runs {@code set -x} - which, because it is sourced, would survive its return and trace this
+     * script's own secret handling from that point on.</p>
      *
      * <p>The hook used here is deliberately hostile in exactly those two ways: it enables tracing and then
      * prints every secret variable it can see. Both the executable and the sourced form are exercised, because
@@ -1491,9 +1668,7 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * configure_database: which source is rendered, and how often
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
@@ -1533,6 +1708,161 @@ public final class SchemaInitEntryPointTests {
         Element afterSecond = parseXml(Files.readString(sandbox.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8));
         assertEquals("111", inlineJdbcOf(afterSecond, "localpostgres").getAttribute("pool-maxsize"),
                 "the changed setting must reach the configuration on the next start");
+    }
+
+    /**
+     * Every non-secret input the managed render substitutes changes the recorded desired state, so a start that
+     * applies a different configuration is reported as applying a different one.
+     *
+     * <p>The record exists to tell an operator that the container is not connected to what the previous start
+     * was connected to. A field the record omits defeats that silently and in the worst possible way: the two
+     * starts rendered genuinely different artefacts and the container reported no change at all. The omission
+     * cannot be caught by reading the fingerprint function, because what has to be compared is that function
+     * against the render - so this drives the REAL render for each input in turn and requires the record to
+     * move. Both halves of the promise are asserted: the same configuration twice records the same state, and
+     * every single input records a different one.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void everyNonSecretRenderInputMovesTheRecordedDesiredState(@TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        String baseline = recordedDesiredState(renderedWith(tempDir, managedDatabaseEnvironment()));
+        assertEquals(declaredRecordVersion(), baseline.lines().findFirst().orElse(""),
+                "the record must open with the format version the entry point declares");
+        assertEquals(baseline, recordedDesiredState(renderedWith(tempDir, managedDatabaseEnvironment())),
+                "two starts applying the same configuration must record the same state");
+
+        // Every input is tried before anything is asserted, so a failure reports the COMPLETE set of inputs
+        // the record does not notice rather than only the first one - which is what makes the difference
+        // between "one field is missing" and "a whole family of them is" visible from the failure alone.
+        List<String> unnoticed = new ArrayList<>();
+        for (Map.Entry<String, String> input : NON_SECRET_RENDER_INPUTS.entrySet()) {
+            Map<String, String> perturbed = managedDatabaseEnvironment();
+            perturbed.put(input.getKey(), input.getValue());
+            if (baseline.equals(recordedDesiredState(renderedWith(tempDir, perturbed)))) {
+                unnoticed.add(input.getKey());
+            }
+        }
+        assertEquals(List.of(), unnoticed,
+                "each of these changes what is rendered, so each must change the recorded desired state");
+    }
+
+    /**
+     * The record names the database identity the render actually used, so an initialisation run and a serving
+     * run against the same host are not recorded as the same target.
+     *
+     * <p>An initialisation run renders the privileged roles into the configuration and a serving run renders
+     * the serving roles, and the two are required to be different roles. Recording the serving names in both
+     * cases would therefore give two starts with genuinely different rendered artefacts an identical record -
+     * which is the one thing the record must never do. The rendered file is read as well as the record, so the
+     * case checks the record agrees with the artefact rather than merely differing from its sibling.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run or the render could not be parsed, either of which fails
+     *         the test rather than being handled
+     */
+    @Test
+    public void theRecordedDesiredStateNamesTheDatabaseIdentityTheRenderActuallyUsed(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Map<String, String> serving = managedDatabaseEnvironment();
+        serving.put("OFBIZ_SCHEMA_INIT", "true");
+        Map<String, String> privileged = new LinkedHashMap<>(serving);
+        privileged.putAll(initIdentityEnvironment());
+
+        Path servingSandbox = renderedWith(tempDir, serving);
+        Path privilegedSandbox = renderedWith(tempDir, privileged);
+        String servingRecord = recordedDesiredState(servingSandbox);
+        String privilegedRecord = recordedDesiredState(privilegedSandbox);
+
+        assertNotEquals(servingRecord, privilegedRecord,
+                "an initialisation identity renders different roles, so it must record a different state");
+        assertTrue(servingRecord.contains("database-identity=serving"),
+                "the serving run must record the serving identity, record was:\n" + servingRecord);
+        assertTrue(servingRecord.contains("ofbiz-username=" + OFBIZ_USER),
+                "the serving run must record the role it rendered, record was:\n" + servingRecord);
+        assertTrue(privilegedRecord.contains("database-identity=schema-init"),
+                "the init run must record the initialisation identity, record was:\n" + privilegedRecord);
+        assertTrue(privilegedRecord.contains("ofbiz-username=" + OFBIZ_INIT_USER),
+                "the init run must record the role it rendered, record was:\n" + privilegedRecord);
+        assertEquals(OFBIZ_INIT_USER, renderedManagedUsers(privilegedSandbox).get("localpostgres"),
+                "the recorded role must be the one the configuration really authenticates as");
+    }
+
+    /**
+     * A record written in an earlier format is discarded rather than compared field by field, so an existing
+     * state volume upgrades instead of reporting a change that did not happen.
+     *
+     * <p>The fields a record carries have grown, and a record written before they existed cannot be compared
+     * with one written after: every added field would show up as a change of target. The version on the first
+     * line is what makes that decidable, and this asserts the consequence an operator sees - the run reports
+     * that there was no comparable record, does NOT report a difference, and leaves a record in the current
+     * format behind.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void aDesiredStateRecordInAnEarlierFormatIsDiscardedRatherThanCompared(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        assertNotEquals(EARLIER_RECORD_VERSION, declaredRecordVersion(),
+                "the format this case plants must be an EARLIER one than the entry point writes");
+
+        Path sandbox = prepareSandbox(tempDir);
+        Path record = sandbox.resolve(DB_CONFIG_APPLIED_MARKER);
+        Files.createDirectories(record.getParent());
+        Files.writeString(record, EARLIER_RECORD_VERSION + "\n"
+                + "profile=dev\n"
+                + "database-mode=managed\n"
+                + "schema-init=false\n"
+                + "distributed-cache-clear=false\n"
+                + "postgres-host=" + DATABASE_HOST + "\n", StandardCharsets.UTF_8);
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, managedDatabaseEnvironment());
+        assertEquals(0, run.getExitCode(), "an earlier record must not fail the render, output was:\n"
+                + run.getOutput());
+        assertTrue(run.getOutput().contains("No comparable record from an earlier start was present"),
+                "the run must report the earlier record as not comparable, output was:\n" + run.getOutput());
+        assertFalse(run.getOutput().contains("differs from the previous start"),
+                "an incomparable record must not be reported as a difference, output was:\n" + run.getOutput());
+        assertEquals(declaredRecordVersion(),
+                Files.readString(record, StandardCharsets.UTF_8).lines().findFirst().orElse(""),
+                "the run must leave a record in the format it writes");
+    }
+
+    /**
+     * A rotated password changes nothing in the record, and no password appears in it.
+     *
+     * <p>Two things at once, and both are load bearing. The record is written into the container's state
+     * directory, so a secret in it would outlive the process that had the secret in its environment; and the
+     * configuration is re-rendered unconditionally on every start, so a rotated password takes effect whatever
+     * the record says and reporting it as a change of target would be misleading.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void aRotatedDatabasePasswordLeavesTheRecordedDesiredStateUnchanged(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        String baseline = recordedDesiredState(renderedWith(tempDir, managedDatabaseEnvironment()));
+
+        Map<String, String> rotated = managedDatabaseEnvironment();
+        rotated.put("OFBIZ_POSTGRES_OFBIZ_PASSWORD", OFBIZ_PASSWORD + "-rotated");
+        rotated.put("OFBIZ_POSTGRES_OLAP_PASSWORD", OLAP_PASSWORD + "-rotated");
+        rotated.put("OFBIZ_POSTGRES_TENANT_PASSWORD", TENANT_PASSWORD + "-rotated");
+        String afterRotation = recordedDesiredState(renderedWith(tempDir, rotated));
+
+        assertEquals(baseline, afterRotation, "a rotated password must not be reported as a changed target");
+        for (String secret : List.of(OFBIZ_PASSWORD, OLAP_PASSWORD, TENANT_PASSWORD)) {
+            assertFalse(baseline.contains(secret), "no password may reach the record, record was:\n" + baseline);
+        }
     }
 
     /**
@@ -1611,9 +1941,7 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * load_data and _main: what init mode DOES, and that it never serves
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
@@ -1622,8 +1950,10 @@ public final class SchemaInitEntryPointTests {
      * <p>This is the step that actually applies the DDL, and the reason it is not obvious: the Entity Engine
      * has no standalone DDL command, so the schema is created when a delegator is created, which the data
      * loader does before reading anything. {@code readers=none} names a reader no component declares, so
-     * {@code EntityDataLoader} resolves an empty URL list and loads not one row while the delegator - and with
-     * it the {@code check-on-start}/{@code add-missing-on-start} DDL - still happens. Deleting the invocation
+     * {@code EntityDataLoader} resolves an empty URL list and loads no business data while the delegator - and
+     * with it the {@code check-on-start}/{@code add-missing-on-start} DDL - still happens. It is not a run that
+     * writes nothing: {@code EntityDataLoadContainer} upserts the framework's own {@code Component} metadata
+     * before it resolves a reader, which is asserted in {@code SchemaInitGatingTests}. Deleting the invocation
      * would leave init mode rendering a DDL-enabled configuration that nothing ever opens.</p>
      *
      * <p>The loader is intercepted by a shell function named for its absolute path, which bash resolves ahead
@@ -1685,8 +2015,8 @@ public final class SchemaInitEntryPointTests {
         // schema application would exit 0 having created nothing, which is the failure the skip-init conflict
         // also guards against. The stage named here is initialise_schema rather than load_data because init
         // mode takes NEITHER of the generic data stages: those are gated on their own markers, and running
-        // them in this mode is what made an init job load seed data, provision a login, and - on a state
-        // volume from an earlier start - report success without having applied anything.
+        // them in this mode would make an init job load seed data, provision a login, and - on a reused state
+        // volume - report success without having applied anything.
         assertTrue(initialising.getOutput().contains("STAGE configure_database")
                 && initialising.getOutput().contains("STAGE initialise_schema"),
                 "an init run must reach the rendering and schema-application stages before exiting, output "
@@ -1702,6 +2032,190 @@ public final class SchemaInitEntryPointTests {
                 "a normal start must exec the command it was given, output was:\n" + serving.getOutput());
         assertFalse(serving.getOutput().contains("schema initialisation complete"),
                 "a normal start must not take the one-shot exit, output was:\n" + serving.getOutput());
+    }
+
+    /**
+     * Every container variable the entry point declares is withdrawn before it execs, and the withdrawal is
+     * driven by those declarations rather than by a hand written list.
+     *
+     * <p>The sibling case below plants a realistic environment and starts the whole script, which is what
+     * exercises the withdrawal on the real serving path. It cannot plant EVERY name, because most of them
+     * have a grammar the script validates before it will start at all. This case takes the other half: it
+     * drives the withdrawal on its own, with every declared name present, so the rule is asserted over
+     * the complete set instead of over a representative sample of it.</p>
+     *
+     * <p>The names come from the script's own two arrays, never from a list restated here, and the entry point
+     * is required to contain no hand written {@code unset OFBIZ_} statement at all. Together those two make
+     * the agreement structural: a variable added to either array is withdrawn without anything else being
+     * edited, and a future change that replaced the loop with statements again would have to reintroduce the
+     * drift this case exists to prevent - which it cannot do unnoticed.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void everyContainerVariableTheEntryPointDeclaresIsWithdrawnBeforeItExecs(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+
+        Set<String> rendered = declaredVariableNames("RUNTIME_APPLIED_VARIABLES");
+        Set<String> control = declaredVariableNames("CONTAINER_CONTROL_VARIABLES");
+        assertEquals(Set.of(), intersection(rendered, control),
+                "a variable is either rendered into a file or it steers the script, never declared as both");
+
+        Set<String> declared = new LinkedHashSet<>(rendered);
+        declared.addAll(control);
+        String marker = "WITHDRAWN7f42ce18";
+        Map<String, String> everything = new LinkedHashMap<>();
+        for (String variable : declared) {
+            everything.put(variable, marker + variable);
+        }
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, WITHDRAWAL_BODY, everything);
+        assertEquals(0, run.getExitCode(), "the withdrawal must succeed, output was:\n" + run.getOutput());
+
+        Set<String> before = reportedVariableNames(run.getOutput(), "BEFORE");
+        assertEquals(declared, before,
+                "every declared name must be present before the withdrawal, or this case proves nothing");
+        assertEquals(Set.of(), reportedVariableNames(run.getOutput(), "AFTER"),
+                "no OFBIZ_ variable may survive the withdrawal, output was:\n" + run.getOutput());
+        // Against the complete environment the exec'd process would receive, not against the whole run: with
+        // OFBIZ_TRACE planted, sourcing the script traces its own reading of that variable, so the value
+        // appears in the run's output before the withdrawal has even been reached. What a value may not do is
+        // survive INTO the environment - including under some other name it was copied to, which a listing of
+        // names alone would not reveal. Whether tracing itself may publish a secret is asserted by the cases
+        // that are about tracing.
+        String survived = section(run.getOutput(), "ENVIRONMENT");
+        assertFalse(survived.contains(marker),
+                "no value the container was configured with may survive under any name, environment was:\n"
+                        + survived);
+
+        String script = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
+        assertFalse(Pattern.compile("^\\s*unset OFBIZ_", Pattern.MULTILINE).matcher(script).find(),
+                "the withdrawal must be driven by the declared arrays, not by hand written unset statements");
+    }
+
+    /**
+     * Every container variable the entry point reads is declared in one of its two inventories, so none can be
+     * consumed without also being withdrawn.
+     *
+     * <p>The case above asserts that what the inventories declare is withdrawn. This one closes the other
+     * direction: a variable the script reads but has forgotten to declare would be consumed, would decide
+     * something, and would then be handed to the served JVM - which is precisely the drift that left
+     * {@code OFBIZ_DISABLE_COMPONENTS} and {@code OFBIZ_POSTGRES_HOST} visible to it, and precisely what the
+     * inventories' own claim to account for every name would deny.</p>
+     *
+     * <p>Only literal expansions are counted, so a name that merely appears in a message is not mistaken for
+     * one that is read. The nine per-group credentials are built at runtime from a group name and can never
+     * appear literally, which is why the requirement is one-directional: every name read must be declared, not
+     * every name declared must be read literally.</p>
+     *
+     * @throws IOException if the entry point could not be read, which fails the test
+     */
+    @Test
+    public void everyContainerVariableTheEntryPointReadsIsAccountedForByAnInventory() throws IOException {
+        String script = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
+
+        Set<String> declared = new LinkedHashSet<>(declaredVariableNames("RUNTIME_APPLIED_VARIABLES"));
+        declared.addAll(declaredVariableNames("CONTAINER_CONTROL_VARIABLES"));
+
+        // The script's own variables are not container configuration and are deliberately excluded. They are
+        // identified by the script assigning them at top level, rather than by name, so the exclusion cannot
+        // become a way to leave a real container variable out: OFBIZ_PROFILES is the list of profile names this
+        // script accepts, which reads like a container variable and is not one.
+        Set<String> ownVariables = new LinkedHashSet<>();
+        Matcher assignment = Pattern.compile("^(OFBIZ_[A-Z0-9_]+)=", Pattern.MULTILINE).matcher(script);
+        while (assignment.find()) {
+            ownVariables.add(assignment.group(1));
+        }
+
+        Set<String> unaccounted = new LinkedHashSet<>();
+        Matcher expansion = Pattern.compile("\\$\\{?(OFBIZ_[A-Z0-9_]+)").matcher(script);
+        while (expansion.find()) {
+            String name = expansion.group(1);
+            if (!declared.contains(name) && !ownVariables.contains(name)) {
+                unaccounted.add(name);
+            }
+        }
+        assertEquals(Set.of(), unaccounted,
+                "each of these is read by the entry point but declared by neither inventory, so it would be "
+                        + "consumed and then handed to the served JVM");
+    }
+
+    /**
+     * Every count the entry point states about a list agrees with the list, and no count goes unchecked.
+     *
+     * <p>These comments are what an operator reads to know whether a set of variables is complete - "supplied
+     * together or not at all" is only actionable if the reader knows how many "all" is - and they are the first
+     * thing to go stale when a variable is added or removed. Two directions are required. Every registered
+     * claim must still be in the prose, so a reworded comment cannot leave the count unchecked; and every
+     * "&lt;number&gt; variables" the prose contains must be registered, so a NEW count cannot arrive unchecked.</p>
+     *
+     * <p>Comment text is flattened before it is matched, because these claims wrap across lines and a fragment
+     * compared against the raw file would never be found - which would make every assertion here pass
+     * vacuously.</p>
+     *
+     * @throws IOException if the entry point could not be read, which fails the test
+     */
+    @Test
+    public void everyVariableCountTheEntryPointStatesAgreesWithTheListItDescribes() throws IOException {
+        String script = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
+        String prose = flattenedComments(script);
+
+        List<String> disagreeing = new ArrayList<>();
+        for (Map.Entry<String, String> claim : STATED_LIST_SIZES.entrySet()) {
+            String fragment = claim.getKey();
+            assertTrue(prose.contains(fragment),
+                    "this claim is registered here but is no longer in the entry point, so the count it states "
+                            + "is checked against nothing: " + fragment);
+            String[] selector = claim.getValue().split("#", 2);
+            String member = selector.length == 2 ? selector[1] : ".*";
+            long declares = declaredVariableNames(selector[0]).stream()
+                    .filter(name -> name.matches(member))
+                    .count();
+            int states = statedNumber(fragment);
+            if (states != declares) {
+                disagreeing.add(selector[0] + " declares " + declares + " of " + member + ", the prose states "
+                        + states + ": " + fragment);
+            }
+        }
+        // Collected rather than asserted one at a time, so a change that invalidates a family of counts reports
+        // the whole family instead of stopping at whichever happens to be registered first.
+        assertEquals(List.of(), disagreeing,
+                "each of these counts disagrees with the list the comment describes");
+
+        assertTrue(prose.contains(LOCAL_VARIABLE_COUNT),
+                "the one deliberately unregistered count is no longer present, so the exclusion below is stale");
+        List<String> spans = new ArrayList<>(STATED_LIST_SIZES.keySet());
+        spans.add(LOCAL_VARIABLE_COUNT);
+        List<String> unregistered = new ArrayList<>();
+        Matcher counted = Pattern.compile("\\b(" + String.join("|", NUMBER_WORDS.keySet())
+                + ")\\s+(?:[A-Za-z0-9_*/ ]{0,60}?\\s)?variables\\b", Pattern.CASE_INSENSITIVE).matcher(prose);
+        while (counted.find()) {
+            String site = prose.substring(counted.start(), counted.end());
+            boolean registered = spans.stream()
+                    .anyMatch(fragment -> containsAt(prose, fragment, counted.start(), counted.end()));
+            if (!registered) {
+                unregistered.add(site + " (at offset " + counted.start() + ")");
+            }
+        }
+        assertEquals(List.of(), unregistered,
+                "each of these counts variables somewhere no test can check it; register it in STATED_LIST_SIZES "
+                        + "against the array it describes");
+
+        // The one count of names the prose itself enumerates, so the sentence is checked against itself.
+        int claimAt = prose.indexOf(SDK_VARIABLES_CLAIM);
+        assertTrue(claimAt >= 0, "the claim about the SDK's own variables is no longer present");
+        String enumeration = prose.substring(claimAt,
+                Math.min(prose.length(), claimAt + SDK_VARIABLES_CLAIM.length() + SDK_CLAIM_ENUMERATION_LENGTH));
+        Set<String> listed = new LinkedHashSet<>();
+        Matcher sdkName = Pattern.compile("AWS_[A-Z_]+").matcher(enumeration);
+        while (sdkName.find()) {
+            listed.add(sdkName.group());
+        }
+        assertEquals(statedNumber(SDK_VARIABLES_CLAIM), listed.size(),
+                "the claim states a number of SDK variables that its own list does not hold: " + listed);
     }
 
     /**
@@ -1756,6 +2270,14 @@ public final class SchemaInitEntryPointTests {
         distinctive.put("OFBIZ_S3_BUCKET", lowerCaseUnique + "-bucket");
         distinctive.put("OFBIZ_S3_REGION", lowerCaseUnique + "-region");
         distinctive.put("OFBIZ_S3_ENDPOINT", "https://" + lowerCaseUnique + ".objects.invalid");
+        // The endpoint's host has to be declared a second time. require_object_store_endpoint refuses an
+        // endpoint whose host is not allowlisted, and it does so on the resolve path as well as on the render,
+        // so that one mis-set variable cannot redirect content - and the credential every object request
+        // carries - to a host nobody listed. This start reaches only the resolve, because apply_configuration
+        // is one of the stages this fixture replaces with a recorder, which is exactly why the allowlist has
+        // to be supplied here: a rule enforced on only one of the two paths would leave the path that runs on
+        // every start unguarded.
+        distinctive.put("OFBIZ_S3_ENDPOINT_ALLOWLIST", lowerCaseUnique + ".objects.invalid");
 
         // The remainder have a fixed vocabulary, so only the NAME can be asserted on: _main itself parses the
         // profile and the skip-init flag before any stage runs, and a made-up value would abort the start.
@@ -1794,21 +2316,18 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Container state markers: what may be believed, and what may not
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
-     * A marker file that is merely PRESENT no longer suppresses the work it names.
+     * A marker file that is merely PRESENT does not suppress the work it names.
      *
-     * <p>This is the case the review raised. A marker used to be an empty file whose existence was the whole
-     * of the question asked, so anything running as the {@code ofbiz} user - a volume prepared elsewhere, a
-     * hook, a half-copied state directory - could create {@code data_loaded} and the container would then skip
-     * the seed load and, in init mode, exit successfully having created no schema at all. Every empty marker in
-     * the world is now the wrong shape, so it is ignored and the work is done.</p>
+     * <p>A marker whose existence was the whole of the question asked could be created by anything running as
+     * the {@code ofbiz} user - a volume prepared elsewhere, a hook, a half-copied state directory - and the
+     * container would then skip the seed load and, in init mode, exit successfully having created no schema at
+     * all. An empty marker is the wrong shape, so it is ignored and the work is done.</p>
      *
-     * <p>The empty file written here is exactly what the previous {@code touch} produced, so this also pins the
+     * <p>The empty file written here is exactly what a bare {@code touch} produces, so this also pins the
      * upgrade behaviour: a container restarted on a volume written by an older image reloads rather than
      * trusting state it cannot verify.</p>
      *
@@ -1981,9 +2500,9 @@ public final class SchemaInitEntryPointTests {
     /**
      * A marker written for one data-load selection does not cover a different one.
      *
-     * <p>Restarting a container that loaded seed data with {@code OFBIZ_DATA_LOAD=demo} used to keep the
-     * database as it was, because the marker's existence answered a question it had never been asked. The
-     * selection is part of the marker, so the new request is honoured.</p>
+     * <p>Restarting a container that loaded seed data with {@code OFBIZ_DATA_LOAD=demo} must not leave the
+     * database as it was: a marker whose existence alone answered the question would be answering one it had
+     * never been asked. The selection is part of the marker, so the new request is honoured.</p>
      *
      * @param tempDir a per-test sandbox; nothing outside it is written
      * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
@@ -2002,13 +2521,13 @@ public final class SchemaInitEntryPointTests {
 
     /**
      * A rotated administrator password reaches the database instead of being suppressed by the marker of the
-     * previous one, and a demo load no longer discards a supplied password.
+     * previous one, and a demo load does not discard a supplied password.
      *
-     * <p>Two defects with the same cause. The admin marker's existence used to skip the load, so a rotated
-     * password could never take effect and nothing said it had been ignored; and the demo branch touched that
-     * marker unconditionally, so whenever demo data was loaded the account silently kept the password published
-     * in this repository. The marker is now bound to the credential the load would apply, and the demo branch
-     * records the demo data's own account, which can never equal the digest of a real credential.</p>
+     * <p>Two hazards with the same cause. A marker whose mere existence skipped the load would let a rotated
+     * password never take effect, with nothing saying it had been ignored; and a demo branch that touched that
+     * marker unconditionally would leave the account on the password the demo data ships with whenever demo
+     * data was loaded. The marker is bound to the credential the load would apply, and the demo branch records
+     * the demo data's own account, which can never equal the digest of a real credential.</p>
      *
      * <p>No password is asserted on directly - the loader stub records only that it was invoked - because this
      * suite must not print one. What the load produced is covered by the tests of the hash itself.</p>
@@ -2060,8 +2579,8 @@ public final class SchemaInitEntryPointTests {
      * start, so it must mean "the schema has been applied to this database" and nothing weaker. Two independent
      * facts are required: the schema-applying loader invocation really ran in this process, and the load
      * reached its end. Neither can be supplied from outside the run - the first is set only on the lines that
-     * execute the loader, and the second is the completed marker - so a marker planted on a mounted volume can
-     * no longer buy a zero exit status from a job that created nothing.</p>
+     * execute the loader, and the second is the completed marker - so a marker planted on a mounted volume
+     * cannot buy a zero exit status from a job that created nothing.</p>
      *
      * @param tempDir a per-test sandbox; nothing outside it is written
      * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
@@ -2139,9 +2658,7 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Database least privilege: which identity each mode authenticates as
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**
@@ -2209,7 +2726,7 @@ public final class SchemaInitEntryPointTests {
     /**
      * The deployed profile requires the separate identity for an init run and refuses it on a serving one.
      *
-     * <p>Required, because a prod init run that created the schema as the serving role would prove that role
+     * <p>Required, because a prod init run that created the schema as the serving role would show that role
      * holds DDL, which is the whole thing being prevented. Refused on a serving instance, because a credential
      * that can alter the schema, present in a serving instance's environment, is readable through the
      * orchestrator's configuration and through {@code /proc} - so it is a privilege the fleet holds even though
@@ -2369,9 +2886,7 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Harness
-     * ---------------------------------------------------------------------------------------------
      */
 
     /** Records what the intercepted data loader was asked to do, one invocation per line. */
@@ -2419,8 +2934,8 @@ public final class SchemaInitEntryPointTests {
 
     /**
      * Runs the sandbox's {@code hook.sh} through the real {@code run_init_hooks}, then reports what survived:
-     * the admin password's length, which proves the scrubbed variables were restored, and whether shell tracing
-     * is still in force, which proves a hook's own {@code set -x} did not escape it.
+     * the admin password's length, which reports whether the scrubbed variables were restored, and whether shell tracing
+     * is still in force, which reports whether a hook's own {@code set -x} did not escape it.
      */
     private static final String HOOK_BODY =
             "ofbiz_setup_env\n"
@@ -2539,6 +3054,32 @@ public final class SchemaInitEntryPointTests {
                 file.getFileName() + " no longer contains [" + find + "], so this case tests nothing");
         Files.writeString(file, text.replaceFirst(Pattern.quote(find), Matcher.quoteReplacement(replacement)),
                 StandardCharsets.UTF_8);
+    }
+
+    /** How many times a literal occurs in a text, counted without overlap. */
+    private static int occurrences(String text, String literal) {
+        int found = 0;
+        for (int at = text.indexOf(literal); at >= 0; at = text.indexOf(literal, at + literal.length())) {
+            found++;
+        }
+        return found;
+    }
+
+    /**
+     * The attributes of one named {@code <datasource>} element, as one string. A start tag spans many lines in
+     * these files, so an attribute cannot be attributed to a datasource line by line - which is the whole
+     * reason a per-datasource check is possible at all only if the element is isolated first.
+     * @param text the rendered configuration
+     * @param name the datasource name, matched with both quotes so {@code localpostgres} does not also match
+     *        {@code localpostgresolap}
+     * @return everything from the start tag's opening to its closing angle bracket
+     */
+    private static String managedDatasourceAttributes(String text, String name) {
+        int start = text.indexOf("<datasource name=\"" + name + "\"");
+        assertTrue(start >= 0, "the rendered configuration declares no datasource named " + name);
+        int end = text.indexOf('>', start);
+        assertTrue(end > start, "the start tag of the datasource " + name + " is not terminated");
+        return text.substring(start, end);
     }
 
     /** How many recorded loader invocations were exactly {@code expected}. */
@@ -2660,6 +3201,159 @@ public final class SchemaInitEntryPointTests {
             users.put(datasourceName, inlineJdbcOf(rendered, datasourceName).getAttribute("jdbc-username"));
         }
         return users;
+    }
+
+    /**
+     * Renders the managed configuration in a sandbox of its own and returns that sandbox.
+     *
+     * <p>The transport requirement is stubbed so a case may ask for cross-instance invalidation without a
+     * message broker; nothing it stubs takes part in the render or in the record.</p>
+     *
+     * @param tempDir the per-test sandbox root
+     * @param environment the variables the start is given
+     * @return the sandbox, holding both the rendered configuration and the desired-state record
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    private static Path renderedWith(Path tempDir, Map<String, String> environment) throws Exception {
+        Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "state"));
+        EntryPointRun run =
+                runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_WITHOUT_TRANSPORT_BODY, environment);
+        assertEquals(0, run.getExitCode(), "the render must succeed, output was:\n" + run.getOutput());
+        return sandbox;
+    }
+
+    /** The desired-state record a render left behind. */
+    private static String recordedDesiredState(Path sandbox) throws IOException {
+        return Files.readString(sandbox.resolve(DB_CONFIG_APPLIED_MARKER), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * The record format version the entry point declares, read from it rather than restated here.
+     *
+     * <p>Restating it would make every assertion about the version agree with this file instead of with the
+     * script, which is the drift the single declaration exists to prevent.</p>
+     *
+     * @return the first line every desired-state record must carry
+     * @throws IOException if the entry point could not be read, which fails the test
+     */
+    private static String declaredRecordVersion() throws IOException {
+        String script = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
+        Matcher declaration = Pattern.compile("^DESIRED_STATE_RECORD_VERSION='([^']+)'$", Pattern.MULTILINE)
+                .matcher(script);
+        assertTrue(declaration.find(), "the entry point must declare the desired-state record version once");
+        return declaration.group(1);
+    }
+
+    /**
+     * The variable names one of the entry point's own arrays declares.
+     *
+     * <p>Read from the script so that a case asserting something about the set cannot drift away from it; a
+     * list restated here would agree with this file rather than with the entry point.</p>
+     *
+     * @param arrayName the array to read, for example {@code RUNTIME_APPLIED_VARIABLES}
+     * @return the declared names, in declaration order
+     * @throws IOException if the entry point could not be read, which fails the test
+     */
+    /**
+     * Join every comment line in the entry point into one string, the way a reader takes in a comment block.
+     *
+     * <p>Without this, a claim that wraps across lines is present in the file and absent from any search for
+     * it, which turns a prose assertion into one that passes because it found nothing to check.</p>
+     *
+     * @param script the entry point's text
+     * @return every comment line, stripped of its marker and indentation, joined by single spaces
+     */
+    private static String flattenedComments(String script) {
+        StringBuilder prose = new StringBuilder();
+        for (String line : script.split("\\n", -1)) {
+            String trimmed = line.trim();
+            if (!trimmed.startsWith("#")) {
+                continue;
+            }
+            if (prose.length() > 0) {
+                prose.append(' ');
+            }
+            prose.append(trimmed.substring(1).trim());
+        }
+        return prose.toString();
+    }
+
+    /**
+     * The single number word a registered claim states.
+     *
+     * @param fragment the claim
+     * @return what the word means as an integer
+     */
+    private static int statedNumber(String fragment) {
+        Matcher word = Pattern.compile("\\b(" + String.join("|", NUMBER_WORDS.keySet()) + ")\\b",
+                Pattern.CASE_INSENSITIVE).matcher(fragment);
+        List<String> stated = new ArrayList<>();
+        while (word.find()) {
+            stated.add(word.group(1).toLowerCase(Locale.ROOT));
+        }
+        assertEquals(1, stated.size(),
+                "a registered claim has to state exactly one number for the count to be unambiguous: " + fragment);
+        return NUMBER_WORDS.get(stated.get(0));
+    }
+
+    /**
+     * Whether an occurrence of {@code fragment} in {@code prose} encloses the range {@code from..to}.
+     *
+     * @param prose the flattened comment text
+     * @param fragment the registered claim
+     * @param from start of the range, inclusive
+     * @param to end of the range, exclusive
+     * @return true when some occurrence of the fragment contains the whole range
+     */
+    private static boolean containsAt(String prose, String fragment, int from, int to) {
+        int at = prose.indexOf(fragment);
+        while (at >= 0) {
+            if (at <= from && to <= at + fragment.length()) {
+                return true;
+            }
+            at = prose.indexOf(fragment, at + 1);
+        }
+        return false;
+    }
+
+    private static Set<String> declaredVariableNames(String arrayName) throws IOException {
+        String script = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
+        Matcher declaration = Pattern.compile("^" + Pattern.quote(arrayName) + "=\\((.*?)^\\)$",
+                Pattern.MULTILINE | Pattern.DOTALL).matcher(script);
+        assertTrue(declaration.find(), arrayName + " must be declared as a multi-line array in the entry point");
+        Set<String> names = new LinkedHashSet<>();
+        Matcher name = Pattern.compile("OFBIZ_[A-Z0-9_]+").matcher(declaration.group(1));
+        while (name.find()) {
+            names.add(name.group());
+        }
+        assertFalse(names.isEmpty(), arrayName + " must declare at least one variable");
+        return names;
+    }
+
+    /** One delimited section of a run's output, failing if the run did not produce it. */
+    private static String section(String output, String name) {
+        Matcher block = Pattern.compile(name + "-BEGIN\\n(.*?)" + name + "-END", Pattern.DOTALL)
+                .matcher(output);
+        assertTrue(block.find(), "the run must report its " + name + " environment, output was:\n" + output);
+        return block.group(1);
+    }
+
+    /** The names a withdrawal run reported inside the named section of its output. */
+    private static Set<String> reportedVariableNames(String output, String sectionName) {
+        Set<String> names = new LinkedHashSet<>();
+        for (String line : section(output, sectionName).split("\\n")) {
+            if (!line.isBlank()) {
+                names.add(line.trim());
+            }
+        }
+        return names;
+    }
+
+    /** The names two sets have in common, so a disjointness requirement can name what broke it. */
+    private static Set<String> intersection(Set<String> first, Set<String> second) {
+        Set<String> shared = new LinkedHashSet<>(first);
+        shared.retainAll(second);
+        return shared;
     }
 
     /** The administrator credential, as one map the caller may modify. */

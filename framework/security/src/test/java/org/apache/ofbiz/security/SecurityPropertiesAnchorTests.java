@@ -211,6 +211,39 @@ public final class SecurityPropertiesAnchorTests {
                 "the image build must still assemble the distribution");
     }
 
+    /**
+     * The loop the entry point's withdrawal is driven by, in place of a hand written {@code unset} per name.
+     */
+    private static final String WITHDRAWAL_LOOP =
+            "for variableName in \"${RUNTIME_APPLIED_VARIABLES[@]}\" \"${CONTAINER_CONTROL_VARIABLES[@]}\"; do";
+
+    /**
+     * Whether the entry point withdraws {@code variable} from the environment before it execs the server.
+     *
+     * <p>The withdrawal is driven by the two declared inventories rather than by one hand written
+     * {@code unset} per name, so what has to be present is the variable's DECLARATION plus the loop that
+     * consumes both arrays. Asserting on a literal {@code unset OFBIZ_X} would hold only while the list
+     * stayed hand written, which is the drift the loop exists to remove - two names were once missed by
+     * exactly that list. The behaviour itself is exercised end to end by
+     * {@code SchemaInitEntryPointTests}, which plants every declared name and drives the real function.</p>
+     *
+     * @param entryPoint the entry point's text
+     * @param variable the environment variable that must not survive into the served JVM
+     * @return true when the variable is declared by an inventory the withdrawal loop consumes
+     */
+    private static boolean withdrawnBeforeExec(String entryPoint, String variable) {
+        boolean declared = false;
+        for (String inventory : List.of("RUNTIME_APPLIED_VARIABLES=(", "CONTAINER_CONTROL_VARIABLES=(")) {
+            int at = entryPoint.indexOf(inventory);
+            int end = at < 0 ? -1 : entryPoint.indexOf("\n)", at);
+            if (end < 0) {
+                continue;
+            }
+            declared = declared || List.of(entryPoint.substring(at, end).split("\\s+")).contains(variable);
+        }
+        return declared && entryPoint.contains(WITHDRAWAL_LOOP) && entryPoint.contains("unset \"$variableName\"");
+    }
+
     @Test
     public void entryPointSuppliesBothSigningKeysAtRuntimeWithoutExposingThem() throws IOException {
         String entryPoint = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
@@ -220,8 +253,9 @@ public final class SecurityPropertiesAnchorTests {
         for (String variable : List.of("OFBIZ_LOGIN_SECRET_KEY", "OFBIZ_JWT_TOKEN_KEY")) {
             assertTrue(entryPoint.contains(variable),
                     "the entry point must resolve " + variable + " now that the build generates no key");
-            assertTrue(entryPoint.contains("unset " + variable),
-                    variable + " must be unset before OFBiz is executed, so /proc/<pid>/environ cannot expose it");
+            assertTrue(withdrawnBeforeExec(entryPoint, variable),
+                    variable + " must be withdrawn before OFBiz is executed, so /proc/<pid>/environ cannot "
+                            + "expose it");
         }
         for (String key : List.of(LOGIN_SECRET_KEY, JWT_TOKEN_KEY)) {
             assertTrue(entryPoint.contains(key + "=%s"),

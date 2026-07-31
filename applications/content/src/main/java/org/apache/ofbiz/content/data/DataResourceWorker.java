@@ -42,6 +42,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -54,6 +56,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpSession;
+import javax.transaction.Status;
+import javax.transaction.Synchronization;
 import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.transform.TransformerException;
 
@@ -164,6 +168,19 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * ordering structure.
      */
     private static final int STORE_SYNC_REGISTER_MAX = 20000;
+
+    /**
+     * The modification time a file handed to a caller is stamped with, so that a write through it is
+     * detectable however fast it is and however many bytes it keeps.
+     *
+     * <p>One second past the epoch rather than zero, which some filesystems and tools read as "unknown"
+     * rather than as a time. No write can reproduce it: a write stamps the file with the time of the write.
+     * {@code ContentStoreFactory} stamps the files it stages for the same reason.
+     */
+    private static final long RESOLVED_SENTINEL_MODIFIED = 1000L;
+
+    /** Stable code reported when a write made through a resolved file is published as the transaction commits. */
+    private static final String EVENT_STORE_COMMITTED = "CONTENT-STORE-WORKER-COMMITTED";
 
     /**
      * Traverses the DataCategory parent/child structure and put it in categoryNode. Returns non-null error string if there is an error.
@@ -681,8 +698,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * configured content store when one is configured.
      *
      * <p>The signature, the return type and every existing failure mode are unchanged, and so is the whole
-     * resolution when no content store is configured - which is the committed default, so an unmodified
-     * checkout behaves exactly as it did before. The reconciliation is layered on top rather than replacing
+     * resolution when no content store is configured - which is the committed default. The
+     * reconciliation is layered on top rather than replacing
      * anything: the path is still computed the same way, and every existing allow-list and boundary check
      * still runs against it, so no deployment can reach a location through the store that it could not reach
      * before.
@@ -700,6 +717,20 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      *   <li>if neither the store nor the local filesystem has the content, the original
      *       {@link FileNotFoundException} is raised, with the same message as before.</li>
      * </ul>
+     *
+     * <p><strong>A write made through the returned file is published by the transaction that made it.</strong>
+     * The reconciliation above can only see what is on disk at the moment the location is resolved, and the
+     * frozen binary-content services write <em>afterwards</em>: {@code DataServices.createBinaryFileMethod} and
+     * {@code updateBinaryFileMethod} take the {@link File} returned here and open a {@code FileOutputStream} on
+     * it. Reconciling again at the next resolution would catch that write only on the instance that made it,
+     * and only if a later resolution happened at all - another instance has no local copy, finds the object
+     * unchanged in the store, and serves the content the write was meant to replace, so the write is lost.
+     * A publication is therefore registered with the surrounding transaction for every file handed out, and it
+     * publishes the file if, and only if, it changed. A caller that only reads leaves the file alone and
+     * nothing is published, so a read still costs nothing; a caller that writes has its bytes in the store
+     * before the transaction commits, and a store that refuses the write rolls the transaction back rather than
+     * committing a {@code DataResource} row whose content was never stored. When there is no transaction at
+     * all, nothing is registered and the reconciliation above remains the mechanism, exactly as before.
      *
      * @param dataResourceTypeId the {@code DataResource} type, which selects how the path is resolved
      * @param objectInfo the type-relative location recorded on the {@code DataResource}
@@ -743,6 +774,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
             SecurityUtil.checkLocalFileAllowList(file);
             reconcileWithContentStore(store, key, file);
+            publishOnCommitIfWrittenThrough(store, key, file);
         } else if ("OFBIZ_FILE".equals(dataResourceTypeId) || "OFBIZ_FILE_BIN".equals(dataResourceTypeId)) {
             String prefix = System.getProperty("ofbiz.home");
 
@@ -756,6 +788,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
             SecurityUtil.checkOfbizFileAllowList(file);
             reconcileWithContentStore(store, key, file);
+            publishOnCommitIfWrittenThrough(store, key, file);
         } else if ("CONTEXT_FILE".equals(dataResourceTypeId) || "CONTEXT_FILE_BIN".equals(dataResourceTypeId)) {
             if (UtilValidate.isEmpty(contextRoot)) {
                 throw new GeneralException("Cannot find CONTEXT_FILE with an empty context root!");
@@ -771,6 +804,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 throw new FileNotFoundException("No file found: " + (contextRoot + sep + objectInfo));
             }
             reconcileWithContentStore(store, key, file);
+            publishOnCommitIfWrittenThrough(store, key, file);
         }
 
         return file;
@@ -831,7 +865,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         String key = contentStoreKey(dataResourceTypeId, objectInfo, contextRoot);
         store.delete(key);
         STORE_SYNC_REGISTER.remove(key);
-        Debug.logVerbose(EVENT_STORE_REMOVED + " key [" + key + "]", MODULE);
+        Debug.logVerbose(EVENT_STORE_REMOVED + " " + ContentStoreFactory.reference(key), MODULE);
         return true;
     }
 
@@ -922,7 +956,12 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         // derived from the path returned here. The maxFiles fan-out has nothing to do in that mode,
         // because an object store has neither directories nor a per-directory limit. In the default
         // database mode the factory answers null and the local allocation below runs unchanged.
-        String staged = ContentStoreFactory.uploadStagingPath(initialPath, absolute);
+        String staged;
+        try {
+            staged = ContentStoreFactory.uploadStagingPath(initialPath, absolute);
+        } catch (GeneralException e) {
+            throw uploadLocationRefused(e);
+        }
         if (staged != null) {
             return staged;
         }
@@ -1671,14 +1710,12 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         return renderDataResourceAsText(null, delegator, dataResourceId, templateContext, locale, targetMimeTypeId, cache);
     }
 
-    // -------------------------------------------------------------------------------------------------
     // Content store seam
     //
     // The whole integration with the object-storage providers lives below. It is deliberately confined to
     // this one region, and every method in it returns "nothing to do" when no provider is configured, so the
     // committed default - DataResource database storage, with file-backed resources on the local filesystem -
     // reaches none of it.
-    // -------------------------------------------------------------------------------------------------
 
     /**
      * Returns the configured content store, or null when the deployment stores content in the database.
@@ -1760,7 +1797,11 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         try {
             return store.exists(key);
         } catch (IOException e) {
-            throw new GeneralException("The configured content store could not be interrogated for key [" + key + "]", e);
+            // The failure is named by type rather than chained: GeneralException.getMessage() composes a
+            // nested message into its own, and a provider's or the operating system's text is not this
+            // package's to republish.
+            throw new GeneralException("The configured content store could not be interrogated for "
+                    + ContentStoreFactory.reference(key) + ": " + e.getClass().getSimpleName());
         }
     }
 
@@ -1777,6 +1818,14 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * <p>A local file the store has never held is published rather than deleted, so a deployment that already
      * has content on disk adopts object storage on first use instead of losing it.
      *
+     * <p>An unmodified local copy is refreshed from the store on <strong>every</strong> resolution rather than
+     * being trusted because it was fetched before. There is no invalidation channel for file-backed content, so
+     * a copy trusted on the strength of an earlier fetch is a copy that goes stale the moment another instance
+     * writes: that instance's content would be invisible here for the life of the JVM, and which version a
+     * customer saw would depend on which instance the load balancer picked. The cost is one store read per
+     * resolution, which is the same cost the render seam already pays by streaming every render straight out of
+     * the store, and it is what makes a fleet's instances interchangeable.
+     *
      * @param store the configured provider, or null when content is stored in the database
      * @param key the storage key, or null when there is no provider
      * @param file the local working copy
@@ -1792,11 +1841,6 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 publish(store, key, file);
                 return;
             }
-            if (present && isSynchronised(key, file)) {
-                // this JVM already agreed with the store about this exact copy and has not overwritten it since,
-                // so there is nothing to move in either direction
-                return;
-            }
             if (store.exists(key)) {
                 materialise(store, key, file);
                 return;
@@ -1805,7 +1849,186 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 publish(store, key, file);
             }
         } catch (IOException e) {
-            throw new GeneralException("The configured content store could not be reconciled for key [" + key + "]", e);
+            throw new GeneralException("The configured content store could not be reconciled for "
+                    + ContentStoreFactory.reference(key) + ": " + e.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Arranges for a write made through a resolved local file to be published when the transaction commits.
+     *
+     * <p>This is the durability half of {@link #getContentFile(String, String, String)}, and it exists because
+     * that method hands out a {@link File} and cannot tell a reader from a writer. The frozen binary-content
+     * services write through the returned file after it has been resolved, so nothing the resolution itself
+     * observes can carry those bytes to the store. Registering here means the transaction that performed the
+     * write is the transaction that publishes it - not a later resolution on the same instance, which another
+     * instance would never perform.
+     *
+     * <p>Nothing is registered in two cases, each of which would make the registration wrong rather than
+     * merely redundant: in the committed database mode there is no provider and the file is not a copy of
+     * anything, and for a provider that backs this very file, publishing would write the file onto itself.
+     * A resource resolved repeatedly inside one transaction still costs one publication, because
+     * {@link ContentStoreFactory#publishOnCommit(javax.transaction.Synchronization, String, String)} attaches
+     * at most one per key to a given transaction.
+     *
+     * @param store the configured provider, or null when content is stored in the database
+     * @param key the storage key, or null when there is no provider
+     * @param file the local working copy that was just handed to the caller
+     * @throws GeneralException if a transaction is in place but refuses the registration, or if the provider
+     *     cannot be asked which file it backs
+     */
+    private static void publishOnCommitIfWrittenThrough(ContentStore store, String key, File file) throws GeneralException {
+        if (store == null || backsTheSameFile(store, key, file)) {
+            return;
+        }
+        ContentStoreFactory.publishOnCommit(new LocalWritePublication(key, file), key,
+                "content resolved for key [" + key + "]");
+    }
+
+    /**
+     * Publishes a local working copy at commit time, if and only if it changed after it was resolved.
+     *
+     * <p>Registered by {@link #publishOnCommitIfWrittenThrough(ContentStore, String, File)} for every file
+     * {@link #getContentFile(String, String, String)} hands out while a provider is configured. It answers the
+     * one question the resolution cannot: did the caller write through the file it was given?
+     *
+     * <p>Change is decided from the file's own attributes, read once at registration and once again at commit.
+     * Comparing what was observed at each moment is not on its own enough: a write that preserves the byte
+     * count and lands within one filesystem timestamp tick would be indistinguishable from no write at all,
+     * and the timestamp granularity is a property of the filesystem rather than something this code can
+     * assume. Registration therefore does not merely observe the timestamp, it <em>sets</em> it, to
+     * {@link #RESOLVED_SENTINEL_MODIFIED}. Any write moves the timestamp to the time of the write, which is
+     * never the sentinel, so detection does not depend on the granularity, on the size changing, or on how
+     * quickly the caller writes. A file that was absent at registration and is present at commit is new
+     * content and is always published.
+     *
+     * <p>If the timestamp cannot be set - a read-only filesystem, or a file this process does not own -
+     * detection falls back to comparing the observed attributes. A caller that cannot set the modification
+     * time of a file cannot write to it either, so the fallback covers a case that is degenerate by
+     * construction, and it is never worse than comparing attributes alone.
+     *
+     * <p>Publication runs in {@code beforeCompletion}, so a store that refuses the write fails the commit
+     * instead of leaving a {@code DataResource} row pointing at content that was never stored. It is reported
+     * as an unchecked failure because the callback signature admits nothing else, which is the same contract
+     * the storage bridge's own publications observe.
+     *
+     * <p>{@code afterCompletion} deliberately does <strong>not</strong> remove the local file. Unlike a staged
+     * upload, this file is the caller's working copy at the location {@code DataResource.objectInfo} names: it
+     * is a reconstructible cache of the stored object, removing it would force a fetch on every single read,
+     * and for a provider whose content is on local disk it would delete the content itself.
+     */
+    private static final class LocalWritePublication implements Synchronization {
+
+        private final String key;
+        private final File file;
+        private final boolean existed;
+        private final long resolvedSize;
+        private final FileTime resolvedModified;
+
+        /**
+         * Records how the file stood at the moment it was handed to the caller.
+         *
+         * @param key the storage key the file carries the content of
+         * @param file the local working copy handed to the caller
+         */
+        private LocalWritePublication(String key, File file) {
+            this.key = key;
+            this.file = file;
+            BasicFileAttributes attributes = attributesOrNull(file);
+            this.existed = attributes != null;
+            this.resolvedSize = attributes == null ? -1L : attributes.size();
+            this.resolvedModified = attributes == null ? null : armChangeDetection(key, file, attributes);
+        }
+
+        @Override
+        public void beforeCompletion() {
+            BasicFileAttributes attributes = attributesOrNull(file);
+            if (attributes == null || !attributes.isRegularFile()) {
+                // The caller removed the file, or never created one. Content removal is not this
+                // publication's business - removeContentFile is - so there is nothing to do.
+                return;
+            }
+            if (existed && attributes.size() == resolvedSize
+                    && attributes.lastModifiedTime().equals(resolvedModified)) {
+                return;
+            }
+            try {
+                publish(configuredContentStore(), key, file);
+                Debug.logVerbose(EVENT_STORE_COMMITTED + " " + ContentStoreFactory.reference(key)
+                        + " published as the transaction commits",
+                        MODULE);
+            } catch (GeneralException | IOException e) {
+                // Named by type rather than chained. GeneralRuntimeException composes a nested failure's
+                // message into its own, and the local working copy's absolute path is exactly what an
+                // IOException raised while reading it would carry - the one value the opaque reference
+                // above exists to withhold. The type, the reference and the provider's own log entry are
+                // what a reader correlates.
+                throw new GeneralRuntimeException("Cannot publish the content written for "
+                        + ContentStoreFactory.reference(key) + ", so the transaction is rolled back: "
+                        + e.getClass().getSimpleName());
+            }
+        }
+
+        @Override
+        public void afterCompletion(int status) {
+            if (status != Status.STATUS_COMMITTED) {
+                // The row that named this content did not commit, so the local copy no longer describes
+                // anything the store is expected to hold. Forgetting the stamp costs at most one redundant
+                // transfer on the next resolution and can never lose content.
+                STORE_SYNC_REGISTER.remove(key);
+            }
+        }
+
+        /**
+         * Stamps the file with the sentinel modification time, so that any write through it is detectable.
+         *
+         * <p>The synchronisation register is brought along with the stamp, because it records the same
+         * {@code length:lastModified} pair: leaving the recorded pair naming the timestamp this call has just
+         * replaced would make the next resolution read an untouched file as locally modified and publish it
+         * again. The register is only updated when it already holds this key, so arming never asserts an
+         * agreement with the store that was not established by an actual transfer.
+         *
+         * @param key the storage key the file carries the content of
+         * @param file the local working copy being handed to the caller
+         * @param observed the attributes just read from the file
+         * @return the modification time now in force, which is the sentinel when it could be set and the
+         *     observed time when it could not
+         */
+        private static FileTime armChangeDetection(String key, File file, BasicFileAttributes observed) {
+            if (!observed.isRegularFile()) {
+                return observed.lastModifiedTime();
+            }
+            FileTime sentinel = FileTime.fromMillis(RESOLVED_SENTINEL_MODIFIED);
+            if (sentinel.equals(observed.lastModifiedTime())) {
+                return sentinel;
+            }
+            try {
+                Files.setLastModifiedTime(file.toPath(), sentinel);
+            } catch (IOException e) {
+                Debug.logVerbose("The modification time of " + ContentStoreFactory.reference(file.getPath())
+                        + " could not be set, so a write"
+                        + " through it is detected by comparing its attributes: "
+                        + e.getClass().getSimpleName(), MODULE);
+                return observed.lastModifiedTime();
+            }
+            if (STORE_SYNC_REGISTER.containsKey(key)) {
+                recordSynchronised(key, file);
+            }
+            return sentinel;
+        }
+
+        /**
+         * Reads a file's attributes, answering null for a file that is not there or cannot be read.
+         *
+         * @param target the file to stat
+         * @return its attributes, or null
+         */
+        private static BasicFileAttributes attributesOrNull(File target) {
+            try {
+                return Files.readAttributes(target.toPath(), BasicFileAttributes.class);
+            } catch (IOException e) {
+                return null;
+            }
         }
     }
 
@@ -1829,17 +2052,6 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         }
         Path backing = ((LocalContentStore) store).backingPath(key);
         return backing.equals(file.toPath().toAbsolutePath().normalize());
-    }
-
-    /**
-     * Reports whether the local working copy is exactly the copy this JVM last synchronised with the store.
-     *
-     * @param key the storage key
-     * @param file the local working copy
-     * @return {@code true} if a synchronisation was recorded and the copy still matches it
-     */
-    private static boolean isSynchronised(String key, File file) {
-        return syncStamp(file).equals(STORE_SYNC_REGISTER.get(key));
     }
 
     /**
@@ -1897,7 +2109,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             store.put(key, content, length);
         }
         recordSynchronised(key, file);
-        Debug.logVerbose(EVENT_STORE_PUBLISHED + " key [" + key + "] length [" + length + "]", MODULE);
+        Debug.logVerbose(EVENT_STORE_PUBLISHED + " " + ContentStoreFactory.reference(key) + " length [" + length + "]",
+                MODULE);
     }
 
     /**
@@ -1919,7 +2132,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         Path target = file.toPath();
         Path parent = target.getParent();
         if (parent == null) {
-            throw new IOException("Cannot materialise key [" + key + "]: [" + file.getPath() + "] has no parent directory");
+            throw new IOException("Cannot materialise " + ContentStoreFactory.reference(key) + ": "
+                    + ContentStoreFactory.reference(file.getPath()) + " has no parent directory");
         }
         Files.createDirectories(parent);
         Path staging = Files.createTempFile(parent, MATERIALISE_PREFIX, MATERIALISE_SUFFIX);
@@ -1942,7 +2156,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
         }
         recordSynchronised(key, file);
-        Debug.logVerbose(EVENT_STORE_READ + " key [" + key + "] materialised for local access", MODULE);
+        Debug.logVerbose(EVENT_STORE_READ + " " + ContentStoreFactory.reference(key) + " materialised for local access",
+                MODULE);
     }
 
     /**
@@ -1975,7 +2190,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         }
         if (configuredContentStore() == null) {
             // Database mode: no key is derived and no provider is consulted, so the local resolution runs
-            // exactly as it did before this seam existed.
+            // unchanged.
             return false;
         }
         String key = contentStoreKey(dataResourceTypeId, objectInfo, contextRoot);
@@ -1992,7 +2207,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 InputStreamReader in = new InputStreamReader(owned, StandardCharsets.UTF_8)) {
             UtilIO.copy(in, out);
         }
-        Debug.logVerbose(EVENT_STORE_READ + " key [" + key + "] rendered", MODULE);
+        Debug.logVerbose(EVENT_STORE_READ + " " + ContentStoreFactory.reference(key) + " rendered", MODULE);
         return true;
     }
 
@@ -2023,7 +2238,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         }
         long length = store.size(key);
         InputStream content = store.openStream(key);
-        Debug.logVerbose(EVENT_STORE_READ + " key [" + key + "] streamed length [" + length + "]", MODULE);
+        Debug.logVerbose(EVENT_STORE_READ + " " + ContentStoreFactory.reference(key) + " streamed length [" + length + "]",
+                MODULE);
         return UtilMisc.toMap("stream", content, "length", length);
     }
 
@@ -2040,11 +2256,29 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             // same provider here as it does everywhere else, and database mode simply answers null.
             return ContentStoreFactory.resolveUploadPath(delegator, absolute);
         } catch (GeneralException e) {
-            // These two methods have never declared a checked exception and widening them would change a public
-            // signature, so the failure is raised unchecked rather than swallowed. Failing the request is the
-            // point: handing back a local path to a deployment that believes it is writing to object storage is
-            // how one instance ends up holding the only copy of an upload.
-            throw new GeneralRuntimeException("The configured content store provider could not supply an upload location", e);
+            throw uploadLocationRefused(e);
         }
+    }
+
+    /**
+     * Converts a refused upload location into the one unchecked failure the frozen upload path can raise.
+     *
+     * <p>This is the single place the package's checked failure policy is converted, and it exists because the
+     * upload-path methods have never declared a checked exception: widening them would change a public signature
+     * this refactor must preserve. Both ways into the content store - the provider that supplies a location of its
+     * own and the staging allocation used for one that does not - are converted here, so the identical condition is
+     * reported identically whichever route the deployment's configuration takes, and the checked failure is carried
+     * as the cause so a caller can still tell a misconfigured deployment
+     * ({@code ContentStoreConfigurationException}) from a single failed allocation.
+     *
+     * <p>Refusing is the point. Handing back a local path to a deployment that believes it is writing to object
+     * storage is how one instance ends up holding the only copy of an upload, so no location is ever invented here.
+     *
+     * @param refusal the checked failure the content store reported
+     * @return the unchecked failure to throw
+     */
+    private static GeneralRuntimeException uploadLocationRefused(GeneralException refusal) {
+        return new GeneralRuntimeException("The configured content store provider could not supply an upload location",
+                refusal);
     }
 }

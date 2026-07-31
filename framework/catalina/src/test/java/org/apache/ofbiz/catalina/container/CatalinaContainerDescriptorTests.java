@@ -113,9 +113,7 @@ public final class CatalinaContainerDescriptorTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Structure: exactly two containers, told apart by name AND loaders
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -135,9 +133,7 @@ public final class CatalinaContainerDescriptorTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The three load-balancer declarations on the PRODUCTION engine
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -205,9 +201,7 @@ public final class CatalinaContainerDescriptorTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * What the production parser resolves those declarations to
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -231,9 +225,7 @@ public final class CatalinaContainerDescriptorTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The test container must be untouched
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -243,7 +235,7 @@ public final class CatalinaContainerDescriptorTests {
         assertNotNull(engine, "the test container must declare the " + ENGINE_PROPERTY + " engine block");
 
         // The integration-test container is not part of a load-balanced fleet, so this refactor left it
-        // alone. Asserting the ABSENCE of the two new properties here is what proves the change was
+        // alone. Asserting the ABSENCE of the two new properties here is what confines the change to the
         // applied to the production container only.
         assertEquals("jvm1", ContainerConfig.getPropertyValue(engine, JVM_ROUTE, null),
                 "the test container keeps its own unchanged jvm-route");
@@ -262,9 +254,7 @@ public final class CatalinaContainerDescriptorTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The trust boundary the valve itself cannot enforce
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -327,7 +317,6 @@ public final class CatalinaContainerDescriptorTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The session scope this configuration actually provides
      *
      * jvm-route is sticky-routing metadata and nothing more. Sessions here are held in the memory of
@@ -337,7 +326,6 @@ public final class CatalinaContainerDescriptorTests {
      * enabled" reads to an operator as "sessions survive an instance", and the two are not the same.
      *
      * The entry point restores these defaults from constants of its own, which must not drift
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -432,7 +420,7 @@ public final class CatalinaContainerDescriptorTests {
 
     /**
      * The comment immediately preceding the n-th occurrence of a declaration, counted from the start of
-     * the file, so a per-declaration guarantee can be asserted on each declaration separately.
+     * the file, so a per-declaration rule can be asserted on each declaration separately.
      */
     private String commentPreceding(String declaration, int occurrence) throws Exception {
         String descriptor = Files.readString(repositoryRoot().resolve(DESCRIPTOR));
@@ -540,9 +528,7 @@ public final class CatalinaContainerDescriptorTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Schema validity
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -581,14 +567,12 @@ public final class CatalinaContainerDescriptorTests {
         validator.validate(new StreamSource(descriptor.toFile()));
 
         // The three new declarations use the generic <property name=".." value=".."/> grammar, so schema
-        // validity is what proves no bespoke element was smuggled into a shared component descriptor.
+        // validity is what rules out a bespoke element into a shared component descriptor.
         assertEquals(List.of(), problems, "schema validation problems");
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /** The {@code <container>} children of the root, keyed by name, in document order. */

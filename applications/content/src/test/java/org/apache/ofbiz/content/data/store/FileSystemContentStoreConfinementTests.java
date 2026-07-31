@@ -41,7 +41,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * Runs the whole {@link ContentStoreBehaviourContract} against the production
- * {@link FileSystemContentStore}, and proves that everything which CHANGES the store is confined to the
+ * {@link FileSystemContentStore}, and asserts that everything which CHANGES the store is confined to the
  * configured {@code content.upload.path.prefix} upload root.
  *
  * <p><strong>Two surfaces, deliberately unequal.</strong> A storage key is resolved relative to
@@ -65,7 +65,7 @@ import org.junit.jupiter.api.io.TempDir;
  * from request data, so a resolver that lets the key rather than the configuration choose the location
  * is a read, overwrite and delete primitive over the whole application tree. The tests below therefore
  * do not merely assert that hostile keys raise an exception; the decisive ones plant a real file
- * OUTSIDE the upload root and prove it is still byte-identical afterwards. That is an assertion no
+ * OUTSIDE the upload root and check it is still byte-identical afterwards. That is an assertion no
  * rewording of the resolver can satisfy by accident.
  *
  * <p><strong>Global state.</strong> {@link FileSystemContentStore} is configuration-driven: it reads
@@ -181,9 +181,7 @@ public final class FileSystemContentStoreConfinementTests extends ContentStoreBe
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Where content lands
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -225,7 +223,7 @@ public final class FileSystemContentStoreConfinementTests extends ContentStoreBe
         assertTrue(Files.isRegularFile(expected), "the provider must follow the configured prefix and create " + expected);
         assertArrayEquals(PAYLOAD, Files.readAllBytes(expected), "the bytes on disk");
 
-        // The other direction is what proves the configured prefix is the BOUNDARY and not merely the
+        // The other direction is what makes the configured prefix the BOUNDARY and not merely the
         // default location: the tree that was the upload root a moment ago is now outside it, and a write
         // addressed there is refused. A provider that treated the prefix as a default would accept both.
         assertEveryMutationRefuses(store, COMMITTED_PREFIX + "/party/logo.png", "the only tree this provider may modify");
@@ -258,7 +256,7 @@ public final class FileSystemContentStoreConfinementTests extends ContentStoreBe
         Path confined = home.resolve(COMMITTED_PREFIX).resolve(key);
         assertFalse(Files.exists(confined), "a refused write may not be re-rooted onto the upload root, at " + confined);
 
-        // Reading such a key deliberately still resolves, and that is a compatibility guarantee rather than
+        // Reading such a key deliberately still resolves, and that is a compatibility requirement rather than
         // an oversight: OFBIZ_FILE object information in existing databases points all over the OFBiz home
         // directory, and narrowing reads to the upload root would start refusing content that resolves
         // today. The Content component's allow lists stay the read boundary; the upload root is the write
@@ -268,9 +266,7 @@ public final class FileSystemContentStoreConfinementTests extends ContentStoreBe
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Keys that must be refused
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -320,7 +316,7 @@ public final class FileSystemContentStoreConfinementTests extends ContentStoreBe
         assertEveryReadRefuses(store, "/tmp/escaped-by-an-absolute-key.bin", "not within an allowed directory");
 
         // The one addressing a legal location inside the upload root resolves, and finds nothing. That is
-        // the proof the refused write was refused outright rather than performed somewhere unnoticed.
+        // what shows the refused write was refused outright rather than performed somewhere unnoticed.
         assertThrows(FileNotFoundException.class, () -> store.get(inside.toString()),
                 "an absolute key inside the tree must resolve and report absence, not content");
         assertFalse(store.exists(inside.toString()), "and must report the location as empty");
@@ -355,9 +351,7 @@ public final class FileSystemContentStoreConfinementTests extends ContentStoreBe
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Failing closed
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -388,15 +382,13 @@ public final class FileSystemContentStoreConfinementTests extends ContentStoreBe
 
         // Confinement to the upload root is necessary but not sufficient: the operator also decides
         // which parts of the tree may hold file-backed content at all. Asserting the allow list's own
-        // wording is what proves that check is genuinely in the chain rather than merely nearby.
+        // wording is what ties that check into the chain rather than merely nearby.
         assertEveryOperationRefuses(store, COMMITTED_PREFIX + "/party/logo.png", "not within an allowed directory");
         assertFalse(Files.exists(inside), "a key the allow list rejects may not create " + inside);
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The upload path helpers, which storage keys do not go through
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -417,9 +409,7 @@ public final class FileSystemContentStoreConfinementTests extends ContentStoreBe
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**

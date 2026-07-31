@@ -71,9 +71,7 @@ public final class ContentStoreSelectionTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Selecting a provider
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -113,8 +111,31 @@ public final class ContentStoreSelectionTests {
 
         assertTrue(selected instanceof FileSystemContentStore, "the filesystem value must select the filesystem provider");
         // The worker seam asks the active provider where uploads belong, so a provider that can answer has to
-        // announce it structurally rather than by being recognised by type.
-        assertTrue(selected instanceof ContentUploadLocation, "a non-database provider must be able to report an upload location");
+        // announce it structurally rather than by being recognised by type. Both capabilities are required,
+        // not just the first: the location is written to directly by frozen services that open a
+        // FileOutputStream on it, so it is only a usable answer from a provider that also backs that very
+        // local file. See ContentStoreFactory.resolveUploadPath.
+        assertTrue(selected instanceof ContentUploadLocation, "the filesystem provider must report an upload location");
+        assertTrue(selected instanceof LocalContentStore,
+                "the filesystem provider's upload location is the file it stores, which is what makes the "
+                        + "location it reports a usable one");
+    }
+
+    @Test
+    public void anObjectStoreSelectionYieldsAProviderThatAnnouncesNoUploadLocationAtAll() throws Exception {
+        ContentStore selected = ContentStoreFactory.resolve("s3");
+
+        assertTrue(selected instanceof S3ContentStore, "the s3 value must select the object-store provider");
+        // A bucket has no writable local path, and a key prefix is not one. Announcing the capability and
+        // answering with a prefix is the defect this asserts against: the frozen callers treat the answer as
+        // a directory to open a FileOutputStream in, so the upload would have been created beside the process
+        // working directory and never published to the bucket at all. An upload bound for this provider is
+        // staged by ContentStoreFactory.uploadStagingPath and published on commit instead.
+        assertFalse(selected instanceof ContentUploadLocation,
+                "the object-store provider must announce no upload location: it has no writable local path to "
+                        + "offer, and offering one would send the upload to local disk instead of the bucket");
+        assertFalse(selected instanceof LocalContentStore,
+                "the object-store provider backs no local file, so it must not claim to");
     }
 
     @Test
@@ -130,9 +151,7 @@ public final class ContentStoreSelectionTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Refusing an unusable object-store configuration, before any client exists
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test

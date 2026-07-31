@@ -104,7 +104,7 @@ under the License.
                  unparseable value would otherwise abort startup with a NumberFormatException, while a value
                  matching no connector would silently mark nothing secure.
                  Left EMPTY by default, which ContainerConfig treats as absent, so the SslAcceleratorValve is NOT
-                 installed - exactly the same behaviour as the previously commented-out declaration.
+                 installed and an unconfigured deployment behaves as it does with no such declaration at all.
 
                  TRUST BOUNDARY - READ BEFORE ENABLING THIS. SslAcceleratorValve grants TLS semantics on the
                  strength of request.getLocalPort() alone: every request arriving on the configured port is marked
@@ -125,8 +125,8 @@ under the License.
                  forwarded values must be honoured inside Tomcat, the RemoteIpValve contract is the mechanism that
                  does it safely - internalProxies / trustedProxies pinned to the proxy's own addresses plus an
                  explicit protocolHeader - and it authenticates the hop that this valve cannot. That valve is not
-                 installed by CatalinaContainer, so with this configuration surface the equivalent guarantee has
-                 to come from the network restriction and header hygiene described above. -->
+                 installed by CatalinaContainer, so with this configuration surface that authentication of the
+                 hop has to come from the network restriction and header hygiene described above. -->
             <property name="ssl-accelerator-port" value=""/>
             <!-- Shares the session cookie across sub-domains by installing CrossSubdomainSessionValve. Only the
                  literal "true" (case-insensitive) enables it; the default is "false". Configurable via

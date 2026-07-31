@@ -60,9 +60,10 @@ import org.apache.ofbiz.security.SecurityUtil;
  * <p>This is the {@code filesystem} provider named by the {@code content.store.provider} property of
  * the {@code content} resource. Content is rooted at the {@code content.upload.path.prefix} location
  * (committed value {@code runtime/uploads}, resolved relative to the {@code ofbiz.home} system
- * property) and is spread over timestamp-named sub-directories that hold at most
- * {@code content.upload.max.files} entries each (committed value {@code 250}, which is also the
- * effective default whenever that property is absent or unusable).
+ * property) and is spread over timestamp-named sub-directories, each of which is reused until its
+ * observed entry count reaches {@code content.upload.max.files} (committed value {@code 250}, which is
+ * also the effective default whenever that property is absent or unusable). The count is observed, not
+ * held under a lock, so concurrent uploads may carry a directory past it.
  *
  * <p><strong>This provider is opt-in and is never the default.</strong> The committed value of
  * {@code content.store.provider} is {@code database}; in that mode the pre-existing
@@ -113,13 +114,13 @@ import org.apache.ofbiz.security.SecurityUtil;
  * against the {@code content.data.local.file.allowed.paths} allow list; every other key is taken as the
  * relative form, is prefixed with the OFBiz home directory, and is validated against the
  * {@code content.data.ofbiz.file.allowed.paths} allow list. Both are then confined twice, and each test
- * closes something the other does not: the canonical-plus-normalized boundary check the rest of the
- * Content component uses, whose normalized branch tolerates a mount point inside the tree by design,
- * and a purely canonical containment test, in which symbolic links are resolved on both sides so that a
- * link planted inside the tree pointing out of it is refused rather than accepted. Because canonical
- * containment alone would reject the legitimate case of a link or a mount point standing where content
- * belongs, additional roots are declared explicitly through
- * {@code content.store.filesystem.allowed.roots} rather than by relaxing the test.
+ * closes something the other does not: the boundary check the rest of the Content component uses,
+ * which requires canonical containment and lexical containment of the normalized paths together so
+ * that a traversal is refused even where the tail of the path does not exist yet, and a purely
+ * canonical containment test against the declared roots, in which symbolic links are resolved on both
+ * sides so that a link planted inside the tree pointing out of it is refused rather than accepted. A
+ * deployment whose content really does live behind such a link declares the far end through
+ * {@code content.store.filesystem.allowed.roots} rather than the test being relaxed for everyone.
  *
  * <p><strong>The mutation surface is narrower than the read surface.</strong> A read may address
  * anything the two allow lists admit inside the home directory, because that is exactly what the
@@ -152,13 +153,10 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
 
     private static final String MODULE = FileSystemContentStore.class.getName();
 
-    /** The resource every property this provider reads lives in, shared with the rest of the package. */
     private static final String PROPERTY_RESOURCE = ContentStoreSupport.PROPERTY_RESOURCE;
 
-    /** The property naming the top level upload location, resolved relative to {@code ofbiz.home}. */
     private static final String UPLOAD_PATH_PREFIX_PROPERTY = "content.upload.path.prefix";
 
-    /** The property capping the number of entries placed in a single upload sub-directory. */
     private static final String UPLOAD_MAX_FILES_PROPERTY = "content.upload.max.files";
 
     /** The property declaring roots, beyond {@code ofbiz.home}, that content may canonically resolve inside. */
@@ -194,7 +192,6 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
     /** Prefix of the temporary file a write is staged in, so a stray one is identifiable. */
     private static final String STAGING_PREFIX = ".ofbiz-content-";
 
-    /** Suffix of the temporary file a write is staged in. */
     private static final String STAGING_SUFFIX = ".part";
 
     /** Stable code reported when the upload-directory scan stopped at its configured bound. */
@@ -226,11 +223,8 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
             PosixFilePermissions.asFileAttribute(OWNER_ONLY_DIRECTORY);
 
     /**
-     * Creates a filesystem content store.
-     *
-     * <p>The instance is stateless and reads every setting it needs from the {@code content}
-     * resource at the moment it is used, so it never has to be rebuilt when configuration is
-     * reloaded.
+     * Reads every setting from the {@code content} resource at the moment it is used, so an instance
+     * does not have to be rebuilt when configuration changes.
      */
     public FileSystemContentStore() {
     }
@@ -422,8 +416,6 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
             if (!Files.readAttributes(path, BasicFileAttributes.class).isRegularFile()) {
                 throw absent(key);
             }
-            // deliberately not closed here: the ContentStore contract hands ownership of the stream to
-            // the caller, which is expected to close it with a try-with-resources statement
             return Files.newInputStream(path, StandardOpenOption.READ);
         } catch (NoSuchFileException e) {
             // the content was removed between the check and the open; the SPI promises the same absence
@@ -565,8 +557,8 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
      * from {@code content.upload.path.prefix} and the per-directory cap from
      * {@code content.upload.max.files}.
      *
-     * <p>The most recent sub-directory of the top level location is reused until it holds the cap
-     * number of entries, at which point a further timestamp-named sub-directory is created. Two
+     * <p>The most recent sub-directory of the top level location is reused until its observed entry
+     * count reaches the cap, at which point a further timestamp-named sub-directory is created. Two
      * properties of this selection are deliberate:
      * <ul>
      *   <li>The scan is <strong>bounded</strong>. At most
@@ -583,8 +575,7 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
      * @param delegator the delegator used to let the {@code SystemProperty} entity override
      *     {@code content.upload.path.prefix}; may be null, in which case only the property file is
      *     consulted. The per-directory cap is deliberately still read from {@code content.properties}
-     *     alone, reproducing the pre-existing asymmetry so that selecting this provider cannot change
-     *     where content lands
+     *     alone, which is what keeps selecting this provider from changing where content lands
      * @param absolute {@code true} for the absolute path, which is the form {@code LOCAL_FILE} and
      *     {@code LOCAL_FILE_BIN} content is addressed by; {@code false} for the path relative to the
      *     OFBiz home directory, which is the form {@code OFBIZ_FILE} and {@code OFBIZ_FILE_BIN}
@@ -605,7 +596,7 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
         // the configured location is confined BEFORE anything is listed or created underneath it, so a
         // prefix carrying traversal is refused rather than acted on and then judged
         String location = ofbizHome() + relativePath;
-        String rendered = ContentStoreSupport.describe(location);
+        String rendered = ContentStoreUtil.reference(location);
         Path parent = confine(toPath(location, rendered), rendered);
         Path selected = selectUploadDirectory(parent, maxFiles);
         if (absolute) {
@@ -646,9 +637,9 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
      * Returns the directory that the next uploaded file should be placed in, letting the given
      * delegator override the top level location from the {@code SystemProperty} entity.
      *
-     * <p>The per-directory cap is deliberately still read from {@code content.properties} alone,
-     * without consulting the delegator. That asymmetry is pre-existing and is reproduced here on
-     * purpose, so that selecting this provider cannot change where content lands.
+     * <p>The delegator may override {@code content.upload.path.prefix}. The per-directory cap
+     * {@code content.upload.max.files} stays classpath-configured and is not looked up through the
+     * delegator, which is what keeps selecting this provider from changing where content lands.
      *
      * @param delegator the delegator used to look {@code content.upload.path.prefix} up in the
      *     {@code SystemProperty} entity; the property file value is used when the entity holds none
@@ -692,7 +683,6 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
             initialPath = "/" + initialPath;
         }
 
-        // check for the latest subdirectory
         String parentDir = ofbizHome + initialPath;
         File parent = FileUtil.getFile(parentDir);
         File latestDir = null;
@@ -727,9 +717,9 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
         // log verbatim. Verbose rather than informational, because it identifies one upload's destination.
         Debug.logVerbose("Content store provider [filesystem] upload directory " + ContentStoreUtil.reference(name),
                 MODULE);
-        // the guard above and the dereference below treat latestDir inconsistently; that is
-        // pre-existing behaviour and is reproduced here on purpose, because tightening it would
-        // change what callers observe
+        // Only the name is null-guarded; absolute mode still dereferences latestDir. Preserving that
+        // asymmetry is what keeps the answer identical to the one DataResourceWorker gives, so selecting
+        // this provider cannot change what a caller observes.
         if (absolute) {
             return latestDir.getAbsolutePath().replace('\\', '/');
         }
@@ -750,7 +740,7 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
             Files.createDirectories(parent);
         } catch (IOException e) {
             throw new GeneralException("Unable to create the top level content upload directory ["
-                    + ContentStoreSupport.describe(parent.toString()) + "]", e);
+                    + ContentStoreUtil.reference(parent.toString()) + "]: " + e.getClass().getSimpleName());
         }
         int scanLimit = ContentStoreSupport.boundedIntProperty(MAX_UPLOAD_DIRECTORIES_PROPERTY,
                 DEFAULT_MAX_UPLOAD_DIRECTORIES, 1, MAX_UPLOAD_DIRECTORIES_LIMIT);
@@ -774,10 +764,10 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
             }
         } catch (IOException e) {
             throw new GeneralException("Unable to examine the content upload directory ["
-                    + ContentStoreSupport.describe(parent.toString()) + "]", e);
+                    + ContentStoreUtil.reference(parent.toString()) + "]: " + e.getClass().getSimpleName());
         }
         if (bounded) {
-            Debug.logWarning(EVENT_UPLOAD_SCAN_BOUNDED + " location [" + ContentStoreSupport.describe(parent.toString())
+            Debug.logWarning(EVENT_UPLOAD_SCAN_BOUNDED + " location [" + ContentStoreUtil.reference(parent.toString())
                     + "]: only the first " + scanLimit + " entries were examined; raise ["
                     + MAX_UPLOAD_DIRECTORIES_PROPERTY + "] or prune the location", MODULE);
         }
@@ -813,7 +803,7 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
             return ceiling;
         } catch (IOException e) {
             throw new GeneralException("Unable to count the content upload directory ["
-                    + ContentStoreSupport.describe(directory.toString()) + "]", e);
+                    + ContentStoreUtil.reference(directory.toString()) + "]: " + e.getClass().getSimpleName());
         }
         return counted;
     }
@@ -824,9 +814,9 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
      * <p>Creation is atomic and is never assumed to have succeeded: {@link Files#createDirectory}
      * fails if the name is already taken, which is exactly the collision a second instance writing
      * into shared storage in the same millisecond produces, so the name is advanced and the creation
-     * retried. Every other failure propagates - the previous behaviour of logging the failure and then
-     * returning the directory as though it had been created is what turned a full or read-only volume
-     * into a mysterious "file not found" much later.
+     * retried. Every other failure propagates, rather than being logged while the directory is returned
+     * as though it had been created, because that is what turns a full or read-only volume into a
+     * mysterious "file not found" much later.
      *
      * @param parent the top level location to create the sub-directory in
      * @return the sub-directory that was created, which is guaranteed to exist
@@ -840,7 +830,7 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
                 return Files.createDirectory(candidate, OWNER_ONLY_DIRECTORY_ATTRIBUTE);
             } catch (FileAlreadyExistsException e) {
                 Debug.logVerbose(EVENT_UPLOAD_DIRECTORY_TAKEN + " location ["
-                        + ContentStoreSupport.describe(candidate.toString()) + "]: trying the next name", MODULE);
+                        + ContentStoreUtil.reference(candidate.toString()) + "]: trying the next name", MODULE);
             } catch (UnsupportedOperationException e) {
                 // a filesystem with no POSIX permission model cannot be handed a mode; the directory is
                 // still created, just with whatever the platform's default is
@@ -848,18 +838,19 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
                     return Files.createDirectory(candidate);
                 } catch (FileAlreadyExistsException taken) {
                     Debug.logVerbose(EVENT_UPLOAD_DIRECTORY_TAKEN + " location ["
-                            + ContentStoreSupport.describe(candidate.toString()) + "]: trying the next name", MODULE);
+                            + ContentStoreUtil.reference(candidate.toString()) + "]: trying the next name", MODULE);
                 } catch (IOException failed) {
                     throw new GeneralException("Unable to create the content upload directory ["
-                            + ContentStoreSupport.describe(candidate.toString()) + "]", failed);
+                            + ContentStoreUtil.reference(candidate.toString()) + "]: "
+                            + failed.getClass().getSimpleName());
                 }
             } catch (IOException e) {
                 throw new GeneralException("Unable to create the content upload directory ["
-                        + ContentStoreSupport.describe(candidate.toString()) + "]", e);
+                        + ContentStoreUtil.reference(candidate.toString()) + "]: " + e.getClass().getSimpleName());
             }
         }
         throw new GeneralException("Unable to create a content upload directory under ["
-                + ContentStoreSupport.describe(parent.toString()) + "] after " + DIRECTORY_CREATE_ATTEMPTS + " attempts");
+                + ContentStoreUtil.reference(parent.toString()) + "] after " + DIRECTORY_CREATE_ATTEMPTS + " attempts");
     }
 
     /**
@@ -970,13 +961,13 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
             // exactly what File.listFiles answering null already meant here: the location cannot be
             // examined, so no sub-directory is reusable and a fresh one is started
             Debug.logWarning("Content store provider [filesystem] could not examine the upload location ["
-                    + ContentStoreSupport.describe(parent.getPath()) + "] [" + e.getClass().getSimpleName()
+                    + ContentStoreUtil.reference(parent.getPath()) + "] [" + e.getClass().getSimpleName()
                     + "]; a new sub-directory will be started", MODULE);
             return null;
         }
         if (bounded) {
             Debug.logWarning(EVENT_UPLOAD_SCAN_BOUNDED + " location ["
-                    + ContentStoreSupport.describe(parent.getPath()) + "]: only the first " + scanLimit
+                    + ContentStoreUtil.reference(parent.getPath()) + "]: only the first " + scanLimit
                     + " entries were examined; raise [" + MAX_UPLOAD_DIRECTORIES_PROPERTY
                     + "] or prune the location", MODULE);
         }
@@ -1142,8 +1133,8 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
             // long as what exists really is a directory and not a link planted in its place.
             return Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS);
         } catch (UnsupportedOperationException noPosix) {
-            // The filesystem has no POSIX permission model, so the mode cannot be requested at all. Creating
-            // the directory without one is the only available behaviour and matches the previous mkdir call.
+            // The filesystem has no POSIX permission model, so the mode cannot be requested at all.
+            // Creating the directory without one is the only available behaviour.
             return createDirectoryWithoutMode(directory);
         } catch (IOException e) {
             Debug.logVerbose("Content store provider [filesystem] could not create directory "
@@ -1212,8 +1203,8 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
      * directory tree by handle. It is narrowed to almost nothing instead, and its consequence is removed:
      * the callers re-verify the fully resolved containing directory immediately before acting, they create
      * the object with {@code CREATE_NEW} rather than opening one that may already be there, and they reach
-     * the final name only through a rename, which replaces a symbolic link rather than following it. The
-     * outcome is that winning the race no longer redirects a write or a removal.
+     * the final name only through a rename, which replaces a symbolic link rather than following it, so
+     * winning the race does not redirect a write or a removal.
      *
      * @param key the storage key to resolve, in the shape held by {@code DataResource.objectInfo} and so
      *     relative to the OFBiz home directory
@@ -1279,9 +1270,9 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
                     + UPLOAD_PATH_PREFIX_PROPERTY + "] of resource [" + PROPERTY_RESOURCE + "] is not configured,"
                     + " so there is no upload root to confine changes to");
         }
-        // The committed value carries no leading separator, but getUploadPath tolerates one by supplying it, so
-        // the same tolerance is reproduced here rather than resolving an absolute path against the home
-        // directory - which would silently discard the home directory altogether.
+        // The committed value carries no leading separator and getUploadPath tolerates one by supplying it,
+        // so a leading separator is stripped here as well rather than resolving an absolute path against the
+        // home directory - which would silently discard the home directory altogether.
         String relative = prefix.replace('\\', '/');
         while (relative.startsWith("/")) {
             relative = relative.substring(1);
@@ -1541,9 +1532,8 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
     }
 
     /**
-     * Resolves a storage key to the location that holds its content, applying the very same allow list
-     * checks that the Content component applies to file-backed data resources today and then confining
-     * the result.
+     * Resolves a storage key to the location that holds its content, applying the allow list the
+     * Content component applies to file-backed data resources and then confining the result.
      *
      * <p>This is the READ resolution, and it is deliberately as wide as the behaviour it replaces and
      * no wider. A key already beginning with the OFBiz home directory is the absolute form persisted
@@ -1558,9 +1548,10 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
      * <p>Two containment tests then run, and each closes something the other does not:
      * <ol>
      *   <li>{@link #checkFileBoundary(File, String)} against the OFBiz home directory - the
-     *       canonical-plus-normalised shape the rest of the Content component uses. It is what refuses
-     *       an absolute key that a widened allow list would otherwise admit, and its normalised branch
-     *       tolerates a mount point inside the tree by design.</li>
+     *       canonical-plus-normalised shape the rest of the Content component uses, which requires both
+     *       tests together. It is what refuses an absolute key that a widened allow list would otherwise
+     *       admit, and its normalised test is what still refuses a traversal whose tail does not exist
+     *       yet.</li>
      *   <li>{@link #confine(Path, String)} against the home directory plus every root declared by
      *       {@code content.store.filesystem.allowed.roots} - a purely canonical test, so a symbolic
      *       link planted inside the tree that points out of it is refused rather than accepted. A
@@ -1578,17 +1569,15 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
     private static Path resolvePath(String key) throws GeneralException {
         ContentStoreSupport.requireUsableKey(key);
         String prefix = ofbizHome();
-        // FileUtil.getFile is used throughout rather than new File(String) so that a "component://"
-        // key keeps resolving exactly as it does today; it answers null for a malformed "component://"
-        // location, which is refused here rather than being dereferenced
+        // FileUtil.getFile is used throughout rather than new File(String) so that a "component://" key
+        // retains OFBiz resolution semantics; it answers null for a malformed "component://" location,
+        // which is refused here rather than being dereferenced
         String identifier = ContentStoreSupport.reference(key);
         File resolved = requireLocation(FileUtil.getFile(key), identifier);
-        File home = requireLocation(FileUtil.getFile(prefix), ContentStoreSupport.describe(prefix));
+        File home = requireLocation(FileUtil.getFile(prefix), ContentStoreUtil.reference(prefix));
         if (resolved.getPath().startsWith(home.getPath())) {
-            // the absolute form, as persisted for LOCAL_FILE and LOCAL_FILE_BIN content
             SecurityUtil.checkLocalFileAllowList(resolved);
         } else {
-            // the relative form, as persisted for OFBIZ_FILE and OFBIZ_FILE_BIN content
             String separator = "";
             if (key.indexOf('/') != 0 && prefix.lastIndexOf('/') != (prefix.length() - 1)) {
                 separator = "/";
@@ -1645,7 +1634,7 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
     static void checkFileBoundary(File file, String root) throws GeneralException {
         try {
             String canonicalAllowed = requireLocation(FileUtil.getFile(root),
-                    ContentStoreSupport.describe(root)).getCanonicalPath();
+                    ContentStoreUtil.reference(root)).getCanonicalPath();
             String canonicalFilePath = file.getCanonicalPath();
             boolean passesCanonical = canonicalFilePath.startsWith(canonicalAllowed + File.separator)
                     || canonicalFilePath.equals(canonicalAllowed);
@@ -1718,13 +1707,13 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
     private static List<Path> allowedRoots() throws GeneralException {
         List<Path> roots = new ArrayList<>();
         String home = ofbizHome();
-        roots.add(canonicalise(toPath(home, ContentStoreSupport.describe(home)), ContentStoreSupport.describe(home)));
+        roots.add(canonicalise(toPath(home, ContentStoreUtil.reference(home)), ContentStoreUtil.reference(home)));
         String declared = UtilProperties.getPropertyValue(ContentStoreSupport.PROPERTY_RESOURCE, ALLOWED_ROOTS_PROPERTY);
         if (UtilValidate.isNotEmpty(declared)) {
             for (String candidate : declared.split(ROOT_SEPARATOR)) {
                 String trimmed = candidate.trim();
                 if (!trimmed.isEmpty()) {
-                    String rendered = ContentStoreSupport.describe(trimmed);
+                    String rendered = ContentStoreUtil.describe(trimmed);
                     roots.add(canonicalise(toPath(trimmed, rendered), rendered));
                 }
             }
@@ -1761,7 +1750,8 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
             }
             return real.resolve(absolute.subpath(existing.getNameCount(), absolute.getNameCount()));
         } catch (IOException e) {
-            throw new GeneralException("Unable to validate the content location [" + identifier + "]", e);
+            throw new GeneralException("Unable to validate the content location [" + identifier + "]: "
+                    + e.getClass().getSimpleName());
         }
     }
 
@@ -1777,7 +1767,8 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
         try {
             return Path.of(location);
         } catch (InvalidPathException e) {
-            throw new GeneralException("Unusable content location [" + identifier + "]", e);
+            throw new GeneralException("Unusable content location [" + identifier + "]: "
+                    + e.getClass().getSimpleName());
         }
     }
 
@@ -1806,16 +1797,22 @@ public final class FileSystemContentStore implements ContentStore, ContentUpload
     }
 
     /**
-     * The one form in which this provider reports that a key addresses no stored content, carrying the
-     * filesystem answer that established it.
+     * The one form in which this provider reports that a key addresses no stored content when the
+     * filesystem is what established the absence.
+     *
+     * <p>The filesystem answer is <em>not</em> carried. A {@link NoSuchFileException} names the resolved
+     * path in full - the one thing {@link #absent(String)} deliberately does not name - so attaching it
+     * would republish, through any reader that prints the trace, exactly what the opaque reference exists
+     * to withhold. Nothing diagnostic is lost: the absence is fully described by the key's reference, and
+     * the type is named so a reader can tell a filesystem-established absence from one established by the
+     * attribute check.
      *
      * @param key the storage key that addresses nothing
-     * @param cause the filesystem answer that established the absence
+     * @param cause the filesystem answer that established the absence, named by type only
      * @return the exception to throw
      */
     private static FileNotFoundException absent(String key, NoSuchFileException cause) {
-        FileNotFoundException absent = absent(key);
-        absent.initCause(cause);
-        return absent;
+        return new FileNotFoundException("No content found for " + ContentStoreUtil.reference(key)
+                + ": " + cause.getClass().getSimpleName());
     }
 }

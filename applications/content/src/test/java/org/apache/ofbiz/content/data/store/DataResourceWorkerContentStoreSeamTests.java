@@ -21,6 +21,7 @@ package org.apache.ofbiz.content.data.store;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -48,7 +49,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Proves that the content storage providers are reached from production code, and that reaching them carries
+ * Asserts that the content storage providers are reached from production code, and that reaching them carries
  * content in both directions without changing anything for a deployment that has not configured one.
  *
  * <p>This is the expectation that makes the whole storage package worth having. A provider nothing calls is not
@@ -175,23 +176,25 @@ public final class DataResourceWorkerContentStoreSeamTests {
     }
 
     @Test
-    public void aResolutionThatChangedNothingCostsTheStoreNoTrafficAtAll() throws Exception {
+    public void repeatedResolutionsCostNoUploadAndEachOneServesWhatTheStoreHolds() throws Exception {
         configureObjectStorage();
         client.seed(OBJECT_INFO, STORED);
         DataResourceWorker.getContentFile(TYPE_OFBIZ_FILE_BIN, OBJECT_INFO, null);
         int gets = client.getCalls();
         int puts = client.putCalls();
-        int heads = client.headObjectCalls();
 
         DataResourceWorker.getContentFile(TYPE_OFBIZ_FILE_BIN, OBJECT_INFO, null);
-        DataResourceWorker.getContentFile(TYPE_OFBIZ_FILE_BIN, OBJECT_INFO, null);
+        File third = DataResourceWorker.getContentFile(TYPE_OFBIZ_FILE_BIN, OBJECT_INFO, null);
 
-        // Reading a resource repeatedly must not re-transfer it. Without this, every render of a page carrying
-        // an uploaded image would pull the whole object again, rewrite it locally, and change the modification
-        // time that every cache above this layer keys on.
-        assertEquals(gets, client.getCalls(), "a repeat resolution must not read the object again");
-        assertEquals(puts, client.putCalls(), "a repeat resolution must not write the object either");
-        assertEquals(heads, client.headObjectCalls(), "nor interrogate the store about it again");
+        // A read must never cost an upload: that is what would turn every render of a page carrying an uploaded
+        // image into a write, and it is the direction that can actually lose content.
+        assertEquals(puts, client.putCalls(), "a repeat resolution must not write the object");
+
+        // Reading it again, on the other hand, is exactly what is required. A local copy trusted because it was
+        // fetched earlier is a copy that goes stale as soon as another instance writes, and nothing invalidates
+        // it - so each resolution asks the store, once, and serves what the store holds.
+        assertEquals(gets + 2, client.getCalls(), "each resolution reads the object exactly once");
+        assertArrayEquals(STORED, Files.readAllBytes(third.toPath()), "and serves what the store holds");
     }
 
     @Test
@@ -230,21 +233,49 @@ public final class DataResourceWorkerContentStoreSeamTests {
     }
 
     @Test
-    public void anObjectStoreUploadLocationIsTheProvidersOwnAndNotALocallyComputedPath() throws Exception {
+    public void anObjectStoreUploadIsStagedOnRealLocalDiskAndNotSentToAKeyPrefix() throws Exception {
         configureObjectStorage();
+
+        // The provider itself must decline. A bucket has no writable local path, so an object-store provider
+        // that answered here would be answering with something the frozen callers cannot use: they open a
+        // FileOutputStream inside whatever this returns, and DataServices.createFileMethod additionally
+        // requires the LOCAL_FILE form to be absolute. A key prefix satisfies neither.
+        assertNull(ContentStoreFactory.resolveUploadPath(null, false),
+                "the object-store provider must offer no upload location of its own");
+        assertNull(ContentStoreFactory.resolveUploadPath(null, true),
+                "not in the absolute form either - a key prefix is not a writable local path");
 
         String relative = DataResourceWorker.getDataResourceContentUploadPath(false);
         String absolute = DataResourceWorker.getDataResourceContentUploadPath(true);
 
-        // The object store answers with a key prefix, which the local computation can never produce: it always
-        // yields a path under the deployment home with a timestamped subdirectory, and it creates that
-        // subdirectory as a side effect. Both facts are asserted, so this cannot pass by coincidence.
-        assertEquals(ContentStoreFactory.resolveUploadPath(null, false), relative, "the relative upload location");
-        assertEquals(ContentStoreFactory.resolveUploadPath(null, true), absolute, "the absolute upload location");
-        assertFalse(relative.startsWith("/"), "an object key prefix carries no leading separator: " + relative);
-        assertFalse(relative.contains(deploymentHome.toString()), "the location must not name the local deployment: " + relative);
-        assertFalse(Files.exists(deploymentHome.resolve("runtime/uploads")),
-                "nothing local may be created for a deployment whose uploads go to object storage");
+        // What the caller gets instead is a real, existing, writable directory inside the deployment, which is
+        // the only thing an upload can actually be written into. Every property the frozen callers depend on is
+        // asserted, so this cannot pass on a prefix-shaped answer: the relative form is deployment relative,
+        // the absolute form is absolute and inside the deployment, and both exist before the caller writes.
+        assertTrue(relative.startsWith("/runtime/uploads/"), "the deployment-relative form: " + relative);
+        assertTrue(Files.isDirectory(deploymentHome.resolve(relative.substring(1))),
+                "the staging directory must exist ready for the upload: " + relative);
+        assertTrue(Path.of(absolute).isAbsolute(), "the absolute form must be absolute: " + absolute);
+        assertTrue(absolute.startsWith(deploymentHome.toAbsolutePath().toString().replace('\\', '/')),
+                "the staging location must sit inside the deployment: " + absolute);
+        assertTrue(Files.isDirectory(Path.of(absolute)), "the absolute form must exist too: " + absolute);
+        assertFalse(relative.contains("content/uploads"),
+                "the location must not be the provider's key prefix: " + relative);
+
+        // Each allocation is its own directory, which is what makes publishing everything in one of them safe
+        // while other uploads are in flight.
+        assertNotEquals(relative, absolute.substring(absolute.length() - relative.length()),
+                "two allocations must not share a directory: " + relative + " / " + absolute);
+
+        // And what is written there reaches the bucket under the flat key the read side resolves from the
+        // persisted objectInfo, with the staging segment spliced out, so the object stays addressable after the
+        // staging directory is gone.
+        String objectInfo = relative.substring(1) + "/10000.png";
+        writeLocally(deploymentHome.resolve(objectInfo).toFile(), STORED);
+        assertTrue(ContentStoreFactory.publishContentFile(TYPE_OFBIZ_FILE_BIN, objectInfo, null),
+                "publishing the staged upload must report that the store acted");
+        assertArrayEquals(STORED, client.stored("runtime/uploads/10000.png"),
+                "the staged upload must arrive in the bucket under the flat key, with the staging segment gone");
     }
 
     @Test

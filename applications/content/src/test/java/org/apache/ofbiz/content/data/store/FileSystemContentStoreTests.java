@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -174,7 +175,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
         override(SECURITY_RESOURCE, LOCAL_ALLOW_LIST, "${ofbiz.home}");
         // The provider-specific expectations further down share one instance rooted at the home
         // directory above. It is built here rather than per test because one of them clears
-        // ofbiz.home afterwards to prove the provider resolves the home directory on every call
+        // ofbiz.home afterwards to show the provider resolves the home directory on every call
         // instead of capturing it once at construction.
         store = new FileSystemContentStore();
     }
@@ -229,9 +230,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Where the bytes actually land
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -317,9 +316,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Key resolution, the two allow lists, and the boundary check behind them
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -347,7 +344,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
         assertArrayEquals(PAYLOAD, store.get(absoluteKey), "an absolute key inside the allow list must resolve");
 
         // ...and narrowing that list to somewhere else is what refuses it. Only the LOCAL list is narrowed here,
-        // which is what proves the absolute form is checked against that list rather than the OFBiz one.
+        // which is what has the absolute form checked against that list rather than the OFBiz one.
         override(SECURITY_RESOURCE, LOCAL_ALLOW_LIST, "${ofbiz.home}/nowhere");
         GeneralException refused = assertThrows(GeneralException.class, () -> store.get(absoluteKey));
         assertTrue(refused.getMessage().contains("not within an allowed directory"),
@@ -403,9 +400,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The mutation surface: one confined root, which no link may redirect a change out of
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -572,9 +567,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Owner-only permissions, applied as the object is created rather than afterwards
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -631,9 +624,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The whole-content read ceiling
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -680,9 +671,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The upload directory: which properties are read, and when a new directory is started
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -781,9 +770,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Differential parity with the behaviour this provider exists to reproduce
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -902,9 +889,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /** Overrides a property for the duration of one test, remembering what it held so it can be put back. */
@@ -971,9 +956,7 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The provider's own write path and boundary check
-     * ---------------------------------------------------------------------------------------------
      *
      * Everything below asserts against the real filesystem rather than through the SPI alone, and so
      * addresses content under a second sub-tree of the upload root - STORE_KEY and the keys beside it -
@@ -990,9 +973,9 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
      *   aZeroLengthPayloadIsStorableAndReadableAsEmptyContent  the contract's version is stricter: it also
      *                                                          drains openStream over the empty content
      *   writesUnderDistinctKeysDoNotInterfere                  identical to the contract's version
-     *   putRejectsNullContent                                  the contract's version additionally proves
+     *   putRejectsNullContent                                  the contract's version additionally asserts
      *                                                          the refused put stored nothing
-     *   openStreamHandsOutAnIndependentStreamEveryTime         the contract's version additionally proves
+     *   openStreamHandsOutAnIndependentStreamEveryTime         the contract's version additionally asserts
      *                                                          the two streams are distinct objects and
      *                                                          drains both of them in full
      *   existsDistinguishesStoredContentFromAnAbsentKey...     identical to the contract's version
@@ -1000,7 +983,6 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
      * The seventh, deleteRemovesContentAndIsIdempotent, did pin something nothing else here pins - that
      * the file is gone from the filesystem and not merely from the store's view - so it is kept below
      * under a name that says exactly that.
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -1196,6 +1178,59 @@ public final class FileSystemContentStoreTests extends ContentStoreBehaviourCont
         assertThrows(GeneralException.class, () -> store.delete(ESCAPING_KEY), "delete must refuse the escape");
         assertArrayEquals(REPLACEMENT, Files.readAllBytes(victim),
                 "content outside the storage root may be neither overwritten nor removed");
+    }
+
+    /**
+     * Nothing this provider reports carries a storage key, a resolved location or a filesystem answer -
+     * neither in the message it composes nor in a cause attached underneath it.
+     *
+     * <p><strong>Why the cause is the interesting half.</strong> Redacting a message and then chaining the
+     * exception that caused it publishes exactly what was redacted:
+     * {@link GeneralException#getMessage()} composes a nested exception's message into its own, and both
+     * {@code NoSuchFileException} and {@code FileAlreadyExistsException} carry the resolved path as their
+     * whole message. A reader printing the trace sees the deployment's layout either way. This holds both
+     * halves to the rule at once, over a real absence and a real allocation failure, so a future rewording
+     * of either message cannot quietly reintroduce the exposure.
+     *
+     * @throws Exception if the provider cannot be driven
+     */
+    @Test
+    public void noDiagnosticFromThisProviderRepublishesAKeyOrALocationThroughAChainedCause() throws Exception {
+        List<FileNotFoundException> absences = List.of(
+                assertThrows(FileNotFoundException.class, () -> store.get(ABSENT_KEY)),
+                assertThrows(FileNotFoundException.class, () -> store.openStream(ABSENT_KEY)),
+                assertThrows(FileNotFoundException.class, () -> store.size(ABSENT_KEY)));
+        for (FileNotFoundException reported : absences) {
+            String message = String.valueOf(reported.getMessage());
+            assertNull(reported.getCause(),
+                    "the filesystem answer names the resolved path in full, so attaching it republishes what the "
+                            + "reference withholds: " + message);
+            assertFalse(message.contains(home.toString()),
+                    "a resolved location must not publish the deployment's layout: " + message);
+            assertFalse(message.contains(ABSENT_KEY), "nor may the key be echoed: " + message);
+            assertTrue(message.contains(ContentStoreUtil.reference(ABSENT_KEY)),
+                    "while the content still has to be identifiable, by its stable reference: " + message);
+        }
+
+        // A regular file where the top level upload directory has to go is the one way allocating an upload
+        // location fails on a healthy filesystem, and it is the path that renders a location rather than a key.
+        Path blocked = home.resolve(UPLOAD_ROOT.substring(0, UPLOAD_ROOT.length() - 1));
+        Files.createDirectories(blocked.getParent());
+        Files.write(blocked, PAYLOAD);
+
+        GeneralException refused = assertThrows(GeneralException.class, () -> store.uploadPath(null, true),
+                "a top level upload location that cannot be created has to be reported, not worked around");
+        String reported = refused.getMessage();
+        assertNull(refused.getCause(),
+                "GeneralException.getMessage() composes a nested message into its own, so chaining the filesystem "
+                        + "answer would republish the location however safely this message was built: " + reported);
+        assertFalse(reported.contains(home.toString()),
+                "a resolved location must not publish the deployment's layout: " + reported);
+        assertTrue(reported.contains(ContentStoreUtil.reference(blocked.toString())),
+                "while the location still has to be identifiable, by its stable reference: " + reported);
+        assertTrue(reported.contains("FileAlreadyExistsException"),
+                "and the kind of failure is named by its type, which this class generates rather than quotes: "
+                        + reported);
     }
 
     /**

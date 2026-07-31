@@ -48,7 +48,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * Proves the database least-privilege posture of Objective 4 against a real PostgreSQL server: the
+ * Asserts the database least-privilege posture of Objective 4 against a real PostgreSQL server: the
  * account a serving instance authenticates as can move rows but cannot change the schema, while the
  * account the one-shot schema-initialization execution authenticates as can.
  *
@@ -127,7 +127,7 @@ public class DatabaseLeastPrivilegeTests {
 
     /**
      * Two entity-model-shaped tables, created by the initialization role exactly as the init execution
-     * would create them, and then used to prove what the serving role can and cannot do to them.
+     * would create them, and then used to establish what the serving role can and cannot do to them.
      * {@code SequenceValueItem} is the table OFBiz writes to on almost every insert, so a serving role
      * that cannot update it cannot serve at all.
      */
@@ -176,9 +176,7 @@ public class DatabaseLeastPrivilegeTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
-     * The proof
-     * ---------------------------------------------------------------------------------------------
+     * The privilege assertions
      */
 
     /**
@@ -326,9 +324,7 @@ public class DatabaseLeastPrivilegeTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Opt-in gating
-     * ---------------------------------------------------------------------------------------------
      */
 
     private static void assumeConfigured() {
@@ -396,9 +392,7 @@ public class DatabaseLeastPrivilegeTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Assertions
-     * ---------------------------------------------------------------------------------------------
      */
 
     private static void assertAllowed(Connection connection, String label, String sql) {
@@ -434,9 +428,7 @@ public class DatabaseLeastPrivilegeTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Provisioning through the shipped script
-     * ---------------------------------------------------------------------------------------------
      */
 
     /** The three entity groups the provisioning script and the entry point both iterate over. */
@@ -617,9 +609,7 @@ public class DatabaseLeastPrivilegeTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /**

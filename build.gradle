@@ -1277,8 +1277,8 @@ def createOfbizCommandTask(taskName, arguments) {
              * tracked framework/security/config/security.properties. That file ships BLANK, it is
              * copied into build/resources/main by the 'config' resource srcDir, and
              * build/resources/main precedes the test output on this classpath - so the blank
-             * security.token.key used to win over the populated test fixture and every JWT
-             * integration test failed with "The JWT secret key is too short.".
+             * security.token.key would otherwise win over the populated test fixture and every JWT
+             * integration test would fail with "The JWT secret key is too short.".
              *
              * Prepending the generated, git-ignored override makes ClassLoader.getResource find
              * usable key material first, without altering the production source and without

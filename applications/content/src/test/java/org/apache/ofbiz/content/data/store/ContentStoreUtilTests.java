@@ -78,9 +78,7 @@ public final class ContentStoreUtilTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * reference: stable, one-way, and incapable of forging a log record
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -137,9 +135,7 @@ public final class ContentStoreUtilTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * describe: echoes a configured value only while doing so is provably harmless
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -208,9 +204,7 @@ public final class ContentStoreUtilTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The ceiling: in force by default, and never switched off by a configuration mistake
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -264,9 +258,7 @@ public final class ContentStoreUtilTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * readWithin: the ceiling is enforced while reading, not from what the store claimed
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -305,7 +297,7 @@ public final class ContentStoreUtilTests {
     @Test
     public void theRefusalHappensAtTheFirstByteBeyondTheCeilingRatherThanAtTheEndOfTheContent() throws Exception {
         // A bound that is checked only after the whole stream has been consumed protects nothing: the heap is
-        // already gone by the time it fails. This proves the read STOPS - the stream still has bytes in it
+        // already gone by the time it fails. This shows the read STOPS - the stream still has bytes in it
         // afterwards, so the reader gave up rather than draining a hostile object.
         byte[] content = new byte[8192 * 4];
         CountingInputStream counting = new CountingInputStream(content);
@@ -330,9 +322,7 @@ public final class ContentStoreUtilTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /** Overrides a property for one test, remembering what it held so it can be put back afterwards. */

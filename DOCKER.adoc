@@ -111,6 +111,13 @@ are manged by the `+docker-entrypoint.sh+` script.
 Environment variables are used in `+docker-entrypoint.sh+` to control
 configuration options for the OFBiz container.
 
+Every variable documented below as a boolean accepts `+true+`, `+yes+` or
+`+1+` and `+false+`, `+no+` or `+0+`, in any letter case. The value is
+normalised before anything is written, so a rendered configuration file only
+ever receives the literal `+true+` or `+false+` - which is all the OFBiz
+side recognises - and any other value aborts the start up rather than being
+guessed at.
+
 The table below lists the variables that are not specific to one
 subsystem. Variables that configure a single subsystem are listed and
 explained in that subsystem's own section further down - the database
@@ -379,28 +386,39 @@ served:
   zero or a chunked `+Transfer-Encoding+` - is `+400+`, decided from the
   headers so that no part of the body is ever read;
 * only these two exact paths are served. They are reached anonymously
-  because `+/health+` is in the `+allowedPaths+` list of
-  `+ControlFilter+`, the same mechanism the long-standing
-  `+/ping.txt+` entry uses, and they are mapped to a plain servlet on
-  those two exact `+url-pattern+` values. That list is matched with
-  `+startsWith+`, so a near miss under the prefix -
-  `+/webtools/health+`, `+/webtools/health/live/+`,
-  `+/webtools/healthz/live+` - does clear the authentication gate, but it
-  matches neither `+url-pattern+`, reaches no probe handler and is
-  answered `+404+` by the container. Nothing else is mapped under
-  `+/health+`, so the prefix exposes no other resource. A spelling
-  outside the prefix, `+/webtools/HEALTH/live+` included - the match is
-  case-sensitive - is redirected to the login-protected controller
-  exactly as any other unknown path is, and, being an ordinary controller
-  request, mints a `+JSESSIONID+`. Copy the two paths above into the
+  because the probe class is registered twice in the webtools descriptor:
+  as the *first* filter, mapped to those two exact `+url-pattern+`
+  values, and as a servlet on the same two. The servlet specification
+  builds the chain in the order the mappings appear, so the probe filter
+  runs ahead of `+ControlFilter+`, answers the probe and does not call
+  the rest of the chain - which is why no `+allowedPaths+` entry is
+  needed for a probe. It is deliberately *not* added to that list either:
+  `+ControlFilter+` matches `+allowedPaths+` with `+startsWith+`, so a
+  bare `+/health+` entry would hand anonymous passage to every
+  `+/health*+` spelling rather than to the two probes. A near miss under
+  the prefix - `+/webtools/health+`, `+/webtools/health/live/+`,
+  `+/webtools/healthz/live+` - is compared exactly, so the probe filter
+  passes it on untouched and it is then gated by `+ControlFilter+` and
+  redirected to the login-protected controller exactly as any other
+  unknown path is, mints a `+JSESSIONID+` in doing so, and reaches no
+  probe handler. A spelling outside the prefix,
+  `+/webtools/HEALTH/live+` included - the match is case-sensitive - is
+  treated identically. Copy the two paths above into the
   target group verbatim and configure the check to expect `+200+` and the
   JSON body rather than merely "not `+5xx+`", so that a typo fails the
-  check instead of passing it on a `+404+` or a redirect;
-* the probe handler itself holds no state and reads none: no session, no
-  principal, no role, no parameter and no attribute. The webapp's
-  pre-existing filter chain still runs ahead of it, unchanged, so a probe
-  response may carry the `+JSESSIONID+` that chain establishes, exactly as
-  a poll of the long-standing `+/ping.txt+` path does;
+  check instead of passing it on a redirect;
+* a probe creates no session and reads no request body, because the
+  webapp's ordinary filter chain is not entered at all. That is what the
+  filter registration above is for: `+ControlFilter+` and
+  `+ContextFilter+` both call `+getSession()+` unconditionally, so every
+  probe would otherwise mint an `+HttpSession+` and a `+JSESSIONID+` that
+  a target group never returns, and `+ContextFilter+` parses a declared
+  `+application/json+` body of any size into memory before a servlet
+  method is dispatched. Terminating the chain first removes both from the
+  probe path; the handler itself then holds no state and reads none: no
+  session, no cookie, no principal, no role, no parameter and no
+  attribute. A probe answer therefore carries no `+JSESSIONID+`, which is
+  what makes continuous anonymous polling free of per-probe server state;
 * every answer, a rejection included, still carries the framework's safe
   response headers - `+X-Content-Type-Options: nosniff+`,
   `+X-Frame-Options: sameorigin+` and
@@ -947,13 +965,6 @@ environment before OFBiz starts.
 style, because they cannot serve a bucket as a sub-domain of the endpoint
 host; Amazon S3 does not. Normalised to the literal `+true+` or
 `+false+`; a value that is not clearly a boolean aborts the start up.
-
-|OFBIZ_S3_KEY_PREFIX |content/uploads |Key prefix new uploads are placed
-under, so that several deployments can share one bucket without colliding.
-Leading and trailing `+/+` are insignificant. At most 512 characters,
-because an object key is limited to 1024 bytes in total and the prefix has
-to leave room for the key itself; leaving the variable unset is how the
-default is asked for, and an explicitly empty value aborts the start up.
 |===
 
 The values are written into `+/ofbiz/config/content.properties+`, which
@@ -1549,29 +1560,46 @@ database must still apply the DDL even when it is handed a state volume a
 previous container wrote.
 
 What that state volume remembers about the database is recorded in
-`+/ofbiz/runtime/container_state/db_config_applied+`, which holds both the
-host the container configured itself against and the schema mode it ran
-in. It is now read back, and not merely written, on every start that
-configures a managed database - that is, whenever
-`+OFBIZ_POSTGRES_HOST+` is set and `+OFBIZ_SKIP_INIT+` is not. Two
-differences are acted on when the volume outlives the container that wrote
-it:
+`+/ofbiz/runtime/container_state/db_config_applied+`. The record is a
+versioned, non-secret fingerprint of the entity engine configuration the
+start applied: the profile, the database mode, the schema mode and the
+cache-invalidation flag, and - for a managed database - the host and port,
+the three database names, the three user names that were actually rendered
+and whether those were the serving or the initialization identity, the TLS
+settings, the pgJDBC network deadlines and the connection-pool sizing. No
+password is included, so rotating one is not reported as a changed target,
+and does not need to be: the configuration is re-rendered on every start
+regardless of what the record says. It is read back, and not merely
+written, on every start that configures a managed database - that is,
+whenever `+OFBIZ_POSTGRES_HOST+` is set and `+OFBIZ_SKIP_INIT+` is not -
+and what differs is reported by field *name*, never by value, so the log
+identifies what moved without becoming an inventory of the deployment.
 
-* a *changed host* means the `+data_loaded+` and `+admin_loaded+` flags
-describe a different database. Both are discarded, and the change is
-reported, so a container pointed at a freshly provisioned database
-re-evaluates the data and admin loads instead of skipping them and coming
-up against an empty schema with no seed data and no way to log in;
-* a *changed schema mode* against the same host discards nothing - the
+The comparison is a diagnostic and never decides whether to render, so a
+corrupt, empty or earlier-format record can cost a log line and nothing
+more. Two changes are worth knowing about when a volume outlives the
+container that wrote it:
+
+* a *changed database* - a different host, port, database name or user name
+- means the `+data_loaded+` and `+admin_loaded+` markers were written for
+another deployment. They are disbelieved for the reason given in
+_Container runtime options_ above, because each marker body embeds that
+same structural identity, so a container pointed at a freshly provisioned
+database re-evaluates the data and admin loads instead of skipping them and
+coming up against an empty schema with no seed data and no way to log in.
+The record is what names the fields that changed, which is what makes the
+reason visible rather than leaving a re-run to be puzzled over;
+* a *changed schema mode* against the same database discards nothing - the
 data is still there - but is reported, and the record is refreshed to the
 new mode. A serving container that has become an init job, or an init job
 that has become a serving container, is the transition most worth seeing
 in a log, and an init run applies its DDL regardless of any flag, so
 nothing has to be removed for it to do its work.
 
-A marker written before the schema mode was recorded - a bare host with no
-field names - cannot be compared field by field. It is reported and
-replaced, again discarding no load state; delete
+A record written in an earlier format - an image that wrote a bare host
+name, or one that recorded fewer fields - is not comparable with one
+written now and is replaced rather than compared field by field. That is
+reported too, and again discards no load state; delete
 `+/ofbiz/runtime/container_state+` yourself if that volume was last used
 against a different database.
 
@@ -2044,8 +2072,8 @@ The `+DataResource+` database columns. This is the default and the
 behaviour of an unconfigured checkout, and it is the only backend that
 needs no further configuration. No object store is contacted and the
 bundled AWS SDK is never loaded, so a container that leaves every variable
-in this group alone behaves exactly as it did before object storage
-existed. An instance holds no durable local state in this mode, so
+in this group alone behaves exactly as one with no object storage
+configured. An instance holds no durable local state in this mode, so
 instances are freely replaceable.
 
 `+filesystem+`::
@@ -2098,7 +2126,7 @@ docker run -it -p 8443:8443 \
 with `+OFBIZ_S3_ACCESS_KEY_ID+` and `+OFBIZ_S3_SECRET_ACCESS_KEY+` in
 `+ofbiz-secrets.env+`.
 
-All eleven variables are rendered into `+/ofbiz/config/content.properties+`
+All ten variables are rendered into `+/ofbiz/config/content.properties+`
 and are then removed from the environment, exactly as the secrets in the
 _Secrets_ section are: the file is written atomically with mode `+0600+`,
 the values are substituted from a temporary file rather than from a
@@ -2215,6 +2243,38 @@ persisted in the database are unchanged by the choice of backend, so
 nothing in the data model records which store a document went to. That is
 also why a switch moves nothing - see _Content and upload storage_ above
 for what that means for content written before one.
+
+===== How content reaches and leaves the object store
+
+Uploads and content writes are ordinary local file writes as far as the
+Content component is concerned; the container turns them into object
+storage operations underneath. Two things follow that are worth knowing
+when you operate a fleet.
+
+*A write is published by the transaction that made it.* An upload is
+written to a short-lived local directory under `+runtime/uploads+` whose
+name begins with `+.contentstore-staging+`, and a write to existing
+content is made through a local working copy of it. Either way the bytes
+are streamed into the bucket as the surrounding transaction commits, and
+the staging directory is removed afterwards, so these directories are
+transient by design and never accumulate. Publication happens *before* the
+commit completes, so an object store that refuses the write rolls the
+transaction back rather than committing a `+DataResource+` row naming
+content the bucket never received. There is no ceiling on the size of a
+published upload: content is streamed with its length declared, never held
+in memory, so the `+content.store.max.get.bytes+` ceiling above applies
+only to reading an object whole and not to uploading or serving one.
+
+*Every read asks the bucket.* An instance keeps a local copy of content
+only as a working file for the request that needed it, and re-reads the
+object on each resolution rather than trusting a copy it fetched earlier.
+That is what makes the instances interchangeable: content another instance
+uploaded a moment ago is served correctly by an instance that had already
+served the version it replaced, so which instance a load balancer picked
+does not change what a customer sees. Nothing durable is held locally, so
+no shared filesystem is needed between instances and `+/ofbiz/runtime+`
+does not have to survive a replacement - unlike the `+filesystem+`
+provider above, which does.
 
 === Examples of running the OFBiz container
 

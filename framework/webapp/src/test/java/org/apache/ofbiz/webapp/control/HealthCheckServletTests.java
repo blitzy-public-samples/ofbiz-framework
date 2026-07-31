@@ -33,6 +33,7 @@ import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -82,8 +83,12 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.MockedStatic;
 
+import jakarta.servlet.Filter;
+import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletConfig;
 import jakarta.servlet.ServletContext;
+import jakarta.servlet.ServletRequest;
+import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpServletResponseWrapper;
@@ -92,19 +97,20 @@ import jakarta.servlet.http.HttpServletResponseWrapper;
  * Behavioural contract of {@link HealthCheckServlet}, the unauthenticated liveness and readiness
  * probe served at {@code /health/live} and {@code /health/ready}.
  *
- * <p>Every test invokes a production entry point - the {@code service} gate, or {@code doGet} and
- * {@code doHead} where a container would dispatch to them directly - and asserts the observable
- * response: status code, exact JSON document, content type, character encoding, cache header and,
- * where it matters, the
+ * <p>Every test invokes a production entry point - the {@code service} gate, the {@code doFilter}
+ * short-circuit, or {@code doGet} and {@code doHead} where a container would dispatch to them
+ * directly - and asserts the observable response: status code, exact JSON document, content type,
+ * character encoding, cache header and, where it matters, the
  * {@code Allow} header. Mocks only supply the collaborators; no assertion is ever made against a
  * value a mock was configured to return. The static seams the class depends on,
  * {@link WebAppUtil#getDelegator} and {@link Debug}, are replaced with scoped static mocks inside
  * try-with-resources so nothing leaks into another test, and no test opens a database connection,
  * reads configuration or touches the network.
  *
- * <p>Three properties are pinned here that the probes' exposure depends on, since they answer
- * anonymous callers: the request body is never read, no method other than GET or HEAD is served,
- * and a readiness failure never writes an internal detail to the log.
+ * <p>Four properties are pinned here that the probes' exposure depends on, since they answer
+ * anonymous callers: a probe is answered from the first position in the filter chain without the
+ * chain being called at all, the request body is never read, no method other than GET or HEAD is
+ * served, and a readiness failure never writes an internal detail to the log.
  */
 public final class HealthCheckServletTests {
 
@@ -306,9 +312,7 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Liveness
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -391,9 +395,7 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Readiness
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -560,14 +562,14 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
-     * Readiness under overlapping probes: one check, one shared verdict, never a manufactured DOWN
+     * Readiness under overlapping probes: one check, one shared verdict, and no DOWN invented
      *
      * A load-balancer target group is probed by one node per Availability Zone, so several readiness
      * probes are in flight at once in normal operation. Answering a healthy instance "not ready"
-     * because probes overlapped drains it, which is why every case below asserts that concurrency
-     * alone can never change a verdict, and that a verdict is only ever one the datasource produced.
-     * ---------------------------------------------------------------------------------------------
+     * because probes overlapped drains it, which is why every case below asserts that overlapping
+     * probes do not change a verdict that exists, and that a verdict is only ever one the datasource
+     * produced. The answers the servlet does own - a shed, a full waiter set with nothing published,
+     * an expired check deadline - each carry an event code of their own and are pinned separately.
      */
 
     @Test
@@ -591,7 +593,7 @@ public final class HealthCheckServletTests {
 
     @Test
     public void aColdStartBurstFillingTheWholeWaiterSetIsStillAnsweredUpByTheOneCheckItShares() throws Exception {
-        // The boundary of the same guarantee, expressed against the bound the servlet declares rather
+        // The boundary of the same rule, expressed against the bound the servlet declares rather
         // than against a number chosen here, so retuning the bound retunes this case with it. One probe
         // runs the check and every other probe of the burst fits in the waiter set, which is the largest
         // burst that can arrive with no verdict at all and still be answered entirely by the datasource.
@@ -720,7 +722,6 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * A bounded check, a stepped clock, an interrupted wait, and the bounds of the wait itself
      *
      * The permit admits one check at a time, which bounds what the datasource sees but says nothing
@@ -739,7 +740,6 @@ public final class HealthCheckServletTests {
      * mid-wait. The cases below drive each of those, and the last of them pin down that the wait is a
      * real wait and a bounded one, so neither the loop nor the constants that size it can be removed
      * unnoticed.
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -819,7 +819,7 @@ public final class HealthCheckServletTests {
         WorkerProbe observed = readinessProbeOnAWorkerThread(true);
 
         // Thread.sleep CLEARS the interrupt flag when it throws, so the flag still being set when the
-        // servlet returned proves the servlet put it back. A probe that swallowed the interruption
+        // servlet returned means the servlet put it back. A probe that swallowed the interruption
         // would hand the thread back looking as though it had never been asked to stop, and nothing
         // above it - the container's own shutdown included - would learn otherwise.
         assertTrue(observed.interruptFlagRestored(),
@@ -877,7 +877,6 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The waiter bound: how many container threads readiness may occupy
      *
      * Coalescing the database work bounds what the datasource sees - one check - but on its own it
@@ -886,8 +885,8 @@ public final class HealthCheckServletTests {
      * that wait and starve real traffic without issuing a single query. The cases below pin the bound
      * that closes it, and pin just as firmly that the bound is NOT an admission counter: a probe over
      * the bound is answered from the shared verdict whenever there is one, so probe concurrency alone
-     * still cannot turn a healthy instance into a drained one.
-     * ---------------------------------------------------------------------------------------------
+     * cannot drain an instance that has established a verdict. With no verdict to stand on, a probe over
+     * the bound is answered 503 under its own event code, which the cases below pin too.
      */
 
     @Test
@@ -1459,9 +1458,7 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Unmapped, empty, malformed and look-alike sub-paths
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "servletPath={0} pathInfo={1} -> 404")
@@ -1495,7 +1492,199 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
+     * Filter role: a probe is answered ahead of the webapp's filter chain
+     *
+     * The same class is registered twice - as a Filter on the two exact probe paths, mapped FIRST, and
+     * as a servlet on those same two paths. The filter registration is what keeps a probe out of the
+     * ordinary chain, and the two things that chain would otherwise do to every probe of every instance
+     * are why it matters: ControlFilter and ContextFilter both call getSession() unconditionally, so
+     * each anonymous probe minted a session that lived until it expired, and ContextFilter calls
+     * WebAppUtil.setAttributesFromRequestBody, which reads a declared application/json body of any size
+     * into a String and then into a Map before any servlet is reached.
+     *
+     * These tests therefore assert the two halves of the short-circuit: a probe is answered here and
+     * chain.doFilter is NOT called, and everything else is passed down the chain untouched. The probe
+     * paths are deliberately NOT in ControlFilter's allowedPaths - that list is matched with startsWith,
+     * so a /health entry would grant passage to every /health* spelling - which HealthEndpointRegistration
+     * Tests asserts from the descriptor itself.
+     */
+
+    @ParameterizedTest(name = "{0} is answered by the filter without the chain being called")
+    @ValueSource(strings = {"/health/live", "/health/ready"})
+    public void aProbeIsAnsweredFromTheFilterWithoutTheChainEverBeingCalled(String probePath) throws Exception {
+        givenProbePath(probePath, null);
+        // A verdict inside the fresh window, so readiness answers without a datasource and this measures
+        // the short-circuit alone.
+        givenEstablishedVerdict(true, 0L);
+        FilterChain chain = mock(FilterChain.class);
+
+        servlet.doFilter(request, response, chain);
+
+        // The whole point of the filter registration: nothing downstream of it runs for a probe.
+        verifyNoInteractions(chain);
+        assertProbeResponse(HttpServletResponse.SC_OK, "/health/live".equals(probePath) ? LIVE_UP : READY_UP);
+    }
+
+    @Test
+    public void aProbeAnsweredFromTheFilterTouchesNothingButThePathTheMethodAndTheBodyHeaders() throws Exception {
+        givenProbePath("/health/live", null);
+        FilterChain chain = mock(FilterChain.class);
+
+        servlet.doFilter(request, response, chain);
+
+        // The exhaustive list of what the filter role is allowed to look at, closed by
+        // verifyNoMoreInteractions. A session, a principal, a role, an attribute, a parameter or an
+        // input stream appearing here later fails this test - and a session is exactly what the chain
+        // this filter replaces was creating for every anonymous probe.
+        verify(request).getServletPath();
+        verify(request).getPathInfo();
+        // Once, not twice: the filter role calls the shared handler directly, so HttpServlet.service
+        // never runs and never re-reads the method to choose a dispatch.
+        verify(request).getMethod();
+        verify(request).getContentLengthLong();
+        verify(request).getHeader("Transfer-Encoding");
+        verifyNoMoreInteractions(request);
+        verifyNoInteractions(chain);
+        // No cookie either. A probe client returns nothing, so anything set here would be minted afresh
+        // on every poll of every target-group health-check node.
+        verify(response, never()).addCookie(any());
+        assertProbeResponse(HttpServletResponse.SC_OK, LIVE_UP);
+    }
+
+    @Test
+    public void anOrdinaryProbeAnsweredFromTheFilterWritesNothingToTheLog() throws Exception {
+        givenProbePath("/health/live", null);
+        FilterChain chain = mock(FilterChain.class);
+
+        try (MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            servlet.doFilter(request, response, chain);
+
+            // A continuously polled endpoint that logged a line per probe would be the log amplifier,
+            // and a probe traversing the chain reaches the exception ControlFilter raises for a path
+            // no request map knows. Answering here means there is nothing to log.
+            debug.verifyNoInteractions();
+        }
+        verifyNoInteractions(chain);
+        assertProbeResponse(HttpServletResponse.SC_OK, LIVE_UP);
+    }
+
+    @ParameterizedTest(name = "{0} is passed down the chain rather than answered")
+    @CsvSource(nullValues = "NULL", value = {
+        "/health, NULL",
+        "/health/, NULL",
+        "/health/live/, NULL",
+        "/health/liveness, NULL",
+        "/healthz/live, NULL",
+        "/health//live, NULL",
+        "/HEALTH/LIVE, NULL",
+        "/control/main, NULL",
+        "/health, /bogus" })
+    public void aRequestThatIsNotAProbeIsPassedStraightDownTheChainUntouched(String servletPath, String pathInfo)
+            throws Exception {
+        givenProbePath(servletPath, pathInfo);
+        FilterChain chain = mock(FilterChain.class);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+            servlet.doFilter(request, response, chain);
+
+            webAppUtil.verifyNoInteractions();
+        }
+        // Passed on unchanged, so a path this filter's mapping happens to cover but that is not one of
+        // the two probes is served by whatever the descriptor says should serve it.
+        verify(chain).doFilter(request, response);
+        verifyNoMoreInteractions(chain);
+        // Nothing is written, so the filter cannot commit a response the rest of the chain then tries to
+        // add to, and the decision is taken from the path alone - the method is not even consulted.
+        verifyNoInteractions(response);
+        verify(request, never()).getMethod();
+        assertEquals("", responseBody.toString(), "a request the filter passes on must have no body written by it");
+    }
+
+    @Test
+    public void anExchangeThatIsNotHttpIsPassedDownTheChainUntouched() throws Exception {
+        // A filter is declared against a url-pattern, not against a protocol, so the container may drive
+        // it with a plain ServletRequest. This class has nothing to say about one, and casting blindly
+        // would turn it into a ClassCastException on a path that is not even a probe.
+        ServletRequest plainRequest = mock(ServletRequest.class);
+        ServletResponse plainResponse = mock(ServletResponse.class);
+        FilterChain chain = mock(FilterChain.class);
+
+        servlet.doFilter(plainRequest, plainResponse, chain);
+
+        verify(chain).doFilter(plainRequest, plainResponse);
+        verifyNoMoreInteractions(chain);
+        verifyNoInteractions(plainRequest);
+        verifyNoInteractions(plainResponse);
+    }
+
+    @ParameterizedTest(name = "{0} /health/live -> 405 from the filter, chain untouched")
+    @ValueSource(strings = {"POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT", "get", "Head", "PROPFIND"})
+    public void theMethodGateIsEnforcedInTheFilterRoleToo(String method) throws Exception {
+        givenProbePath("/health/live", null);
+        givenMethod(method);
+        FilterChain chain = mock(FilterChain.class);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+            servlet.doFilter(request, response, chain);
+
+            webAppUtil.verifyNoInteractions();
+        }
+        // The gate is the shared one, so the filter role cannot answer a method the servlet role refuses -
+        // and refusing it here rather than passing it on keeps a POST to a probe path out of the chain
+        // too, which is where the unbounded body read lives.
+        verifyNoInteractions(chain);
+        verify(response).setHeader(ALLOW_HEADER, ALLOW_VALUE);
+        assertProbeResponse(HttpServletResponse.SC_METHOD_NOT_ALLOWED, UNKNOWN);
+    }
+
+    @Test
+    public void aBodyBearingProbeIsRefusedByTheFilterFromItsHeadersAndNeverPassedOn() throws Exception {
+        givenProbePath("/health/ready", null);
+        when(request.getContentLengthLong()).thenReturn(1L);
+        FilterChain chain = mock(FilterChain.class);
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+            servlet.doFilter(request, response, chain);
+
+            // Refused before the datasource is reached, from a header lookup, and not handed to the
+            // chain - where setAttributesFromRequestBody would have read it into the heap in full.
+            webAppUtil.verifyNoInteractions();
+        }
+        verifyNoInteractions(chain);
+        assertProbeResponse(HttpServletResponse.SC_BAD_REQUEST, UNKNOWN);
+    }
+
+    @ParameterizedTest(name = "the filter and the servlet answer {0} identically")
+    @ValueSource(strings = {"/health/live", "/health/ready"})
+    public void theTwoRegistrationsAnswerTheSameProbeIdentically(String probePath) throws Exception {
+        givenProbePath(probePath, null);
+        givenEstablishedVerdict(true, 0L);
+
+        // The filter role first, against the shared response mock, so assertProbeResponse's full set of
+        // status, document, header and never-touched assertions applies to it.
+        servlet.doFilter(request, response, mock(FilterChain.class));
+        assertProbeResponse(HttpServletResponse.SC_OK, "/health/live".equals(probePath) ? LIVE_UP : READY_UP);
+
+        // Then the servlet role, against its own response, and the two answers are compared rather than
+        // restated: a divergence between the registrations fails here whichever way it goes.
+        HttpServletResponse second = mock(HttpServletResponse.class);
+        StringWriter secondBody = new StringWriter();
+        when(second.getWriter()).thenReturn(new PrintWriter(secondBody));
+        givenEstablishedVerdict(true, 0L);
+
+        servlet.service(request, second);
+
+        ArgumentCaptor<Integer> filterStatus = ArgumentCaptor.forClass(Integer.class);
+        verify(response).setStatus(filterStatus.capture());
+        ArgumentCaptor<Integer> servletStatus = ArgumentCaptor.forClass(Integer.class);
+        verify(second).setStatus(servletStatus.capture());
+        assertEquals(filterStatus.getValue(), servletStatus.getValue(),
+                "the filter and the servlet must answer " + probePath + " with the same status");
+        assertEquals(responseBody.toString(), secondBody.toString(),
+                "the filter and the servlet must answer " + probePath + " with the same document");
+    }
+
+    /*
      * The published probe-path predicate
      *
      * Machinery that runs BEFORE this class - a Tomcat engine valve, which executes ahead of every
@@ -1505,7 +1694,6 @@ public final class HealthCheckServletTests {
      * session that lived until it expired. The predicate is published so that the valve does not carry
      * a second copy of the two literals, because a copy can drift out of step - and a valve exempting a
      * stale spelling would silently resume doing to probes exactly what the exemption prevents.
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "isProbePath({0}) agrees with what the probe serves")
@@ -1572,9 +1760,7 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Method allow-list: only GET and HEAD are served
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "{0} /health/live -> 405")
@@ -1621,9 +1807,7 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Request bodies are refused from the headers, never read
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "Content-Length {0} -> 400")
@@ -1676,9 +1860,7 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Safe response headers are retained even though the chain is never entered
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "a {1} verdict on {0} still carries the safe response headers")
@@ -1758,9 +1940,7 @@ public final class HealthCheckServletTests {
 
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Servlet dispatch: the method gate, then doGet or doHead
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "GET {0} is dispatched to doGet")
@@ -1843,9 +2023,7 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Readiness failures are logged as a stable code, rate limited and sanitised
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -1944,9 +2122,9 @@ public final class HealthCheckServletTests {
 
     @Test
     public void suppressedOccurrencesAreWrittenOutOnceTheConditionStops() throws Exception {
-        // The counter used to be carried only by the NEXT occurrence of the same code, so everything
+        // A counter carried only by the NEXT occurrence of the same code would leave everything
         // suppressed after the last one - the tail of every burst, and the whole of a burst that ends
-        // inside its own window - never reached the log at all. A later probe has to write it out.
+        // inside its own window - out of the log entirely. A later probe has to write it out.
         givenProbePath("/health/ready", null);
         Delegator healthy = delegatorCountingRows(7L);
 
@@ -2150,7 +2328,6 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Cache-coherence dimension
      *
      * A delegator with distributed cache clear enabled dispatches the distributedClearCacheLine
@@ -2160,13 +2337,12 @@ public final class HealthCheckServletTests {
      * marks the CALLER's transaction rollback-only, and EntityCacheServices can only log. An instance
      * in that state rolls back the writes it is asked to perform. Nothing in the write path stops it,
      * so readiness has to: the instance must be reported not ready and taken out of the target group.
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
     public void readyReturnsUpWithNoTransportAtAllWhenTheDelegatorDoesNotRequireCoherence() throws Exception {
         // The committed configuration has distributed cache clear off, so a single-node or local H2
-        // deployment must be completely unaffected by this dimension - the parity guarantee.
+        // deployment must be completely unaffected by this dimension - the parity requirement.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(7L);
 
@@ -2426,7 +2602,7 @@ public final class HealthCheckServletTests {
     public void theSuppressedTransportOccurrencesAreWrittenOutOnceTheBrokerReturns() throws Exception {
         // The count is otherwise carried only by the NEXT occurrence of the same code, so recovery -
         // which is precisely when the occurrences stop - would lose the tail of the burst. This is also
-        // what proves the code is wired into the flush, not merely into the warning path.
+        // what tells a code wired into the flush apart from one wired only into the warning path.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(7L);
         GenericMessageListener listener = mock(GenericMessageListener.class);
@@ -2467,9 +2643,7 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
-     * Structural guarantees
-     * ---------------------------------------------------------------------------------------------
+     * Structural constraints
      */
 
     @Test
@@ -2490,16 +2664,42 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void theClassIsAPlainServletAndNotAFilter() {
+    public void theClassIsBothTheServletAndTheFilterThatShortCircuitsTheChain() throws Exception {
+        // Both roles are required, and by the same class, because a probe has to be answered BEFORE the
+        // webapp's ordinary filters run - see the filter-role section above for what ControlFilter and
+        // ContextFilter would otherwise do to every probe of every instance - while the servlet mapping
+        // is what makes the container resolve these paths to this component at all.
         assertTrue(jakarta.servlet.http.HttpServlet.class.isAssignableFrom(HealthCheckServlet.class),
                 "the probe must be registrable as a servlet");
-        // Registration is a servlet mapping plus a /health entry in ControlFilter's allowedPaths, the
-        // same mechanism the pre-existing /ping.txt entry uses. Implementing Filter as well would put
-        // the class back in the chain and let a deployment descriptor declare it twice.
-        assertFalse(jakarta.servlet.Filter.class.isAssignableFrom(HealthCheckServlet.class),
-                "the probe must not be a filter");
-        for (java.lang.reflect.Method method : HealthCheckServlet.class.getDeclaredMethods()) {
-            assertNotEquals("doFilter", method.getName(), "the probe must declare no doFilter method");
+        assertTrue(Filter.class.isAssignableFrom(HealthCheckServlet.class),
+                "the probe must be registrable as a filter, or it cannot short-circuit the chain");
+
+        // Declared on this class rather than inherited: Filter.doFilter has no default, so a class that
+        // merely implemented the interface without overriding it would not compile - but a doFilter that
+        // was moved to a superclass or replaced by a differently-shaped helper would still satisfy
+        // isAssignableFrom above while no longer being the chain entry point the container calls.
+        Method doFilter = HealthCheckServlet.class.getDeclaredMethod("doFilter",
+                ServletRequest.class, ServletResponse.class, FilterChain.class);
+        assertTrue(Modifier.isPublic(doFilter.getModifiers()),
+                "the container calls doFilter through the Filter interface, so it must be public");
+        assertFalse(Modifier.isStatic(doFilter.getModifiers()),
+                "the container calls doFilter on the instance it created");
+
+        // The two roles must not be able to answer the same request differently, which is why the method
+        // gate and the handler are shared rather than restated. Both are private and static, so neither
+        // role can be given its own copy without that showing up here.
+        for (String shared : List.of("methodRefused", "handleProbe")) {
+            List<Method> declared = new ArrayList<>();
+            for (Method method : HealthCheckServlet.class.getDeclaredMethods()) {
+                if (shared.equals(method.getName())) {
+                    declared.add(method);
+                }
+            }
+            assertEquals(1, declared.size(),
+                    shared + " must exist exactly once, so the servlet role and the filter role cannot diverge");
+            int modifiers = declared.get(0).getModifiers();
+            assertTrue(Modifier.isPrivate(modifiers) && Modifier.isStatic(modifiers),
+                    shared + " must be a private static helper shared by both roles");
         }
     }
 
@@ -2611,9 +2811,7 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     private void givenProbePath(String servletPath, String pathInfo) {
@@ -2932,7 +3130,7 @@ public final class HealthCheckServletTests {
     /**
      * The single lifecycle hook of this class carrying the given annotation.
      *
-     * <p>Requiring exactly one is part of the guarantee: two hooks of the same kind could drift apart,
+     * <p>Requiring exactly one is part of the contract: two hooks of the same kind could drift apart,
      * and none means the state this class mutates is never put back.
      */
     private static Method lifecycleHook(Class<? extends Annotation> annotation) {
@@ -3145,8 +3343,8 @@ public final class HealthCheckServletTests {
     }
 
     /**
-     * A worker thread for the pools above. Daemon status is what guarantees that a probe which somehow
-     * never returns cannot keep the JVM alive once the build has finished with it.
+     * A worker thread for the pools above. Daemon status is what keeps a probe that somehow
+     * never returns cannot from holding the JVM open once the build has finished with it.
      */
     private static Thread daemonWorker(Runnable runnable) {
         Thread worker = new Thread(runnable, "health-probe-under-test");

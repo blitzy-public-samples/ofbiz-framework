@@ -54,7 +54,7 @@ import org.junit.jupiter.api.Test;
  * {@link S3ContentStore} with only its SDK client boundary replaced - so provider parity is enforced by
  * construction rather than by re-describing the same expectations in two places. A third subclass,
  * {@link ContentStoreContractSatisfiabilityTests}, runs the same suite against an implementation written from
- * this javadoc alone; it exists to prove the contract below is satisfiable and is explicitly NOT provider
+ * this javadoc alone; it exists to show the contract below is satisfiable and is explicitly NOT provider
  * coverage.
  *
  * <p>The two provider-specific behaviour suites, {@link FileSystemContentStoreBehaviourTests} and
@@ -152,9 +152,7 @@ public abstract class ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Writing
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -290,9 +288,7 @@ public abstract class ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Reading, and the absent key
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -338,9 +334,7 @@ public abstract class ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Measuring
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -366,9 +360,7 @@ public abstract class ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Deleting
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -386,9 +378,7 @@ public abstract class ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Unusable input
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -422,9 +412,7 @@ public abstract class ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Lifecycle
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test

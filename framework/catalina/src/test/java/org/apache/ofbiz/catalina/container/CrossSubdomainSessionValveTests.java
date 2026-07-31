@@ -111,9 +111,7 @@ public final class CrossSubdomainSessionValveTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The exemption
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "{0} is passed through without a session")
@@ -201,9 +199,7 @@ public final class CrossSubdomainSessionValveTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Everything else keeps the behaviour the valve was installed for
-     * ---------------------------------------------------------------------------------------------
      */
 
     @ParameterizedTest(name = "{0} still gets its session")
@@ -258,9 +254,7 @@ public final class CrossSubdomainSessionValveTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The cookie-rewriting path runs at engine scope, where no delegator has been published
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -295,8 +289,9 @@ public final class CrossSubdomainSessionValveTests {
     public void aReturningClientIsServedWhateverHostItNamed(String serverName) throws Exception {
         // Exercised across the host shapes the domain-widening step branches on - a single label with no
         // parent domain, a sub-domain, a deeper sub-domain, a dotted-quad address and a bare two-label
-        // domain - because the property lookup that used to fail happens BEFORE any of them is examined.
-        // Every shape must be served, and none may reach the pipeline by throwing.
+        // domain - because the property lookup happens BEFORE any of them is examined, so a lookup that
+        // fails would fail for every shape alike. Every shape must be served, and none may reach the
+        // pipeline by throwing.
         givenMappedPath("/control/main", null);
         givenReturningClient(serverName);
 
@@ -339,9 +334,7 @@ public final class CrossSubdomainSessionValveTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The exemption and the endpoint cannot drift apart
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test

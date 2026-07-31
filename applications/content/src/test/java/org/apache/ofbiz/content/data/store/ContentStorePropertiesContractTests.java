@@ -104,7 +104,6 @@ public final class ContentStorePropertiesContractTests {
     private static final String MAX_MEMORY_BYTES = "content.store.max.memory.bytes";
     private static final String ALLOWED_ROOTS = "content.store.filesystem.allowed.roots";
     private static final String MAX_UPLOAD_DIRECTORIES = "content.store.filesystem.max.upload.directories";
-    private static final String KEY_PREFIX = "content.store.s3.key.prefix";
     private static final String CONNECT_TIMEOUT = "content.store.s3.connect.timeout.millis";
     private static final String READ_TIMEOUT = "content.store.s3.read.timeout.millis";
     private static final String CALL_TIMEOUT = "content.store.s3.call.timeout.millis";
@@ -140,7 +139,6 @@ public final class ContentStorePropertiesContractTests {
             Map.entry(SECRET_ACCESS_KEY, ""),
             Map.entry(PATH_STYLE, "false"),
             Map.entry(MAX_GET_BYTES, "33554432"),
-            Map.entry(KEY_PREFIX, "content/uploads"),
             Map.entry(CONNECT_TIMEOUT, "5000"),
             Map.entry(READ_TIMEOUT, "30000"),
             Map.entry(CALL_TIMEOUT, "60000"),
@@ -192,8 +190,7 @@ public final class ContentStorePropertiesContractTests {
             Map.entry(CREDENTIALS_PROVIDER, "OFBIZ_S3_CREDENTIALS_PROVIDER"),
             Map.entry(ACCESS_KEY_ID, "OFBIZ_S3_ACCESS_KEY_ID"),
             Map.entry(SECRET_ACCESS_KEY, "OFBIZ_S3_SECRET_ACCESS_KEY"),
-            Map.entry(PATH_STYLE, "OFBIZ_S3_PATH_STYLE"),
-            Map.entry(KEY_PREFIX, "OFBIZ_S3_KEY_PREFIX"));
+            Map.entry(PATH_STYLE, "OFBIZ_S3_PATH_STYLE"));
 
     /** The container entry point, which is the whole of the bridge from a deployment environment to these keys. */
     private static final String CONTAINER_ENTRY_POINT = "docker/docker-entrypoint.sh";
@@ -205,9 +202,7 @@ public final class ContentStorePropertiesContractTests {
     private static final String PROPERTIES_URL_CACHE = "properties.UtilPropertiesUrlCache";
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The whole key set, as one complete structured comparison
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -417,9 +412,7 @@ public final class ContentStorePropertiesContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The object-storage client those keys configure must actually be supplied
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -431,7 +424,7 @@ public final class ContentStorePropertiesContractTests {
 
         assertTrue(client.isInterface(), S3_CLIENT + " is expected to be the SDK v2 client interface");
         // The builder is reached only as a TYPE. Its presence is what makes endpointOverride and forcePathStyle -
-        // the two settings that let one client target any S3-compatible store - available to the provider.
+        // the two settings that let one client target an S3-compatible store as well as Amazon S3 - available to the provider.
         assertTrue(builder.isInterface(), S3_CLIENT_BUILDER + " is expected to be an interface");
         assertEquals(builder, client.getMethod("builder").getReturnType(), "S3Client.builder() must return " + S3_CLIENT_BUILDER);
         for (String setting : List.of("endpointOverride", "forcePathStyle")) {
@@ -457,9 +450,7 @@ public final class ContentStorePropertiesContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The container entry point is the only bridge from a deployment environment to these keys
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -524,16 +515,49 @@ public final class ContentStorePropertiesContractTests {
                 CONTAINER_ENTRY_POINT + " must treat database as the unconfigured default, matching this file");
     }
 
+    /**
+     * The loop the entry point's withdrawal is driven by, in place of a hand written {@code unset} per name.
+     */
+    private static final String WITHDRAWAL_LOOP =
+            "for variableName in \"${RUNTIME_APPLIED_VARIABLES[@]}\" \"${CONTAINER_CONTROL_VARIABLES[@]}\"; do";
+
+    /**
+     * Whether the entry point withdraws {@code variable} from the environment before it execs the server.
+     *
+     * <p>The withdrawal is driven by the two declared inventories rather than by one hand written
+     * {@code unset} per name, so what has to be present is the variable's DECLARATION plus the loop that
+     * consumes both arrays. Asserting on a literal {@code unset OFBIZ_X} would hold only while the list
+     * stayed hand written, which is the drift the loop exists to remove - two names were once missed by
+     * exactly that list. The behaviour itself is exercised end to end by
+     * {@code SchemaInitEntryPointTests}, which plants every declared name and drives the real function.</p>
+     *
+     * @param entryPoint the entry point's text
+     * @param variable the environment variable that must not survive into the served JVM
+     * @return true when the variable is declared by an inventory the withdrawal loop consumes
+     */
+    private static boolean withdrawnBeforeExec(String entryPoint, String variable) {
+        boolean declared = false;
+        for (String inventory : List.of("RUNTIME_APPLIED_VARIABLES=(", "CONTAINER_CONTROL_VARIABLES=(")) {
+            int at = entryPoint.indexOf(inventory);
+            int end = at < 0 ? -1 : entryPoint.indexOf("\n)", at);
+            if (end < 0) {
+                continue;
+            }
+            declared = declared || List.of(entryPoint.substring(at, end).split("\\s+")).contains(variable);
+        }
+        return declared && entryPoint.contains(WITHDRAWAL_LOOP) && entryPoint.contains("unset \"$variableName\"");
+    }
+
     @Test
     public void theContainerEntryPointRemovesEveryObjectStoreVariableFromTheServingEnvironment() {
-        List<String> lines = linesOf(repositoryRoot().resolve(CONTAINER_ENTRY_POINT));
+        String entryPoint = String.join("\n", linesOf(repositoryRoot().resolve(CONTAINER_ENTRY_POINT)));
 
         // An environment variable is readable through /proc/<pid>/environ, and any child process, crash handler or
         // diagnostic dump that reports the environment republishes it. The values have already been written to the
         // mode 0600 rendered configuration by the time the serving command is executed, so nothing needs them.
         for (String variable : ENTRY_POINT_BRIDGE.values()) {
-            assertTrue(lines.stream().anyMatch(line -> line.strip().equals("unset " + variable)),
-                    CONTAINER_ENTRY_POINT + " must unset " + variable + " before executing the serving command");
+            assertTrue(withdrawnBeforeExec(entryPoint, variable),
+                    CONTAINER_ENTRY_POINT + " must withdraw " + variable + " before executing the serving command");
         }
     }
 
@@ -554,9 +578,7 @@ public final class ContentStorePropertiesContractTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     private static boolean hasMethodNamed(Class<?> type, String name) {

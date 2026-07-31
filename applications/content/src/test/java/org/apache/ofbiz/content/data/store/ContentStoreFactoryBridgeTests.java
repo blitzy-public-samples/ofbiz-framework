@@ -20,6 +20,7 @@ package org.apache.ofbiz.content.data.store;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -39,8 +40,12 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -51,7 +56,9 @@ import javax.transaction.Synchronization;
 
 import org.apache.ofbiz.base.util.GeneralException;
 import org.apache.ofbiz.base.util.GeneralRuntimeException;
+import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.content.data.DataResourceWorker;
+import org.apache.ofbiz.entity.Delegator;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -71,23 +78,40 @@ import org.junit.jupiter.api.Test;
  * every read and write can be asserted. Not placing one leaves the committed configuration in force,
  * which is how the database-mode tests below confirm the bridge is inert.
  *
- * <p><strong>Why the publications are constructed directly.</strong> Publication is registered with
- * the current transaction, and a unit test has no transaction factory, so
- * {@code TransactionUtil.isTransactionInPlace} answers that there is no transaction infrastructure
- * and nothing is registered - which is itself asserted here. The two publication callbacks are
- * therefore built with the arguments the bridge builds them with and driven directly, which is the
- * only way to assert what happens on commit and on rollback without a running entity container.
+ * <p><strong>How a publication is observed.</strong> Publication is registered with the current
+ * transaction, and a unit test has no transaction factory, so {@code TransactionUtil} answers that
+ * there is no transaction infrastructure and production registers nothing - which is itself asserted
+ * here. Every test that needs to see a registration therefore seats a recording registrar through
+ * {@link ContentStoreFactory#installPublicationRegistrarForTesting}, which is what lets the
+ * <em>production</em> seam be driven end to end: the registration is the one production made, with the
+ * arguments production chose, and the test only supplies the transaction that would have carried it.
+ * That distinction matters, because a publication a test constructs itself says nothing about
+ * whether production ever registers one - and "the write is never registered" is exactly the defect
+ * this covers.
  */
 public final class ContentStoreFactoryBridgeTests {
 
     private static final String UPLOAD_PREFIX = "runtime/uploads";
     private static final String STAGING_SEGMENT = ".contentstore-staging";
+
+    /** What the recording store says when it refuses a write, so an assertion can look for it by name. */
+    private static final String REFUSAL_TEXT = "this store refuses writes";
     private static final byte[] STORED = "stored bytes".getBytes(StandardCharsets.UTF_8);
     private static final byte[] REPLACEMENT = "written bytes".getBytes(StandardCharsets.UTF_8);
+
+    /** The flat key {@code runtime/uploads/10000.png} derives to, for the many tests that use that location. */
+    private static final String KEY = "runtime/uploads/10000.png";
+
+    /** The flat key a staged {@code 10000.bin} upload derives to. */
+    private static final String KEY_BIN = "runtime/uploads/10000.bin";
+
+    /** Chunk the large-object tests generate and drain content in; big enough to be quick, small enough to be free. */
+    private static final int CHUNK = 64 * 1024;
 
     private Path home;
     private String previousHome;
     private RecordingContentStore store;
+    private RecordingRegistrar registrar;
 
     @BeforeEach
     public void giveThisTestItsOwnHomeAndProvider() throws Exception {
@@ -96,10 +120,14 @@ public final class ContentStoreFactoryBridgeTests {
         previousHome = System.getProperty("ofbiz.home");
         System.setProperty("ofbiz.home", home.toString());
         store = new RecordingContentStore();
+        registrar = new RecordingRegistrar();
     }
 
     @AfterEach
     public void leaveNoHomeProviderOrStagedFileBehind() throws Exception {
+        // Restored before anything else: leaving a test registrar seated would silently redirect every
+        // later test in the same JVM away from the transaction manager.
+        ContentStoreFactory.installPublicationRegistrarForTesting(null);
         ContentStoreFactory.clearCache();
         if (previousHome == null) {
             System.clearProperty("ofbiz.home");
@@ -109,7 +137,7 @@ public final class ContentStoreFactoryBridgeTests {
         deleteRecursively(home.toFile());
     }
 
-    // --- key derivation -----------------------------------------------------------------------
+    // key derivation
 
     @Test
     public void everyLocalFileFormDerivesTheKeyRelativeToTheHomeDirectory() throws Exception {
@@ -205,7 +233,7 @@ public final class ContentStoreFactoryBridgeTests {
                 "/" + UPLOAD_PREFIX + "/" + STAGING_SEGMENT + "/318/10000.png", null));
     }
 
-    // --- upload allocation --------------------------------------------------------------------
+    // upload allocation
 
     @Test
     public void allocatingAStagingPathAnswersBothFormsTheUploadFlowUses() throws Exception {
@@ -255,7 +283,7 @@ public final class ContentStoreFactoryBridgeTests {
     }
 
     @Test
-    public void allocatingAStagingPathIsInertWhileDatabaseStorageIsConfigured() {
+    public void allocatingAStagingPathIsInertWhileDatabaseStorageIsConfigured() throws Exception {
         assertNull(ContentStoreFactory.uploadStagingPath(UPLOAD_PREFIX, true));
         assertNull(ContentStoreFactory.uploadStagingPath(UPLOAD_PREFIX, false));
         assertFalse(new File(home + "/" + UPLOAD_PREFIX).exists(),
@@ -265,15 +293,20 @@ public final class ContentStoreFactoryBridgeTests {
     @Test
     public void anUnusableStagingLocationFailsLoudlyRatherThanSilentlyStayingLocal() throws Exception {
         activateRecordingProvider();
-        // A regular file where the staging directory has to go makes the directory impossible to
-        // create, which is the one way this can fail on a healthy filesystem.
+        // A regular file where the staging directory has to go stops the directory being
+        // created, which is the one way this can fail on a healthy filesystem.
         File blocker = new File(home + "/" + UPLOAD_PREFIX);
         assertTrue(blocker.getParentFile().mkdirs() || blocker.getParentFile().isDirectory());
         write(blocker, STORED);
-        assertThrows(GeneralRuntimeException.class, () -> ContentStoreFactory.uploadStagingPath(UPLOAD_PREFIX, true));
+        GeneralException refused = assertThrows(GeneralException.class, () ->
+                ContentStoreFactory.uploadStagingPath(UPLOAD_PREFIX, true),
+                "an upload must never fall back to a local directory the deployment did not ask for");
+        assertFalse(refused instanceof ContentStoreConfigurationException,
+                "a usable provider whose staging location cannot be allocated is not a misconfigured deployment, "
+                        + "and a caller has to be able to tell the two apart: " + refused.getMessage());
     }
 
-    // --- reading ------------------------------------------------------------------------------
+    // reading
 
     @Test
     public void materialisingHandsBackExactlyTheFileTheFrozenCallersCompute() throws Exception {
@@ -350,7 +383,7 @@ public final class ContentStoreFactoryBridgeTests {
         assertNull(ContentStoreFactory.openContentStream("OFBIZ_FILE", "/runtime/uploads/a.txt", null));
     }
 
-    // --- writing ------------------------------------------------------------------------------
+    // writing
 
     @Test
     public void publishingSendsTheStagedBytesToTheStoreAndRemovesTheLocalFile() throws Exception {
@@ -389,7 +422,107 @@ public final class ContentStoreFactoryBridgeTests {
                 ContentStoreFactory.publishContentFile("OFBIZ_FILE", objectInfo, null));
     }
 
-    // --- guards -------------------------------------------------------------------------------
+    // diagnostics
+
+    /**
+     * The SPI requires that a diagnostic name neither the storage key, nor a resolved path, nor
+     * anything the store itself said. All three are caller- or remote-influenced: a key names a
+     * party's document and arrives from request data, a path publishes the deployment's layout, and
+     * a message from a store or from the operating system is text this package did not write. This
+     * drives the failing paths of the bridge and holds every message they produce to that rule.
+     *
+     * @throws Exception if the bridge cannot be driven
+     */
+    @Test
+    public void noDiagnosticFromTheBridgeNamesTheKeyThePathOrWhatTheStoreSaid() throws Exception {
+        activateRecordingProvider();
+        store.refuseWrites();
+        String objectInfo = "/" + UPLOAD_PREFIX + "/10000.png";
+        File staged = new File(home + objectInfo);
+        assertTrue(staged.getParentFile().mkdirs());
+        write(staged, REPLACEMENT);
+
+        GeneralException refused = assertThrows(GeneralException.class, () ->
+                ContentStoreFactory.publishContentFile("OFBIZ_FILE", objectInfo, null));
+
+        // getMessage is the whole of what a reader sees here, because nothing is chained on this path.
+        String reported = refused.getMessage();
+        assertFalse(reported.contains("runtime/uploads/10000.png"),
+                "the key must be reported as an opaque reference, not as itself: " + reported);
+        assertFalse(reported.contains(home.toString()),
+                "a resolved path must not publish the deployment's layout: " + reported);
+        assertFalse(reported.contains(REFUSAL_TEXT),
+                "what the store said must not be quoted into a message: " + reported);
+        assertTrue(reported.contains(ContentStoreFactory.reference("runtime/uploads/10000.png")),
+                "the key still has to be identifiable, by its stable reference: " + reported);
+        assertTrue(reported.contains("CONTENT-STORE-PUBLISH-FAILED"),
+                "a stable code is what makes this class of failure findable at all: " + reported);
+        assertTrue(reported.contains("IOException"),
+                "the kind of failure is named by its type, which is generated here rather than read from the store: "
+                        + reported);
+        assertNull(refused.getCause(),
+                "and it must not be chained either: GeneralException.getMessage() composes a nested message into its "
+                        + "own, so chaining would republish what the store said however safely this message was built");
+    }
+
+    /**
+     * A location bearing a control character is refused where it would become a key, rather than
+     * being stored under a key no operator can address and then carried into every diagnostic about
+     * it. A newline is the case that matters: reported as itself it forges a log record.
+     */
+    @Test
+    public void aLocationCarryingAControlCharacterIsRefusedBeforeItBecomesAKey() {
+        String forging = UPLOAD_PREFIX + "/10000.png\nWARN forged log record";
+
+        GeneralException refused = assertThrows(GeneralException.class, () ->
+                ContentStoreFactory.storageKeyFor("OFBIZ_FILE", forging, null),
+                "a location that cannot be logged safely must not become a key either");
+
+        String reported = refused.getMessage();
+        assertFalse(reported.contains("\n") || reported.contains("\r"),
+                "the refusal itself must not carry the line break it refused: " + reported);
+        assertFalse(reported.contains("forged log record"), "nothing of the value may be echoed: " + reported);
+    }
+
+    /**
+     * The bridge reports a configuration it cannot honour as a configuration failure on both routes
+     * into it, and the frozen upload path converts that one failure into one unchecked carrier. The
+     * alternative - one route checked and the other unchecked, with different wording - is what
+     * leaves a caller unable to tell a misconfigured deployment from a failed allocation.
+     *
+     * @throws Exception if the configuration cannot be driven
+     */
+    @Test
+    public void aConfigurationThatCannotBeHonouredIsRefusedTheSameWayOnBothRoutes() throws Exception {
+        ContentStoreFactory.clearCache();
+        UtilProperties.setPropertyValueInMemory("content", "content.store.provider", "s4");
+        try {
+            assertThrows(ContentStoreConfigurationException.class, () ->
+                    ContentStoreFactory.uploadStagingPath(UPLOAD_PREFIX, true),
+                    "the staging route must report a misconfigured deployment as a configuration failure");
+
+            GeneralRuntimeException viaStaging = assertThrows(GeneralRuntimeException.class, () ->
+                    DataResourceWorker.getDataResourceContentUploadPath(UPLOAD_PREFIX, 250, true));
+            GeneralRuntimeException viaProvider = assertThrows(GeneralRuntimeException.class, () ->
+                    DataResourceWorker.getDataResourceContentUploadPath(null, true));
+
+            assertEquals(viaStaging.getMessage(), viaProvider.getMessage(),
+                    "one policy means one message, whichever route the configuration takes");
+            // GeneralRuntimeException keeps its nested failure in a field of its own rather than in the
+            // Throwable cause, so getNested is what a caller has to ask - as the sibling suite does too.
+            assertInstanceOf(ContentStoreConfigurationException.class, viaStaging.getNested(),
+                    "the checked failure has to be carried, so a caller can still tell what kind of failure it was");
+            assertInstanceOf(ContentStoreConfigurationException.class, viaProvider.getNested(),
+                    "the checked failure has to be carried on this route too");
+            assertFalse(new File(home + "/" + UPLOAD_PREFIX).exists(),
+                    "a refused configuration must not leave a local directory an upload could be written into");
+        } finally {
+            UtilProperties.setPropertyValueInMemory("content", "content.store.provider", "database");
+            ContentStoreFactory.clearCache();
+        }
+    }
+
+    // guards
 
     @Test
     public void aLocationOutsideTheAllowListIsRefusedBeforeAnythingIsStaged() throws Exception {
@@ -415,7 +548,7 @@ public final class ContentStoreFactoryBridgeTests {
                 "images/../../../../etc/shadow", contextRoot));
     }
 
-    // --- publication on commit and on rollback ------------------------------------------------
+    // publication on commit and on rollback
 
     @Test
     public void noPublicationIsRegisteredWhereThereIsNoTransactionInfrastructure() throws Exception {
@@ -544,7 +677,7 @@ public final class ContentStoreFactoryBridgeTests {
         assertThrows(GeneralRuntimeException.class, publication::beforeCompletion);
     }
 
-    // --- the production vertical, driven through DataResourceWorker ---------------------------
+    // the production vertical, driven through DataResourceWorker
     //
     // Everything above drives the bridge directly. These tests instead call the frozen entry points
     // a deployment calls, so they fail if the seam in DataResourceWorker is ever removed - which is
@@ -646,6 +779,31 @@ public final class ContentStoreFactoryBridgeTests {
         assertTrue(allocated.startsWith("/" + UPLOAD_PREFIX + "/" + STAGING_SEGMENT), allocated);
     }
 
+    /**
+     * A provider may be able to name where an upload should go without that name being a writable
+     * local file, and the two frozen write services this bridge sits under do not tolerate the
+     * difference: they open a {@code FileOutputStream} on whatever they are told, and for
+     * {@code LOCAL_FILE} they require it to be absolute. Believing such a provider is how an upload
+     * ends up in a directory created beside the process working directory, reported as stored, and
+     * never sent anywhere - so a location is only ever taken from a provider that also backs the
+     * very file it names, and every other provider's upload is staged locally and published on
+     * commit instead.
+     *
+     * @throws Exception if the bridge cannot be driven
+     */
+    @Test
+    public void aProviderNamingALocationItDoesNotBackIsStagedRatherThanBelieved() throws Exception {
+        activateProvider(new AnnouncingContentStore(store));
+
+        assertNull(ContentStoreFactory.resolveUploadPath(null, true),
+                "a provider that does not back the file it names must answer no upload location at all");
+        String allocated = DataResourceWorker.getDataResourceContentUploadPath(UPLOAD_PREFIX, 250, true);
+        assertFalse(allocated.contains(AnnouncingContentStore.ANNOUNCED),
+                "the location the provider named must never reach the upload flow: " + allocated);
+        assertTrue(allocated.contains(STAGING_SEGMENT), allocated);
+        assertTrue(new File(allocated).isDirectory(), "the staged location has to exist to be written to: " + allocated);
+    }
+
     @Test
     public void theProductionUploadAndCreateVerticalPublishesToTheStoreOnCommit() throws Exception {
         activateRecordingProvider();
@@ -660,19 +818,427 @@ public final class ContentStoreFactoryBridgeTests {
     @Test
     public void theProductionBinaryWriteVerticalPublishesWhatTheFrozenCallerWrote() throws Exception {
         activateRecordingProvider();
-        store.hold("runtime/uploads/10000.png", STORED);
+        withTransaction();
+        store.hold(KEY, STORED);
+
+        // The exact call DataServices.createBinaryFileMethod and updateBinaryFileMethod make.
         File served = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
-        // The publication is built here because that is where materialiseContentFile builds it - it
-        // captures the fetched file's length and timestamp in order to recognise a later write - and
-        // a unit test has no transaction for the seam to have registered it with.
-        Synchronization publication = contentPublication("runtime/uploads/10000.png", served, false);
+
+        // The seam has to have registered the publication itself. Nothing the
+        // resolution observes can carry a write that has not happened yet, so a seam that registers
+        // nothing here leaves the write below reaching local disk only - and on any other instance,
+        // which has no local copy and finds the object unchanged in the store, the write is lost.
+        assertEquals(1, registrar.registered().size(),
+                "resolving a file while a provider is configured must register exactly one publication "
+                        + "with the transaction, because the caller may write through the file afterwards");
+
         // exactly what DataServices.createBinaryFileMethod and updateBinaryFileMethod do
         write(served, REPLACEMENT);
-        publication.beforeCompletion();
-        assertArrayEqualsBytes(REPLACEMENT, store.held("runtime/uploads/10000.png"));
+        registrar.commit();
+
+        assertArrayEqualsBytes(REPLACEMENT, store.held(KEY));
+        assertTrue(served.isFile(),
+                "the working copy is the location objectInfo names, not a staging file, so completing the "
+                        + "transaction must not remove it");
     }
 
-    // --- helpers ------------------------------------------------------------------------------
+    @Test
+    public void aFileTheSeamOnlyHandedOutForReadingPublishesNothingWhenTheTransactionCommits() throws Exception {
+        activateRecordingProvider();
+        withTransaction();
+        store.hold(KEY, STORED);
+
+        File served = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        assertEquals(1, registrar.registered().size(), "a publication is registered whether or not it is needed");
+        registrar.commit();
+
+        assertArrayEqualsBytes(STORED, readFully(served), "a read must not disturb the content");
+        assertTrue(store.writes().isEmpty(),
+                "a caller that only read must cost no write at all: publication has to be conditional on the "
+                        + "file actually having changed, or every read would re-upload the content it served");
+    }
+
+    /**
+     * The file the seam hands out carries a modification time no write can reproduce.
+     *
+     * <p>This is the mechanism the test below depends on, asserted directly because it is the only part of it
+     * that can be established without a clock. Comparing the timestamp observed at resolution with the one
+     * observed at commit is not sufficient on its own: a write that keeps the byte count and lands inside a
+     * single filesystem timestamp tick is then indistinguishable from no write at all, and the granularity of
+     * that tick belongs to the filesystem rather than to anything this code can assume. Stamping the resolved
+     * file with a time in 1970 removes the assumption: a write stamps the file with the time of the write.
+     *
+     * <p>Found by this suite failing only when it ran alongside another class, that is only when the write
+     * happened to land in the same tick as the resolution - which is exactly how a deployment would have lost
+     * a same-length write, silently and occasionally.
+     */
+    @Test
+    public void theSeamStampsTheFileItHandsOutSoThatAnyWriteThroughItIsDetectable() throws Exception {
+        activateRecordingProvider();
+        withTransaction();
+        store.hold(KEY, STORED);
+
+        File served = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+
+        assertEquals(FileTime.fromMillis(1000L), Files.getLastModifiedTime(served.toPath()),
+                "the file handed to a caller has to carry the sentinel modification time: that is what makes a "
+                        + "same-length write inside one timestamp tick detectable at all");
+        assertArrayEqualsBytes(STORED, readFully(served), "and stamping it must not disturb the content");
+    }
+
+    /**
+     * Stamping the resolved file does not make an untouched copy look like a write.
+     *
+     * <p>The reconciliation register records the same {@code length:lastModified} pair the stamp changes, so a
+     * stamp applied without bringing the register along would make the very next resolution read an untouched
+     * file as locally modified and upload it again - on every read, for the life of the JVM.
+     */
+    @Test
+    public void resolvingTheSameUntouchedFileInALaterTransactionPublishesNothing() throws Exception {
+        activateRecordingProvider();
+        store.hold(KEY, STORED);
+
+        withTransaction();
+        DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        registrar.commit();
+
+        // A second transaction on the same instance, resolving the same resource it did not write to.
+        registrar = new RecordingRegistrar();
+        withTransaction();
+        DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        registrar.commit();
+
+        assertTrue(store.writes().isEmpty(),
+                "reading content twice must cost no write at all, however the resolved file is stamped");
+    }
+
+    @Test
+    public void aWriteThroughTheSeamKeepingTheByteCountIdenticalIsStillPublished() throws Exception {
+        activateRecordingProvider();
+        withTransaction();
+        store.hold(KEY, STORED);
+        File served = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+
+        // Same length, and written immediately: nothing about the size or the timing of this write
+        // distinguishes it from no write, which is why the resolved file was stamped with a 1970 time.
+        byte[] sameLength = new byte[STORED.length];
+        System.arraycopy(REPLACEMENT, 0, sameLength, 0, Math.min(REPLACEMENT.length, sameLength.length));
+        write(served, sameLength);
+        registrar.commit();
+
+        assertArrayEqualsBytes(sameLength, store.held(KEY),
+                "a write that preserves the byte count must still be published");
+    }
+
+    @Test
+    public void theSeamRegistersOnePublicationPerKeyHoweverOftenTheSameFileIsResolved() throws Exception {
+        activateRecordingProvider();
+        withTransaction();
+        store.hold(KEY, STORED);
+
+        DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        File served = DataResourceWorker.getContentFile("OFBIZ_FILE_BIN", UPLOAD_PREFIX + "/10000.png", null);
+
+        // One transaction resolves the same resource several times - ContentWorker, the render pipeline
+        // and the write services all do - and each extra publication would be another store round trip
+        // on the critical path of the commit.
+        assertEquals(1, registrar.registered().size(),
+                "one key needs one publication per transaction, however often it is resolved");
+
+        write(served, REPLACEMENT);
+        registrar.commit();
+        assertEquals(List.of(KEY), store.writes(), "and it must publish exactly once");
+    }
+
+    /**
+     * A transaction nested on one thread publishes its own write.
+     *
+     * <p>OFBiz suspends and resumes transactions on the thread that owns them, so a thread can be running a
+     * second transaction while a first is still in flight. Whatever records that a key is already covered has
+     * to be scoped to the transaction that covers it: a record kept against the <em>thread</em> would let the
+     * publication belonging to the suspended transaction stand in for the nested one, and the nested write
+     * would then never leave local disk - which is the whole failure this seam exists to close.
+     */
+    @Test
+    public void aTransactionNestedOnTheSameThreadPublishesItsOwnWriteOfTheSameKey() throws Exception {
+        activateRecordingProvider();
+        store.hold(KEY, STORED);
+
+        withTransaction();
+        DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        RecordingRegistrar suspended = registrar;
+        assertEquals(1, suspended.registered().size(), "the outer transaction registers its own publication");
+
+        // The outer transaction is left in flight, exactly as a suspended one is.
+        registrar = new RecordingRegistrar();
+        withTransaction();
+        File served = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+
+        assertEquals(1, registrar.registered().size(),
+                "the nested transaction has to get a publication of its own, because the outer one's cannot "
+                        + "publish what the nested one writes");
+        write(served, REPLACEMENT);
+        registrar.commit();
+        assertArrayEqualsBytes(REPLACEMENT, store.held(KEY), "so the nested transaction's write is published");
+    }
+
+    @Test
+    public void theSeamRegistersNothingAtAllWhileDatabaseStorageIsConfigured() throws Exception {
+        withTransaction();
+        File local = stagedFileHolding(STORED);
+
+        File served = DataResourceWorker.getContentFile("LOCAL_FILE", local.getAbsolutePath(), null);
+
+        assertEquals(local.getAbsolutePath(), served.getAbsolutePath(), "the committed resolution is unchanged");
+        assertTrue(registrar.registered().isEmpty(),
+                "in the committed database mode there is no provider and the file is a copy of nothing, so "
+                        + "there is nothing to publish and no transaction callback to install");
+    }
+
+    @Test
+    public void theSeamRegistersNothingForAProviderThatBacksTheVerySameFile() throws Exception {
+        ContentStoreFactory.installForTesting("database", ContentStoreFactory.resolve("filesystem"));
+        withTransaction();
+        File local = stagedFileHolding(STORED);
+
+        DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+
+        assertTrue(registrar.registered().isEmpty(),
+                "publishing a file onto itself would rewrite the content on every read, so a provider whose "
+                        + "storage IS this file must have no publication registered for it");
+        assertTrue(local.isFile(), "and the file must be left exactly as it was");
+    }
+
+    @Test
+    public void aStoreRefusingAWriteMadeThroughTheSeamRollsTheTransactionBack() throws Exception {
+        activateRecordingProvider();
+        withTransaction();
+        store.hold(KEY, STORED);
+        File served = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        write(served, REPLACEMENT);
+        store.refuseWrites();
+
+        // Publication runs in beforeCompletion so that this is possible at all: committing here would
+        // leave a DataResource row naming content the store never received.
+        GeneralRuntimeException refused = assertThrows(GeneralRuntimeException.class, () -> registrar.commit(),
+                "a store that will not accept the write must fail the commit");
+        assertTrue(refused.getMessage().contains("rolled back"), refused.getMessage());
+    }
+
+    @Test
+    public void contentWrittenThroughTheSeamOnOneInstanceIsServedByAPeerThatNeverHadALocalCopy() throws Exception {
+        activateRecordingProvider();
+        withTransaction();
+        store.hold(KEY, STORED);
+
+        // Instance A: resolve, write through the returned File, commit.
+        File served = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        write(served, REPLACEMENT);
+        registrar.commit();
+
+        // Instance B is the same code with a different deployment directory and therefore an empty disk -
+        // which is exactly the state a freshly started container behind a load balancer is in. The store is
+        // the shared one, as it would be for a fleet sharing a bucket.
+        Path peerHome = Files.createTempDirectory("blitzy-content-peer").toRealPath();
+        try {
+            System.setProperty("ofbiz.home", peerHome.toString());
+            assertFalse(Files.exists(peerHome.resolve(UPLOAD_PREFIX + "/10000.png")),
+                    "the peer must start with no local copy, or this proves nothing");
+
+            File peerServed = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+
+            assertArrayEqualsBytes(REPLACEMENT, readFully(peerServed),
+                    "the peer must serve what the write produced, not the content it replaced");
+        } finally {
+            System.setProperty("ofbiz.home", home.toString());
+            deleteRecursively(peerHome.toFile());
+        }
+    }
+
+    /**
+     * An instance that has already read content still serves what another instance later wrote.
+     *
+     * <p>The companion of the peer test above, and the harder half of it: that one starts the peer with an
+     * empty disk, which any freshly started container has, while this one gives the peer the state every
+     * long-running container acquires - a local copy of content it has served before. There is no invalidation
+     * channel for file-backed content, so a local copy that is trusted without asking the store is a copy that
+     * goes stale for the life of the JVM: every invoice this instance renders would carry the superseded logo,
+     * and which logo a customer saw would depend on which instance the load balancer picked.
+     */
+    @Test
+    public void anInstanceThatAlreadyHoldsALocalCopyStillServesWhatAnotherInstanceWrote() throws Exception {
+        activateRecordingProvider();
+        store.hold(KEY, STORED);
+
+        withTransaction();
+        File first = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        assertArrayEqualsBytes(STORED, readFully(first), "the first read serves what the store holds");
+        registrar.commit();
+
+        // Another instance replaces the object in the shared store. Nothing informs this one.
+        store.hold(KEY, REPLACEMENT);
+
+        registrar = new RecordingRegistrar();
+        withTransaction();
+        File again = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+
+        assertArrayEqualsBytes(REPLACEMENT, readFully(again),
+                "every resolution has to ask the store, or a write made on one instance is invisible on every "
+                        + "instance that had already read the content it replaced");
+    }
+
+    // streaming: no ceiling on staged publication or on materialisation
+
+    @Test
+    public void aStagedUploadLargerThanTheInMemoryCeilingIsPublishedByStreamingIt() throws Exception {
+        StreamingOnlyContentStore streaming = new StreamingOnlyContentStore();
+        ContentStoreFactory.installForTesting("database", streaming);
+        withTransaction();
+
+        // Deliberately past content.store.max.memory.bytes (20 MiB), which is the ceiling the bounded
+        // put(String, byte[]) form refuses. Staged publication must not be subject to it: the pre-existing
+        // local-filesystem behaviour had no such limit, so imposing one would cap what a deployment can
+        // upload, and reading the file whole would allocate the document in the heap of the serving
+        // instance.
+        long length = 21L * 1024L * 1024L + 7L;
+        String uploadPath = DataResourceWorker.getDataResourceContentUploadPath(UPLOAD_PREFIX, 250, true);
+        File uploaded = new File(uploadPath, "10000.bin");
+        String expected = writePattern(uploaded, length);
+
+        registrar.commit();
+
+        assertEquals(List.of(KEY_BIN), streaming.streamed(), "the upload must have been published by streaming");
+        assertEquals(length, streaming.lengthOf(KEY_BIN), "the whole object must have been declared and delivered");
+        assertEquals(expected, streaming.digestOf(KEY_BIN), "and delivered byte for byte");
+    }
+
+    @Test
+    public void materialisingAnObjectLargerThanTheInMemoryCeilingStreamsItToDisk() throws Exception {
+        long length = 21L * 1024L * 1024L + 7L;
+        StreamingOnlyContentStore streaming = new StreamingOnlyContentStore();
+        String expected = streaming.holdPattern(KEY, length);
+        ContentStoreFactory.installForTesting("database", streaming);
+
+        File materialised = ContentStoreFactory.materialiseContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+
+        assertEquals(length, materialised.length(), "the whole object must have been staged");
+        assertEquals(expected, digestOf(materialised), "and staged byte for byte");
+        assertEquals(List.of(KEY), streaming.opened(),
+                "materialisation must stream the object; the bounded whole-content read would refuse it");
+    }
+
+    @Test
+    public void theBridgeNeverReachesTheBoundedWholeContentFormsAtAll() throws Exception {
+        StreamingOnlyContentStore streaming = new StreamingOnlyContentStore();
+        streaming.holdPattern(KEY, 1024L);
+        ContentStoreFactory.installForTesting("database", streaming);
+        withTransaction();
+
+        // Every integrated direction, on content small enough that the bounded forms would have worked:
+        // read, render, materialise, write through the resolved file, and a staged upload.
+        File materialised = ContentStoreFactory.materialiseContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        try (InputStream rendered = ContentStoreFactory.openContentStream("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null)) {
+            assertNotNull(rendered);
+        }
+        File served = DataResourceWorker.getContentFile("OFBIZ_FILE", UPLOAD_PREFIX + "/10000.png", null);
+        write(served, REPLACEMENT);
+        registrar.commit();
+
+        assertNotNull(materialised);
+        // StreamingOnlyContentStore fails the test from inside get() and put(byte[]), so reaching here at
+        // all is the assertion. It is stated explicitly as well, so the reason this test exists survives.
+        assertTrue(streaming.streamed().contains(KEY), "the write must have been published as a stream");
+        assertFalse(streaming.opened().isEmpty(), "and the reads must have been streamed");
+    }
+
+    // helpers
+
+    /**
+     * Seats the recording registrar with a transaction in place, so a registration can be observed.
+     *
+     * <p>Production registers through {@code TransactionUtil}, which in a test JVM reports that there is
+     * no transaction infrastructure at all - see {@code ContentStoreFactory.PublicationRegistrar}. Only
+     * the transaction is supplied here; the publication, its arguments and the decision to register it
+     * all remain production's.
+     */
+    private void withTransaction() {
+        ContentStoreFactory.installPublicationRegistrarForTesting(registrar);
+    }
+
+    /**
+     * Reads a file whole, for an assertion on content the test wrote or the bridge staged.
+     *
+     * @param file the file to read
+     * @return its bytes
+     * @throws IOException if it cannot be read
+     */
+    private static byte[] readFully(File file) throws IOException {
+        return Files.readAllBytes(file.toPath());
+    }
+
+    /**
+     * Writes a deterministic pattern of the requested length, without ever holding it whole.
+     *
+     * @param file the file to create
+     * @param length how many bytes to write
+     * @return the SHA-256 of what was written, hex encoded
+     * @throws IOException if the file cannot be written
+     * @throws GeneralException if SHA-256 is unavailable, which no JRE permits
+     */
+    private static String writePattern(File file, long length) throws IOException, GeneralException {
+        MessageDigest digest = digest();
+        byte[] chunk = new byte[CHUNK];
+        for (int i = 0; i < chunk.length; i++) {
+            chunk[i] = (byte) (i * 31 + 7);
+        }
+        assertTrue(file.getParentFile().isDirectory() || file.getParentFile().mkdirs());
+        try (OutputStream out = new FileOutputStream(file)) {
+            long remaining = length;
+            while (remaining > 0) {
+                int step = (int) Math.min(chunk.length, remaining);
+                out.write(chunk, 0, step);
+                digest.update(chunk, 0, step);
+                remaining -= step;
+            }
+        }
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    /**
+     * Digests a file's content, for an assertion that content arrived byte for byte.
+     *
+     * @param file the file to digest
+     * @return the SHA-256 of its content, hex encoded
+     * @throws IOException if it cannot be read
+     * @throws GeneralException if SHA-256 is unavailable, which no JRE permits
+     */
+    private static String digestOf(File file) throws IOException, GeneralException {
+        MessageDigest digest = digest();
+        byte[] buffer = new byte[CHUNK];
+        try (InputStream in = Files.newInputStream(file.toPath())) {
+            int read = in.read(buffer);
+            while (read > 0) {
+                digest.update(buffer, 0, read);
+                read = in.read(buffer);
+            }
+        }
+        return HexFormat.of().formatHex(digest.digest());
+    }
+
+    /**
+     * Supplies a SHA-256 digest.
+     *
+     * @return the digest
+     * @throws GeneralException if SHA-256 is unavailable, which no JRE permits
+     */
+    private static MessageDigest digest() throws GeneralException {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new GeneralException("SHA-256 is required of every JRE", e);
+        }
+    }
 
     /**
      * Places the recording provider into the factory's resolution cache under the committed
@@ -681,6 +1247,17 @@ public final class ContentStoreFactoryBridgeTests {
      * @throws Exception if the cache or the outcome type cannot be reached
      */
     private void activateRecordingProvider() throws Exception {
+        activateProvider(store);
+    }
+
+    /**
+     * Places the given provider into the factory's resolution cache under the committed
+     * configuration value, so that the bridge resolves it through the very code a deployment runs.
+     *
+     * @param provider the provider the bridge is to resolve
+     * @throws Exception if the cache or the outcome type cannot be reached
+     */
+    private void activateProvider(ContentStore provider) throws Exception {
         Class<?> outcome = Class.forName(ContentStoreFactory.class.getName() + "$Resolution");
         Method succeeded = outcome.getDeclaredMethod("succeeded", String.class, ContentStore.class);
         succeeded.setAccessible(true);
@@ -688,8 +1265,8 @@ public final class ContentStoreFactoryBridgeTests {
         cache.setAccessible(true);
         @SuppressWarnings("unchecked")
         Map<String, Object> resolutions = (Map<String, Object>) cache.get(null);
-        resolutions.put("database", succeeded.invoke(null, "database", store));
-        assertNotNull(ContentStoreFactory.getContentStore(), "the recording provider has to be the active one");
+        resolutions.put("database", succeeded.invoke(null, "database", provider));
+        assertNotNull(ContentStoreFactory.getContentStore(), "the provider under test has to be the active one");
     }
 
     /**
@@ -727,7 +1304,7 @@ public final class ContentStoreFactoryBridgeTests {
      *
      * @return the allocated directory
      */
-    private File allocatedStagingDirectory() {
+    private File allocatedStagingDirectory() throws Exception {
         String allocated = ContentStoreFactory.uploadStagingPath(UPLOAD_PREFIX, true);
         File directory = new File(allocated);
         assertTrue(directory.isDirectory(), allocated);
@@ -815,7 +1392,7 @@ public final class ContentStoreFactoryBridgeTests {
         @Override
         public void put(String key, byte[] data) throws GeneralException, IOException {
             if (refusing) {
-                throw new IOException("this store refuses writes");
+                throw new IOException(REFUSAL_TEXT);
             }
             writes.add(key);
             objects.put(key, data.clone());
@@ -824,7 +1401,7 @@ public final class ContentStoreFactoryBridgeTests {
         @Override
         public void put(String key, InputStream content, long length) throws GeneralException, IOException {
             if (refusing) {
-                throw new IOException("this store refuses writes");
+                throw new IOException(REFUSAL_TEXT);
             }
             if (length < 0 || length > Integer.MAX_VALUE) {
                 throw new GeneralException("A length of " + length + " cannot be stored under key [" + key + "]");
@@ -926,6 +1503,328 @@ public final class ContentStoreFactoryBridgeTests {
          */
         private List<String> writes() {
             return List.copyOf(writes);
+        }
+    }
+
+    /**
+     * A provider that names an upload location it does not back, which is the shape an object store
+     * has: it can say which key space an upload belongs under, but that answer is not a writable
+     * local file. It stores through the recording provider, so a write that does reach it is
+     * observable, and the point of the double is that no write should reach the location it names.
+     */
+    private static final class AnnouncingContentStore implements ContentStore, ContentUploadLocation {
+
+        private static final String ANNOUNCED = "announced-key-space";
+
+        private final ContentStore backing;
+
+        AnnouncingContentStore(ContentStore backing) {
+            this.backing = backing;
+        }
+
+        @Override
+        public String uploadPath(Delegator delegator, boolean absolute) {
+            return ANNOUNCED;
+        }
+
+        @Override
+        public void put(String key, byte[] data) throws GeneralException, IOException {
+            backing.put(key, data);
+        }
+
+        @Override
+        public void put(String key, InputStream content, long length) throws GeneralException, IOException {
+            backing.put(key, content, length);
+        }
+
+        @Override
+        public byte[] get(String key) throws GeneralException, IOException {
+            return backing.get(key);
+        }
+
+        @Override
+        public InputStream openStream(String key) throws GeneralException, IOException {
+            return backing.openStream(key);
+        }
+
+        @Override
+        public long size(String key) throws GeneralException, IOException {
+            return backing.size(key);
+        }
+
+        @Override
+        public boolean exists(String key) throws GeneralException, IOException {
+            return backing.exists(key);
+        }
+
+        @Override
+        public void delete(String key) throws GeneralException, IOException {
+            backing.delete(key);
+        }
+
+        @Override
+        public void close() throws GeneralException, IOException {
+            backing.close();
+        }
+    }
+
+    /**
+     * A registrar that records what the production seam registers, and drives it on demand.
+     *
+     * <p>It stands in for a transaction, which is the only thing a test JVM cannot arrange for itself, and
+     * otherwise does nothing at all: the publication objects it holds are the objects production
+     * constructed, so driving them exercises production's own commit behaviour.
+     *
+     * <p>One registrar is one transaction. Each test seats a new one, so each test's registrations are
+     * scoped to its own transaction exactly as a real one would be - and a test that never completes its
+     * transaction cannot leave a record behind that suppresses a later test's publication.
+     */
+    private static final class RecordingRegistrar implements ContentStoreFactory.PublicationRegistrar {
+
+        private final List<Synchronization> registered = new ArrayList<>();
+
+        @Override
+        public Object currentTransaction() {
+            return this;
+        }
+
+        @Override
+        public void register(Synchronization publication) {
+            registered.add(publication);
+        }
+
+        /**
+         * Reports the publications registered so far.
+         *
+         * @return the publications, in registration order
+         */
+        private List<Synchronization> registered() {
+            return List.copyOf(registered);
+        }
+
+        /**
+         * Completes the transaction the way a successful commit does.
+         */
+        private void commit() {
+            for (Synchronization publication : registered()) {
+                publication.beforeCompletion();
+            }
+            for (Synchronization publication : registered()) {
+                publication.afterCompletion(Status.STATUS_COMMITTED);
+            }
+        }
+
+        /**
+         * Completes the transaction the way a rollback does: no publication, only completion.
+         */
+        private void rollBack() {
+            for (Synchronization publication : registered()) {
+                publication.afterCompletion(Status.STATUS_ROLLEDBACK);
+            }
+        }
+    }
+
+    /**
+     * A provider that accepts <strong>only</strong> the streaming operations, and fails the test from
+     * inside the bounded ones.
+     *
+     * <p>This is how "no ceiling was introduced" is exercised rather than asserted. The bounded forms
+     * {@link ContentStore#get(String)} and {@link ContentStore#put(String, byte[])} materialise content in
+     * the heap and are therefore required to refuse anything above
+     * {@code content.store.max.memory.bytes}; if the bridge reached either of them, an upload larger than
+     * that ceiling would fail where the pre-existing local-filesystem behaviour succeeded. Making them
+     * throw an {@link AssertionError} means a regression cannot pass by being merely slow or merely large.
+     *
+     * <p>Content is never held whole: a write is drained in chunks into a digest, and a read is generated
+     * from the same deterministic pattern, so an object far beyond any ceiling costs no heap here either.
+     */
+    private static final class StreamingOnlyContentStore implements ContentStore {
+
+        private final Map<String, Long> lengths = new HashMap<>();
+        private final Map<String, String> digests = new HashMap<>();
+        private final List<String> streamed = new ArrayList<>();
+        private final List<String> opened = new ArrayList<>();
+
+        @Override
+        public void put(String key, byte[] data) {
+            throw new AssertionError("The bounded put(String, byte[]) form must never be reached by an "
+                    + "integrated write: it caps what a deployment can upload and allocates the whole "
+                    + "document in the heap. Key: " + key);
+        }
+
+        @Override
+        public void put(String key, InputStream content, long length) throws GeneralException, IOException {
+            MessageDigest digest = digest();
+            byte[] buffer = new byte[CHUNK];
+            long drained = 0;
+            int read = content.read(buffer);
+            while (read > 0) {
+                digest.update(buffer, 0, read);
+                drained += read;
+                read = content.read(buffer);
+            }
+            if (drained != length) {
+                throw new IOException("The stream for key [" + key + "] yielded " + drained
+                        + " byte(s) but " + length + " were declared");
+            }
+            lengths.put(key, length);
+            digests.put(key, HexFormat.of().formatHex(digest.digest()));
+            streamed.add(key);
+        }
+
+        @Override
+        public byte[] get(String key) {
+            throw new AssertionError("The bounded get(String) form must never be reached by an integrated "
+                    + "read: it refuses content above the in-memory ceiling and allocates whatever it does "
+                    + "accept. Key: " + key);
+        }
+
+        @Override
+        public InputStream openStream(String key) throws GeneralException, IOException {
+            Long length = lengths.get(key);
+            if (length == null) {
+                throw new FileNotFoundException("Nothing is stored under key [" + key + "]");
+            }
+            opened.add(key);
+            return new PatternInputStream(length);
+        }
+
+        @Override
+        public long size(String key) throws GeneralException, IOException {
+            Long length = lengths.get(key);
+            if (length == null) {
+                throw new FileNotFoundException("Nothing is stored under key [" + key + "]");
+            }
+            return length;
+        }
+
+        @Override
+        public boolean exists(String key) {
+            return lengths.containsKey(key);
+        }
+
+        @Override
+        public void delete(String key) {
+            lengths.remove(key);
+            digests.remove(key);
+        }
+
+        @Override
+        public void close() {
+            // Nothing to release: this double holds only lengths and digests.
+        }
+
+        /**
+         * Seeds a stored object of the requested length, generated from the shared pattern.
+         *
+         * @param key the key to store it under
+         * @param length how long the object is
+         * @return the SHA-256 of the object's content, hex encoded
+         * @throws GeneralException if SHA-256 is unavailable, which no JRE permits
+         * @throws IOException if the generated stream cannot be read
+         */
+        private String holdPattern(String key, long length) throws GeneralException, IOException {
+            MessageDigest digest = digest();
+            byte[] buffer = new byte[CHUNK];
+            try (InputStream in = new PatternInputStream(length)) {
+                int read = in.read(buffer);
+                while (read > 0) {
+                    digest.update(buffer, 0, read);
+                    read = in.read(buffer);
+                }
+            }
+            String hex = HexFormat.of().formatHex(digest.digest());
+            lengths.put(key, length);
+            digests.put(key, hex);
+            return hex;
+        }
+
+        /**
+         * Reports the keys written as a stream.
+         *
+         * @return the keys, in order
+         */
+        private List<String> streamed() {
+            return List.copyOf(streamed);
+        }
+
+        /**
+         * Reports the keys read as a stream.
+         *
+         * @return the keys, in order
+         */
+        private List<String> opened() {
+            return List.copyOf(opened);
+        }
+
+        /**
+         * Reports how long a stored object is.
+         *
+         * @param key the key to measure
+         * @return the length, or -1 when nothing is stored
+         */
+        private long lengthOf(String key) {
+            return lengths.getOrDefault(key, -1L);
+        }
+
+        /**
+         * Reports the digest of a stored object.
+         *
+         * @param key the key to digest
+         * @return the SHA-256, hex encoded, or null when nothing is stored
+         */
+        private String digestOf(String key) {
+            return digests.get(key);
+        }
+    }
+
+    /**
+     * A stream of the deterministic pattern the large-object tests use, of any length, costing no heap.
+     */
+    private static final class PatternInputStream extends InputStream {
+
+        private long remaining;
+        private long position;
+
+        /**
+         * @param length how many bytes the stream yields
+         */
+        private PatternInputStream(long length) {
+            this.remaining = length;
+        }
+
+        @Override
+        public int read() {
+            if (remaining <= 0) {
+                return -1;
+            }
+            remaining--;
+            return byteAt(position++) & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] target, int offset, int length) {
+            if (remaining <= 0) {
+                return -1;
+            }
+            int step = (int) Math.min(length, remaining);
+            for (int i = 0; i < step; i++) {
+                target[offset + i] = byteAt(position + i);
+            }
+            position += step;
+            remaining -= step;
+            return step;
+        }
+
+        /**
+         * The pattern byte at a position, matching what {@code writePattern} produces.
+         *
+         * @param at the position in the stream
+         * @return the byte at that position
+         */
+        private static byte byteAt(long at) {
+            int within = (int) (at % CHUNK);
+            return (byte) (within * 31 + 7);
         }
     }
 }

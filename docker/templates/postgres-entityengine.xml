@@ -26,8 +26,20 @@ access. For a detailed description see the core/docs/entityconfig.html file.
  - which precedes ofbiz.jar on the runtime classpath, whenever OFBIZ_POSTGRES_HOST is set. Each at-sign delimited
  - placeholder below is substituted with a validated, XML escaped environment value in one non-recursive pass, and
  - the entry point then re-reads the rendered file to confirm that every substitution landed in its intended
- - attribute, that no placeholder survives anywhere, and that the result validates against
- - framework/entity/dtd/entity-config.xsd.
+ - attribute and that no placeholder survives anywhere. Both re-reads are fail-closed: a rendered file that does
+ - not satisfy them is deleted before the failure is reported, so the class path cannot find a configuration that
+ - was refused.
+ -
+ - Those re-reads are STRUCTURAL, not schema validation. The entry point does not validate the rendered file
+ - against framework/entity/dtd/entity-config.xsd, and it has no means to: the runtime image carries no XML
+ - schema validator on PATH, and the Entity Engine's own parse of this file logs a validation error rather than
+ - refusing to start. XSD validity is therefore a BUILD-time gate instead - SchemaInitEntryPointTests and
+ - EntityEngineConfigContractTests each render this template and validate the result against that schema with
+ - external access forbidden - while the container's own gate is the targeted read-back of the attributes the
+ - deployed profile depends on: the TLS mode of every managed URI, the JDBC deadlines, both startup-DDL flags of
+ - every named managed datasource, the cache-clear value, the test delegator's isolation from it, and the
+ - database identity each datasource authenticates as - a schema can only say the document is well typed,
+ - whereas those read-backs say the values are the ones this start requested.
  -
  - The environment variables that drive it are OFBIZ_POSTGRES_HOST and OFBIZ_POSTGRES_PORT, the three
  - OFBIZ_POSTGRES_{OFBIZ,OLAP,TENANT}_{DB,USER,PASSWORD} triples, OFBIZ_POSTGRES_SSLMODE and
@@ -43,9 +55,38 @@ access. For a detailed description see the core/docs/entityconfig.html file.
  - The raw template is well formed but is NOT XSD-valid, because boolean and integer attributes hold
  - placeholders rather than typed values; validate only after the render has substituted them.
  -
- - The placeholder census is fixed and is enforced from both sides: docker-entrypoint.sh refuses to render a
- - template whose census differs from the contract, and EntityEngineConfigContractTests asserts the same
- - census against this file from the build.
+ - The placeholder census is 20 distinct placeholders in 41 occurrences, and the two sides guard different
+ - failures rather than the same one. EntityEngineConfigContractTests pins the census itself from the build, name
+ - by name and count by count, so a placeholder cannot be added, removed or repeated here without that test
+ - failing. docker-entrypoint.sh does not re-count the census; what it enforces at run time is CLOSURE - a
+ - placeholder for which it has no writer survives the substitution pass, and the rendered file is then refused
+ - and deleted rather than installed with the undelimited placeholder text standing in for an attribute value -
+ - which the Entity Engine would read as the value itself. Between them, the census
+ - cannot drift at build time and an uncovered placeholder cannot reach a running instance.
+ -
+ - WHY THERE ARE 20. Because of the maintenance rule below, the sixteen and the four are identified by the
+ - environment variable each is substituted from rather than by placeholder name.
+ -
+ - Sixteen placeholders, in 29 of the occurrences, are named by the Agent Action Plan's own surface: the host and
+ - the port, the three database-name, username and password triples, the two connection-pool sizing variables,
+ - the two startup-DDL flags of its schema-init objective, and the cache-clear flag of its multi-instance
+ - objective. The remaining four, in 12 occurrences, exist because a review of this work required them, and each
+ - one is load-bearing for a finding that was accepted:
+ -
+ - the TLS query string, from OFBIZ_POSTGRES_SSLMODE and OFBIZ_POSTGRES_SSLROOTCERT. Its absence was raised as a
+ - CRITICAL finding by three independent reviews: with no sslmode in the URI the bundled pgJDBC resolves to a
+ - non-verifying PREFER, which neither requires encryption nor verifies the peer, and so publishes on the wire
+ - the very credentials this deployment externalises.
+ -
+ - the deadline query string, from the five OFBIZ_POSTGRES_*_TIMEOUT variables and OFBIZ_POSTGRES_TCP_KEEPALIVE,
+ - together with the pool borrow wait from OFBIZ_DB_POOL_WAIT and the borrow validation from
+ - OFBIZ_DB_POOL_TEST_ON_BORROW. Their absence was raised as a MAJOR database-resilience finding: DBCP's default
+ - borrow wait is 300,000 ms and an undeadlined socket has no bound at all, so a start up, a readiness probe or a
+ - request thread can block for minutes or indefinitely, and a pooled connection left over from a failover is
+ - handed to a request without being tested first.
+ -
+ - No placeholder here is decorative. Removing any of the four would re-commit the finding that put it here, and
+ - adding a seventeenth beyond the plan's surface requires the same written justification as these four.
  -
  - MAINTENANCE RULE: no placeholder may be named in a comment - not a secret-bearing one, and not any other.
  - sed rewrites comments as readily as attributes, so a placeholder mentioned in prose is substituted there too:
@@ -88,13 +129,22 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          services inherit use-transaction="true" with require-new-transaction="false", so a dispatch failure marks
          the caller's transaction rollback only and loses the entity write that triggered the invalidation.
          Whenever the flag resolves to true, docker-entrypoint.sh renders an active serviceMessenger into
-         /ofbiz/config/serviceengine.xml from the OFBIZ_JMS_* variables, schema validates it, reads every attribute
-         back out of the installed file, asserts that exactly one serviceMessenger is active, and pre-flights the
-         provider by performing JmsServiceEngine.runTopic's own sequence: resolving the jndi-server, looking up the
-         connection factory, opening a topic connection with the configured credentials, looking up the topic and
-         creating a publisher on it. Nothing is published, so delivery, subscribers and cache coherence are not
-         verified; every instance must be configured with the same topic and must listen on it for an invalidation
-         to reach its peers. Any failure aborts the start up under both OFBIZ_PROFILE=dev and OFBIZ_PROFILE=prod.
+         /ofbiz/config/serviceengine.xml from the OFBIZ_JMS_* variables, reads every attribute back out of the
+         installed file and compares it with what was requested, asserts that exactly one serviceMessenger is
+         active, and requires that the rendered jndi.properties declares the connection factory and topic names.
+         It then requires three pieces of start up evidence: listen="true" on the active element, so this instance
+         subscribes rather than only publishing; the initial-context-factory class it names resolving on the class
+         path; and at least one host and port in the provider URL accepting a TCP connection within a bounded
+         deadline.
+         WHAT THAT DOES NOT ESTABLISH: no JNDI context is created, the connection factory and topic names are
+         checked only for being DECLARED and are never looked up, no credentials are authenticated, no subscriber
+         or publisher is constructed, and nothing is published - so delivery between instances is not verified at
+         start up, and the three checks are necessary conditions rather than sufficient ones. A live lookup is not
+         available when the configuration is rendered, because only the JMS API is bundled and the provider's
+         client library is deployment specific. Every instance must be configured with the same physical topic and
+         must listen on it for an invalidation to reach its peers; that coherence is established by running two
+         instances and observing an invalidation arrive, not by this start up. Any failure of the three aborts the
+         start up under both OFBIZ_PROFILE=dev and OFBIZ_PROFILE=prod.
          DOCKER.adoc carries the procedure and the provider requirements. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="@DISTRIBUTED_CACHE_CLEAR@">
         <group-map group-name="org.apache.ofbiz" datasource-name="localpostgres"/>
@@ -152,10 +202,10 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          syntax appears in any comment in this file: after substituting, the entry point rejects the rendered
          artifact if any at-sign delimited token has survived, and a token quoted in prose would trip that guard
          on a file that is in fact fully rendered.
-         The host and the port are separate placeholders on purpose. The port used to have to be smuggled into
-         the host value, where it reached the URI without ever being checked; it now comes from
-         OFBIZ_POSTGRES_PORT (default 5432), is validated as a decimal integer between 1 and 65535, and a host
-         value that still carries an embedded port is refused. The host is additionally matched against two
+         The host and the port are separate placeholders on purpose. Carrying the port inside the host value
+         would let it reach the URI without ever being checked; it comes from OFBIZ_POSTGRES_PORT (default 5432)
+         instead, is validated as a decimal integer between 1 and 65535, and a host value that carries an
+         embedded port is refused. The host is additionally matched against two
          mutually exclusive grammars - an unbracketed DNS name or IPv4 literal, or a fully bracketed IPv6
          literal - so a partially bracketed, empty or otherwise malformed authority cannot reach the URI either.
          The database name, the user name and the password of each entity group are likewise separate
@@ -183,9 +233,10 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          ${user.home}/.postgresql/root.crt), so a deployment either mounts its provider CA bundle and points
          OFBIZ_POSTGRES_SSLROOTCERT at it, or imports the CA into the JVM trust store and additionally sets
          sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory.
-         Enforce it from the server as well, and prefer that lever: hostssl rules in pg_hba.conf, or
-         rds.force_ssl on a managed instance, reject a plaintext connection outright and cannot be forgotten the
-         way a per-client setting can.
+         Enforce it from the server as well: hostssl rules in pg_hba.conf, or rds.force_ssl on a managed
+         instance, make the server reject a plaintext connection outright, which a per-client setting cannot be
+         relied on to do. That is a separate concern from the certificate and hostname verification above, which
+         stays a client and deployment responsibility - neither lever substitutes for the other.
          A deployment that needs a pgJDBC connection parameter beyond the ones templated here states it on the
          jdbc-uri attributes of its own /ofbiz/config/entityengine.xml and leaves OFBIZ_POSTGRES_HOST unset,
          because it is that variable which selects the managed mode and so renders this template over that file -
@@ -223,8 +274,9 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          connection when the pool is exhausted, from OFBIZ_DB_POOL_WAIT (default 20000 ms).
          DBCPConnectionFactory maps this attribute onto GenericObjectPoolConfig.setMaxWaitMillis, and
          InlineJdbc defaults it to 300000 when the attribute is ABSENT - five minutes, which is longer than
-         any load-balancer health-check timeout and longer than most HTTP client timeouts, so an exhausted
-         pool used to be indistinguishable from a hung instance. Rendering the attribute explicitly is what
+         the health-check and HTTP client timeouts such deployments are normally configured with, so leaving
+         it absent would make an exhausted pool indistinguishable from a hung instance. Rendering the
+         attribute explicitly is what
          makes the wait a bounded, health-appropriate figure: a thread gives up, the request fails visibly
          and the readiness probe reports the instance unhealthy instead of appearing to hang.
          pool-jdbc-test-stmt and test-while-idle together stop the pool handing out a connection that died

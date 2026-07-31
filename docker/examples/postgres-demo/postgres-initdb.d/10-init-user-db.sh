@@ -20,11 +20,11 @@
 
 # Provisions the three OFBiz databases of the compose example with TWO accounts each.
 #
-# This script used to create one account per database and give it ALL PRIVILEGES, which is the
-# privilege set the container needs while it is CREATING the schema, not the one it needs while it is
-# serving traffic. Rendering check-on-start="false" and add-missing-on-start="false" stops a serving
-# instance from ISSUING DDL, but as long as it authenticates as an account that MAY issue DDL, anything
-# that reaches the instance or reads its environment inherits that privilege.
+# One account per database holding ALL PRIVILEGES would grant the privilege set the container needs
+# while it is CREATING the schema, not the one it needs while it is serving traffic. Rendering
+# check-on-start="false" and add-missing-on-start="false" stops a serving instance from ISSUING DDL,
+# but as long as it authenticates as an account that MAY issue DDL, anything that reaches the instance
+# or reads its environment inherits that privilege.
 #
 # So each database gets:
 #

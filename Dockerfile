@@ -126,11 +126,11 @@ USER ofbiz
 RUN /ofbiz/bin/ofbiz --load-data
 
 # Record that load, so a container from this image starts immediately instead of loading the demo data
-# a second time. The entry point owns the format of the container state markers, so it writes them:
-# these used to be three empty files created with 'touch', which a checksummed marker no longer accepts,
-# and which was also wrong - an empty data_loaded suppressed the load even when the image was pointed at
-# an external database, leaving the container serving an empty schema. The marker written here is bound
-# to the embedded database baked into this image, so that case now loads correctly.
+# a second time. The entry point owns the format of the container state markers, so it writes them here
+# rather than this stage creating them with 'touch': a checksummed marker does not accept an empty file,
+# and an empty data_loaded would suppress the load even when the image is pointed at an external
+# database, leaving the container serving an empty schema. The marker written here is bound to the
+# embedded database baked into this image, so that case loads correctly.
 #
 # No db_config_applied marker is written: no database is configured at build time, so there is nothing
 # for it to record.

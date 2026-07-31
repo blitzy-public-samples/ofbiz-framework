@@ -91,9 +91,7 @@ public final class ContentStoreProviderSelectionTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Database storage is the default, and the default is what keeps existing deployments intact
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -136,9 +134,7 @@ public final class ContentStoreProviderSelectionTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Anything that is not one of those three states fails closed
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -148,7 +144,7 @@ public final class ContentStoreProviderSelectionTests {
             ContentStoreFactory.clearCache();
             select(typo);
 
-            // The refusal is the fix for the fail-open selection this suite used to pin. An operator who writes
+            // The refusal is what makes an unrecognised value fail closed. An operator who writes
             // "s4" for "s3", or "local" for "filesystem", has stated that content must leave the database;
             // answering null would put it back there without a word, in a backend with different retention and
             // access controls, and the mistake would surface only when someone went looking for the content.
@@ -221,9 +217,7 @@ public final class ContentStoreProviderSelectionTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The two providers that do exist, and how forgiving the value is
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -238,7 +232,7 @@ public final class ContentStoreProviderSelectionTests {
     public void theS3ValueSelectsTheObjectStorageProvider() throws Exception {
         select("s3");
 
-        // Reaching this class is also the proof that selecting s3 costs nothing until it is used: its constructor
+        // Reaching this class also shows that selecting s3 costs nothing until it is used: its constructor
         // reads configuration only, so no credential is resolved and no connection is opened here.
         assertInstanceOf(S3ContentStore.class, ContentStoreFactory.getContentStore(),
                 "s3 must select the object-storage provider");
@@ -279,9 +273,7 @@ public final class ContentStoreProviderSelectionTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Caching: one resolution per distinct value, and a seam to discard it
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -343,9 +335,7 @@ public final class ContentStoreProviderSelectionTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The delegator-aware overload
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -372,7 +362,7 @@ public final class ContentStoreProviderSelectionTests {
             assertInstanceOf(S3ContentStore.class, ContentStoreFactory.getContentStore(delegator),
                     "a SystemProperty override must be able to select a provider the property file does not");
 
-            // Pinning the four arguments is what proves the committed key names are the ones consumed, and that
+            // Pinning the four arguments is what pins the committed key names as the ones consumed, and that
             // "database" - not "" - is the default handed to the lookup, which is why an emptied SystemProperty
             // row means database storage instead of taking the unrecognised-value branch.
             databaseLookup.verify(() -> EntityUtilProperties.getPropertyValue(CONTENT_RESOURCE, PROVIDER_PROPERTY, "database", delegator));
@@ -442,9 +432,7 @@ public final class ContentStoreProviderSelectionTests {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /** Configures the provider selector for one test, remembering what it held. */

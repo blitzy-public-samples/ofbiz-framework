@@ -22,15 +22,27 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
+import javax.transaction.Status;
 import javax.transaction.Synchronization;
+import javax.transaction.SystemException;
+import javax.transaction.TransactionManager;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.FileUtil;
@@ -40,6 +52,7 @@ import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.base.util.UtilValidate;
 import org.apache.ofbiz.entity.Delegator;
 import org.apache.ofbiz.entity.transaction.GenericTransactionException;
+import org.apache.ofbiz.entity.transaction.TransactionFactoryLoader;
 import org.apache.ofbiz.entity.transaction.TransactionUtil;
 import org.apache.ofbiz.entity.util.EntityUtilProperties;
 import org.apache.ofbiz.security.SecurityUtil;
@@ -66,7 +79,7 @@ import org.apache.ofbiz.security.SecurityUtil;
  * <p>That render is validated at container start rather than here: the entry point refuses a
  * provider name that is not one of the three below, writes the whole resource - not a fragment,
  * because an OFBiz property override shadows a resource rather than being merged into it - with
- * mode {@code 0600}, reads back every value it wrote, and then removes all eleven object-store
+ * mode {@code 0600}, reads back every value it wrote, and then removes all ten object-store
  * variables from the environment the OFBiz process inherits. When no object-store variable is set
  * at all it renders nothing, so an unconfigured deployment reads the committed file unchanged.
  * {@code ContentStoreRenderingTests} is the executable contract of that chain, from environment
@@ -80,8 +93,6 @@ import org.apache.ofbiz.security.SecurityUtil;
  *   <li>{@code s3} - an {@link S3ContentStore}, configured from the {@code content.store.s3.*}
  *       properties.</li>
  * </ul>
- * Matching ignores case and surrounding whitespace, so {@code Database} and {@code S3} are
- * understood, as is a value padded with spaces. No other spelling, abbreviation or synonym is.
  *
  * <p><strong>{@code null} is the database-storage signal, not an error.</strong> Both
  * {@link #getContentStore()} and {@link #getContentStore(Delegator)} return {@code null}
@@ -130,14 +141,14 @@ import org.apache.ofbiz.security.SecurityUtil;
  * through {@code computeIfAbsent}, which constructs at most one provider per value however many
  * threads resolve it at once, so no provider is ever left unreachable while it still holds a
  * connection pool open. It is keyed by configuration rather than by anything a request carries, so it
- * holds one small entry per distinct configured spelling. Both providers are documented as holding no
+ * holds one small entry per distinct canonical value. Both providers are documented as holding no
  * per-request state, so the one instance is shared safely by every request thread. A refusal is
  * cached exactly as a success is - reported once, then enforced without rebuilding anything - and
  * correcting the value takes effect immediately, because a corrected value is a different key.
  *
  * <p><strong>Nothing is left orphaned.</strong> {@link #clearCache()} closes whatever each evicted
- * outcome held, and a hook registered the first time a provider is built closes the rest at JVM
- * shutdown, so no provider ever survives with its object-storage client or its connection pool still
+ * outcome held, and a hook registered the first time a provider is built closes whatever is still
+ * cached at JVM shutdown, so no provider ever survives with its object-storage client or its connection pool still
  * open. A deployment in configured database mode constructs no provider and so installs no hook at
  * all.
  *
@@ -162,6 +173,11 @@ import org.apache.ofbiz.security.SecurityUtil;
  *       this method when a transaction is available and the surrounding guards are not needed.</li>
  *   <li>{@link #openContentStream(String, String, String)} streams a stored object for
  *       {@code DataResourceWorker.renderFile}, which needs no file at all.</li>
+ *   <li>{@link #resolveUploadPath(Delegator, boolean)} answers with the active provider's own upload
+ *       location, but only for a provider that both names one and backs the very local file it names
+ *       - the filesystem provider - because the location is written to directly by frozen services
+ *       that open a {@code FileOutputStream} on it. Any other provider declines, which is what sends
+ *       the allocation on to the staging path below.</li>
  *   <li>{@link #uploadStagingPath(String, boolean)} answers
  *       {@code DataResourceWorker.getDataResourceContentUploadPath} with a per-allocation staging
  *       directory whose contents are published on commit, which is what captures the two writers
@@ -187,17 +203,9 @@ public final class ContentStoreFactory {
 
     private static final String MODULE = ContentStoreFactory.class.getName();
 
-    /**
-     * The property naming the active provider. {@code docker/docker-entrypoint.sh} fills it from
-     * the {@code OFBIZ_CONTENT_STORE_PROVIDER} environment variable.
-     */
     private static final String PROPERTY_PROVIDER = "content.store.provider";
 
-    /**
-     * Keeps the pre-existing {@code DataResource} database storage. This is the committed value of
-     * {@link #PROPERTY_PROVIDER} and the meaning of an unset or blank value - and of nothing else, so
-     * that content can only reach the database when the database was actually asked for.
-     */
+    /** The committed value of {@link #PROPERTY_PROVIDER}, and the meaning of an unset or blank value. */
     private static final String PROVIDER_DATABASE = "database";
 
     private static final String PROVIDER_FILESYSTEM = "filesystem";
@@ -213,28 +221,35 @@ public final class ContentStoreFactory {
     /** Stable code reported when a provider that is no longer in use could not be closed. */
     private static final String EVENT_CLOSE_FAILED = "CONTENT-STORE-PROVIDER-CLOSE-FAILED";
 
-    /** Name of the thread that closes the last resolved provider at JVM shutdown. */
+    /**
+     * Stable code reported when content could not be staged on local disk for a frozen caller.
+     *
+     * <p>A code rather than prose because the prose around it carries no identifier a reader could
+     * search for: keys and paths are reported as opaque references, so the code is what makes one
+     * class of failure findable in a log without any caller-influenced text being echoed.
+     */
+    private static final String EVENT_STAGE_FAILED = "CONTENT-STORE-STAGE-FAILED";
+
+    /** Stable code reported when content written locally could not be published to the store. */
+    private static final String EVENT_PUBLISH_FAILED = "CONTENT-STORE-PUBLISH-FAILED";
+
     private static final String SHUTDOWN_THREAD_NAME = "ofbiz-content-store-shutdown";
 
-    /** Whether the shutdown hook that closes the last provider has been registered. */
     private static final AtomicBoolean SHUTDOWN_HOOK_REGISTERED = new AtomicBoolean();
 
     /** {@code DataResource.dataResourceTypeId} for content held at an absolute local path. */
     private static final String TYPE_LOCAL_FILE = "LOCAL_FILE";
 
-    /** The binary companion of {@link #TYPE_LOCAL_FILE}. */
     private static final String TYPE_LOCAL_FILE_BIN = "LOCAL_FILE_BIN";
 
     /** {@code DataResource.dataResourceTypeId} for content held relative to {@code ofbiz.home}. */
     private static final String TYPE_OFBIZ_FILE = "OFBIZ_FILE";
 
-    /** The binary companion of {@link #TYPE_OFBIZ_FILE}. */
     private static final String TYPE_OFBIZ_FILE_BIN = "OFBIZ_FILE_BIN";
 
     /** {@code DataResource.dataResourceTypeId} for content held relative to a separate context root. */
     private static final String TYPE_CONTEXT_FILE = "CONTEXT_FILE";
 
-    /** The binary companion of {@link #TYPE_CONTEXT_FILE}. */
     private static final String TYPE_CONTEXT_FILE_BIN = "CONTEXT_FILE_BIN";
 
     /**
@@ -256,10 +271,36 @@ public final class ContentStoreFactory {
     private static final AtomicLong STAGING_SEQUENCE = new AtomicLong();
 
     /**
+     * Name parts of the temporary file a fetch streams into before it is moved onto its target.
+     *
+     * <p>The prefix starts with a dot so that a partially fetched object is not picked up by the
+     * upload-directory scan, and the suffix names the reason the file exists so that one left behind
+     * by a killed process is identifiable rather than mysterious.
+     */
+    private static final String FETCH_PREFIX = ".contentstore-fetch-";
+
+    private static final String FETCH_SUFFIX = ".part";
+
+    /**
      * The modification time a freshly materialised staging file is backdated to, so that any write
      * through it is detectable even when the write keeps the byte count identical.
      */
     private static final long STAGED_SENTINEL_MODIFIED = 1000L;
+
+    /**
+     * The storage keys each in-flight transaction has already attached a publication for.
+     *
+     * <p>Keyed on the transaction rather than on the thread because OFBiz suspends and resumes
+     * transactions on a single thread: a thread-wide record would let a publication belonging to a
+     * suspended transaction suppress the publication a nested transaction needs, losing that write.
+     *
+     * <p>Weak keys, following {@code ServiceSynchronization}, which holds its per-transaction
+     * synchronizations the same way. The transaction manager holds every live transaction, so an entry
+     * survives exactly as long as the transaction it belongs to can still complete, and a transaction
+     * abandoned without completing cannot leak an entry. Access is serialised on the map itself because
+     * {@link WeakHashMap} is not thread safe and transactions on different threads share it.
+     */
+    private static final Map<Object, Set<String>> PUBLISHED_KEYS = new WeakHashMap<>();
 
     /**
      * The outcome of every canonical configured value resolved so far, empty before anything has
@@ -295,8 +336,8 @@ public final class ContentStoreFactory {
      *     absent, blank or {@code database} value
      */
     public static ContentStore getContentStore() throws GeneralException {
-        // The three-argument lookup self-defaults, yielding PROVIDER_DATABASE for an absent, blank
-        // or whitespace-only property value, so no separate emptiness check is needed here.
+        // The three-argument lookup trims and self-defaults, so a whitespace-only value yields
+        // PROVIDER_DATABASE and no separate emptiness check is needed here.
         return resolve(UtilProperties.getPropertyValue(ContentStoreSupport.PROPERTY_RESOURCE, PROPERTY_PROVIDER,
                 PROVIDER_DATABASE));
     }
@@ -325,12 +366,28 @@ public final class ContentStoreFactory {
     }
 
     /**
-     * Returns the location the active provider wants the next uploaded file placed in.
+     * Returns the upload location the active provider owns directly, if it owns one at all.
      *
      * <p>This is how {@code DataResourceWorker} asks the question without knowing which provider is
-     * active. In configured database mode there is no provider and therefore no answer, and
-     * {@code null} is returned so that the caller keeps computing the location exactly as it always
-     * has.
+     * active. Only a provider that is <em>both</em> a {@link ContentUploadLocation} and a
+     * {@link LocalContentStore} answers it: the first says it can name an upload location, and the
+     * second says the location it names is the very file the provider stores, so a file written there
+     * by the component's frozen write services is already in the store and needs no publication. The
+     * filesystem provider is the one that satisfies both.
+     *
+     * <p>Every other case returns {@code null}, which tells the caller to compute the location itself
+     * - and, because the caller's own computation is
+     * {@link #uploadStagingPath(String, boolean)} whenever a provider is active, an upload bound for a
+     * provider that does not back a local file is staged on local disk and published when the
+     * transaction commits. That is the only correct answer for such a provider. A location handed back
+     * here is written to directly by services this refactor must leave untouched, which open a
+     * {@code FileOutputStream} on it and, for {@code LOCAL_FILE}, require it to be absolute; a bucket
+     * has no such path, and a key prefix is not one - returned here it would be created as a relative
+     * directory beside the process working directory and never reach the store at all.
+     *
+     * <p>So database mode returns {@code null} because there is no provider; an object store returns
+     * {@code null} because its answer would not be a writable local location; and only the filesystem
+     * provider, whose answer is both, returns a location of its own.
      *
      * @param delegator the delegator used to let the {@code SystemProperty} entity override both the
      *     provider selection and the configured location; may be {@code null}
@@ -338,13 +395,14 @@ public final class ContentStoreFactory {
      *     addressed; {@code false} for the form relative to the OFBiz home directory, which is how
      *     {@code OFBIZ_FILE} content is addressed
      * @return the location the next uploaded file should be placed in, or {@code null} when database
-     *     storage is configured and the caller must compute the location itself
+     *     storage is configured, or when the active provider does not itself back a local file, and
+     *     the caller must therefore compute the location itself
      * @throws GeneralException if the configured value names no recognised provider, if the provider
      *     cannot be constructed, or if the provider cannot establish a usable location
      */
     public static String resolveUploadPath(Delegator delegator, boolean absolute) throws GeneralException {
         ContentStore store = getContentStore(delegator);
-        if (store instanceof ContentUploadLocation) {
+        if (store instanceof ContentUploadLocation && store instanceof LocalContentStore) {
             return ((ContentUploadLocation) store).uploadPath(delegator, absolute);
         }
         return null;
@@ -358,11 +416,8 @@ public final class ContentStoreFactory {
      * <p>Production code never needs this. A provider is resolved once per distinct configured
      * value and then cached for the life of the JVM, which is exactly what makes several provider
      * values impossible to exercise from a single test JVM without a reset. The seam therefore
-     * exists so that the unit tests in the sibling {@code src/test/java} tree - which share this
-     * package and so reach a package-private member, a different source root being irrelevant to
-     * package-private access in Java - can drive {@code database}, {@code filesystem}, {@code s3}
-     * and an unrecognised value within one run. It is deliberately not public, so it widens no
-     * API.
+     * exists so that one test JVM can drive {@code database}, {@code filesystem}, {@code s3} and an
+     * unrecognised value in turn. It is deliberately not public, so it widens no API.
      *
      * <p>Discarding a provider also releases what it owns: an object-storage client the discarded
      * provider opened is closed here rather than left to the garbage collector, which would never
@@ -403,10 +458,100 @@ public final class ContentStoreFactory {
         closeQuietly(RESOLUTIONS.put(provider, Resolution.succeeded(provider, store)));
     }
 
-    // -------------------------------------------------------------------------------------------
-    // The storage-aware bridge. The type documentation explains how the pieces fit together and
-    // which frozen call site each one serves.
-    // -------------------------------------------------------------------------------------------
+    /**
+     * How a publication is attached to the surrounding transaction.
+     *
+     * <p>One interface with one production implementation, for the same reason
+     * {@link #installForTesting(String, ContentStore)} exists: the behaviour on the far side of this
+     * boundary cannot be reached from a unit test. {@code TransactionUtil} answers
+     * {@code IllegalStateException} from {@code TransactionFactoryLoader} whenever the entity
+     * container has not started a transaction factory, which is the situation in every test JVM, so
+     * {@link #currentTransaction()} is permanently {@code null} there. Registration - the whole point
+     * of the durability guarantee - would therefore be covered by nothing at all. Seating a registrar
+     * lets a test observe exactly what production registers, and with what.
+     */
+    interface PublicationRegistrar {
+
+        /**
+         * Identifies the transaction a publication would be attached to.
+         *
+         * <p>An identity rather than a flag, because {@link #publishOnCommit} has to tell one
+         * transaction from another: OFBiz suspends and resumes transactions on the <em>same</em>
+         * thread, so a thread can be running a second transaction while a first is suspended, and a
+         * publication already attached to the first must not be taken to cover the second.
+         *
+         * @return the transaction in place, or {@code null} when there is none that could accept a
+         *     publication
+         * @throws GeneralException if the transaction manager cannot be asked
+         */
+        Object currentTransaction() throws GeneralException;
+
+        /**
+         * Attaches a publication to the current transaction.
+         *
+         * @param publication the publication to attach
+         * @throws GenericTransactionException if the transaction refuses the registration
+         */
+        void register(Synchronization publication) throws GenericTransactionException;
+    }
+
+    /**
+     * The production registrar: the OFBiz transaction manager itself.
+     *
+     * <p>Stateless and immutable, so the single instance below is shared by every thread.
+     */
+    private static final class TransactionRegistrar implements PublicationRegistrar {
+
+        @Override
+        public Object currentTransaction() throws GeneralException {
+            try {
+                TransactionManager manager = TransactionFactoryLoader.getInstance().getTransactionManager();
+                // Only an active transaction is answered. TransactionUtil.registerSynchronization
+                // silently does nothing for any other status, so reporting a transaction that is, say,
+                // already marked rollback-only would claim a publication that was never attached.
+                if (manager == null || manager.getStatus() != Status.STATUS_ACTIVE) {
+                    return null;
+                }
+                return manager.getTransaction();
+            } catch (SystemException e) {
+                // The one failure this class still chains. A transaction manager's SystemException is
+                // raised by local infrastructure that no caller can influence and that holds no storage
+                // key, path, bucket, endpoint or credential, so it falls outside the remote-and-I/O text
+                // the SPI forbids composing - and diagnosing a transaction manager fault needs its trace.
+                throw new GeneralException("Cannot determine whether a transaction is in place", e);
+            } catch (IllegalStateException e) {
+                // This is what TransactionFactoryLoader answers while the entity container has not
+                // started a transaction factory - during a unit test, or in any process that uses the
+                // Content component without the entity container. There is then no transaction
+                // infrastructure at all, which for publication purposes is the same situation as no
+                // transaction being in place, so it is reported the same way rather than as a failure.
+                Debug.logVerbose("No transaction factory is initialised, so no publication can be"
+                        + " registered: " + summarise(e), MODULE);
+                return null;
+            }
+        }
+
+        @Override
+        public void register(Synchronization publication) throws GenericTransactionException {
+            TransactionUtil.registerSynchronization(publication);
+        }
+    }
+
+    /** The registrar every publication is attached through; the transaction manager unless a test seats one. */
+    private static volatile PublicationRegistrar registrar = new TransactionRegistrar();
+
+    /**
+     * Package-private test seam: replaces the registrar publications are attached through.
+     *
+     * <p>Production never calls this. See {@link PublicationRegistrar} for why a test cannot otherwise
+     * observe a registration at all.
+     *
+     * @param replacement the registrar to attach publications through, or {@code null} to restore the
+     *     transaction manager
+     */
+    static void installPublicationRegistrarForTesting(PublicationRegistrar replacement) {
+        registrar = replacement == null ? new TransactionRegistrar() : replacement;
+    }
 
     /**
      * Derives the durable storage key of a file-backed data resource.
@@ -447,6 +592,14 @@ public final class ContentStoreFactory {
         if (UtilValidate.isEmpty(objectInfo)) {
             throw new GeneralException("Cannot derive a content storage key: objectInfo is null or empty");
         }
+        if (ContentStoreUtil.hasUnsafeCharacter(objectInfo)) {
+            // Refused here rather than sanitised later, because this is the one place a location becomes
+            // a key: a location carrying a newline or a terminal escape would otherwise be stored under a
+            // key no operator can address and would travel into every diagnostic about it. No legitimate
+            // DataResource location contains a control character, so nothing usable is turned away.
+            throw new GeneralException("Cannot derive a content storage key: the location carries a control"
+                    + " character, which no storage key may contain");
+        }
         String type = dataResourceTypeId == null ? "" : dataResourceTypeId.trim();
         String location = slashed(objectInfo);
         if (TYPE_OFBIZ_FILE.equals(type) || TYPE_OFBIZ_FILE_BIN.equals(type)) {
@@ -460,7 +613,7 @@ public final class ContentStoreFactory {
             return flatKey(relativeToHome(location));
         }
         throw new GeneralException("Cannot derive a content storage key for dataResourceTypeId ["
-                + type + "]: it is not one of the six file backed types");
+                + ContentStoreUtil.describe(type) + "]: it is not one of the six file backed types");
     }
 
     /**
@@ -512,7 +665,8 @@ public final class ContentStoreFactory {
         if (!alreadyStaged) {
             fetchInto(store, key, local, objectInfo);
         }
-        registerOrWarn(new ContentFilePublication(key, local, alreadyStaged), "content for key [" + key + "]");
+        registerOrWarn(new ContentFilePublication(key, local, alreadyStaged),
+                "content for " + ContentStoreUtil.reference(key));
         return local;
     }
 
@@ -594,25 +748,26 @@ public final class ContentStoreFactory {
      *     pre-existing method receives it
      * @param absolute {@code true} for the absolute form {@code LOCAL_FILE} uploads use,
      *     {@code false} for the {@code ofbiz.home}-relative form {@code OFBIZ_FILE} uploads use
+     * <p><strong>One failure policy.</strong> Every refusal leaves this method as a checked
+     * {@link GeneralException} - a {@link ContentStoreConfigurationException} when the deployment's
+     * configuration cannot be honoured, a plain one when a usable provider's staging location cannot
+     * be allocated. Nothing is converted to an unchecked failure here. The frozen caller, which
+     * declares no checked exception, performs that conversion once at its own boundary, so the two
+     * ways into this package - this method and {@link #resolveUploadPath(Delegator, boolean)} -
+     * report the identical condition identically instead of one throwing checked and the other
+     * unchecked. The configuration is resolved before any location is allocated, so a misconfigured
+     * deployment is refused before the frozen upload work begins rather than after a directory has
+     * been created for it.
+     *
      * @return the staging path in the requested form, or {@code null} in database mode, in which
      *     case the caller keeps allocating the location itself exactly as before
-     * @throws GeneralRuntimeException if the staging directory cannot be allocated; the pre-existing
-     *     method declares no checked exception, and falling back to a local directory would store
+     * @throws GeneralException a {@link ContentStoreConfigurationException} if the configured
+     *     provider cannot be honoured, or a plain one if the staging directory cannot be allocated;
+     *     either way the upload is refused, because falling back to a local directory would store
      *     content the provider never receives
      */
-    public static String uploadStagingPath(String initialPath, boolean absolute) {
-        ContentStore store;
-        try {
-            store = getContentStore();
-        } catch (GeneralException e) {
-            // The frozen caller - DataResourceWorker.getDataResourceContentUploadPath - declares no
-            // checked exception, so a configured value that cannot be honoured is reported unchecked
-            // rather than swallowed. Returning null here would send the upload to a local directory
-            // the deployment did not ask for, which is the very fail-open behaviour this refuses.
-            throw new GeneralRuntimeException("No content storage provider could be resolved from "
-                    + ContentStoreSupport.PROPERTY_RESOURCE + ":" + PROPERTY_PROVIDER
-                    + ", so no upload staging location can be allocated", e);
-        }
+    public static String uploadStagingPath(String initialPath, boolean absolute) throws GeneralException {
+        ContentStore store = getContentStore();
         if (store == null) {
             return null;
         }
@@ -625,13 +780,16 @@ public final class ContentStoreFactory {
             String located = requiredHome() + relative;
             File directory = requireResolved(located, FileUtil.getFile(located));
             if (!directory.isDirectory() && !directory.mkdirs() && !directory.isDirectory()) {
-                throw new GeneralException("Cannot create the content staging directory [" + located + "]");
+                throw new GeneralException("Cannot create the content staging directory ["
+                        + ContentStoreUtil.describe(relative) + "] under the OFBiz home directory");
             }
             SecurityUtil.checkOfbizFileAllowList(directory);
-            registerOrWarn(new StagedUploadPublication(directory), "uploads staged in [" + relative + "]");
+            registerOrWarn(new StagedUploadPublication(directory),
+                    "uploads staged in [" + ContentStoreUtil.describe(relative) + "]");
             return absolute ? directory.getAbsolutePath().replace('\\', '/') : relative;
         } catch (GeneralException e) {
-            throw new GeneralRuntimeException("Cannot allocate a content staging directory at [" + relative + "]", e);
+            throw new GeneralException("Cannot allocate a content staging directory at ["
+                    + ContentStoreUtil.describe(relative) + "]", e);
         }
     }
 
@@ -681,12 +839,25 @@ public final class ContentStoreFactory {
             SecurityUtil.checkLocalFileAllowList(file);
             return file;
         }
-        throw new GeneralException("Cannot resolve a local file for dataResourceTypeId [" + type
+        throw new GeneralException("Cannot resolve a local file for dataResourceTypeId ["
+                + ContentStoreUtil.describe(type)
                 + "]: it is not one of the six file backed types");
     }
 
     /**
      * Fetches a stored object into a local staging file, creating the directory holding it.
+     *
+     * <p>The object is <strong>streamed</strong>, never materialised in the heap. Content whose size
+     * an uploader chose is exactly what travels through here, so reading it whole would impose a
+     * ceiling on how large a document a deployment may store - and, up to that ceiling, would let one
+     * request allocate as much heap as the largest object in the store. The bounded convenience form
+     * {@link ContentStore#get(String)} is therefore deliberately not used; see the ceilings documented
+     * on {@link ContentStore}.
+     *
+     * <p>The stream lands in a temporary file beside the target and is moved onto it, so a reader that
+     * resolves the same location while the fetch is in progress sees either no file or the whole file,
+     * never a partially written one - and a fetch that fails part-way leaves nothing behind for a
+     * later read to mistake for stored content.
      *
      * @param store the active provider
      * @param key the storage key to read
@@ -698,34 +869,69 @@ public final class ContentStoreFactory {
      */
     private static void fetchInto(ContentStore store, String key, File local, String objectInfo)
             throws GeneralException, FileNotFoundException {
-        byte[] content;
+        File parent = local.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+            throw new GeneralException("Cannot create the directory holding staged content "
+                    + ContentStoreUtil.reference(parent.getPath()));
+        }
+        Path target = local.toPath();
+        Path directory = target.getParent() == null ? Paths.get(".") : target.getParent();
+        Path partial = null;
         try {
-            content = store.get(key);
+            partial = Files.createTempFile(directory, FETCH_PREFIX, FETCH_SUFFIX);
+            try (InputStream content = store.openStream(key)) {
+                Files.copy(content, partial, StandardCopyOption.REPLACE_EXISTING);
+            }
+            moveOnto(partial, target);
+            partial = null;
         } catch (FileNotFoundException e) {
             FileNotFoundException absent = new FileNotFoundException("No file found: " + objectInfo);
             absent.initCause(e);
             throw absent;
         } catch (IOException e) {
-            throw new GeneralException("Cannot read content for key [" + key + "]: " + e.getMessage(), e);
+            // Not chained, and not only unquoted: GeneralException.getMessage() composes a nested
+            // exception's message into its own, so chaining a failure raised by a provider or by the
+            // operating system would publish that text through every reader of this message however
+            // carefully the message itself was built. The type is named instead, and the stable code
+            // and the references are what a reader correlates with the provider's own log.
+            throw new GeneralException(EVENT_STAGE_FAILED + ": cannot stage content for "
+                    + ContentStoreUtil.reference(key) + " at " + ContentStoreUtil.reference(local.getPath())
+                    + ": " + summarise(e));
+        } finally {
+            if (partial != null) {
+                discard(partial.toFile());
+            }
         }
-        File parent = local.getParentFile();
-        if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
-            throw new GeneralException("Cannot create the directory holding staged content [" + parent.getPath() + "]");
-        }
+    }
+
+    /**
+     * Replaces one file with another, atomically where the filesystem supports it.
+     *
+     * @param partial the fully written temporary file to move
+     * @param target the location to move it onto, replacing whatever is there
+     * @throws IOException if neither the atomic nor the replacing move succeeds
+     */
+    private static void moveOnto(Path partial, Path target) throws IOException {
         try {
-            Files.write(local.toPath(), content);
-        } catch (IOException e) {
-            throw new GeneralException("Cannot stage content for key [" + key + "] at ["
-                    + local.getPath() + "]: " + e.getMessage(), e);
+            Files.move(partial, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            // Not every filesystem can move atomically; a replacing move is still a single rename on
+            // every implementation OFBiz runs on, and it is strictly better than writing in place.
+            Files.move(partial, target, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
     /**
      * Writes a staged local file to the active provider.
      *
-     * <p>The whole file is read into memory because the storage contract is byte oriented; that is
-     * the shape of {@link ContentStore#put(String, byte[])} and of the data-resource content it
-     * carries.
+     * <p>The file is <strong>streamed</strong> with its measured length, never read into memory. A
+     * staged file holds content an uploader chose the size of, so
+     * {@link ContentStore#put(String, byte[])} - which refuses anything above
+     * {@code content.store.max.memory.bytes} - would put a ceiling on what a deployment can upload
+     * that the pre-existing local-filesystem behaviour never had, and would allocate the whole
+     * document in the heap of whichever instance served the upload. The length is taken from the file
+     * immediately before the stream is opened, which is what the streaming contract requires and what
+     * lets a provider declare a content length up front.
      *
      * @param key the storage key to write under
      * @param staged the staged local file to publish
@@ -735,15 +941,56 @@ public final class ContentStoreFactory {
     private static void publish(String key, File staged) throws GeneralException {
         ContentStore store = getContentStore();
         if (store == null) {
-            throw new GeneralException("Cannot publish content for key [" + key
-                    + "]: no content storage provider is active");
+            throw new GeneralException("Cannot publish content for " + ContentStoreUtil.reference(key)
+                    + ": no content storage provider is active");
         }
+        Path path = staged.toPath();
         try {
-            store.put(key, Files.readAllBytes(staged.toPath()));
+            long length = Files.size(path);
+            try (InputStream content = Files.newInputStream(path, StandardOpenOption.READ)) {
+                store.put(key, content, length);
+            }
         } catch (IOException e) {
-            throw new GeneralException("Cannot publish content for key [" + key + "] from ["
-                    + staged.getPath() + "]: " + e.getMessage(), e);
+            // Neither quoted nor chained, for the reason given in fetchInto: a nested message would
+            // reach every reader of this one through GeneralException.getMessage().
+            throw new GeneralException(EVENT_PUBLISH_FAILED + ": cannot publish content for "
+                    + ContentStoreUtil.reference(key) + " from " + ContentStoreUtil.reference(staged.getPath())
+                    + ": " + summarise(e));
         }
+    }
+
+    /**
+     * Summarises a failure for a diagnostic without reproducing anything it says.
+     *
+     * <p>The type name is locally generated - it names a class on this classpath - whereas the
+     * message is not: an {@code IOException} raised by an object store, a proxy or the operating
+     * system carries text this package did not write and cannot vouch for, and a message containing
+     * a newline placed into a log line would forge a record. The failure itself is still chained as
+     * the cause of whatever is thrown, so a reader loses nothing: the full detail reaches the log
+     * through the stack trace, where it is rendered as a trace rather than as a line of its own.
+     *
+     * @param cause the failure to summarise; may be null
+     * @return a short summary that is always safe to place in a message, never null
+     */
+    private static String summarise(Throwable cause) {
+        return cause == null ? "<none>" : cause.getClass().getSimpleName();
+    }
+
+    /**
+     * Renders a content identifier as the opaque reference this package puts into a diagnostic.
+     *
+     * <p>Exists because {@code DataResourceWorker} reports on the same content this package stores,
+     * from another package, and the SPI's rule that a diagnostic carries no raw key applies to both
+     * sides of the seam. Rather than widening the package-private redactors, the one operation the
+     * worker needs is offered here, so there is a single implementation of the rule and a single
+     * form of reference: a failure logged by the worker and a failure logged by a provider about the
+     * same content produce the same reference and can be correlated.
+     *
+     * @param value the content identifier - a storage key, or a path derived from one; may be null
+     * @return a stable, opaque reference that is safe to place in any message, never null
+     */
+    public static String reference(String value) {
+        return ContentStoreUtil.reference(value);
     }
 
     /**
@@ -759,55 +1006,110 @@ public final class ContentStoreFactory {
         try {
             Files.deleteIfExists(staged.toPath());
         } catch (IOException e) {
-            Debug.logWarning("Cannot remove the staged content file [" + staged.getPath() + "]: "
-                    + e.getMessage() + ". It will be published and removed by the next access to the"
+            Debug.logWarning("Cannot remove the staged content file " + ContentStoreUtil.reference(staged.getPath())
+                    + ": " + summarise(e) + ". It will be published and removed by the next access to the"
                     + " same location.", MODULE);
         }
     }
 
     /**
+     * Arranges for a caller's own publication to run when the surrounding transaction commits.
+     *
+     * <p>This exists for {@code DataResourceWorker.getContentFile}. That method hands a caller a real
+     * local {@link File} and cannot tell a read from a write, so a caller that writes through the file
+     * <em>after</em> it was resolved - {@code DataServices.createBinaryFileMethod} and
+     * {@code updateBinaryFileMethod} open a {@code FileOutputStream} on exactly that file - has
+     * written content the provider has not seen. Reconciling at the next resolution catches it only on
+     * the instance that did the write, and only if a later resolution happens at all: another instance
+     * has no local copy, finds the object unchanged in the store, and serves the content the write was
+     * meant to replace. Registering the publication at resolution time closes that gap, because the
+     * write is published by the very transaction that performed it.
+     *
+     * <p>The registration machinery is here rather than at the seam because it belongs to this
+     * package: the seam must not learn about transaction managers, and this factory already owns
+     * every other publication. Publication runs in {@code beforeCompletion}, so a store that refuses
+     * the write rolls the transaction back rather than committing a {@code DataResource} row whose
+     * content was never stored.
+     *
+     * <p>At most one publication is attached per key per transaction. One transaction routinely
+     * resolves the same resource several times - the render pipeline, {@code ContentWorker} and a write
+     * service can each ask for it - and every extra publication would be another store round trip for
+     * the same bytes on the critical path of the commit. The record is kept against the transaction
+     * itself rather than against the thread, because OFBiz suspends and resumes transactions on one
+     * thread: a thread-wide record would let a publication attached to a suspended transaction suppress
+     * the one a nested transaction needs, and that write would then never leave local disk.
+     *
+     * @param publication what to run as the transaction completes
+     * @param key the storage key being published, which at most one publication per transaction covers
+     * @param what a description of what would have been published, for the report when there is no
+     *     transaction to register with
+     * @return {@code true} when the current transaction will publish that key - whether this call
+     *     attached the publication or an earlier one in the same transaction already did; {@code false}
+     *     when there is no transaction to attach to and the caller remains responsible for the content
+     * @throws GeneralException if a transaction is in place but refuses the registration
+     */
+    public static boolean publishOnCommit(Synchronization publication, String key, String what) throws GeneralException {
+        Object transaction = registrar.currentTransaction();
+        if (transaction == null) {
+            reportNoTransaction(what);
+            return false;
+        }
+        synchronized (PUBLISHED_KEYS) {
+            if (!PUBLISHED_KEYS.computeIfAbsent(transaction, held -> new HashSet<>()).add(key)) {
+                return true;
+            }
+        }
+        try {
+            registrar.register(publication);
+        } catch (GenericTransactionException e) {
+            // Nothing is attached, so the key must not be left recorded as covered: a later resolution
+            // in this transaction has to be free to try again.
+            synchronized (PUBLISHED_KEYS) {
+                Set<String> covered = PUBLISHED_KEYS.get(transaction);
+                if (covered != null) {
+                    covered.remove(key);
+                }
+            }
+            throw new GeneralException("Cannot register the publication of " + what
+                    + " with the current transaction", e);
+        }
+        return true;
+    }
+
+    /**
      * Registers a publication with the current transaction, reporting when there is none.
+     *
+     * <p>Unconditional: each call attaches its own publication. That is what the staged-upload and
+     * fetched-file publications need, because each one owns a different local file.
      *
      * @param publication the publication to register
      * @param what a description of what would have been published, for the report
+     * @return {@code true} when the publication was registered with a transaction
      * @throws GeneralException if the transaction refuses the registration
      */
-    private static void registerOrWarn(Synchronization publication, String what) throws GeneralException {
-        if (transactionInPlace()) {
+    private static boolean registerOrWarn(Synchronization publication, String what) throws GeneralException {
+        if (registrar.currentTransaction() != null) {
             try {
-                TransactionUtil.registerSynchronization(publication);
-                return;
+                registrar.register(publication);
+                return true;
             } catch (GenericTransactionException e) {
                 throw new GeneralException("Cannot register the publication of " + what
                         + " with the current transaction", e);
             }
         }
-        Debug.logWarning("No transaction is in place, so " + what + " will not be published when one commits."
-                + " A caller writing content outside a transaction has to call"
-                + " ContentStoreFactory.publishContentFile itself.", MODULE);
+        reportNoTransaction(what);
+        return false;
     }
 
     /**
-     * Reports whether a transaction is in place to hang a publication on.
+     * Reports that content will not be published because there is no transaction to attach to.
      *
-     * @return {@code true} when a transaction is in place
-     * @throws GeneralException if the transaction manager cannot be asked
+     * @param what a description of what would have been published
      */
-    private static boolean transactionInPlace() throws GeneralException {
-        try {
-            return TransactionUtil.isTransactionInPlace();
-        } catch (GenericTransactionException e) {
-            throw new GeneralException("Cannot determine whether a transaction is in place", e);
-        } catch (IllegalStateException e) {
-            // This is what TransactionFactoryLoader answers while the entity container has not
-            // started a transaction factory - during a unit test, or in any process that uses the
-            // Content component without the entity container. There is then no transaction
-            // infrastructure at all, which for publication purposes is the same situation as no
-            // transaction being in place, so it is reported the same way rather than as a failure.
-            Debug.logVerbose("No transaction factory is initialised, so no publication can be"
-                    + " registered: " + e.getMessage(), MODULE);
-            return false;
-        }
+    private static void reportNoTransaction(String what) {
+        Debug.logWarning("No transaction is in place, so " + what + " will not be published when one commits."
+                + " A caller writing content outside a transaction has to call"
+                + " ContentStoreFactory.publishContentFile itself.", MODULE);
     }
 
     /**
@@ -909,8 +1211,8 @@ public final class ContentStoreFactory {
             home = home.substring(0, home.length() - 1);
         }
         if (location.equals(home)) {
-            throw new GeneralException("Cannot derive a content storage key from [" + location
-                    + "]: it names the OFBiz home directory itself");
+            throw new GeneralException("Cannot derive a content storage key from ["
+                    + ContentStoreUtil.describe(location) + "]: it names the OFBiz home directory itself");
         }
         if (location.startsWith(home + "/")) {
             return location.substring(home.length());
@@ -941,13 +1243,13 @@ public final class ContentStoreFactory {
         }
         for (String segment : key.split("/")) {
             if ("..".equals(segment)) {
-                throw new GeneralException("Cannot derive a content storage key from [" + location
-                        + "]: it traverses above its root");
+                throw new GeneralException("Cannot derive a content storage key from ["
+                        + ContentStoreUtil.describe(location) + "]: it traverses above its root");
             }
         }
         if (key.isEmpty() || key.endsWith("/")) {
-            throw new GeneralException("Cannot derive a content storage key from [" + location
-                    + "]: it does not name content");
+            throw new GeneralException("Cannot derive a content storage key from ["
+                    + ContentStoreUtil.describe(location) + "]: it does not name content");
         }
         return key;
     }
@@ -996,7 +1298,7 @@ public final class ContentStoreFactory {
      * Checks that a location resolved to a file at all.
      *
      * <p>{@code FileUtil.getFile} is used throughout so that a {@code component://} location keeps
-     * resolving as it does today, and it answers {@code null} for a malformed one, so every result
+     * OFBiz's own resolution semantics, and it answers {@code null} for a malformed one, so every result
      * passes through here before it is dereferenced.
      *
      * @param located the location that was resolved, for the report
@@ -1006,8 +1308,8 @@ public final class ContentStoreFactory {
      */
     private static File requireResolved(String located, File resolved) throws GeneralException {
         if (resolved == null) {
-            throw new GeneralException("Cannot resolve content location [" + located
-                    + "]: it is not a well formed file location");
+            throw new GeneralException("Cannot resolve content location "
+                    + ContentStoreUtil.reference(located) + ": it is not a well formed file location");
         }
         return resolved;
     }
@@ -1069,8 +1371,8 @@ public final class ContentStoreFactory {
                 // rolling back is the safe direction, because a DataResource row whose content never
                 // reached the store would read as missing content for good, whereas a stored object
                 // whose row rolls back is an orphan the next write to the same key replaces.
-                throw new GeneralRuntimeException("Cannot publish content for key [" + key
-                        + "], so the transaction is rolled back", e);
+                throw new GeneralRuntimeException("Cannot publish content for " + ContentStoreUtil.reference(key)
+                        + ", so the transaction is rolled back", e);
             }
         }
 
@@ -1114,8 +1416,8 @@ public final class ContentStoreFactory {
                 try {
                     publish(stagedKeyOf(file), file);
                 } catch (GeneralException e) {
-                    throw new GeneralRuntimeException("Cannot publish the upload staged at ["
-                            + file.getPath() + "], so the transaction is rolled back", e);
+                    throw new GeneralRuntimeException("Cannot publish the upload staged at "
+                            + ContentStoreUtil.reference(file.getPath()) + ", so the transaction is rolled back", e);
                 }
             }
         }
@@ -1129,8 +1431,9 @@ public final class ContentStoreFactory {
                 }
             }
             if (!directory.delete() && directory.isDirectory()) {
-                Debug.logWarning("Cannot remove the content staging directory [" + directory.getPath()
-                        + "]. It holds no published content and can be removed at any time.", MODULE);
+                Debug.logWarning("Cannot remove the content staging directory "
+                        + ContentStoreUtil.reference(directory.getPath())
+                        + ". It holds no published content and can be removed at any time.", MODULE);
             }
         }
     }
@@ -1159,8 +1462,8 @@ public final class ContentStoreFactory {
         // EntityUtilProperties database branch returns a SystemProperty value verbatim, so a row
         // padded with whitespace would otherwise never match a provider name. Lower-casing in the
         // same breath yields the single canonical form used from here on, so that the form which
-        // selects a provider is by construction the form the outcome is cached under - the two can
-        // no longer disagree, as they did while matching ignored case but caching did not.
+        // selects a provider is by construction the form the outcome is cached under, and the two
+        // cannot disagree.
         String reported = configuredProvider == null ? "" : configuredProvider.trim();
         String provider = reported.toLowerCase(Locale.ROOT);
         // computeIfAbsent runs the mapping function under the map's bin lock, so exactly one
@@ -1228,10 +1531,10 @@ public final class ContentStoreFactory {
             if (PROVIDER_FILESYSTEM.equals(provider)) {
                 store = new FileSystemContentStore();
             } else {
-                // The object-storage provider is reached only here, and its constructor reads
-                // configuration without touching an object-storage client type, so selecting it neither
-                // resolves a credential nor opens a connection. Because the JVM resolves this reference
-                // lazily, no other path so much as loads the class or the client library behind it.
+                // This is the only branch that constructs the object-storage provider, and its
+                // constructor reads configuration without referring to an object-storage client type, so
+                // selecting it neither resolves a credential nor opens a connection. In database mode the
+                // branch is not taken, so this factory does not load the client library behind it.
                 store = new S3ContentStore();
             }
             registerShutdownHook();
@@ -1256,7 +1559,7 @@ public final class ContentStoreFactory {
     }
 
     /**
-     * Registers, at most once, the hook that closes the last resolved provider at JVM shutdown.
+     * Registers, at most once, the hook that closes every cached provider at JVM shutdown.
      *
      * <p>Registered on first successful construction rather than from a static initialiser, so a
      * deployment in configured database mode - the committed default - installs no hook at all.
@@ -1291,7 +1594,7 @@ public final class ContentStoreFactory {
             // reported rather than propagated: the provider is already unreachable, and failing the
             // caller's content operation because a superseded provider could not be closed would turn a
             // resource-release problem into a functional one
-            Debug.logWarning(EVENT_CLOSE_FAILED + " provider [" + ContentStoreSupport.describe(outcome.provider())
+            Debug.logWarning(EVENT_CLOSE_FAILED + " provider [" + ContentStoreUtil.describe(outcome.provider())
                     + "]: [" + e.getClass().getSimpleName() + "]", MODULE);
         }
     }
@@ -1320,13 +1623,7 @@ public final class ContentStoreFactory {
      */
     private record Resolution(String provider, ContentStore store, String failure, Throwable cause) {
 
-        /**
-         * Records a value that resolved cleanly, whether or not it produced a provider.
-         *
-         * @param provider the canonical configured value this outcome was resolved from
-         * @param store the provider that value resolved to, or {@code null} for database storage
-         * @return an outcome every caller can use as it stands
-         */
+        /** Records a value that resolved cleanly, whether or not it produced a provider. */
         static Resolution succeeded(String provider, ContentStore store) {
             return new Resolution(provider, store, null, null);
         }
@@ -1334,24 +1631,15 @@ public final class ContentStoreFactory {
         /**
          * Records a value that names no recognised provider, which is refused rather than quietly
          * read as database storage.
-         *
-         * @param provider the canonical configured value this outcome was resolved from
-         * @param failure why the value cannot be honoured, already rendered safe to log
-         * @return an outcome that refuses every use
          */
         static Resolution refused(String provider, String failure) {
             return new Resolution(provider, null, failure, null);
         }
 
         /**
-         * Records a value that named a recognised provider which could not be constructed.
-         *
-         * @param provider the canonical configured value this outcome was resolved from
-         * @param failure why the provider could not be constructed, already rendered safe to log
-         * @param cause the construction failure itself, carried so that a caller reporting the
-         *     refusal still names the underlying reason without it being logged again on every later
-         *     content operation
-         * @return an outcome that refuses every use
+         * Records a value that named a recognised provider which could not be constructed. The cause
+         * is carried so that a caller reporting the refusal still names the underlying reason without
+         * it being logged again on every later content operation.
          */
         static Resolution failed(String provider, String failure, Throwable cause) {
             return new Resolution(provider, null, failure, cause);

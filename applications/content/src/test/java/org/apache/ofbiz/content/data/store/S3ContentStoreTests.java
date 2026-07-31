@@ -208,9 +208,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The round trip, and the requests each operation issues
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -286,9 +284,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Stream ownership across the get / openStream boundary
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -354,9 +350,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The two ways an S3-compatible store can say "there is nothing there"
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -410,9 +404,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * A store that is reachable but failing, and a store that cannot be reached at all
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -432,9 +424,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Configuration: what the provider reads, and what it builds from it
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -473,7 +463,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
             new S3ContentStore().exists(KEY);
         }
 
-        // These two settings together are the whole reason one client can serve Amazon S3 and any S3-compatible
+        // These two settings together are the whole reason one client can serve Amazon S3 and an S3-compatible
         // store alike, so both have to reach the builder from configuration rather than being hard-coded.
         verify(recorder.builder()).endpointOverride(URI.create(ENDPOINT));
         verify(recorder.builder()).forcePathStyle(true);
@@ -520,7 +510,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
 
     @Test
     public void anIdentitySourceThatIsNotNamedOrThatContradictsTheCredentialsIsRefused() {
-        // Every one of these was previously accepted by INFERRING the identity source from whether a credential
+        // Every one of these would be accepted by a resolver that INFERRED the identity source from whether a credential
         // happened to be present. Half a pair silently authenticated as the ambient identity - the instance role
         // of whatever host the container ran on - which is a different, usually far more privileged, principal
         // than the one the operator was trying to configure. Inference is exactly what is being removed here.
@@ -587,9 +577,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Which endpoint the provider may be pointed at
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -777,9 +765,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * The whole-object read ceiling
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -844,9 +830,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Nothing credential-derived may escape
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -931,9 +915,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Helpers
-     * ---------------------------------------------------------------------------------------------
      */
 
     /** Drives every operation against a client that always fails, and checks each wraps the failure identically. */
@@ -1200,10 +1182,8 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
     }
 
     /*
-     * ---------------------------------------------------------------------------------------------
      * Against a plain mocked client: absence versus store failure, credential selection, endpoint
      * validation and client ownership
-     * ---------------------------------------------------------------------------------------------
      */
 
     @Test
@@ -1454,7 +1434,7 @@ public final class S3ContentStoreTests extends ContentStoreBehaviourContract {
         verify(owned, times(1)).close();
         // The reference was cleared under the lock, so a later operation builds a fresh client rather than
         // reaching for the closed one. Nothing is configured here, so that build stops at the unconfigured
-        // bucket - which is also the committed default, and proves the provider is inert until configured.
+        // bucket - which is also the committed default, and shows the provider is inert until configured.
         GeneralException refused = assertThrows(GeneralException.class, () -> configured.exists(KEY));
         assertTrue(refused.getMessage().contains("content.store.s3.bucket"));
     }

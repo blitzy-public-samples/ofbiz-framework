@@ -26,10 +26,14 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 
@@ -57,29 +61,15 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  *
  * <p>Two configuration objectives are covered:</p>
  *
- * <p>The end-to-end scenarios that drive the container entry point through a whole start - the
- * render and its schema validity, init mode applying then verifying the DDL before exiting, a
- * loader that logs a failure but exits successfully, a loader that never reports completion, and
- * the refusal to combine schema initialisation with skipping initialisation - are pinned by
- * {@code SchemaInitEntryPointTests} rather than duplicated here. That suite's harness models the
- * lifecycle this tree actually implements: the database configuration is re-rendered on
- * <i>every</i> start, including an {@code OFBIZ_SKIP_INIT} start, and the state record beside it
- * is a field-named fingerprint rather than a {@code host|mode} pair. A fixture that installs an
- * override and expects it to be inherited untouched would therefore be asserting a lifecycle that
- * was deliberately replaced; the guarantee it was reaching for - that no serving instance issues
- * startup DDL - is pinned here by {@link #managedRdbmsRunModeHasDdlDisabled()} and
- * {@link #containerEntryPointCannotLetSkipInitBypassTheServingModeDdlCheck()}, which read the
- * authoritative file whoever wrote it.</p>
- *
  * <ul>
  * <li><b>Objective 4 - gated single schema initialization.</b> The managed-RDBMS datasources
  * ({@code localpostgres}, {@code localpostgresolap}, {@code localpostgrestenant}) must resolve to a
  * <i>run mode</i> that issues no start up DDL, so a serving instance needs no DDL privilege and a
  * scaled-out fleet cannot race on schema changes. Schema changes are applied exclusively by a
  * separate one-shot init execution, for which the container entry point renders the very same two
- * attributes as {@code true}. Both halves are established here - the run mode on the committed
- * model, the init mode by executing the entry point - and the one-shot execution as a whole,
- * including the {@code readers=none} load and the exit before any traffic is served, additionally in
+ * attributes as {@code true}. Both halves are asserted here - the run mode on the committed model,
+ * the init mode by executing the entry point - and the one-shot execution as a whole, including the
+ * {@code readers=none} load and the exit before the serving command, additionally in
  * {@code SchemaInitEntryPointTests}. No committed constant is used as a stand-in for the init mode:
  * a constant cannot fail when the machinery that would produce it is deleted, so crediting one as
  * init-mode coverage would report protection that does not exist.</li>
@@ -90,54 +80,49 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  *
  * <p>Just as importantly, these tests pin the <i>backward-compatible local run</i>: the
  * {@code test} delegator stays bound to H2 so {@code gradlew loadAll} and {@code gradlew
- * testIntegration} are unaffected, and the embedded H2 datasources keep both start up DDL flags
- * enabled so a bare checkout still self-provisions. Those embedded flags are pinned here at the one
- * moment this class can see them change:
+ * testIntegration} do not target the managed datasources, and the embedded H2 datasources keep both
+ * start up DDL flags enabled so a bare checkout still self-provisions. Those embedded flags are
+ * pinned here at the one moment this class can see them change:
  * {@link #schemaModeChangesReRenderTheManagedDdlFlagsOnAReusedStateVolume(Path)} reads the file the
  * deployed profile actually runs on, which is generated at every container start and therefore
- * cannot be reviewed once and trusted afterwards. The committed half is deliberately not restated
- * here, because {@code EntityEngineConfigContractTests} already holds it more strongly than this
- * class could: it asserts an exact dialect, DDL-flag and driver tuple for {@code localh2},
- * {@code localh2olap} and {@code localh2tenant} <i>together</i> - not just the first of the three -
- * and then proves the parse asymmetry by removing the attributes from a cloned element and
- * re-parsing. A partial restatement here would be weaker coverage in a second place to maintain, so
- * this class states the posture the rendered file must have and that suite states the committed
- * grammar it rests on.</p>
+ * cannot be reviewed once and trusted afterwards. The committed half is left to
+ * {@code EntityEngineConfigContractTests}, which asserts an exact dialect, DDL-flag and driver tuple
+ * for {@code localh2}, {@code localh2olap} and {@code localh2tenant} <i>together</i> and then
+ * establishes the parse asymmetry by removing the attributes from a cloned element and re-parsing.
+ * This class states the posture the rendered file must have; that suite states the committed grammar
+ * it rests on.</p>
  *
  * <p>PostgreSQL becomes the default only for the deployed profile, which the container entry point
  * renders from {@code docker/templates/postgres-entityengine.xml} when the database environment
  * variables are present - never in the committed source. No assertion here may therefore expect the
  * {@code default} delegator to reference a managed datasource.</p>
  *
- * <p>Most assertions read the <em>parsed</em> entity-engine configuration model through
- * {@link EntityConfig}, which is the same model the running engine consumes, so what they pin is the
- * behaviour the engine will exhibit rather than the text of a file. The remainder read
- * {@code docker/docker-entrypoint.sh}, and two of those execute it:
- * {@link #theSchemaInitVerdictsRejectEveryIncompleteOutcome(Path)} sources it in a POSIX shell and
- * calls its two schema-init verdicts over synthetic engine logs, and
- * {@link #schemaModeChangesReRenderTheManagedDdlFlagsOnAReusedStateVolume(Path)} drives its own mode
- * resolution and database configuration step three times against one state volume and reads the
- * attributes that came out, which is the only way to observe a <i>transition</i> between the two
- * modes. Where an assertion is a claim about the text of the script rather than about its behaviour
- * it is made by reading the script, because what is being pinned is the literal an author would edit
- * in the file they would edit it in.</p>
+ * <p>What each kind of assertion observes:</p>
+ *
+ * <ul>
+ * <li><b>Configuration assertions</b> read the <em>parsed</em> entity-engine configuration model
+ * through {@link EntityConfig}, which is the same model the running engine consumes, so what they
+ * pin is the behaviour the engine will exhibit rather than the text of a file.</li>
+ * <li><b>Lifecycle assertions</b> execute one of {@code docker/docker-entrypoint.sh}'s functions
+ * against a sandbox that stands in for the container's {@code /ofbiz} home, with the data loader
+ * replaced by a stub. What they inspect is the artefact the execution rendered, the order in which
+ * its steps ran, how the stub's output was handled, and whether the serving command was reached.
+ * They execute no Entity Engine DDL and connect to no PostgreSQL server, so a rendered attribute
+ * pair is evidence of what a deployment would read and not of a schema that exists.</li>
+ * <li><b>Text assertions</b> read the script without executing it, because what is being pinned is
+ * the literal an author would edit in the file they would edit it in.</li>
+ * </ul>
  *
  * <p>The whole class stays hermetic: it opens no database connection, performs no network access,
  * writes nothing of its own outside the per-test temporary directory JUnit supplies and deletes,
  * touches no file of the repository other than by reading it, and mutates no engine state. The one
  * exception is not this class's to make: the entry point creates its own short-lived substitution
- * script with {@code mktemp} under the system temporary directory and deletes it itself, exactly as
- * it does in the container. {@link EntityConfig} resolves {@code entityengine.xml} and validates it
- * against {@code entity-config.xsd}, both of which the build places on
- * {@code sourceSets.main.resources}, and the schema location is remapped to that local copy rather
- * than fetched, so the class runs offline. The entry-point assertions copy the template into a
- * sandbox that stands in for the container's {@code /ofbiz} home - the same relative
- * {@code templates/} and {@code config/} layout the image lays down - source the entry point with
- * its trailing {@code _main "$@"} line removed so an individual function can be invoked, and
- * redirect the container state directory into that sandbox so nothing on this host is read or
- * written. An assertion that needs a shell is skipped rather than failed where none exists. Schema
- * truth remains the entity model: no migration framework, schema-version table or hand-written DDL
- * is involved.</p>
+ * script with {@code mktemp} under the system temporary directory and deletes it itself. The schema
+ * location {@link EntityConfig} resolves is remapped to the local {@code entity-config.xsd} the
+ * build places on {@code sourceSets.main.resources} rather than fetched, so the class runs offline.
+ * An assertion that needs a shell is skipped rather than failed where none exists. Schema truth
+ * remains the entity model: no migration framework, schema-version table or hand-written DDL is
+ * involved.</p>
  */
 public final class SchemaInitGatingTests {
 
@@ -147,7 +132,7 @@ public final class SchemaInitGatingTests {
      * The container entry point, relative to the repository root. It is the file that reads the datasource
      * signatures these tests pin.
      *
-     * <p>The methods below read it as TEXT on purpose: the DDL guarantee this class asserts against the parsed
+     * <p>The methods below read it as TEXT on purpose: the DDL posture this class asserts against the parsed
      * configuration model is only worth as much as the container flow that keeps a serving instance pointed at a
      * run-mode configuration, and that flow lives in shell rather than in anything a parser can be pointed at.</p>
      */
@@ -200,7 +185,7 @@ public final class SchemaInitGatingTests {
      * guard rejects a rendered configuration on, and the same character set the template token
      * inventory is taken with, so closure is asserted here against exactly the grammar that is enforced
      * at run time. Digits are part of it deliberately — a pattern that omitted them would silently
-     * ignore every token whose name contains one and so could not prove closure at all.
+     * ignore every token whose name contains one and so could not assert closure at all.
      */
     private static final Pattern PLACEHOLDER = Pattern.compile("@[A-Z0-9_]+@");
     /** The field the mode-aware database state marker records the resolved schema mode under. */
@@ -212,9 +197,50 @@ public final class SchemaInitGatingTests {
     /** What the entry point reports when a reused state volume turns from serving into initialising. */
     private static final String RUN_TO_INIT_TRANSITION =
             "previously ran with startup DDL disabled and is now an initialisation job";
-    /** What it reports for the reverse transition, when an init job becomes a serving instance again. */
+    /**
+     * What it reports for the reverse transition. A successful initialisation reaches this itself, before it
+     * exits, so the message may not claim the container has become a serving instance.
+     */
     private static final String INIT_TO_RUN_TRANSITION =
-            "previously ran as an initialisation job and is now a serving instance";
+            "previously rendered with startup DDL enabled for an initialisation job and have now been"
+            + " re-rendered with it disabled";
+    /** What the init job prints once it has handed the configuration volume back in serving mode. */
+    private static final String SERVING_MODE_RESTORED =
+            "so the configuration volume this job leaves behind is safe for a serving instance to read";
+    /** The entity group only {@code plugins/bi} declares, and so the one a deployment can legitimately lack. */
+    private static final String OLAP_ENTITY_GROUP = "org.apache.ofbiz.olap";
+    /** The component that declares {@link #OLAP_ENTITY_GROUP}, left out to model a BI-disabled deployment. */
+    private static final String BUSINESS_INTELLIGENCE_COMPONENT = "plugins/bi";
+    /** Where a component declares which entity group each of its entities belongs to. */
+    private static final String ENTITY_GROUP_DESCRIPTOR = "entitydef/entitygroup.xml";
+    /** The component roots the image lays down, and therefore where entity-group descriptors are found. */
+    private static final List<String> COMPONENT_ROOTS = List.of("framework", "applications", "plugins", "themes");
+    /** How deep below a component root an entity-group descriptor lies: {@code <component>/entitydef/<file>}. */
+    private static final int COMPONENT_DESCRIPTOR_DEPTH = 3;
+    /** What makes a directory a component the engine loads, and therefore whose entity groups it reads. */
+    private static final String COMPONENT_DESCRIPTOR = "ofbiz-component.xml";
+    /** The flag whose acceptance message the transport validation prints, used to locate that message. */
+    private static final String CACHE_CLEAR_ENABLED = "OFBIZ_DISTRIBUTED_CACHE_CLEAR=true";
+    /**
+     * Phrasings that would describe the transport preconditions as proof of coherence. Held as data rather than as
+     * separate assertions because the defect is the class and not any one wording: each of these has at some point
+     * been the natural way to summarise a passing check, and none is true of what is actually checked.
+     */
+    private static final List<String> COHERENCE_OVERCLAIMS = List.of(
+            "coherent",
+            "transport to travel on",
+            "invalidations will",
+            "is propagat",
+            "are propagat");
+    /**
+     * The group a delegator carrying no {@code default-group-name} defaults to. Both the schema of the
+     * configuration and {@code DelegatorElement} apply this same literal, and neither the committed
+     * configuration nor the rendered template states it, so it is the effective default of every delegator here.
+     */
+    private static final String DEFAULT_ENTITY_GROUP = "org.apache.ofbiz";
+    /** Path of the container that performs the schema-only load, and upserts Component metadata while doing it. */
+    private static final String DATA_LOAD_CONTAINER_SOURCE =
+            "framework/entityext/src/main/java/org/apache/ofbiz/entityext/data/EntityDataLoadContainer.java";
     /**
      * Resolves the mode flags from the environment and configures the database, which is exactly the
      * pair of steps {@code _main} performs on a container start. {@code configure_database} reconciles
@@ -280,9 +306,9 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 4, <b>run mode</b>: proves a serving instance issues no start up DDL.
+     * AAP Objective 4, <b>run mode</b>: asserts the committed managed-RDBMS run-mode DDL flags resolve false.
      *
-     * <p>This is the assertion that makes the fleet safe to scale out. Because both flags resolve
+     * <p>Both committed managed-RDBMS run-mode attributes must resolve {@code false}. Because both flags resolve
      * to {@code false} on all three managed-RDBMS datasources, no instance attempts to check or
      * amend the schema while booting, so none of them needs a DDL privilege and none of them can
      * collide with a peer over a schema change.</p>
@@ -314,25 +340,33 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 4 end to end, on the artifact the deployment really reads: proves the gate
+     * AAP Objective 4 end to end, on the artifact the deployment really reads: asserts the gate
      * <i>discriminates</i>, that it is re-evaluated on every start, and that a schema-mode change on a
      * reused state volume is detected rather than silently ignored.
      *
      * <p>Three starts are driven against one sandbox and one container state directory, through the
      * entry point's own {@code resolve_entity_engine_flags} and {@code configure_database} — the same
      * pair {@code _main} performs — so what is exercised is the whole path from the environment
-     * variable to the rendered attribute:</p>
+     * variable to the rendered attribute. The middle start is the init job <i>in full</i>, because the
+     * {@code false} → {@code true} → {@code false} transition happens INSIDE one init execution: the
+     * flag renders the DDL-enabled configuration, and {@code restore_serving_mode_after_schema_init}
+     * renders it back before that same execution exits. Driving the return as a separate start would
+     * model a lifecycle this tree does not have and would leave the real restoration untested:</p>
      * <ol>
      * <li><b>unset</b>, which is what a deployment that never heard of the flag gets and therefore the
      * case that matters most: the managed datasources must render {@code false}, and the marker must
      * record that mode, because a mode that is not recorded cannot be seen to change;</li>
-     * <li><b>{@code true}</b> on that same volume: the managed datasources must now render
-     * {@code true}, the marker must be refreshed, and the run-to-init transition must be reported. The
-     * two load-skipping markers a previous container left behind must survive, because the host has not
-     * changed and that data is still in that database;</li>
-     * <li><b>{@code false}</b> again: the run mode must come back and the reverse transition must be
-     * reported. A state volume that had recorded an init run must not leave a serving instance
-     * configured to issue DDL.</li>
+     * <li><b>{@code true}</b> on that same volume, run to its end: the managed datasources must render
+     * {@code true} <i>while the initialisation is running</i> — asserted on a copy taken at that
+     * moment, which is the only point at which the DDL-enabled configuration exists — and the volume
+     * must be handed back rendering {@code false}, with the marker refreshed and both transitions
+     * reported by the one execution. {@code RESOLVED_SCHEMA_INIT} must still be {@code true}
+     * afterwards, because {@code _main} decides from that same flag whether to exit instead of serving.
+     * The two load-skipping markers a previous container left behind must survive, because the host has
+     * not changed and that data is still in that database;</li>
+     * <li><b>unset</b> again, which is the redeploy that follows a successful init job: the run mode
+     * must still be in place and <em>no</em> transition may be reported, because the init job restored
+     * it itself. A report here would send an operator looking for a mode change that did not happen.</li>
      * </ol>
      *
      * <p>Because one renderer produces {@code true} or {@code false} on the same three datasources
@@ -347,7 +381,7 @@ public final class SchemaInitGatingTests {
      * resolves to <b>false</b>. Only the exact token {@code true} enables both halves of the DDL, and
      * only the exact token {@code false} disables the first half. That is also why the template carries
      * a placeholder per attribute — {@code @CHECK_ON_START@} and {@code @ADD_MISSING_ON_START@} — and
-     * why every leg additionally proves the render left no placeholder of the complete token grammar
+     * why every leg additionally asserts the render left no placeholder of the complete token grammar
      * behind: a surviving {@code @CHECK_ON_START@} is not the string {@code "false"}, so it would
      * re-enable schema checking on a fleet instance while the template still looked correct.</p>
      *
@@ -369,7 +403,6 @@ public final class SchemaInitGatingTests {
         Path home = prepareEntryPointHome(tempDir);
         Path stateDir = tempDir.resolve("container_state");
 
-        // 1. A first start with the flag unset: the mode every serving instance in the fleet runs.
         String firstStart = configureDatabase(tempDir, home, stateDir, null);
         assertRenderedSchemaMode(home, "false", "with OFBIZ_SCHEMA_INIT unset");
         assertEquals("false", recordedSchemaMode(stateDir),
@@ -383,29 +416,211 @@ public final class SchemaInitGatingTests {
             Files.createFile(stateDir.resolve(loadMarker));
         }
 
-        // 2. That same state volume, now asked for a one-shot initialisation run.
-        String initStart = configureDatabase(tempDir, home, stateDir, "true");
-        assertRenderedSchemaMode(home, "true", "with OFBIZ_SCHEMA_INIT=true");
-        assertEquals("true", recordedSchemaMode(stateDir),
-                "the state marker must be refreshed with the schema mode this start resolved");
-        assertTrue(initStart.contains(RUN_TO_INIT_TRANSITION),
-                "the run-to-init transition must be reported on a reused volume, output was:\n" + initStart);
+        Path midInitialisation = tempDir.resolve("rendered-mid-initialisation.xml");
+        String initJob = initialiseAndRestoreServingMode(tempDir, home, stateDir, midInitialisation);
+        assertSchemaModeOfRenderedFile(midInitialisation, "true", "while the initialisation was running");
+        assertRenderedSchemaMode(home, "false", "once the initialisation had restored serving mode");
+        assertEquals("false", recordedSchemaMode(stateDir),
+                "the marker must record the mode the volume was handed back in, not the one it was asked for");
+        assertTrue(initJob.contains(RUN_TO_INIT_TRANSITION),
+                "the run-to-init transition must be reported on a reused volume, output was:\n" + initJob);
+        assertTrue(initJob.contains(INIT_TO_RUN_TRANSITION), "the init job must report the return to run mode it"
+                + " performs itself, output was:\n" + initJob);
+        assertTrue(initJob.contains(SERVING_MODE_RESTORED), "the init job must say it left the configuration"
+                + " volume safe for a serving instance, output was:\n" + initJob);
+        assertTrue(initJob.contains("RESOLVED_SCHEMA_INIT=true"), "restoring serving mode must leave the requested"
+                + " mode alone: _main decides from that same flag whether to exit instead of serving, so an init"
+                + " job whose flag was cleared here would go on to serve traffic. Output was:\n" + initJob);
         for (String loadMarker : LOAD_MARKERS) {
             assertTrue(Files.exists(stateDir.resolve(loadMarker)), "the " + loadMarker + " marker must survive a"
                     + " schema-mode change against the same host: that database still holds the data");
         }
 
-        // 3. Back to serving on that same volume, which is what a redeploy after an init job does.
-        String servingAgain = configureDatabase(tempDir, home, stateDir, "false");
-        assertRenderedSchemaMode(home, "false", "with OFBIZ_SCHEMA_INIT=false after an init run");
+        String servingAgain = configureDatabase(tempDir, home, stateDir, null);
+        assertRenderedSchemaMode(home, "false", "on the serving start that followed the initialisation");
         assertEquals("false", recordedSchemaMode(stateDir),
-                "the state marker must record the return to the serving mode");
-        assertTrue(servingAgain.contains(INIT_TO_RUN_TRANSITION),
-                "the init-to-run transition must be reported on a reused volume, output was:\n" + servingAgain);
+                "the state marker must still record the serving mode");
+        assertFalse(servingAgain.contains("Schema mode changed"), "a serving start after a successful"
+                + " initialisation has no transition to report, because that job handed the volume back in"
+                + " serving mode itself, output was:\n" + servingAgain);
     }
 
     /**
-     * AAP validation gate "Test delegator on H2": proves the frozen {@code test} delegator still
+     * AAP Objective 4, <b>helper postcondition</b>: the per-group evidence the one-shot init job's exit
+     * status depends on accepts the default component set <i>and</i> a business-intelligence-disabled one,
+     * against the PostgreSQL configuration the deployed profile really renders.
+     *
+     * <p>What is at stake here is a false REFUSAL, which on this path costs as much as a false acceptance:
+     * the verdict is handed to {@code config_fatal}, so a postcondition that a correct run cannot satisfy
+     * turns a completed initialisation into a failed job and blocks a deployment that has nothing wrong
+     * with it.</p>
+     *
+     * <p>{@code GenericDelegator.initializeOneGenericHelper} is called once per group returned by
+     * {@code ModelGroupReader.getGroupNames}, which is the delegator's own default group plus the groups
+     * declared by the {@code entitydef/entitygroup.xml} of the components that were <b>loaded</b> — not the
+     * groups the delegator maps. {@code org.apache.ofbiz.olap} is declared by exactly one component in
+     * either repository, {@code plugins/bi}, so a deployment without that plugin initialises two of the
+     * three mapped groups and has no third group of database objects to create. Confirmed by execution
+     * against this checkout: {@code bin/ofbiz --load-data readers=none} logs three helper initialisations,
+     * and the same command with {@code plugins/bi/ofbiz-component.xml} withdrawn logs two and still exits
+     * {@code 0}.</p>
+     *
+     * <p>Both component sets are derived from the repository rather than written down here, and the group
+     * maps are read from the <i>rendered</i> configuration rather than the committed one, so what is
+     * exercised is the component and group resolution a deployment actually performs against PostgreSQL.
+     * The difference between the two sets is asserted before either verdict is taken: were they equal, the
+     * second case would be the first one twice and would add no coverage.</p>
+     *
+     * @param tempDir a JUnit-managed sandbox; nothing is written outside it
+     * @throws Exception if the entry point could not be executed or its render could not be read, either of
+     *         which fails the test rather than being handled
+     */
+    @Test
+    public void theHelperPostconditionAcceptsTheDefaultAndABusinessIntelligenceDisabledComponentSet(
+            @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the container entry point");
+
+        Path home = prepareEntryPointHome(tempDir);
+        configureDatabase(tempDir, home, tempDir.resolve("container_state"), "true");
+        assertRenderedSchemaMode(home, "true", "with OFBIZ_SCHEMA_INIT=true");
+
+        Map<String, String> groupMaps = renderedDefaultDelegatorGroupMaps(home);
+        assertEquals(MANAGED_DATASOURCES.size(), groupMaps.size(), "the rendered 'default' delegator must map"
+                + " every frozen entity group, or this case would be judging a configuration no fleet runs");
+        assertTrue(groupMaps.values().containsAll(MANAGED_DATASOURCES), "the rendered group-maps must resolve to"
+                + " the managed datasources " + MANAGED_DATASOURCES + ", but resolve to " + groupMaps.values()
+                + ": this case has to be taken against PostgreSQL, not against the embedded profile");
+
+        Set<String> everyComponent = consideredEntityGroups(home, Set.of());
+        Set<String> withoutBusinessIntelligence = consideredEntityGroups(home, Set.of(BUSINESS_INTELLIGENCE_COMPONENT));
+        assumeTrue(everyComponent.contains(OLAP_ENTITY_GROUP), OLAP_ENTITY_GROUP + " is declared by no component"
+                + " in this checkout, so the difference this case rests on cannot be constructed");
+        assertFalse(withoutBusinessIntelligence.contains(OLAP_ENTITY_GROUP), "withdrawing "
+                + BUSINESS_INTELLIGENCE_COMPONENT + " must leave " + OLAP_ENTITY_GROUP + " undeclared, otherwise"
+                + " some other component declares it and the BI-disabled case is not the case it claims to be");
+
+        assertEquals("", helperVerdict(tempDir, home, loaderLogFor(groupMaps, everyComponent)),
+                "the default component set initialises every mapped group through the mapped datasource, which"
+                        + " is the outcome this postcondition exists to accept");
+        assertEquals("", helperVerdict(tempDir, home, loaderLogFor(groupMaps, withoutBusinessIntelligence)),
+                "a deployment without " + BUSINESS_INTELLIGENCE_COMPONENT + " has no " + OLAP_ENTITY_GROUP
+                        + " entity for the delegator to reach, so the absence of that group's helper line must"
+                        + " not fail an initialisation that did everything there was to do");
+    }
+
+    /**
+     * The same postcondition still <em>discriminates</em>: a group initialised against the wrong database, a
+     * group the delegator refused, and a load that initialised nothing are each refused, and the refusal names
+     * what went wrong.
+     *
+     * <p>This is the other half of the case above and cannot be separated from it. Accepting a mapped group
+     * that produced no line is only correct because a group that produced the <i>wrong</i> line is still
+     * refused; without these three cases, a postcondition that accepts everything would look identical to one
+     * that accepts exactly what the engine reports.</p>
+     *
+     * <p>The diverted case is the one an aggregate check cannot see: every mapped group is initialised, the
+     * count is right, and one of them went to the embedded database instead of the managed one — so the init
+     * job would report a schema that the fleet's database does not have.</p>
+     *
+     * @param tempDir a JUnit-managed sandbox; nothing is written outside it
+     * @throws Exception if the entry point could not be executed or its render could not be read
+     */
+    @Test
+    public void theHelperPostconditionRefusesADivertedGroupARefusedGroupAndASilentLoad(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the container entry point");
+
+        Path home = prepareEntryPointHome(tempDir);
+        configureDatabase(tempDir, home, tempDir.resolve("container_state"), "true");
+        Map<String, String> groupMaps = renderedDefaultDelegatorGroupMaps(home);
+        Set<String> considered = consideredEntityGroups(home, Set.of());
+
+        // 1. Every mapped group initialised, one of them against a database this configuration does not name.
+        String divertedGroup = groupMaps.keySet().iterator().next();
+        String elsewhere = EMBEDDED_DATASOURCES.get(0);
+        Map<String, String> diverted = new LinkedHashMap<>(groupMaps);
+        diverted.put(divertedGroup, elsewhere);
+        String verdict = helperVerdict(tempDir, home, loaderLogFor(diverted, considered));
+        assertTrue(verdict.contains(divertedGroup) && verdict.contains(elsewhere), "a group initialised through"
+                + " a datasource the configuration does not map it to must be refused, and the refusal must name"
+                + " both the group and the datasource that was used instead -- verdict was: " + verdict);
+
+        // 2. A mapped group the delegator refused to associate, which is what a group-map the engine never
+        // read looks like from outside: the configuration says one thing and the running delegator another.
+        Map<String, String> withoutOlap = new LinkedHashMap<>(groupMaps);
+        withoutOlap.remove(OLAP_ENTITY_GROUP);
+        verdict = helperVerdict(tempDir, home,
+                loaderLogFor(withoutOlap, considered) + refusalLine(OLAP_ENTITY_GROUP));
+        assertTrue(verdict.contains(OLAP_ENTITY_GROUP), "a mapped group the delegator reports as not associated"
+                + " must be refused, and the refusal must name it -- verdict was: " + verdict);
+
+        // 3. A load that reached the end without initialising anything at all. The engine logs a per-helper
+        // failure as a warning and leaves the exit status at 0, so silence here must not read as success.
+        verdict = helperVerdict(tempDir, home, "Finished the data load with 0 rows changed.");
+        assertFalse(verdict.isEmpty(), "a load whose log shows no helper initialisation at all must be refused:"
+                + " nothing in it shows the schema was applied");
+    }
+
+    /**
+     * The lifecycle claim the schema-only load is documented with: it loads no business reader data, and it is
+     * <em>not</em> a run that writes nothing.
+     *
+     * <p>{@code EntityDataLoadContainer} upserts one {@code Component} row per loaded component before it
+     * resolves any reader, unconditionally — so {@code readers=none} performs DML even though it reports
+     * "Finished the data load with 0 rows changed", because that counter is the number of rows the
+     * <i>readers</i> loaded. Confirmed by execution against this checkout: a {@code readers=none} run left 51
+     * {@code Component} rows carrying its own timestamp. Documenting the run as "zero rows changed" would
+     * therefore be wrong in a way that matters operationally, because the identity the init job connects as
+     * needs INSERT and UPDATE on the group that holds {@code Component} — {@code org.apache.ofbiz.tenant} —
+     * and not DDL rights alone.</p>
+     *
+     * <p>The engine is read as source rather than executed, because the write cannot be observed without a
+     * database, and the fact being pinned is that the call is <em>unconditional and first</em>: it is asserted
+     * at method-body indentation, which is what rules out its having been moved under a reader test, and
+     * before the reader load, which is what makes it happen even when there is no reader. The entry point's
+     * prose is asserted alongside it, because the defect this guards against was a comment that claimed the
+     * opposite.</p>
+     *
+     * @throws Exception if the engine source, the group descriptor or the entry point cannot be read
+     */
+    @Test
+    public void theSchemaOnlyLoadUpsertsComponentMetadataAndLoadsNoBusinessReaderData() throws Exception {
+        String container = repositoryText(DATA_LOAD_CONTAINER_SOURCE);
+        String upsert = "\n        createOrUpdateComponentEntities(baseDelegator, allComponents);\n";
+        String readerLoad = "\n        loadData(delegator, baseDelegator, allComponents, helperInfo, loadDataProps);\n";
+        assertTrue(container.contains(upsert), DATA_LOAD_CONTAINER_SOURCE + " no longer upserts the component"
+                + " metadata as an unconditional statement of the load method, so the entry point's account of"
+                + " what a readers=none run writes is out of date");
+        assertTrue(container.contains(readerLoad), DATA_LOAD_CONTAINER_SOURCE + " no longer calls loadData the"
+                + " way this census reads it, so the ordering below cannot be established");
+        assertTrue(container.indexOf(upsert) < container.indexOf(readerLoad), "the component metadata must be"
+                + " upserted BEFORE the reader load, which is what makes it happen when there is no reader");
+
+        assertTrue(container.contains("makeValue(\"Component\")"), DATA_LOAD_CONTAINER_SOURCE + " no longer"
+                + " writes the Component entity, so the privilege this run needs is no longer what is documented");
+        String upsertBody = container.substring(container.indexOf("private static void createOrUpdateComponentEntities"));
+        upsertBody = upsertBody.substring(0, upsertBody.indexOf("private static void dropDbConstraints"));
+        assertTrue(upsertBody.contains(".create()") && upsertBody.contains(".store()"),
+                "the component metadata must still be created when absent and stored when present");
+        assertFalse(upsertBody.contains("totalRowsChanged"), "the component upsert must stay outside the row"
+                + " counter the loader reports, which is why \"0 rows changed\" does not count it");
+
+        assertTrue(repositoryText("framework/entity/" + ENTITY_GROUP_DESCRIPTOR)
+                        .contains("<entity-group group=\"org.apache.ofbiz.tenant\" entity=\"Component\"/>"),
+                "the Component entity must stay in the org.apache.ofbiz.tenant group: that is the group whose"
+                        + " datasource the init job writes to, and the privilege the entry point documents");
+
+        String entryPoint = repositoryText(ENTRY_POINT);
+        assertFalse(entryPoint.contains("not one row is loaded"), ENTRY_POINT + " claims a readers=none run"
+                + " loads not one row. It performs no reader load, but it does upsert the Component metadata,"
+                + " so the run must be described as loading no business-reader data instead");
+        assertTrue(entryPoint.contains("upserts one Component row per loaded component"), ENTRY_POINT + " must"
+                + " state that the schema-only load upserts the component metadata, so an operator granting the"
+                + " init identity its privileges is not told the run writes nothing");
+    }
+
+    /**
+     * AAP validation gate "Test delegator on H2": asserts the frozen {@code test} delegator still
      * resolves all three immutable entity groups to the embedded H2 datasources.
      *
      * <p>{@code gradlew testIntegration} runs against this delegator, so it must never be
@@ -429,7 +644,7 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 5 default-off posture: proves distributed cache invalidation stays disabled in
+     * AAP Objective 5 default-off posture: asserts distributed cache invalidation stays disabled in
      * the committed configuration, so an unconfigured checkout keeps single-node cache behaviour.
      *
      * <p>The capability is configuration-driven, not removed: the container entry point sets these
@@ -478,16 +693,17 @@ public final class SchemaInitGatingTests {
      *
      * <p>The entry point cannot use the loader's exit status as evidence. A
      * {@code bin/ofbiz --load-data readers=none} execution — which is how the one-shot init job asks
-     * the engine to apply the entity-model DDL and load nothing — has no data files to read, so it
-     * reports "Finished the data load with 0 rows changed" and exits {@code 0} <b>even when the start
-     * up database check that precedes it failed outright</b>. Verified against a live PostgreSQL with
+     * the engine to apply the entity-model DDL and load no business data — has no data file to read, so
+     * it reports "Finished the data load with 0 rows changed", a count of the rows its READERS loaded,
+     * and exits {@code 0} <b>even when the start up database check that precedes it failed
+     * outright</b>. Verified against a live PostgreSQL with
      * one wrong password: {@link org.apache.ofbiz.entity.jdbc.DatabaseUtil} logged that it could not
      * connect and aborted, the JVM still exited {@code 0}, and no table existed afterwards. Since the
      * only reason the init mode exists is that its exit status means "the schema is ready", the entry
      * point additionally asserts on this log output, and these literals are what make that assertion
      * true.</p>
      *
-     * <p>Four groups of literals are pinned, one per question the entry point has to answer: the
+     * <p>Five groups of literals are pinned, one per question the entry point has to answer: the
      * database check <i>ran in init mode</i> ({@code SCHEMA_INIT_DDL_SIGNATURE}), the verifying pass
      * <i>ran in run mode</i> ({@code SCHEMA_INIT_VERIFY_SIGNATURE}), the check <i>gave up</i>
      * ({@code SCHEMA_INIT_ABORT_SIGNATURES}), part of the DDL <i>was refused</i>
@@ -499,7 +715,7 @@ public final class SchemaInitGatingTests {
      * than left implicit in a shell script: this test fails the build the moment any of these messages
      * is reworded, moved out of a logging call, or dropped from the entry point — which is the whole
      * point, because the alternative failure mode is a container that reports success in production
-     * having created nothing. It also proves the constants are load-bearing: the checks that consume
+     * having created nothing. It also keeps the constants load-bearing: the checks that consume
      * them must still be present in {@code initialise_schema}.</p>
      *
      * @throws Exception if either engine source or the entry point cannot be read, which fails the
@@ -514,7 +730,7 @@ public final class SchemaInitGatingTests {
         String databaseUtilSource = repositoryText(DATABASE_UTIL_SOURCE);
 
         // Positive evidence. The engine logs the flag pair it resolved, so the entry point requires the
-        // "true" form: seeing it proves the check ran AND that this execution really got init mode.
+        // "true" form: seeing it means the check ran and that this execution really got init mode.
         String ddlSignature = shellConstant(entryPoint, "SCHEMA_INIT_DDL_SIGNATURE");
         assertTrue(ddlSignature.endsWith("true"), "the DDL signature must end with the add-missing value"
                 + " the init mode renders, so run-mode flags cannot satisfy it: " + ddlSignature);
@@ -565,15 +781,14 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 4: proves the entry point's failure enumeration covers <em>every</em> failure the
+     * AAP Objective 4: asserts the entry point's failure enumeration covers <em>every</em> failure the
      * entity engine can report, not merely the ones somebody happened to think of.
      *
-     * <p>This is the assertion that would have caught the defect this test class previously encoded. The
-     * entry point used to name two of {@link org.apache.ofbiz.entity.jdbc.DatabaseUtil}'s messages and
-     * this test asserted that there were exactly two of them, which turned an incomplete list into a
-     * pinned requirement. The census below runs the other way round: it reads every message the engine
-     * emits for the two failure classes out of the engine's own source and requires the entry point to
-     * cover each one, so a message added upstream fails the build instead of silently becoming a hole.</p>
+     * <p>A test that fixed the number of messages the entry point names would turn an incomplete list into a
+     * pinned requirement and would keep passing while the enumeration had a hole. The census below runs the
+     * other way round: it reads every message the engine emits for the two failure classes out of the engine's
+     * own source and requires the entry point to name each one, so a message the engine gains is a failure here
+     * rather than a silent gap.</p>
      *
      * <p>Two classes are censused, because they fail in different ways and the second is the dangerous
      * one:</p>
@@ -582,8 +797,8 @@ public final class SchemaInitGatingTests {
      * {@code checkDb} before any entity is examined, so nothing at all was created.</li>
      * <li><b>DDL failure.</b> A {@code "Could not create ..."} or {@code "Could not add column ..."}
      * message is logged at error level and then the engine <em>continues with the next entity</em>. The
-     * run finishes, the data loader exits {@code 0} because it had no rows to load, no abort message is
-     * ever printed, and the database is left with some tables and not others. An enumeration that omits
+     * run finishes, the data loader exits {@code 0} because it had no reader row to load, no abort
+     * message is ever printed, and the database is left with some tables and not others. An enumeration that omits
      * one of these lets the init job record a partial schema as applied.</li>
      * </ul>
      *
@@ -604,7 +819,7 @@ public final class SchemaInitGatingTests {
 
     /**
      * AAP Objective 4: executes the entry point's two schema-init verdicts against synthetic engine logs
-     * and proves that neither an aborted, a partial nor an incomplete outcome can be recorded as applied.
+     * and asserts that neither an aborted, a partial nor an incomplete outcome can be recorded as applied.
      *
      * <p>The verdict functions are pure - they read a log file and print an explanation, and change
      * nothing else - which is precisely so that they can be exercised here. That matters more for this
@@ -863,7 +1078,7 @@ public final class SchemaInitGatingTests {
     private static final String REPOSITORY_MARKER = "dependencies.gradle";
 
     /**
-     * AAP Objective 4 cross-artifact contract: proves the entry point's serving-mode DDL guard covers exactly the
+     * AAP Objective 4 cross-artifact contract: asserts the entry point's serving-mode DDL guard covers exactly the
      * datasources {@link #managedRdbmsRunModeHasDdlDisabled()} pins, and nothing else.
      *
      * <p>The guard cannot simply count {@code field-type-name="postgres"} elements, because the committed
@@ -891,7 +1106,8 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 4, <b>init/serve isolation</b>: proves {@code OFBIZ_SKIP_INIT} cannot bypass the DDL posture.
+     * AAP Objective 4, <b>init/serve isolation</b>: asserts the render and the serving-mode DDL check both
+     * precede the {@code OFBIZ_SKIP_INIT} branch, so that path cannot bypass them.
      *
      * <p>{@code /ofbiz/config} is a declared volume, so a {@code config/entityengine.xml} written by an
      * {@code OFBIZ_SCHEMA_INIT=true} run — which carries both flags {@code true} on purpose — outlives the container
@@ -915,8 +1131,9 @@ public final class SchemaInitGatingTests {
      * rendered result — which is why {@code configure_database} is additionally asserted to precede the guard.</p>
      *
      * <p>The branch is matched on {@code RESOLVED_SKIP_INIT} rather than on {@code OFBIZ_SKIP_INIT} directly,
-     * because the raw variable is parsed once, up front, into a resolved {@code true}/{@code false}: an earlier
-     * release treated any non-empty value as "skip", so {@code OFBIZ_SKIP_INIT=false} skipped the initialisation.
+     * because the raw variable is parsed once, up front, into a resolved {@code true}/{@code false}: reading the
+     * raw value directly would treat any non-empty value as "skip", so {@code OFBIZ_SKIP_INIT=false} would skip
+     * the initialisation.
      * The branch reads the parsed verdict, and this assertion follows it there.</p>
      */
     @Test
@@ -944,7 +1161,7 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 4 state separation: proves schema-init completion is tracked apart from the data-load marker.
+     * AAP Objective 4 state separation: asserts schema-init completion is tracked apart from the data-load marker.
      *
      * <p>The two record different facts. {@code data_loaded} says rows were loaded into some database at some point
      * in the state volume's life; it survives that volume being repointed at a fresh managed database, which has no
@@ -972,12 +1189,13 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 4 success criterion: proves the init-mode exit is gated on evidence produced by that same run.
+     * AAP Objective 4 success criterion: asserts the init-mode exit is gated on evidence produced by that same run.
      *
      * <p>{@code require_schema_init_completed} compares the receipt against a token unique to the execution, so a
      * receipt left by an earlier run cannot stand in for work this run did not do. It must be reached before the
      * successful exit, and the DDL pass it evidences must remain reachable when the data-load marker is already
-     * present — that combination is exactly the case that used to report success having applied nothing.</p>
+     * present — that combination is exactly the case a check placed after the marker
+     * would let report success having applied nothing.</p>
      */
     @Test
     public void containerEntryPointRequiresEvidenceFromThisRunBeforeReportingSchemaInitSuccess() {
@@ -989,7 +1207,7 @@ public final class SchemaInitGatingTests {
 
         // Pins WHICH exit was measured. _main also exits 0 from the --write-initial-container-state
         // sub-command dispatch at its very top, which is build-time bookkeeping and not the init-mode success
-        // this contract is about, so the LAST exit 0 is taken and then proved to be the one the
+        // this contract is about, so the LAST exit 0 is taken and then checked to be the one the
         // SCHEMA_INIT_APPLIED backstop guards.
         assertTrue(applicationBackstop < successfulExit, ENTRY_POINT
                 + " must guard its last exit 0 with the SCHEMA_INIT_APPLIED backstop, so that the exit measured"
@@ -1007,8 +1225,8 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 5 cross-artifact contract: proves the delegator's cache flag can never be enabled without a
-     * transport, in <em>any</em> profile.
+     * AAP Objective 5 cross-artifact contract: asserts the delegator's cache flag is refused unless a
+     * transport is configured, in <em>every</em> profile the entry point recognises.
      *
      * <p>{@link #distributedCacheClearDefaultsToDisabled()} pins the committed default; the entry point is the only
      * thing that turns the flag on, so the entry point is where the pairing has to hold. It matters because the
@@ -1020,7 +1238,7 @@ public final class SchemaInitGatingTests {
      *
      * <p>Two things are therefore asserted. The flag resolution must invoke the transport check, so the two can never
      * drift apart; and the check must refuse unconditionally — no {@code OFBIZ_PROFILE} test may appear in it. A
-     * profile-gated refusal is what used to let a development instance continue into that rollback behind a warning,
+     * profile-gated refusal would let a development instance continue into that rollback behind a warning,
      * and a warning in a start up log is not a defence against a write that silently fails.</p>
      */
     @Test
@@ -1041,14 +1259,25 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 5 / B2-JMS-RES-01: proves a claimed transport is backed by start up evidence, not by its mere
-     * presence in a file.
+     * AAP Objective 5 / B2-JMS-RES-01: asserts a claimed transport is backed by start up evidence rather than by
+     * its mere presence in a file - and, just as importantly, that the evidence is not described as more than it
+     * is.
      *
-     * <p>Three distinct facts have to hold before an instance may claim membership of a coherent fleet, and each is a
-     * separate helper so that each can fail with its own message: the element must {@code listen}, or this instance
+     * <p>Three necessary preconditions are checked, each through its own helper so that each can fail with its own
+     * message: the element must declare {@code listen}, or this instance
      * publishes invalidations while ignoring its peers' — the worst outcome available, because nothing fails and the
      * data is simply wrong on one instance; the broker client must be loadable, or the listener cannot be constructed;
      * and at least one broker endpoint must answer within a bounded deadline.</p>
+     *
+     * <p><b>These are necessary conditions, not sufficient ones, and this test does not claim otherwise.</b> None
+     * of the three creates a JNDI context, looks a connection factory or topic up in one, authenticates
+     * credentials, constructs a subscriber or publisher, or publishes anything, so none of them shows that an
+     * invalidation reaches a peer. A start up cannot show it here: {@code dependencies.gradle} bundles only the JMS
+     * API - the Agent Action Plan authorises exactly two dependency additions, neither a broker client nor an
+     * embedded broker - and the provider's client library is deployment specific and mounted by the operator, so
+     * there is nothing available to perform a lookup with. Propagation is verified instead by running two
+     * instances, for which {@code DOCKER.adoc} carries the procedure, and the companion test below holds the start
+     * up log to that boundary.</p>
      */
     @Test
     public void containerEntryPointRequiresASubscriberAndStartupConnectivityEvidenceForTheTransport() {
@@ -1062,7 +1291,47 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 5 ordering contract: proves the transport is rendered before it is judged, and on every start.
+     * The transport validation may not describe its own evidence as cache coherence, and its acceptance message
+     * must say so in as many words.
+     *
+     * <p>This guards a defect class rather than a line of code. Every check the start up performs is a necessary
+     * precondition, and the temptation in writing the log line that follows them is to summarise them as success:
+     * "the fleet is coherent", "invalidations have a transport to travel on". An operator who reads that stops
+     * looking, and the failure that matters most is exactly the one that leaves every precondition satisfied - a
+     * topic two instances do not physically share, or a subscriber that never registers, publishes nothing to
+     * nobody while the configuration and the network both look correct.</p>
+     *
+     * <p>The acceptance message is therefore required to carry the boundary as well as the finding, so that it
+     * travels with the claim into the container log where it is actually read, and so that a future edit which
+     * re-inflates the claim fails here rather than reaching an operator.</p>
+     */
+    @Test
+    public void theTransportValidationNeverReportsItsPreconditionsAsCacheCoherence() {
+        List<String> transportCheck = entryPointFunctionBody("validate_distributed_cache_transport");
+        String accepted = transportCheck.stream()
+                .filter(line -> line.contains("printf") && line.contains(CACHE_CLEAR_ENABLED))
+                .findFirst()
+                .orElse("");
+        assertFalse(accepted.isEmpty(), ENTRY_POINT + " must report the transport it accepted, so a start up log"
+                + " records which configuration the instance is running with");
+
+        for (String overclaim : COHERENCE_OVERCLAIMS) {
+            assertFalse(accepted.toLowerCase(Locale.ROOT).contains(overclaim), ENTRY_POINT + " reports the accepted"
+                    + " transport with the phrase [" + overclaim + "], which states more than the three checks"
+                    + " establish: none of them looks anything up, authenticates, subscribes or publishes. Report"
+                    + " what was checked and say what it does not prove. The message was: " + accepted);
+        }
+        assertTrue(accepted.contains("not evidence that an invalidation reaches another instance"), ENTRY_POINT
+                + " must state, in the message an operator actually reads, that the accepted preconditions are not"
+                + " evidence of propagation; a boundary recorded only in a comment is not read during an incident."
+                + " The message was: " + accepted);
+        assertTrue(accepted.contains("propagation must be confirmed against a second instance"), ENTRY_POINT
+                + " must tell the operator what would establish coherence, because a disclaimer that leaves no next"
+                + " step is ignored. The message was: " + accepted);
+    }
+
+    /**
+     * AAP Objective 5 ordering contract: asserts the transport is rendered before it is judged, and on every start.
      *
      * <p>Both halves are positional, and both are the kind of regression a presence check would miss. The render must
      * precede {@code resolve_entity_engine_flags}, because that function is what invokes the transport check: rendering
@@ -1095,7 +1364,7 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP section 0.2.1 boundary: proves the reference-only service-engine configuration is only ever read.
+     * AAP section 0.2.1 boundary: asserts no write to the reference-only service-engine configuration appears in the entry point.
      *
      * <p>{@code framework/service/config/serviceengine.xml} is listed in the plan as a reference model that must not be
      * modified, and its commented {@code serviceMessenger} example is documentation the render is required to leave
@@ -1135,7 +1404,7 @@ public final class SchemaInitGatingTests {
     private static final String FALLBACK_JNDI_SERVER = "default";
 
     /**
-     * AAP Objective 5 isolation contract: proves the cache transport is scoped to a jndi-server of its own rather than
+     * AAP Objective 5 isolation contract: asserts the cache transport is scoped to a jndi-server of its own rather than
      * to the JNDI settings the rest of the process resolves through.
      *
      * <p>{@code JNDIContextFactory} has two branches. A jndi-server that carries a {@code context-provider-url} gets
@@ -1205,7 +1474,7 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP section 0.7.1 functional parity: proves the transport render leaves the process-wide JNDI default exactly as
+     * AAP section 0.7.1 functional parity: asserts the transport render leaves the process-wide JNDI default exactly as
      * the distribution ships it.
      *
      * <p>{@code /ofbiz/config} is first on the runtime class path and the JDK merges {@code jndi.properties}
@@ -1270,7 +1539,7 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP Objective 5 lifecycle contract: proves the rendered jndi-server catalogue is managed across restarts like
+     * AAP Objective 5 lifecycle contract: asserts the rendered jndi-server catalogue is managed across restarts like
      * every other generated override.
      *
      * <p>{@code JNDIConfigUtil} reads {@code jndiservers.xml} as a flat class path resource, so the override does not
@@ -1323,7 +1592,7 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * AAP section 0.2.2 boundary: proves the distribution's JNDI configuration is only ever read.
+     * AAP section 0.2.2 boundary: asserts no write to the distribution's JNDI configuration appears in the entry point.
      *
      * <p>Neither {@code framework/base/config/jndiservers.xml} nor {@code framework/base/config/jndi.properties}
      * appears in the plan's change surface, so both are out of scope for modification, and both are shared by the
@@ -1351,30 +1620,14 @@ public final class SchemaInitGatingTests {
         }
     }
 
-    /**
-     * Reads the container entry point as one string.
-     *
-     * @return the whole script, newline joined
-     */
     private static String entryPointText() {
         return repositoryFileText(ENTRY_POINT);
     }
 
-    /**
-     * Reads the container entry point as lines.
-     *
-     * @return every line of the script, in order
-     */
     private static List<String> entryPointLines() {
         return repositoryFileLines(ENTRY_POINT);
     }
 
-    /**
-     * Reads a committed file, addressed relative to the repository root, as one string.
-     *
-     * @param relativePath the path of the file relative to the repository root
-     * @return the whole file, newline joined
-     */
     private static String repositoryFileText(String relativePath) {
         return String.join("\n", repositoryFileLines(relativePath));
     }
@@ -1485,7 +1738,7 @@ public final class SchemaInitGatingTests {
     }
 
     /**
-     * Finds the first line of {@code _main} that is exactly the given call, ignoring indentation.
+     * Finds the LAST line of {@code _main} that is exactly the given call, ignoring indentation.
      *
      * <p>Exact matching after trimming is deliberate: a substring search for {@code load_data} would also match
      * {@code load_data_something}, and a search that ignored comments would match the prose above each step.</p>
@@ -1503,13 +1756,6 @@ public final class SchemaInitGatingTests {
         throw new AssertionError(ENTRY_POINT + " _main does not contain the statement: " + statement);
     }
 
-    /**
-     * The zero-based index of the first line that is exactly the given statement once trimmed.
-     *
-     * @param lines the lines to search
-     * @param statement the statement to locate
-     * @return the zero-based index of the statement
-     */
     private static int indexOfLine(List<String> lines, String statement) {
         for (int index = 0; index < lines.size(); index++) {
             if (statement.equals(lines.get(index).trim())) {
@@ -1533,12 +1779,10 @@ public final class SchemaInitGatingTests {
         return candidate;
     }
 
-    // ---------------------------------------------------------------------------------------------
     // Helpers of the entry-point driven schema-mode assertion above. They execute the real
     // docker/docker-entrypoint.sh as a library inside a sandbox that mimics the container's /ofbiz
     // layout, so what they observe is the rendered artefact a deployment reads rather than a
     // restatement of the committed file.
-    // ---------------------------------------------------------------------------------------------
     /**
      * Runs one container start's worth of database configuration: the entry point resolves the mode
      * flags from the environment and then configures the database, which reconciles the state marker
@@ -1556,18 +1800,189 @@ public final class SchemaInitGatingTests {
      */
     private static String configureDatabase(Path workDir, Path home, Path stateDir, String schemaInitValue)
             throws Exception {
-        String body = "CONTAINER_STATE_DIR=" + shellQuote(stateDir) + "\n"
-                + "CONTAINER_DATA_LOADED=\"$CONTAINER_STATE_DIR/" + LOAD_MARKERS.get(0) + "\"\n"
-                + "CONTAINER_ADMIN_LOADED=\"$CONTAINER_STATE_DIR/" + LOAD_MARKERS.get(1) + "\"\n"
-                + "CONTAINER_DB_CONFIG_APPLIED=\"$CONTAINER_STATE_DIR/" + STATE_MARKER + "\"\n"
-                + "mkdir --parents \"$CONTAINER_STATE_DIR\"\n"
-                + RESOLVE_AND_CONFIGURE;
-
         Map<String, String> environment = new LinkedHashMap<>(MANAGED_DATABASE_ENVIRONMENT);
         if (schemaInitValue != null) {
             environment.put("OFBIZ_SCHEMA_INIT", schemaInitValue);
         }
+        return runEntryPoint(workDir, home, containerStatePreamble(stateDir) + RESOLVE_AND_CONFIGURE, environment);
+    }
+
+    /**
+     * Redirects the container state directory, and the three markers derived from it, into the sandbox. Every
+     * start driven here shares this preamble, so no state on the build host is read or written.
+     * @param stateDir the sandbox's container state directory, created by the preamble if absent
+     * @return the shell that redirects the state, ready to be followed by the steps of a start
+     */
+    private static String containerStatePreamble(Path stateDir) {
+        return "CONTAINER_STATE_DIR=" + shellQuote(stateDir) + "\n"
+                + "CONTAINER_DATA_LOADED=\"$CONTAINER_STATE_DIR/" + LOAD_MARKERS.get(0) + "\"\n"
+                + "CONTAINER_ADMIN_LOADED=\"$CONTAINER_STATE_DIR/" + LOAD_MARKERS.get(1) + "\"\n"
+                + "CONTAINER_DB_CONFIG_APPLIED=\"$CONTAINER_STATE_DIR/" + STATE_MARKER + "\"\n"
+                + "mkdir --parents \"$CONTAINER_STATE_DIR\"\n";
+    }
+
+    /**
+     * Runs a whole one-shot initialisation execution's worth of configuration: the entry point resolves
+     * {@code OFBIZ_SCHEMA_INIT=true}, renders the DDL-enabled configuration, and then hands the configuration
+     * volume back in serving mode exactly as {@code _main} does once the schema has been applied.
+     *
+     * <p>The rendered configuration is copied aside between those two steps, because the DDL-enabled file
+     * exists only for the length of the execution that applies the schema: a test that looked at it afterwards
+     * would find the restored one and could not tell the two modes apart. The requested mode is printed at the
+     * end so the caller can check the restoration left it alone.</p>
+     * @param workDir a per-test temporary directory
+     * @param home the sandbox that stands in for the container's {@code /ofbiz}
+     * @param stateDir the sandbox's container state directory
+     * @param midInitialisation where to copy the configuration the initialisation itself ran with
+     * @return the combined output of the run
+     * @throws Exception if the entry point could not be executed
+     */
+    private static String initialiseAndRestoreServingMode(Path workDir, Path home, Path stateDir,
+            Path midInitialisation) throws Exception {
+        String body = containerStatePreamble(stateDir)
+                + RESOLVE_AND_CONFIGURE
+                + "cp " + shellQuote(home.resolve(RENDERED_CONFIGURATION)) + " "
+                + shellQuote(midInitialisation) + "\n"
+                + "restore_serving_mode_after_schema_init\n"
+                + "printf 'RESOLVED_SCHEMA_INIT=%s\\n' \"$RESOLVED_SCHEMA_INIT\"\n";
+
+        Map<String, String> environment = new LinkedHashMap<>(MANAGED_DATABASE_ENVIRONMENT);
+        environment.put("OFBIZ_SCHEMA_INIT", "true");
         return runEntryPoint(workDir, home, body, environment);
+    }
+
+    /**
+     * The entity groups the rendered {@code default} delegator maps, each with the datasource it maps it to.
+     *
+     * <p>Read from the render rather than from the committed configuration because the render is what a
+     * deployed instance loads, and because the deployed profile's group-maps are the whole point of the
+     * postcondition these feed: taking them from the committed file would judge the embedded profile.</p>
+     * @param home the sandbox the entry point rendered into
+     * @return group name to datasource name, in document order
+     * @throws Exception if the rendered configuration could not be read or parsed
+     */
+    private static Map<String, String> renderedDefaultDelegatorGroupMaps(Path home) throws Exception {
+        Element delegator = declaration(parse(home.resolve(RENDERED_CONFIGURATION)), "delegator", "default");
+        Map<String, String> groupMaps = new LinkedHashMap<>();
+        NodeList maps = delegator.getElementsByTagName("group-map");
+        for (int index = 0; index < maps.getLength(); index++) {
+            Element map = (Element) maps.item(index);
+            groupMaps.put(map.getAttribute("group-name"), map.getAttribute("datasource-name"));
+        }
+        assertFalse(groupMaps.isEmpty(), "the rendered 'default' delegator declares no group-map at all, so"
+                + " there is nothing for the helper postcondition to be taken against");
+        return groupMaps;
+    }
+
+    /**
+     * The entity groups {@code ModelGroupReader.getGroupNames} would return for the rendered {@code default}
+     * delegator: the groups the loaded components declare, plus that delegator's own default group.
+     *
+     * <p>This is the set that decides which helper initialisations the engine performs, and it is emphatically
+     * not the set of groups the delegator <i>maps</i> — which is the assumption a postcondition reading the delegator's map
+     * would make. A component is counted when it has the descriptor that makes it loadable and that
+     * descriptor registers a group reader, because that registration is what {@code ModelGroupReader} follows;
+     * naming a component in {@code excludedComponents} withdraws exactly that descriptor, which is the same
+     * way a deployment leaves a plugin out.</p>
+     * @param home the sandbox the entry point rendered into, whose render supplies the default group
+     * @param excludedComponents component paths relative to the repository root, as {@code plugins/bi}
+     * @return the group names, sorted so a failure message reads the same way twice
+     * @throws Exception if the render, a component descriptor or a group descriptor could not be read
+     */
+    private static Set<String> consideredEntityGroups(Path home, Set<String> excludedComponents) throws Exception {
+        Element delegator = declaration(parse(home.resolve(RENDERED_CONFIGURATION)), "delegator", "default");
+        String declaredDefault = delegator.getAttribute("default-group-name");
+        Set<String> considered = new TreeSet<>();
+        considered.add(declaredDefault.isEmpty() ? DEFAULT_ENTITY_GROUP : declaredDefault);
+
+        Pattern declaration = Pattern.compile("group=\"([^\"]+)\"");
+        for (String root : COMPONENT_ROOTS) {
+            Path start = repositoryRoot().resolve(root);
+            if (!Files.isDirectory(start)) {
+                continue;
+            }
+            List<Path> descriptors = new ArrayList<>();
+            try (Stream<Path> tree = Files.walk(start, COMPONENT_DESCRIPTOR_DEPTH)) {
+                tree.filter(path -> path.endsWith(ENTITY_GROUP_DESCRIPTOR)).forEach(descriptors::add);
+            }
+            for (Path descriptor : descriptors) {
+                Path component = descriptor.getParent().getParent();
+                if (excludedComponents.contains(root + "/" + component.getFileName())
+                        || !Files.isRegularFile(component.resolve(COMPONENT_DESCRIPTOR))
+                        || !Files.readString(component.resolve(COMPONENT_DESCRIPTOR), StandardCharsets.UTF_8)
+                                .contains("type=\"group\"")) {
+                    continue;
+                }
+                Matcher declared = declaration.matcher(Files.readString(descriptor, StandardCharsets.UTF_8));
+                while (declared.find()) {
+                    considered.add(declared.group(1));
+                }
+            }
+        }
+        return considered;
+    }
+
+    /**
+     * The loader log a run against these group-maps produces when it initialises every group it has an entity
+     * for, and nothing else.
+     *
+     * <p>The per-group line is reproduced character for character as {@code GenericDelegator} logs it, verified
+     * against a captured {@code --load-data readers=none} run of this checkout. A group the delegator maps but
+     * no loaded component declares produces no line at all — neither an initialisation nor a refusal — which is
+     * the observation the postcondition has to tolerate and is why such groups are skipped here.</p>
+     * @param groupMaps the group-maps the configuration declares
+     * @param consideredGroups the groups the loaded components bring into play
+     * @return the log text
+     */
+    private static String loaderLogFor(Map<String, String> groupMaps, Set<String> consideredGroups) {
+        StringBuilder log = new StringBuilder("Loading data using delegator 'default'\n");
+        for (Map.Entry<String, String> groupMap : groupMaps.entrySet()) {
+            if (consideredGroups.contains(groupMap.getKey())) {
+                log.append("Delegator \"default\" initializing helper \"").append(groupMap.getValue())
+                        .append("\" for entity group \"").append(groupMap.getKey()).append("\".\n");
+            }
+        }
+        return log.append("=-=-=-=-=-=-= Finished the data load with 0 rows changed.\n").toString();
+    }
+
+    /**
+     * The line the delegator logs when it will not associate a group with itself, character for character as
+     * {@code GenericDelegator} emits it. This is the one outcome that is positive evidence of a group the
+     * configuration maps having had nothing done for it.
+     * @param group the entity group the delegator refused
+     * @return the log line, newline terminated
+     */
+    private static String refusalLine(String group) {
+        return "Delegator \"default\" NOT initializing helper for entity group \"" + group
+                + "\" because the group is not associated to this delegator.\n";
+    }
+
+    /**
+     * Drives the entry point's real helper postcondition against a captured loader log and returns its verdict:
+     * empty when the log carries the completion evidence it requires, otherwise the refusal the initialisation would fail on.
+     *
+     * <p>Nothing tells the function where the configuration is: {@code ENTITY_ENGINE_OVERRIDE} is the relative
+     * path the entry point itself sets and every run here executes from the sandbox home, so what the verdict
+     * is taken against is the render a deployed instance would read, resolved the way the entry point resolves
+     * it. The verdict is printed between sentinels because it is prose that may itself contain punctuation.</p>
+     * @param workDir a per-test temporary directory
+     * @param home the sandbox that stands in for the container's {@code /ofbiz}, already rendered into
+     * @param log the loader log to take the verdict against
+     * @return the verdict, trimmed, empty when the postcondition is satisfied
+     * @throws Exception if the entry point could not be executed
+     */
+    private static String helperVerdict(Path workDir, Path home, String log) throws Exception {
+        Path capture = Files.createTempFile(workDir, "loader", ".log");
+        Files.writeString(capture, log, StandardCharsets.UTF_8);
+        String body = "printf 'VERDICT-BEGIN\\n%s\\nVERDICT-END\\n'"
+                + " \"$(schema_init_helper_verdict " + shellQuote(capture) + ")\"\n";
+        String output = runEntryPoint(workDir, home, body, Map.of());
+
+        int begin = output.indexOf("VERDICT-BEGIN\n");
+        int end = output.lastIndexOf("\nVERDICT-END");
+        assertTrue(begin >= 0 && end > begin, "the helper postcondition printed no delimited verdict, so it"
+                + " could not be executed at all. Its output was:\n" + output);
+        return output.substring(begin + "VERDICT-BEGIN\n".length(), end).trim();
     }
 
     /**
@@ -1581,9 +1996,21 @@ public final class SchemaInitGatingTests {
      * @throws Exception if the rendered configuration could not be read or parsed
      */
     private static void assertRenderedSchemaMode(Path home, String expectedMode, String context) throws Exception {
-        Path renderedFile = home.resolve(RENDERED_CONFIGURATION);
+        assertSchemaModeOfRenderedFile(home.resolve(RENDERED_CONFIGURATION), expectedMode, context);
+    }
+
+    /**
+     * The same assertion against a named file rather than against the sandbox's current render, so the
+     * configuration an execution ran with can be asserted after that execution has replaced it.
+     * @param renderedFile the file to read
+     * @param expectedMode the literal both DDL attributes of the managed datasources must carry
+     * @param context how this render was requested, for the failure messages
+     * @throws Exception if the rendered configuration could not be read or parsed
+     */
+    private static void assertSchemaModeOfRenderedFile(Path renderedFile, String expectedMode, String context)
+            throws Exception {
         assertTrue(Files.isRegularFile(renderedFile),
-                "the entry point rendered no " + RENDERED_CONFIGURATION + " " + context);
+                "the entry point rendered no " + renderedFile.getFileName() + " " + context);
         assertEquals(List.of(), placeholdersIn(Files.readString(renderedFile, StandardCharsets.UTF_8)),
                 "the configuration rendered " + context + " still carries unsubstituted placeholders");
 
