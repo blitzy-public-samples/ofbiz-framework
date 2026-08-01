@@ -104,9 +104,10 @@ import software.amazon.awssdk.utils.SdkAutoCloseable;
  * so the endpoint is validated before a client is built: it must be an absolute {@code http} or
  * {@code https} URI with a host, no user information and no query or fragment, and an instance
  * metadata address is refused outright in every configuration because a request sent there would
- * hand out the instance's own role credentials. A plaintext {@code http} endpoint is accepted with
- * a warning, for a local development store; the container entry point refuses it in the deployed
- * profile, which is where that policy belongs.
+ * hand out the instance's own role credentials. No refusal repeats the configured endpoint back,
+ * since an endpoint can itself carry a credential and a refusal is destined for a log. A plaintext
+ * {@code http} endpoint is accepted with a warning, for a local development store; the container
+ * entry point refuses it in the deployed profile, which is where that policy belongs.
  *
  * <p><strong>Absence is one error code, not one status code.</strong> Only {@code NoSuchKey} means
  * "nothing is stored here". A missing bucket, a wrong endpoint and a refused credential are
@@ -278,8 +279,14 @@ public final class S3ContentStore implements ContentStore {
             this.s3Client = builder.build();
         } catch (SdkException e) {
             closeQuietly(credentials);
-            throw new GeneralException("The S3 content store client could not be built from"
-                    + " content.store.s3.* : " + e.getMessage(), e);
+            // The SDK's own text is logged rather than concatenated or attached: GeneralException.getMessage()
+            // appends the message of any cause it is given, and an SDK build failure quotes the configuration
+            // it rejected - which here is an endpoint and a credential pair. Whoever has to correct the
+            // configuration reads the log; whoever merely receives the refusal does not need the value.
+            Debug.logError(e, "The S3 content store client could not be built from the content.store.s3.*"
+                    + " configuration", MODULE);
+            throw new GeneralException("The S3 content store client could not be built from the"
+                    + " content.store.s3.* configuration; the store's own diagnostic is in the server log");
         }
         this.bucket = configuredBucket;
         this.keyPrefix = validatedKeyPrefix(property(KEY_PREFIX_PROPERTY, delegator));
@@ -605,6 +612,10 @@ public final class S3ContentStore implements ContentStore {
     /**
      * Validates a storage key and places it under the configured prefix.
      *
+     * <p>The grammar every provider shares is applied first, through
+     * {@link ContentStore#requireUsableKey(String)}, so that this provider refuses exactly the keys the
+     * filesystem provider refuses and content migrated between the two keeps every key it had.
+     *
      * <p>The scoping is enforced here and not only where the key is minted, because this class is
      * reachable without coming through {@link ContentStoreFactory} and a bucket is a namespace every
      * instance and every tenant shares. Only the three-segment identity key is accepted:
@@ -615,22 +626,14 @@ public final class S3ContentStore implements ContentStore {
      *
      * @param key the provider-relative storage key
      * @return the object key to name in a request, prefix included
-     * @throws GeneralException if the key is null or empty, carries a control character, is absolute,
-     *     is not the scoped identity key this provider accepts, or exceeds the object-key length
-     *     limit once the prefix is applied
+     * @throws GeneralException if the key breaks the shared key grammar, is not the scoped identity
+     *     key this provider accepts, or exceeds the object-key length limit once the prefix is applied
      */
     private String objectKey(String key) throws GeneralException {
-        if (UtilValidate.isEmpty(key)) {
-            throw new GeneralException("A content store key must not be empty");
-        }
-        for (int index = 0; index < key.length(); index++) {
-            if (Character.isISOControl(key.charAt(index))) {
-                throw new GeneralException("A content store key must not contain a control character");
-            }
-        }
-        if (key.startsWith("/")) {
-            throw new GeneralException("A content store key must be relative: [" + key + "]");
-        }
+        // The grammar every provider shares first, from its one implementation, so that this provider
+        // refuses exactly what the filesystem provider refuses and content migrated between the two keeps
+        // every key it had. What follows is what this provider alone requires of a key.
+        ContentStore.requireUsableKey(key);
         String[] segments = key.split("/", -1);
         boolean scoped = segments.length == KEY_SEGMENT_COUNT
                 && ContentStoreFactory.IDENTITY_KEY_NAMESPACE.equals(segments[0])
@@ -665,8 +668,12 @@ public final class S3ContentStore implements ContentStore {
         try {
             uri = new URI(endpoint);
         } catch (URISyntaxException e) {
-            // The value is never echoed: the case this exists to catch is an endpoint carrying a credential.
-            throw new GeneralException("content.store.s3.endpoint is not a valid URI", e);
+            // The value is never echoed, because the case this exists to catch is an endpoint carrying a
+            // credential. That rules out nesting the cause as much as quoting the value: GeneralException
+            // appends a nested exception's message to its own, and URISyntaxException always reports the whole
+            // input it was handed. Its reason and position carry the entire diagnostic and none of the value.
+            throw new GeneralException("content.store.s3.endpoint is not a valid URI: " + e.getReason()
+                    + (e.getIndex() < 0 ? "" : " at index " + e.getIndex()));
         }
         String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
         if (!"https".equals(scheme) && !"http".equals(scheme)) {

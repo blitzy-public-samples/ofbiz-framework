@@ -136,12 +136,24 @@ import static org.mockito.Mockito.when;
  * tolerates only the JUnit 4 lifecycle annotations, so a non-final class carrying the
  * {@code @BeforeEach} and {@code @AfterEach} that the restore above requires fails the build.
  *
+ * <p><strong>The refusals are asserted as carefully as the successes.</strong> Two of them are
+ * security controls rather than tidiness, so each has its own case here: an endpoint is where this
+ * deployment's credentials are sent, and a key travels to the store inside a request. Every shape
+ * of unusable endpoint is therefore refused before a client exists - including a cloud instance
+ * metadata address, in every form it can be written - and every shape of unusable key is refused
+ * before a request is issued, for all five operations rather than the two that are cheapest to
+ * call. Each refusal is also asserted to name the property or key at fault and to echo neither the
+ * configured value nor the configured credentials, because the value a refusal reports may itself
+ * be a credential.
+ *
  * <p><strong>Nothing here reaches a network, a database or the filesystem.</strong> The object-store
  * operations run against a mocked {@code S3Client} handed to the provider's package-private test
  * seam; the fake configuration the selection cases install builds a client entirely offline, from a
  * static credential pair and an explicit region, and no request is ever issued through it. The
- * {@code S3Client} named here is the single sanctioned reference to the AWS SDK outside
- * {@link S3ContentStore} itself.
+ * endpoints the refusal cases configure are never reached either: they are rejected before a client
+ * is built, and the one legal endpoint asserted to be accepted only ever gets as far as being
+ * stored on a builder. The {@code S3Client} named here is the single sanctioned reference to the
+ * AWS SDK outside {@link S3ContentStore} itself.
  *
  * <p>The public {@code Delegator} form is exercised with a null delegator, which is its documented
  * "consult {@code content.properties} only" contract. A live delegator would make this an
@@ -208,6 +220,17 @@ public final class ContentStoreFactoryTest {
 
     /** A second such bucket, so a change made only in the database can be told from the first. */
     private static final String OTHER_BUCKET = "bucket-changed-in-the-database";
+
+    /**
+     * An obviously fake credential planted inside an endpoint value, so that a refusal can be proved
+     * not to hand back what it was given. An endpoint really can arrive carrying one - user
+     * information is part of the syntax, and a pasted pre-signed URL carries one in its query - which
+     * is exactly why a refusal must not repeat it into a log.
+     */
+    private static final String ENDPOINT_CREDENTIAL = "keyid:not-a-real-secret-in-an-endpoint";
+
+    /** A host that resolves nowhere, for the endpoints that are refused before anything is sent. */
+    private static final String UNREACHED_HOST = "objects.example.test";
 
     /**
      * The one shape of key the object store accepts: the namespace, the tenant scope and the
@@ -449,6 +472,52 @@ public final class ContentStoreFactoryTest {
                 + " be refused by name");
         assertFalse(oneSided.getMessage().contains(ACCESS_KEY_ID), "a refusal must not echo the credential:"
                 + " " + oneSided.getMessage());
+    }
+
+    @Test
+    public void anUnusableObjectStoreEndpointIsRefusedBeforeACredentialCanBeSentToIt() throws Exception {
+        // Every object request carries this deployment's credential to whatever the endpoint names, so the
+        // endpoint is the one configuration value that decides who receives it. Each value below is a shape a
+        // hand-edited file or an expanded environment variable really produces: another scheme entirely, a
+        // host written with no scheme at all, an address with no host, and the three forms that smuggle extra
+        // data past the authority. The last is malformed and carries a credential as well, because a syntax
+        // failure reported by quoting the value back is the one way this refusal could leak what it protects.
+        // All of them are refused before a client exists, so nothing is ever sent anywhere.
+        String[] unusableEndpoints = {"ftp://" + UNREACHED_HOST + "/", "file:///srv/objects",
+                UNREACHED_HOST + ":9000", "http:///" + BUCKET,
+                "http://" + ENDPOINT_CREDENTIAL + "@" + UNREACHED_HOST + "/",
+                "http://" + UNREACHED_HOST + "/?" + ENDPOINT_CREDENTIAL,
+                "http://" + UNREACHED_HOST + "/#" + ENDPOINT_CREDENTIAL,
+                "http://" + ENDPOINT_CREDENTIAL + "@objects example.test/"};
+        for (String unusable : unusableEndpoints) {
+            refusalOfEndpoint(unusable);
+        }
+
+        // A legal endpoint is still accepted. Without this the whole case above could be satisfied by
+        // validation that refused everything, which would take every S3-compatible store out of service.
+        configureEndpoint("https://" + UNREACHED_HOST);
+        assertTrue(storeConfiguredAs(PROVIDER_S3) instanceof S3ContentStore, "a plain absolute https endpoint"
+                + " must still be accepted");
+    }
+
+    @Test
+    public void aCloudInstanceMetadataEndpointIsRefusedInEveryFormItCanBeWritten() {
+        // This refusal is a credential-disclosure defence, not tidiness: the instance metadata service
+        // answers with role credentials for the whole instance, so an endpoint naming it would turn the first
+        // object request into a disclosure of everything this deployment can reach. Every form of the address
+        // is asserted - IPv4 under either scheme, the IPv6 form the SDK also honours, and the container
+        // credentials address - because a blocklist covering only the one address everybody quotes would be
+        // no defence at all. The reason is asserted too, so the refusal cannot pass for an incidental one.
+        String[] metadataEndpoints = {"http://169.254.169.254/",
+                "https://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                "http://[fd00:ec2::254]/latest/meta-data/", "http://169.254.170.2/v2/credentials"};
+        for (String metadata : metadataEndpoints) {
+            GeneralException refusal = refusalOfEndpoint(metadata);
+
+            assertTrue(refusal.getMessage().contains("instance metadata"), "[" + metadata + "] must be refused"
+                    + " for naming an instance metadata address rather than for an incidental reason, was: "
+                    + refusal.getMessage());
+        }
     }
 
     @Test
@@ -836,6 +905,26 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
+    public void aBlankStorageRootIsRefusedExactlyAsAnAbsentOneIs() {
+        // Whitespace is what a shell that expanded an unset variable into a quoted argument leaves behind.
+        // Accepting it would root the whole content store at whatever directory the process started in,
+        // which is a different tree on every instance and a tree nobody chose, so it is refused exactly as
+        // an unset value is - loudly, when the provider is built, rather than quietly on the first read.
+        for (String blank : new String[] {"", " ", "   ", "\t"}) {
+            System.setProperty("ofbiz.home", blank);
+            String reported = "a blank ofbiz.home [" + printable(blank) + "] must be refused";
+            GeneralException refusal = assertThrows(GeneralException.class, () -> new FileSystemContentStore(null),
+                    reported);
+            assertTrue(refusal.getMessage().contains("ofbiz.home"), "the refusal must name the property that is"
+                    + " unusable: " + refusal.getMessage());
+        }
+
+        System.clearProperty("ofbiz.home");
+        assertThrows(GeneralException.class, () -> new FileSystemContentStore(null), "an unset ofbiz.home must"
+                + " be refused");
+    }
+
+    @Test
     public void contentExactlyTheSizeOfTheCeilingIsReadRatherThanRefused() throws Exception {
         UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_MAX_OBJECT_SIZE, "1024");
         byte[] exact = new byte[1024];
@@ -859,10 +948,14 @@ public final class ContentStoreFactoryTest {
         // A bucket is one namespace shared by every instance and, in a multi-tenant deployment, by
         // every tenant, so this provider accepts only the scoped identity key and refuses everything
         // else where it is named rather than sending it to a store that would honour it. The list is
-        // the ways a key can fail to be that: empty, absolute, a traversal, a bare upload path that
-        // two tenants could both record, the right shape under the wrong namespace, too few or too
-        // many segments, and an empty segment.
+        // the ways a key can fail to be that: absent, empty, absolute, a traversal, a bare upload
+        // path that two tenants could both record, the right shape under the wrong namespace, too few
+        // or too many segments, and an empty segment. The last five are the right shape in every
+        // respect but one character, and are refused for a second reason: a key travels to the store
+        // inside the request line and its headers, so one carrying a NUL or a line break could alter
+        // what is sent on this deployment's behalf rather than merely name the wrong object.
         String[] unusable = {
+            null,
             "",
             "/dataresource/default/10000",
             "dataresource/../../etc/passwd",
@@ -872,17 +965,49 @@ public final class ContentStoreFactoryTest {
             "dataresource/default/10000/original",
             "dataresource//10000",
             "dataresource/default/",
+            "dataresource/default/100\u000000",
+            "dataresource/default/10\t000",
+            "dataresource/default/10000\n",
+            "dataresource/default/100\u007f00",
+            "dataresource/default/100\u001b00",
         };
         for (String key : unusable) {
-            assertThrows(GeneralException.class, () -> store.get(key), "[" + key + "] must be refused");
-            assertThrows(GeneralException.class, () -> store.openStream(key), "[" + key + "] must be refused");
-            assertThrows(GeneralException.class, () -> store.exists(key), "[" + key + "] must be refused");
-            assertThrows(GeneralException.class, () -> store.delete(key), "[" + key + "] must be refused");
-            assertThrows(GeneralException.class, () -> store.put(key, PAYLOAD), "[" + key + "] must be refused");
+            // All five operations are asked, not only the two that are cheapest to call: they share
+            // the one key check, so an edit that moved or weakened it for a single operation would
+            // otherwise pass here and let that operation alone reach the store with a key nothing
+            // had vetted.
+            String refused = "[" + printable(key) + "] must be refused by every operation";
+            assertThrows(GeneralException.class, () -> store.get(key), refused);
+            assertThrows(GeneralException.class, () -> store.openStream(key), refused);
+            assertThrows(GeneralException.class, () -> store.exists(key), refused);
+            assertThrows(GeneralException.class, () -> store.delete(key), refused);
+            assertThrows(GeneralException.class, () -> store.put(key, PAYLOAD), refused);
         }
         assertThrows(GeneralException.class, () -> store.put(KEY, null), "a null payload must be refused");
 
         verifyNoInteractions(client);
+    }
+
+    @Test
+    public void emptyContentIsStoredRatherThanRefusedAsAMissingPayload() throws Exception {
+        // The contract permits a zero-length payload and refuses only a null one, and the provider checks the
+        // two a couple of lines apart, so the permitted one is asserted rather than assumed. Content that is
+        // legitimately empty - a cleared upload, a zero-byte attachment - has to remain storable, and has to
+        // arrive at the store as an empty object rather than as no request at all, because the caller that
+        // reads it back expects the zero-length array the contract promises.
+        S3Client client = mock(S3Client.class);
+        ContentStore store = new S3ContentStore(client, BUCKET);
+
+        assertDoesNotThrow(() -> store.put(KEY, new byte[0]), "empty content must be storable");
+
+        ArgumentCaptor<RequestBody> written = ArgumentCaptor.forClass(RequestBody.class);
+        verify(client).putObject(eq(PutObjectRequest.builder().bucket(BUCKET).key(KEY).build()),
+                written.capture());
+        assertEquals(0L, written.getValue().optionalContentLength().orElse(-1L).longValue(), "empty content must"
+                + " be sent as a zero-length body rather than as a body of unknown length");
+        try (InputStream sent = written.getValue().contentStreamProvider().newStream()) {
+            assertEquals(0, sent.readAllBytes().length, "no bytes may be invented for empty content");
+        }
     }
 
     @Test
@@ -896,6 +1021,50 @@ public final class ContentStoreFactoryTest {
         assertThrows(GeneralException.class, () -> store.get(tooLong), "a key over the object-key limit must be"
                 + " refused rather than sent and silently rejected by the store");
         verifyNoInteractions(client);
+    }
+
+    @Test
+    public void theSharedKeyGrammarRefusesTheSameKeysThroughEveryProvider(@TempDir Path tree) throws Exception {
+        // One grammar, one implementation, one exception type. A key is only opaque if it means the same
+        // thing to every provider: a deployment that moves content from a shared filesystem to an object
+        // store must not discover that a key one accepted is a key the next refuses. So the whole matrix is
+        // asserted against both providers at once, on all five operations, and every refusal has to arrive
+        // as a GeneralException - the caller's mistake - rather than as an IOException, which is what a
+        // caller reads as the store itself having failed. Each provider still adds what its own storage
+        // requires on top of this, which is why only keys the shared grammar refuses appear here.
+        ContentStore filesystem = filesystemStoreRootedAt(tree);
+        S3Client client = mock(S3Client.class);
+        ContentStore objectStore = new S3ContentStore(client, BUCKET);
+
+        String longestComponent = "a".repeat(ContentStore.MAX_KEY_COMPONENT_LENGTH_BYTES - 5);
+        String beyondTheKeyLimit = longestComponent + "/" + longestComponent + "/" + longestComponent + "/"
+                + longestComponent + "/" + longestComponent;
+        String beyondTheComponentLimit = "runtime/" + "b".repeat(ContentStore.MAX_KEY_COMPONENT_LENGTH_BYTES + 1);
+        String[] unusable = {null, "", "   ", "\t", "runtime/up\u0000loads/logo.png",
+            "/runtime/uploads/logo.png", "\\runtime\\uploads", "C:/runtime/uploads",
+            "runtime//uploads/logo.png", "runtime/uploads/", "./runtime/uploads/logo.png",
+            "runtime/./uploads/logo.png", "runtime/../../etc/passwd", beyondTheKeyLimit,
+            beyondTheComponentLimit, };
+        for (String key : unusable) {
+            for (ContentStore store : new ContentStore[] {filesystem, objectStore}) {
+                String where = store.getClass().getSimpleName() + " [" + printable(key) + "]";
+                assertThrows(GeneralException.class, () -> store.get(key), where + " must be refused by get");
+                assertThrows(GeneralException.class, () -> store.openStream(key), where + " must be refused by"
+                        + " openStream");
+                assertThrows(GeneralException.class, () -> store.exists(key), where + " must be refused by"
+                        + " exists");
+                assertThrows(GeneralException.class, () -> store.delete(key), where + " must be refused by"
+                        + " delete");
+                assertThrows(GeneralException.class, () -> store.put(key, PAYLOAD), where + " must be refused by"
+                        + " put");
+            }
+        }
+
+        // Refused where it is named, before anything is issued or written.
+        verifyNoInteractions(client);
+        try (var entries = Files.list(tree)) {
+            assertEquals(0, entries.count(), "a refused key must not have created anything in the tree");
+        }
     }
 
     @Test
@@ -1828,6 +1997,70 @@ public final class ContentStoreFactoryTest {
     private static GeneralException refusalOf(String value) {
         return assertThrows(GeneralException.class, () -> storeConfiguredAs(value),
                 "[" + value + "] names a provider that cannot be built, so it must be refused");
+    }
+
+    /**
+     * Configures an object-store endpoint, leaving the rest of the offline fixture in place.
+     *
+     * @param endpoint the endpoint to configure; never null, because blank is how an unset key is
+     *     expressed and the setter is backed by a {@code Hashtable}
+     */
+    private static void configureEndpoint(String endpoint) {
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_ENDPOINT, endpoint);
+    }
+
+    /**
+     * Configures an endpoint the provider must refuse, and asserts the refusal reports itself safely.
+     *
+     * <p>Four things at once, because an endpoint refusal that got any of them wrong would be worse
+     * than none: the provider must refuse rather than build a client aimed somewhere unintended, it
+     * must say which property is at fault so the deployment can be corrected, it must repeat neither
+     * the value it was handed nor the credentials it holds - the value may itself be a credential, and
+     * the refusal is destined for a log - and it must carry no cause, because a
+     * {@code GeneralException} publishes a cause's message through its own.
+     *
+     * @param endpoint the endpoint to configure
+     * @return the refusal, so a caller can assert more about the reason it gives
+     */
+    private static GeneralException refusalOfEndpoint(String endpoint) {
+        configureEndpoint(endpoint);
+        GeneralException refusal = refusalOf(PROVIDER_S3);
+        String reported = refusal.getMessage();
+
+        assertTrue(reported.contains(PROPERTY_S3_ENDPOINT), "[" + endpoint + "] must be refused by the name of"
+                + " the property that carries it, was: " + reported);
+        assertFalse(reported.contains(ENDPOINT_CREDENTIAL), "a refusal must not repeat the endpoint it was"
+                + " given, because that endpoint may itself carry a credential: " + reported);
+        assertFalse(reported.contains(ACCESS_KEY_ID) || reported.contains(SECRET_ACCESS_KEY), "a refusal must"
+                + " not echo the configured credentials: " + reported);
+        // The cause is the second way the value could escape, and the easier one to reintroduce:
+        // GeneralException.getMessage() appends the message of any cause it is given, and a
+        // URISyntaxException always quotes the whole input it was handed.
+        assertNull(refusal.getCause(), "no cause may be attached to an endpoint refusal, because its message"
+                + " would be appended to this one: " + reported);
+        return refusal;
+    }
+
+    /**
+     * Renders a key so that a failure message stays readable, and stays valid XML in the test report.
+     *
+     * @param key the key a case exercised, which may be null or carry a control character
+     * @return the key with every control character shown as its code point
+     */
+    private static String printable(String key) {
+        if (key == null) {
+            return "null";
+        }
+        StringBuilder rendered = new StringBuilder(key.length());
+        for (int index = 0; index < key.length(); index++) {
+            char character = key.charAt(index);
+            if (Character.isISOControl(character)) {
+                rendered.append(String.format("\\u%04x", (int) character));
+            } else {
+                rendered.append(character);
+            }
+        }
+        return rendered.toString();
     }
 
     /**

@@ -1047,6 +1047,20 @@ operation, so verify a round trip - upload a document through the
 content manager and read it back - before putting an instance into a
 target group.
 
+A bucket that is not there is reported as a failure, not as missing
+content. Every operation - reading, streaming, testing for existence and
+deleting - treats "the bucket does not answer for this deployment" as a
+configuration failure rather than as "the bucket holds no such object",
+because only the store's own `+NoSuchKey+` means the second. A `+404+`
+that carries no error code at all, which is what an endpoint that is not
+an object store answers with, is a failure for the same reason. A delete
+in particular fails rather than reporting success, so a mis-typed
+`+OFBIZ_S3_BUCKET+` cannot look like a fleet that is quietly working.
+None of those failures reproduces the bucket, the key or the store's own
+words in what the caller sees - each carries an opaque reference instead -
+and the full diagnostic behind that reference is written to the OFBiz log,
+which is where to look when a round trip fails.
+
 Switching provider does not move anything. Objects written under one
 provider stay where they are, so a switch has to be planned as a
 migration: copy the existing content across first, or accept that older
@@ -2211,6 +2225,19 @@ a single instance only, or for a fleet in which every instance mounts the same
 shared volume: otherwise another instance cannot read what this one wrote, and
 replacing the instance loses the content. Give the container a persistent
 volume for `+/ofbiz/runtime+` if you use it.
+
+Mount that volume inside `+/ofbiz+` rather than symlinking a path in
+`+/ofbiz+` out to it. This backend confines itself to `+/ofbiz+` and never
+follows a symbolic link to decide what it reads or writes: content reached
+through a link, or through a directory that is a link, is refused rather
+than served, because a link's name says nothing about where it points and
+following one is how a link planted in a content tree ends up serving
+`+/etc/passwd+`. A `+runtime+` directory symlinked to `+/mnt+` is
+therefore unreadable through this backend, and a `+DataResource+` whose
+recorded location is reached through a link is refused with a message
+naming the ancestor at fault. Content that has to live elsewhere belongs
+behind a mount point, which this backend follows because the kernel, not a
+link, resolves it.
 
 `+s3+`::
 An S3-compatible object store - Amazon S3, MinIO, Ceph or anything else

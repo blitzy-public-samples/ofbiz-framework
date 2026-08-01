@@ -1653,14 +1653,18 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      *
      * @param file the resolved, already authorised location
      * @return the relative path, or {@code null} when the location is {@code ofbiz.home} itself, lies outside it,
-     *     or {@code ofbiz.home} is not set
+     *     or {@code ofbiz.home} is unset or blank
      */
     private static String deploymentRelativePath(File file) {
+        // Trimmed before it is tested, exactly as the filesystem provider trims it: whitespace is what a
+        // shell that expanded an unset variable into a quoted argument leaves behind, and treating it as a
+        // root would make "part of the deployment" mean "under whatever directory this process started in".
         String home = System.getProperty("ofbiz.home");
-        if (UtilValidate.isEmpty(home)) {
+        String configured = home == null ? "" : home.trim();
+        if (UtilValidate.isEmpty(configured)) {
             return null;
         }
-        Path root = Paths.get(home).toAbsolutePath().normalize();
+        Path root = Paths.get(configured).toAbsolutePath().normalize();
         Path resolved = file.toPath().toAbsolutePath().normalize();
         if (!resolved.startsWith(root) || resolved.equals(root)) {
             return null;

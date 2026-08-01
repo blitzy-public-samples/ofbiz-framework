@@ -54,9 +54,11 @@ import org.apache.ofbiz.entity.Delegator;
  * share that tree through a network filesystem, which is what makes locally written content
  * reachable from every instance.
  *
- * <p><strong>Confinement is lexical and then checked on disk.</strong> A key carrying a control
- * character, an absolute path, a {@code ..} component or a Windows drive prefix is refused before
- * any filesystem call is made, and the resolved, normalised path must lie inside {@code ofbiz.home}.
+ * <p><strong>Confinement is lexical and then checked on disk.</strong> A key is first put through the
+ * grammar every provider shares, {@link ContentStore#requireUsableKey(String)}, which refuses a
+ * control character, an absolute path, a Windows drive prefix, an empty component and a {@code .} or
+ * {@code ..} component before any filesystem call is made; the resolved, normalised path must then
+ * lie inside {@code ofbiz.home}.
  * That much is only arithmetic on strings, so every ancestor that already exists is then read with
  * {@link LinkOption#NOFOLLOW_LINKS} and refused if it is a symbolic link or is not a directory:
  * without that walk a key like {@code runtime/uploads/x} passes every lexical test while
@@ -129,16 +131,20 @@ public final class FileSystemContentStore implements ContentStore {
      *
      * @param delegator the delegator every configuration value is read through; may be null, in
      *     which case only {@code content.properties} is consulted
-     * @throws GeneralException if {@code ofbiz.home} is not set, which means the provider has no
-     *     storage root and cannot resolve any key
+     * @throws GeneralException if {@code ofbiz.home} is unset or blank, either of which means the
+     *     provider has no storage root and cannot resolve any key
      */
     public FileSystemContentStore(Delegator delegator) throws GeneralException {
+        // Trimmed before it is tested: whitespace is what a shell that expanded an unset variable into a
+        // quoted argument leaves behind, and accepting it would silently root the whole content store at
+        // whatever directory the process happened to start in - a different tree on every instance.
         String home = System.getProperty("ofbiz.home");
-        if (UtilValidate.isEmpty(home)) {
+        String configured = home == null ? "" : home.trim();
+        if (UtilValidate.isEmpty(configured)) {
             throw new GeneralException("The filesystem content store cannot be used because the ofbiz.home system"
                     + " property is not set, so it has no storage root to resolve a key against");
         }
-        this.root = Paths.get(home).toAbsolutePath().normalize();
+        this.root = Paths.get(configured).toAbsolutePath().normalize();
         this.delegator = delegator;
     }
 
@@ -192,6 +198,12 @@ public final class FileSystemContentStore implements ContentStore {
                 throw oversized(target, "more than " + limit, limit);
             }
             return read;
+        } catch (NoSuchFileException removedMeanwhile) {
+            // This tree is shared, so content can be removed between the check above and this open. The
+            // filesystem reports that as a NoSuchFileException, which is an IOException but not a
+            // FileNotFoundException, so it would escape every caller that catches absence - including the
+            // integration seam, which catches FileNotFoundException alone.
+            throw absent(target, removedMeanwhile);
         }
     }
 
@@ -202,7 +214,11 @@ public final class FileSystemContentStore implements ContentStore {
         // Deliberately unbounded, and opened NOFOLLOW so the name cannot have become a link: this is
         // the operation content of a size an uploader chose is served through, and it never holds
         // that content in the heap in full.
-        return Files.newInputStream(target, LinkOption.NOFOLLOW_LINKS);
+        try {
+            return Files.newInputStream(target, LinkOption.NOFOLLOW_LINKS);
+        } catch (NoSuchFileException removedMeanwhile) {
+            throw absent(target, removedMeanwhile);
+        }
     }
 
     @Override
@@ -230,39 +246,22 @@ public final class FileSystemContentStore implements ContentStore {
     /**
      * Resolves a storage key to the one path inside this provider's root that it names.
      *
-     * <p>Lexical validation first, then the on-disk confinement check: passing the string tests only
-     * establishes that the key names a path under the root, not that walking to it stays under the
-     * root, which is a different question whenever an ancestor is a link.
+     * <p>The shared key grammar first, then the lexical root test, then the on-disk confinement check:
+     * passing the string tests only establishes that the key names a path under the root, not that
+     * walking to it stays under the root, which is a different question whenever an ancestor is a link.
      *
      * @param key the provider-relative storage key
      * @return the resolved, normalised absolute path, guaranteed to be inside the storage root and
      *     reachable without traversing a link
-     * @throws GeneralException if the key is null, empty, carries a control character, an
-     *     absolute path, a {@code ..} component or a drive prefix, would escape the root, or is
+     * @throws GeneralException if the key breaks the shared key grammar, would escape the root, or is
      *     reached through an ancestor that is a link or is not a directory
      * @throws IOException if an ancestor's attributes cannot be read
      */
     private Path resolve(String key) throws GeneralException, IOException {
-        if (UtilValidate.isEmpty(key)) {
-            throw new GeneralException("A content store key must not be empty");
-        }
-        for (int index = 0; index < key.length(); index++) {
-            if (Character.isISOControl(key.charAt(index))) {
-                throw new GeneralException("A content store key must not contain a control character");
-            }
-        }
-        // A leading separator or a Windows drive prefix would make resolve() ignore the root entirely.
-        // A colon elsewhere is a legal character in a POSIX file name and is deliberately allowed.
-        if (key.startsWith("/") || key.startsWith("\\")
-                || (key.length() > 1 && key.charAt(1) == ':' && Character.isLetter(key.charAt(0)))) {
-            throw new GeneralException("A content store key must be relative and must not carry a drive prefix:"
-                    + " [" + key + "]");
-        }
-        for (String segment : key.split("/")) {
-            if ("..".equals(segment)) {
-                throw new GeneralException("A content store key must not contain a '..' component: [" + key + "]");
-            }
-        }
+        // The grammar every provider shares, from its one implementation: empty, control characters, an
+        // absolute path or a drive prefix, an empty or relative component, and the length bounds. What
+        // follows is what this provider alone requires - that the key stay inside the tree it owns.
+        ContentStore.requireUsableKey(key);
         Path resolved = root.resolve(key).normalize();
         if (!resolved.startsWith(root) || resolved.equals(root)) {
             throw new GeneralException("The content store key [" + key + "] resolves outside the storage root");
@@ -338,14 +337,34 @@ public final class FileSystemContentStore implements ContentStore {
     private BasicFileAttributes requireRegularFile(Path target) throws GeneralException, IOException {
         BasicFileAttributes attributes = readAttributes(target);
         if (attributes == null) {
-            throw new FileNotFoundException("The filesystem content store holds no content at ["
-                    + relative(target) + "]");
+            throw absent(target, null);
         }
         if (!attributes.isRegularFile()) {
             throw new GeneralException("The filesystem content store refuses [" + relative(target)
                     + "] because it is not a regular file");
         }
         return attributes;
+    }
+
+    /**
+     * Builds the absence report the contract requires, whichever way the filesystem reported it.
+     *
+     * <p>The cause is attached rather than described, because {@link FileNotFoundException} does not
+     * fold a cause's message into its own: a caller sees the storage location it asked for, while the
+     * filesystem's own detail stays available to anything that inspects the cause.
+     *
+     * @param target the resolved path that holds nothing
+     * @param cause the filesystem's own report, or {@code null} when absence was established by
+     *     reading attributes rather than by a read that failed
+     * @return the exception to throw
+     */
+    private FileNotFoundException absent(Path target, IOException cause) {
+        FileNotFoundException absent = new FileNotFoundException("The filesystem content store holds no content at ["
+                + relative(target) + "]");
+        if (cause != null) {
+            absent.initCause(cause);
+        }
+        return absent;
     }
 
     /**

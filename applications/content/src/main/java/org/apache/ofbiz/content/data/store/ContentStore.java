@@ -20,6 +20,7 @@ package org.apache.ofbiz.content.data.store;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 
 import org.apache.ofbiz.base.util.GeneralException;
 
@@ -41,9 +42,11 @@ import org.apache.ofbiz.base.util.GeneralException;
  * {@link ContentStoreFactory#storeKey}, which derives it from what the active provider needs - the
  * {@code ofbiz.home}-relative path for a path-keyed provider, and namespace, tenant scope and
  * {@code dataResourceId} for the object store - so the same resource maps to the same key on every
- * instance and no two tenants map to one key. A provider validates the grammar again at its own
- * boundary and refuses a key it cannot confine to the one tree or bucket it owns rather than
- * resolve it somewhere else.
+ * instance and no two tenants map to one key. Every provider applies that grammar again at its own
+ * boundary through the one implementation of it, {@link #requireUsableKey(String)}, which lives here
+ * beside the documentation it enforces so that a key one provider accepts is never a key another
+ * refuses; a provider then adds whatever its own storage requires and refuses a key it cannot
+ * confine to the one tree or bucket it owns rather than resolve it somewhere else.
  *
  * <p><strong>Bounded reads.</strong> {@link #get(String)} materialises whole content and is
  * therefore bounded by {@link ContentStoreFactory#maxObjectSize}: content larger than the
@@ -95,6 +98,74 @@ public interface ContentStore {
      * addressable by the same key after a deployment changes provider.
      */
     int MAX_KEY_LENGTH_BYTES = 1024;
+
+    /**
+     * The greatest length of one key component, in bytes of its UTF-8 encoding.
+     *
+     * <p>255 is the file-name limit common filesystems impose. Applying it to every provider is the
+     * other half of key portability: a key an object store accepts as one long string has to remain
+     * writable as a path once a deployment changes to a path-keyed provider.
+     */
+    int MAX_KEY_COMPONENT_LENGTH_BYTES = 255;
+
+    /**
+     * Requires that a key satisfies the grammar documented above, so that every provider refuses
+     * exactly the same keys, in the same way, before it issues any request or touches any storage.
+     *
+     * <p>One implementation for every provider, because a key is only opaque if it means the same
+     * thing everywhere: a deployment that migrates content from one provider to another must not
+     * discover that a key one accepted is a key the next refuses. It is also why this raises a
+     * {@link GeneralException} rather than an {@link IOException} - an unusable key is the caller's
+     * mistake, not the store's failure, and every caller of this contract distinguishes the two.
+     *
+     * <p>Refused, in this order: a null, empty or whitespace-only key; a control character anywhere,
+     * because a key travels to an object store inside the request line and its headers; a leading
+     * {@code /} or {@code \} or a Windows drive prefix, any of which would make the key absolute and
+     * so make a provider ignore its own root; a key longer than
+     * {@link #MAX_KEY_LENGTH_BYTES} bytes; an empty component, which is a doubled or trailing
+     * separator naming no content at all; a {@code .} or {@code ..} component, which names something
+     * other than what it appears to; and a component longer than
+     * {@link #MAX_KEY_COMPONENT_LENGTH_BYTES} bytes. A colon that is not a drive prefix is legal in a
+     * POSIX file name and is deliberately allowed.
+     *
+     * @param key the key to check
+     * @throws GeneralException if the key does not satisfy the grammar, naming the rule it broke
+     */
+    static void requireUsableKey(String key) throws GeneralException {
+        if (key == null || key.trim().isEmpty()) {
+            throw new GeneralException("A content store key must not be empty");
+        }
+        for (int index = 0; index < key.length(); index++) {
+            if (Character.isISOControl(key.charAt(index))) {
+                throw new GeneralException("A content store key must not contain a control character");
+            }
+        }
+        // A leading separator or a Windows drive prefix would make a provider ignore its own root entirely.
+        if (key.startsWith("/") || key.startsWith("\\")
+                || (key.length() > 1 && key.charAt(1) == ':' && Character.isLetter(key.charAt(0)))) {
+            throw new GeneralException("A content store key must be relative and must not carry a drive prefix:"
+                    + " [" + key + "]");
+        }
+        if (key.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_LENGTH_BYTES) {
+            throw new GeneralException("A content store key must be at most " + MAX_KEY_LENGTH_BYTES
+                    + " bytes long");
+        }
+        // Split keeping trailing empties, so that "a/b/" and "a//b" are both seen as an empty component.
+        for (String component : key.split("/", -1)) {
+            if (component.isEmpty()) {
+                throw new GeneralException("A content store key must not contain an empty component: ["
+                        + key + "]");
+            }
+            if (".".equals(component) || "..".equals(component)) {
+                throw new GeneralException("A content store key must not contain a '" + component
+                        + "' component: [" + key + "]");
+            }
+            if (component.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_COMPONENT_LENGTH_BYTES) {
+                throw new GeneralException("A content store key component must be at most "
+                        + MAX_KEY_COMPONENT_LENGTH_BYTES + " bytes long: [" + key + "]");
+            }
+        }
+    }
 
     /**
      * Stores the supplied content under the supplied key, creating the entry when it is absent
