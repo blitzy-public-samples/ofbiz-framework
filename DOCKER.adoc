@@ -693,7 +693,20 @@ precedes `+/ofbiz/lib+` on the class path. The image ships the JMS 1.1 API
 only (`+geronimo-jms_1.1_spec+`, the `+javax.jms+` package) and no
 provider implementation, so the client library has to implement
 `+javax.jms+`. A client that only provides the newer `+jakarta.jms+`
-package will not work here.
+package will not work here. Add the JMS API jar that client was compiled
+against as well, along with the client's own runtime dependencies:
+current `+javax.jms+` clients are built against JMS 2.0 and declare
+methods returning `+javax.jms.JMSContext+`, a class the shipped 1.1 spec
+does not contain, so the connection factory fails to link with
+`+NoClassDefFoundError: javax/jms/JMSContext+` on the listener thread -
+after the three start-up checks described below have already passed,
+because a class that resolves by name can still fail to link. Since
+`+/ofbiz/lib-extra+` precedes `+/ofbiz/lib+`, a JMS 2.0 `+javax.jms+` API
+jar placed there shadows the shipped 1.1 spec, and OFBiz's own JMS 1.1
+calls keep working against it unchanged. Apache ActiveMQ Classic 5.18.6,
+for example, needs `+activemq-client+`, `+javax.jms-api+` 2.0.1,
+`+hawtbuf+` and `+geronimo-j2ee-management_1.1_spec+`; its 6.x line moved
+to `+jakarta.jms+` and is therefore not usable here.
 . Set `+OFBIZ_JMS_INITIAL_CONTEXT_FACTORY+` and
 `+OFBIZ_JMS_PROVIDER_URL+` to that client's JNDI factory class and the
 broker's URL. That is what asks the container to render the transport,
@@ -933,8 +946,8 @@ an external session store - and it is deliberately not part of this image.
 An instance that keeps content on its own disk is not replaceable: a
 document uploaded through one instance is invisible to every other one
 and is lost when that container is replaced. Selecting an S3-compatible
-object store instead removes the last durable local state from a
-serving instance.
+object store instead gives every instance the same content, so whatever
+one of them still holds locally is a copy another can fetch for itself.
 
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
@@ -943,8 +956,13 @@ serving instance.
 `+DataResource+` content and uploaded files: `+database+` (the
 `+DataResource+` columns, the behaviour of an unconfigured checkout),
 `+filesystem+` (the instance's own `+runtime/uploads+` tree) or `+s3+`
-(an S3-compatible object store). Anything else aborts the start up. See
-_Object storage for content_ below.
+(an S3-compatible object store). Compared after trimming and folding
+letter case, so `+S3+` and `+ s3 +` select the object store. Any other
+value is reported as a warning naming the value and the three it may
+take, and the deployment then uses `+database+` - the same decision
+`+ContentStoreFactory+` makes for the same value, so a mis-spelled
+provider degrades visibly to the committed default instead of stopping
+the instance from starting. See _Object storage for content_ below.
 
 |OFBIZ_S3_BUCKET |_empty_ |Bucket that holds the content. Required when
 `+OFBIZ_CONTENT_STORE_PROVIDER=s3+`, and validated against the S3 bucket
@@ -960,36 +978,13 @@ for Amazon S3, which is addressed from the region alone. `+https+` is
 required in the _prod_ profile; a cloud instance metadata address is
 refused in *every* profile. See _Object storage for content_ below.
 
-|OFBIZ_S3_ENDPOINT_ALLOWLIST |_empty_ |Comma separated list of host names
-this deployment may send content to. Required whenever
-`+OFBIZ_S3_ENDPOINT+` is set, and the endpoint's own host must be on it.
-Matched by host name after trimming, lower-casing and removing the
-brackets of an IPv6 literal, so spacing and letter case in the list do
-not matter. See _Object storage for content_ below.
-
-|OFBIZ_S3_ALLOW_PLAINTEXT_ENDPOINT |false |Permits a plaintext
-`+http://+` endpoint. Intended only for a local development store;
-leaving it at `+false+` is what keeps content and the requests signed for
-it off an unencrypted network. Normalised to the literal `+true+` or
-`+false+`; a value that is not clearly a boolean aborts the start up, and
-`+true+` is refused outright in the _prod_ profile.
-
-|OFBIZ_S3_CREDENTIALS_PROVIDER |_empty_ |Names which identity the
-deployment authenticates to the object store as: `+static+` for the
-credential pair below, or `+default-chain+` for the ambient AWS
-credential chain (an instance role, container credentials, a shared
-profile). `+default-chain+` is the recommended production setting,
-because such an identity supplies short-lived, automatically rotated
-credentials and leaves no long-lived secret to leak. Required when
-`+OFBIZ_CONTENT_STORE_PROVIDER=s3+`; anything else aborts the start up.
-It is deliberately *not* inferred from whether a credential happens to be
-set. See _Object storage for content_ below.
-
 |OFBIZ_S3_ACCESS_KEY_ID |_empty_ |Access key id of a static object-store
-credential. Required by, and permitted only with,
-`+OFBIZ_S3_CREDENTIALS_PROVIDER=static+`, together with
-`+OFBIZ_S3_SECRET_ACCESS_KEY+` - one without the other aborts the start
-up.
+credential. Supplied together with `+OFBIZ_S3_SECRET_ACCESS_KEY+` or not
+at all - one without the other aborts the start up. Leaving both empty
+selects the ambient AWS credential chain (an instance role, container
+credentials, a shared profile), which is the recommended production
+setting because such an identity supplies short-lived, automatically
+rotated credentials and leaves no long-lived secret to leak.
 
 |OFBIZ_S3_SECRET_ACCESS_KEY |_empty_ |Secret access key of a static
 object-store credential. Treated as a secret: rendered from a temporary
@@ -2173,8 +2168,10 @@ behaviour of an unconfigured checkout, and it is the only backend that
 needs no further configuration. No object store is contacted and the
 bundled AWS SDK is never loaded, so a container that leaves every variable
 in this group alone behaves exactly as one with no object storage
-configured. An instance holds no durable local state in this mode, so
-instances are freely replaceable.
+configured - including the file-backed `+DataResource+` types, which go on
+resolving to this instance's own disk. That is the reason to choose one of
+the other two backends for a fleet: content held in the database columns
+is shared already, but content held in a file is not.
 
 `+filesystem+`::
 The instance's own `+runtime/uploads+` tree, or wherever
@@ -2189,9 +2186,9 @@ An S3-compatible object store - Amazon S3, MinIO, Ceph or anything else
 that speaks the same API. Every instance reads and writes the same
 bucket, so this is the backend to use behind a load balancer.
 
-The `+s3+` provider needs a bucket, a region and a named identity source,
-and takes an endpoint, an endpoint allowlist, a credential and an
-addressing style. On Amazon S3 with an instance role, that is:
+The `+s3+` provider needs a bucket and a region, and takes an endpoint, a
+credential pair and an addressing style. On Amazon S3 with an instance
+role - so with no credential supplied - that is:
 
 [source,shell script]
 ----
@@ -2201,7 +2198,6 @@ docker run -it -p 8443:8443 \
     -e OFBIZ_CONTENT_STORE_PROVIDER=s3 \
     -e OFBIZ_S3_BUCKET=ofbiz-content \
     -e OFBIZ_S3_REGION=eu-west-2 \
-    -e OFBIZ_S3_CREDENTIALS_PROVIDER=default-chain \
     ofbiz-docker
 ----
 
@@ -2217,8 +2213,6 @@ docker run -it -p 8443:8443 \
     -e OFBIZ_S3_BUCKET=ofbiz-content \
     -e OFBIZ_S3_REGION=us-east-1 \
     -e OFBIZ_S3_ENDPOINT=https://objects.example.internal:9000 \
-    -e OFBIZ_S3_ENDPOINT_ALLOWLIST=objects.example.internal \
-    -e OFBIZ_S3_CREDENTIALS_PROVIDER=static \
     -e OFBIZ_S3_PATH_STYLE=true \
     ofbiz-docker
 ----
@@ -2226,7 +2220,7 @@ docker run -it -p 8443:8443 \
 with `+OFBIZ_S3_ACCESS_KEY_ID+` and `+OFBIZ_S3_SECRET_ACCESS_KEY+` in
 `+ofbiz-secrets.env+`.
 
-All ten variables are rendered into `+/ofbiz/config/content.properties+`
+All seven variables are rendered into `+/ofbiz/config/content.properties+`
 and are then removed from the environment, exactly as the secrets in the
 _Secrets_ section are: the file is written atomically with mode `+0600+`,
 the values are substituted from a temporary file rather than from a
@@ -2248,10 +2242,13 @@ in sight.
 Values are validated before anything is written, so a mistake is reported
 at start up rather than at the first upload an end user attempts:
 
-* The provider must be one of the three names above, spelled in lower
-case. A mis-cased value such as `+S3+` is refused, naming the variable
-and listing the three accepted names, before any other object-store
-setting is examined.
+* The provider is trimmed and folded to lower case, so `+S3+` and
+`+ s3 +` select the object store. A value that is still not one of the
+three names is reported as a warning naming the variable, the value and
+the three accepted names, and the deployment then uses `+database+`;
+it does not abort, because a mis-spelled provider must not stop a fleet
+member from starting when it can serve every request correctly from the
+committed default and say so in its log.
 * `+OFBIZ_S3_BUCKET+` must satisfy the S3 bucket naming rules - 3 to 63
 characters, lower case letters, digits, hyphens and dots, beginning and
 ending with a letter or digit, no adjacent dots and not shaped like an
@@ -2266,76 +2263,42 @@ URI with a host and without a query string, a fragment or embedded user
 information. Credentials belong in the two credential variables, which
 are rendered into a mode `+0600+` file; an endpoint is treated as
 ordinary configuration and is logged as such.
-* `+OFBIZ_S3_ENDPOINT_ALLOWLIST+` must be set whenever
-`+OFBIZ_S3_ENDPOINT+` is, and must list the endpoint's own host.
-* `+OFBIZ_S3_CREDENTIALS_PROVIDER+` must be `+static+` or
-`+default-chain+`, and must agree with whether a credential is set.
+* `+OFBIZ_S3_ACCESS_KEY_ID+` and `+OFBIZ_S3_SECRET_ACCESS_KEY+` are
+supplied together or not at all. Exactly one of the two aborts the start
+up; neither of them selects the ambient AWS credential chain.
 * An object-store setting supplied while the provider is *not* `+s3+`
 aborts the start up in the _prod_ profile and warns in _dev_. The setting
 would have no effect, and there is no way to guess from inside the
 container which half of the contradiction was the mistake.
 
-Three refusals are worth calling out, because they are about which
-identity and which network the deployment ends up using.
+Two refusals are worth calling out, because they are about which identity
+and which network the deployment ends up using.
 
-*The identity source is named, never inferred.*
-`+OFBIZ_S3_CREDENTIALS_PROVIDER+` has to say which identity the
-deployment authenticates as. `+static+` requires both
-`+OFBIZ_S3_ACCESS_KEY_ID+` and `+OFBIZ_S3_SECRET_ACCESS_KEY+`;
-`+default-chain+` requires neither of them to be set. Every other
-combination - one credential without the other, a credential alongside
-`+default-chain+`, or no named source at all - aborts the start up. The
-alternative, inferring the identity source from whether a credential
-happens to be present, means a typo in one of the two credential variable
-names silently changes *which principal* the deployment authenticates as:
-from the credential the operator supplied to whatever ambient identity the
-platform offers, which on a cloud instance is usually a far more
-privileged role, and with no error anywhere.
-
-*The endpoint has to be on a list.* Whenever `+OFBIZ_S3_ENDPOINT+` is
-set, `+OFBIZ_S3_ENDPOINT_ALLOWLIST+` must list its host. One mis-set
-property is otherwise all it takes to send every byte of a deployment's
-content - in requests signed with the deployment's own identity - to a
-host nobody intended. Requiring the host in a second, separately named
-variable makes that a two-property change rather than a one-property one.
-List every host the deployment may legitimately use; matching ignores
-spacing, letter case and the brackets of an IPv6 literal.
+*A credential pair is all or nothing.* `+OFBIZ_S3_ACCESS_KEY_ID+` and
+`+OFBIZ_S3_SECRET_ACCESS_KEY+` are supplied together, and exactly one of
+the two aborts the start up rather than falling back to the ambient AWS
+credential chain. Falling back would mean a typo in one of the two
+variable names, or a secret whose injection silently failed, changes
+*which principal* the deployment authenticates as: from the credential the
+operator supplied to whatever ambient identity the platform offers, which
+on a cloud instance is usually a far more privileged role, and with no
+error anywhere. Supplying neither is the deliberate way to ask for that
+ambient identity.
 
 *The instance metadata service is refused everywhere.* An endpoint that
 points at `+169.254.169.254+`, `+[fd00:ec2::254]+`, `+169.254.170.2+` or
-`+metadata.google.internal+` is refused in *every* profile, whatever the
-allowlist says and however the plaintext setting is set. The provider
-sends the deployment's own credentials to whatever it is told is the
-object store, and the response from that address is a set of role
-credentials for the whole instance. A plaintext `+http://+` endpoint is
-refused for a related reason - every write carries the store credential
-and every read returns content that may not be public - and is permitted
-only by setting `+OFBIZ_S3_ALLOW_PLAINTEXT_ENDPOINT=true+`, which the
-_prod_ profile refuses outright. That is what lets a local MinIO
-container without a certificate work in _dev_ without weakening
-anything in production.
-
-A whole-content read is bounded as well, by the
-`+content.store.max.get.bytes+` property of `+content.properties+`
-(32 MiB by default). It is a property rather than an environment
-variable because it tunes how much heap one content read may use rather
-than describing the deployment's topology, and because it applies to the
-`+filesystem+` provider just as much as to `+s3+`. Content above the
-ceiling is still readable as a stream; only reading it whole into memory
-is refused, so a single oversized object cannot exhaust the heap of
-whichever instance a load balancer sent the request to.
-
-The client is built with explicit deadlines, a bounded retry policy and a
-failure breaker, so an object store that stops answering fails the request
-that needed it instead of parking a request thread. Those are tuned in
-`+applications/content/config/content.properties+` -
-`+content.store.s3.connect.timeout.millis+`,
-`+read.timeout.millis+`, `+call.timeout.millis+`,
-`+call.attempt.timeout.millis+`, `+max.attempts+`,
-`+breaker.failure.threshold+` and `+breaker.reset.millis+` - and their
-committed values suit a store on the same network. There is no environment
-variable for them, because they are tuning rather than deployment
-configuration.
+`+metadata.google.internal+` is refused in *every* profile, with no
+variable that can relax it. The provider sends the deployment's own
+credentials to whatever it is told is the object store, and the response
+from that address is a set of role credentials for the whole instance.
+`+S3ContentStore+` carries the same list and applies the same refusal, so
+the endpoint is rejected whether it arrives through the entry point or is
+written straight into `+content.properties+`. A plaintext `+http://+`
+endpoint is refused for a related reason - every write carries the store
+credential and every read returns content that may not be public - in the
+_prod_ profile only, and is accepted with a warning in _dev_. That is what
+lets a local MinIO container without a certificate work in _dev_ without
+weakening anything in production.
 
 Withdrawing the configuration undoes it. `+/ofbiz/config+` is a volume that
 outlives the container, so when no object-store variable is set the
@@ -2354,34 +2317,70 @@ for what that means for content written before one.
 ===== How content reaches and leaves the object store
 
 Uploads and content writes are ordinary local file writes as far as the
-Content component is concerned; the container turns them into object
-storage operations underneath. Two things follow that are worth knowing
+Content component is concerned; the provider turns them into object
+storage operations underneath. Five things follow that are worth knowing
 when you operate a fleet.
 
-*A write is published by the transaction that made it.* An upload is
-written to a short-lived local directory under `+runtime/uploads+` whose
-name begins with `+.contentstore-staging+`, and a write to existing
-content is made through a local working copy of it. Either way the bytes
-are streamed into the bucket as the surrounding transaction commits, and
-the staging directory is removed afterwards, so these directories are
-transient by design and never accumulate. Publication happens *before* the
-commit completes, so an object store that refuses the write rolls the
-transaction back rather than committing a `+DataResource+` row naming
-content the bucket never received. There is no ceiling on the size of a
-published upload: content is streamed with its length declared, never held
-in memory, so the `+content.store.max.get.bytes+` ceiling above applies
-only to reading an object whole and not to uploading or serving one.
+*An upload is published when its transaction commits.* The directory an
+upload is written to is the same numbered `+runtime/uploads+`
+subdirectory as ever, because its path becomes the
+`+DataResource.objectInfo+` of the row that names the content and so has
+to outlive the request. What changes is that the directory is restricted
+to the account OFBiz runs as, and that whatever the transaction writes
+into it is copied into the bucket once that transaction has committed -
+after which the local file is removed, so nothing durable is left behind.
+Files that were already in the directory when the transaction started are
+left strictly alone, which is what makes this safe in a directory shared
+by every concurrent upload.
 
-*Every read asks the bucket.* An instance keeps a local copy of content
-only as a working file for the request that needed it, and re-reads the
-object on each resolution rather than trusting a copy it fetched earlier.
-That is what makes the instances interchangeable: content another instance
-uploaded a moment ago is served correctly by an instance that had already
-served the version it replaced, so which instance a load balancer picked
-does not change what a customer sees. Nothing durable is held locally, so
-no shared filesystem is needed between instances and `+/ofbiz/runtime+`
-does not have to survive a replacement - unlike the `+filesystem+`
-provider above, which does.
+*Publication cannot fail a commit, and a failed publication never loses
+content.* The copy into the bucket happens after the commit rather than
+before it, so a bucket that is briefly unreachable does not roll back work
+the database has already accepted. The consequence is the one to plan for:
+a publication that fails logs an error and leaves the upload on that
+instance's local disk, where it is then the only copy. Alert on
+`+DataResourceWorker+` errors mentioning the content store, and treat an
+instance that has reported one as holding content that must be copied to
+the bucket before the instance is replaced.
+
+*A published upload is held in memory once, so it is size limited.* An
+upload larger than an eighth of the JVM heap is not published: it is
+logged as an error and left on local disk for an out-of-band copy. Size
+`+-Xmx+` for the largest upload you accept rather than the average one.
+
+*Reads go to the bucket, except where a local file already answers them.*
+Rendering text content and streaming binary content to a browser read the
+object from the bucket every time, so an instance never serves a version
+another instance has replaced. The one path that cannot work that way is
+the one that hands other code a `+java.io.File+`: it fetches the object
+into the location `+objectInfo+` names and returns that, and while that
+file exists it answers later requests without going to the bucket. Those
+files are the only durable local state an instance keeps, every one of
+them can be fetched again from the bucket, and none of them has to survive
+a replacement - unlike the `+filesystem+` provider above, where the local
+copy *is* the content.
+
+*What is published, precisely.* Every registered service that writes
+file-backed content requires an `+objectInfo+` that its caller has already
+obtained from the upload-path allocation described above, and that
+allocation is what arranges publication; the upload flows that ship with
+OFBiz all work that way and are therefore covered end to end. A caller
+that supplies an `+objectInfo+` of its own - an integration calling
+`+updateFile+` directly against content uploaded in an earlier
+transaction, for example - writes to the location without allocating it
+again, and that write is not published. Re-upload the content, or copy it
+into the bucket out of band, if you drive the file services that way.
+
+*Deleting content does not delete the object.* Removing a
+`+DataResource+` row removes the row and nothing else, exactly as it
+always has: OFBiz has never deleted the file a file-backed resource named,
+and this image does not change that, because doing so would alter the
+behaviour of a service rather than the storage underneath it. Reclaim
+orphaned objects the same way you would reclaim orphaned files - with a
+bucket lifecycle rule, or a reconciliation job that compares the bucket
+against `+DataResource.objectInfo+` - and set that rule up before you
+treat the bucket as a compliance boundary, because an object nobody
+references is still an object somebody can read.
 
 === Examples of running the OFBiz container
 

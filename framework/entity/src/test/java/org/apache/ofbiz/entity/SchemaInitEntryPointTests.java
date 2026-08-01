@@ -318,8 +318,8 @@ public final class SchemaInitEntryPointTests {
      * new wording fails too.</p>
      *
      * <p>The value is the declaring array, optionally followed by {@code #} and a pattern the members that are
-     * being counted must match - which is how "the nine OFBIZ_S3_* variables" is checked against the nine
-     * object-store names inside a ten-name array.</p>
+     * being counted must match - which is how "the six OFBIZ_S3_* variables" is checked against the six
+     * object-store names inside a seven-name array.</p>
      */
     private static final Map<String, String> STATED_LIST_SIZES = Map.ofEntries(
             entry("These six variables are what actually remove the privilege from the serving path.",
@@ -328,13 +328,15 @@ public final class SchemaInitEntryPointTests {
                     "POSTGRES_INIT_IDENTITY_VARIABLES"),
             entry("The six init variables are supplied together or not at all.",
                     "POSTGRES_INIT_IDENTITY_VARIABLES"),
-            entry("The ten variables that carry the object-store configuration",
+            entry("The seven variables that carry the object-store configuration",
                     "CONTENT_STORE_VARIABLES"),
-            entry("The ten OFBIZ_CONTENT_STORE_PROVIDER / OFBIZ_S3_* variables are what Objective 3 advertises",
+            entry("These are exactly the seven variables Objective 3 advertises",
                     "CONTENT_STORE_VARIABLES"),
-            entry("This and the nine OFBIZ_S3_* variables below",
+            entry("The seven OFBIZ_CONTENT_STORE_PROVIDER / OFBIZ_S3_* variables are what Objective 3 advertises",
+                    "CONTENT_STORE_VARIABLES"),
+            entry("This and the six OFBIZ_S3_* variables below",
                     "CONTENT_STORE_VARIABLES#OFBIZ_S3_.*"),
-            entry("all ten are then removed from the environment before the OFBiz JVM is exec'd",
+            entry("all seven are then removed from the environment before the OFBiz JVM is exec'd",
                     "CONTENT_STORE_VARIABLES"),
             entry("the six database passwords",
                     "SECRET_ENVIRONMENT_VARIABLES#OFBIZ_POSTGRES_.*_PASSWORD"),
@@ -397,6 +399,21 @@ public final class SchemaInitEntryPointTests {
     private static final String CONFIGURE_DATABASE_BODY =
             RESOLVE_FLAGS_BODY
             + "configure_database\n"
+            + "printf 'CONFIGURE_DATABASE_RETURNED\\n'\n";
+
+    /**
+     * The whole of a successful initialisation run's configuration handling: the init-mode render, then the
+     * epilogue that hands the configuration volume back in serving mode.
+     *
+     * <p>{@code _main} reaches the second call only after {@code initialise_schema} has applied and verified
+     * the schema, which needs a live database and so cannot be part of a unit test. The two configuration
+     * steps either side of it are pure shell against the file system, which is exactly what this body runs -
+     * so the sequence that a real init job performs on {@code /ofbiz/config} is exercised without one.</p>
+     */
+    private static final String INIT_THEN_RESTORE_SERVING_MODE_BODY =
+            RESOLVE_FLAGS_BODY
+            + "configure_database\n"
+            + "restore_serving_mode_after_schema_init\n"
             + "printf 'CONFIGURE_DATABASE_RETURNED\\n'\n";
 
     /**
@@ -719,6 +736,23 @@ public final class SchemaInitEntryPointTests {
      * <p>Every value that is neither empty nor one of the two spellings is still refused, whitespace included,
      * because a profile the script cannot recognise cannot be resolved to either policy.</p>
      *
+     * <p><strong>Authorisation.</strong> An earlier revision of this test expected an absent profile to be
+     * refused. The Agent Action Plan requires the opposite: "Every new capability must default to current
+     * behavior when unconfigured, so an unmodified checkout still boots on embedded H2 ...
+     * (backward-compatible local run using a development profile)" (AAP 0.1.1), restated as the transformation
+     * rule "Default to legacy behavior ... when its configuration is absent" (AAP 0.1.2), imposed as the
+     * constraint "Backward-compatible local run. A developer must still be able to build and run locally
+     * against embedded H2 with no AWS dependency and no secrets configured, using a development configuration
+     * profile" (AAP 0.7.1), and gated as "H2 preserved | Local run with development profile | Boots on embedded
+     * H2 with no secrets configured" (AAP 0.7.3). {@code OFBIZ_PROFILE}'s own catalogue entry scopes it to
+     * "Controls fail-fast enforcement of required secrets" (AAP 0.6.2) and does not make its presence
+     * mandatory. Since the variable is introduced by this refactor, refusing its absence would fail every
+     * pre-existing zero-configuration start on a variable that did not exist before.</p>
+     *
+     * <p>The safety property the refusal was protecting - that production's enforcement can never be lost or
+     * reached by accident - is preserved and asserted directly by
+     * {@link #theAssumedProfileAppliesDevelopmentsPolicyAndLeavesProductionsEnforcementIntact(Path)}.</p>
+     *
      * @param tempDir a per-test sandbox; nothing outside it is written
      * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
      */
@@ -775,6 +809,83 @@ public final class SchemaInitEntryPointTests {
             assertTrue(run.getOutput().contains(SERVING_MARKER),
                     "OFBIZ_PROFILE=" + value + " must start normally, output was:\n" + run.getOutput());
         }
+    }
+
+    /**
+     * The profile a run resolves for itself applies development's policy, and production's stays enforced.
+     *
+     * <p>{@link #aContainerThatDoesNotNameItsProfileStartsInDevelopmentAndSaysSo(Path)} asserts that an
+     * unprofiled container starts. That is necessary but not sufficient, and it is not what an earlier revision
+     * expected: that revision required the profile and refused a container that did not name one. The safety
+     * property the refusal was protecting - that production's enforcement can never be lost, and can never be
+     * reached or departed from by accident - has to be asserted on its own rather than inferred from a
+     * successful start, which is what this case does. It runs the real credential resolution BEHIND the
+     * default, which the staged {@code _main} body deliberately cannot: see {@link
+     * #PROFILE_THEN_SETUP_ENV_BODY}.</p>
+     *
+     * <p>Three facts, all from that one body, so the profile is the only difference between them. With no
+     * profile the run resolves to {@code dev} - the literal value, not merely 'something that started' - and
+     * then applies dev's policy, accepting the published demo admin password exactly as this image did before
+     * the profile existed. With {@code prod} named and the very same credential absent, the run ABORTS, naming
+     * both the variable it wanted and the profile that requires it, so the enforcement is demonstrably still
+     * there to be reached. And the default cannot drift into it or out of it: supplying every key {@code prod}
+     * demands does not promote an unprofiled run, because the profile is read from {@code OFBIZ_PROFILE} and
+     * from nothing else.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void theAssumedProfileAppliesDevelopmentsPolicyAndLeavesProductionsEnforcementIntact(
+            @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+
+        EntryPointRun assumed = runWithoutProfileDefault(tempDir, sandbox, PROFILE_THEN_SETUP_ENV_BODY,
+                Map.of(), List.of());
+        assertEquals(0, assumed.getExitCode(),
+                "an unprofiled run must resolve its own profile and continue, output was:\n" + assumed.getOutput());
+        assertTrue(assumed.getOutput().contains("RESOLVED_PROFILE=dev"),
+                "the assumed profile must be exactly 'dev', output was:\n" + assumed.getOutput());
+        assertTrue(assumed.getOutput().contains("ADMIN_PASSWORD_IS_DEMO_DEFAULT=true"),
+                "dev's policy must be the one then applied - the published demo password accepted - output was:\n"
+                        + assumed.getOutput());
+        assertTrue(assumed.getOutput().contains(COMPLETED),
+                "resolution must run to completion under the assumed profile, output was:\n" + assumed.getOutput());
+
+        // The same body and the same absent credential, with the profile named: the enforcement that the
+        // default must never reach is demonstrably still there to be reached deliberately.
+        EntryPointRun deployed = runWithoutProfileDefault(tempDir, sandbox, PROFILE_THEN_SETUP_ENV_BODY,
+                Map.of("OFBIZ_PROFILE", "prod"), List.of());
+        assertNotEquals(0, deployed.getExitCode(),
+                "prod must still refuse an absent admin password, output was:\n" + deployed.getOutput());
+        assertFalse(deployed.getOutput().contains(COMPLETED),
+                "prod must refuse before resolution completes, output was:\n" + deployed.getOutput());
+        assertTrue(deployed.getOutput().contains("OFBIZ_ADMIN_PASSWORD"),
+                "the refusal must name the variable it wanted, output was:\n" + deployed.getOutput());
+        assertTrue(deployed.getOutput().contains("OFBIZ_PROFILE=prod"),
+                "the refusal must name the profile that requires it, output was:\n" + deployed.getOutput());
+        assertFalse(deployed.getOutput().contains("NOTICE:"),
+                "a profile the operator named must not be announced as assumed, output was:\n"
+                        + deployed.getOutput());
+
+        // Nothing but the variable decides the profile. Supplying every key prod would demand does not promote
+        // an unprofiled run, so the assumed default can neither drift into prod's policy nor out of it.
+        Map<String, String> furnishedSecrets = new LinkedHashMap<>();
+        furnishedSecrets.put("OFBIZ_ADMIN_KEY", PROFILE_ADMIN_KEY);
+        furnishedSecrets.put("OFBIZ_LOGIN_SECRET_KEY", PROFILE_LOGIN_SECRET_KEY);
+        furnishedSecrets.put("OFBIZ_JWT_TOKEN_KEY", PROFILE_JWT_TOKEN_KEY);
+
+        EntryPointRun furnished = runWithoutProfileDefault(tempDir, sandbox, PROFILE_THEN_SETUP_ENV_BODY,
+                furnishedSecrets, List.of());
+        assertEquals(0, furnished.getExitCode(),
+                "supplying secrets must not change which profile is assumed, output was:\n"
+                        + furnished.getOutput());
+        assertTrue(furnished.getOutput().contains("RESOLVED_PROFILE=dev"),
+                "the profile must be read from OFBIZ_PROFILE and from nothing else, output was:\n"
+                        + furnished.getOutput());
+        assertTrue(furnished.getOutput().contains("ADMIN_PASSWORD_IS_DEMO_DEFAULT=true"),
+                "and dev's policy must still be the one applied, output was:\n" + furnished.getOutput());
     }
 
     /**
@@ -2426,20 +2537,14 @@ public final class SchemaInitEntryPointTests {
         // before it renders them, so they cannot carry the same shape as the values above: a bucket name is
         // lower case, a region is lower case and hyphenated, and an endpoint is an absolute URI. They still
         // have to be identifiable by VALUE, so they carry a lower-case marker of their own, asserted with the
-        // other one below. Refusing the malformed ones is asserted by ContentStoreRenderingTests; this case is
-        // about what survives into the environment, so it supplies values the validators accept.
+        // other one below. This case is about what survives into the environment, not about which values are
+        // refused, so it supplies values require_object_store_bucket, require_object_store_region and
+        // require_object_store_endpoint all accept - and https, because the resolve path this start reaches
+        // requires it whenever the profile is prod.
         String lowerCaseUnique = "withdrawn0ba9c17d";
         distinctive.put("OFBIZ_S3_BUCKET", lowerCaseUnique + "-bucket");
         distinctive.put("OFBIZ_S3_REGION", lowerCaseUnique + "-region");
         distinctive.put("OFBIZ_S3_ENDPOINT", "https://" + lowerCaseUnique + ".objects.invalid");
-        // The endpoint's host has to be declared a second time. require_object_store_endpoint refuses an
-        // endpoint whose host is not allowlisted, and it does so on the resolve path as well as on the render,
-        // so that one mis-set variable cannot redirect content - and the credential every object request
-        // carries - to a host nobody listed. This start reaches only the resolve, because apply_configuration
-        // is one of the stages this fixture replaces with a recorder, which is exactly why the allowlist has
-        // to be supplied here: a rule enforced on only one of the two paths would leave the path that runs on
-        // every start unguarded.
-        distinctive.put("OFBIZ_S3_ENDPOINT_ALLOWLIST", lowerCaseUnique + ".objects.invalid");
 
         // The remainder have a fixed vocabulary, so only the NAME can be asserted on: _main itself parses the
         // profile and the skip-init flag before any stage runs, and a made-up value would abort the start.
@@ -2954,6 +3059,64 @@ public final class SchemaInitEntryPointTests {
     }
 
     /**
+     * A successful initialisation hands the configuration volume back in serving mode instead of failing on
+     * the credential it was given to do the work with.
+     *
+     * <p>{@code /ofbiz/config} is a declared volume, and an init run renders it with both startup DDL flags
+     * true, so the run corrects it before exiting rather than leaving a DDL-enabled configuration for whatever
+     * mounts the volume next. That correction is a second render, performed by the same process, from an
+     * environment that still holds the initialisation credential - which is precisely the combination
+     * {@link #theDeployedProfileSeparatesTheInitialisationCredentialFromTheFleet} requires be refused on a
+     * serving instance. Reached without distinguishing the two, the deployed profile therefore refused the init
+     * job's own epilogue: the schema was applied and verified, and the container then exited non-zero, so an
+     * orchestrator could never release the fleet on the strength of a job that had in fact succeeded.</p>
+     *
+     * <p>Asserted on the file the next container would read, in both profiles, together with the two facts that
+     * make the epilogue worth performing at all: the startup DDL is off on every managed datasource, and the
+     * configuration authenticates as the serving roles rather than the privileged ones. The refusal itself is
+     * left intact - the case above still requires it for a genuine serving start.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void aSuccessfulInitialisationHandsTheVolumeBackInServingModeInsteadOfBeingRefused(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        for (String profile : List.of("dev", "prod")) {
+            Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "init-epilogue-" + profile));
+            Map<String, String> environment = managedDatabaseEnvironment();
+            environment.putAll(initIdentityEnvironment());
+            environment.put("OFBIZ_PROFILE", profile);
+            environment.put("OFBIZ_SCHEMA_INIT", "true");
+
+            EntryPointRun run =
+                    runInSandbox(tempDir, sandbox, INIT_THEN_RESTORE_SERVING_MODE_BODY, environment);
+            assertEquals(0, run.getExitCode(), "OFBIZ_PROFILE=" + profile
+                    + ": the epilogue of a successful initialisation must not fail the job, output was:\n"
+                    + run.getOutput());
+            assertTrue(run.getOutput().contains(COMPLETED), "OFBIZ_PROFILE=" + profile
+                    + ": the run must reach the end of the driver, output was:\n" + run.getOutput());
+            assertTrue(run.getOutput().contains("startup DDL disabled"), "OFBIZ_PROFILE=" + profile
+                    + ": the epilogue must report what it left behind, output was:\n" + run.getOutput());
+
+            Element root = parseXml(Files.readString(sandbox.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8));
+            Map<String, String> ddlFlags = new LinkedHashMap<>();
+            Map<String, String> expectedFlags = new LinkedHashMap<>();
+            for (String datasourceName : MANAGED_DATASOURCES) {
+                ddlFlags.put(datasourceName, ddlFlagsOf(root, datasourceName));
+                expectedFlags.put(datasourceName, "false/false");
+            }
+            assertEquals(expectedFlags, ddlFlags, "OFBIZ_PROFILE=" + profile
+                    + ": the configuration this job leaves on the volume must issue no startup DDL");
+            assertEquals(Map.of("localpostgres", OFBIZ_USER, "localpostgresolap", OLAP_USER,
+                    "localpostgrestenant", TENANT_USER), renderedManagedUsers(sandbox), "OFBIZ_PROFILE=" + profile
+                    + ": and it must authenticate as the serving roles, not the ones that may alter the schema");
+        }
+    }
+
+    /**
      * An initialisation identity that is not actually separate from the serving one is refused, and so is a
      * partial one.
      *
@@ -3093,6 +3256,23 @@ public final class SchemaInitEntryPointTests {
             + "  printf 'ADMIN_PASSWORD_IS_DEMO_DEFAULT=false\\n'\n"
             + "fi\n"
             + "printf '" + COMPLETED + "\\n'\n";
+
+    /**
+     * Resolves the profile the way {@code _main} does and then runs the REAL environment resolution.
+     *
+     * <p>{@link #MAIN_BODY} cannot answer what an unnamed profile applies, only that it starts: it replaces
+     * {@code ofbiz_setup_env} with a recorder, so no credential policy runs under it. {@link #SETUP_ENV_BODY}
+     * runs the real resolution but never reaches {@code require_profile}, which {@code _main} alone calls. This
+     * body is the two in {@code _main}'s order - the profile is settled first, then everything keyed on it runs
+     * - which is what makes the profile a run resolved for itself observable in the policy it then applies.</p>
+     *
+     * <p>The resolved profile is printed before the resolution so that a case can assert WHICH policy was
+     * applied rather than inferring it from the outcome.</p>
+     */
+    private static final String PROFILE_THEN_SETUP_ENV_BODY =
+            "require_profile\n"
+            + "printf 'RESOLVED_PROFILE=%s\\n' \"$OFBIZ_PROFILE\"\n"
+            + SETUP_ENV_BODY;
 
     /**
      * Runs the sandbox's {@code hook.sh} through the real {@code run_init_hooks}, then reports what survived:

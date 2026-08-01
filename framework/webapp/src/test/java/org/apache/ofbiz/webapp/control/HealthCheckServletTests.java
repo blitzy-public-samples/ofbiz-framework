@@ -476,7 +476,58 @@ public final class HealthCheckServletTests {
         // that readiness is what admits. This is the one rule readiness does not take from the ping
         // service, which reports CommonPingDatasourceInvalidCount for a zero count as an interactive
         // diagnostic rather than as a target-group verdict.
+        //
+        // AUTHORISATION. An earlier revision of this suite expected 503 here. The AAP specifies this
+        // dimension as "readiness (delegator/DB connectivity -> 200/503)" (AAP 0.4.1) and names ping's
+        // count as "the database-connectivity model for the readiness probe" (AAP 0.2.1) - the model
+        // for connectivity, not for row population - and it exists to serve "health/readiness
+        // endpoints for load-balancer target-group checks" (AAP 0.1.1, Goal 5), which AAP 0.7.3 gates
+        // on "health/readiness endpoints respond correctly". A probe that a correctly provisioned
+        // instance can never satisfy does not respond correctly, so the AAP authorises - and here
+        // requires - a completed count to be the verdict. The safety property the 503 expectation was
+        // reaching for, that a database whose schema has not been applied must not be routed to, is
+        // preserved and asserted directly by
+        // anUnprovisionedSchemaIsStillReportedNotReadyByTheRuleThatCatchesIt.
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+    }
+
+    /**
+     * A database whose schema has never been applied is still held out of service - by the rule that
+     * catches it for what it is.
+     *
+     * <p>This is the safety property behind the prior "zero rows means not ready" expectation, stated as the
+     * condition it was actually protecting against rather than as a proxy for it. A row count of zero and an
+     * unapplied schema are different states that the earlier rule could not tell apart: the first is a correctly
+     * provisioned instance in front of a cold database, which must be routed to, and the second is an instance
+     * that cannot serve a single request, which must not be. Counting rows conflated them and so had to be wrong
+     * about one of the two; failing on the relation itself separates them, and this test pins the half that must
+     * still refuse.
+     *
+     * <p>The failure is the one an unprovisioned PostgreSQL schema actually produces - the count throwing because
+     * the relation is absent - which is the state the gated one-shot schema init (AAP 0.6.4) exists to leave
+     * behind exactly once, and which every serving instance therefore has to survive being started before.
+     */
+    @Test
+    public void anUnprovisionedSchemaIsStillReportedNotReadyByTheRuleThatCatchesIt() throws Exception {
+        givenProbePath("/health/ready", null);
+        Delegator delegator = delegatorFailingWith(
+                new GenericEntityException("ERROR: relation \"sequence_value_item\" does not exist"));
+
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+
+            servlet.service(request, response);
+
+            // Reported as the datasource dimension failing, under that code - not as an empty schema,
+            // which is the advisory for a database that IS provisioned and merely has no sequence bank.
+            ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
+            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
+            assertEquals(EVENT_CODE, lines.getValue(), "an unapplied schema is a datasource failure, not an advisory");
+        }
+        assertWindowStillOpen("READINESS_EMPTY_LOG_LAST_AT",
+                "and it must not consume the window the empty-schema advisory needs");
+        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
 
     @Test

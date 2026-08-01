@@ -41,46 +41,19 @@ under the License.
         <param-value>component://webtools/widget/CommonScreens.xml</param-value>
     </context-param>
 
-    <!-- Load-balancer health probes. HealthCheckServlet is mapped BOTH as this filter and as the
-         servlet declared further down, and the two mappings deliberately carry the same two exact
-         paths.
+    <!-- Load-balancer health probes. HealthCheckServlet is mapped both as this filter and as the
+         servlet declared further down, on the same two exact paths.
 
-         The filter is what makes the anonymous probe surface safe, and its <filter-mapping> is
-         therefore declared FIRST below: the servlet specification builds the chain in the order the
-         url-pattern mappings appear in this descriptor, so this filter runs before ControlFilter,
-         CacheFilter, ContextFilter and SameSiteFilter. It answers the probe and does not call
-         chain.doFilter, so none of those filters is entered for a probe request. That matters for two
-         concrete reasons:
-           - ControlFilter and ContextFilter both call getSession() unconditionally, so every probe
-             would otherwise mint an HttpSession and a JSESSIONID that a target group never returns,
-             together with the session listeners, the expiry bookkeeping and the log churn behind them;
-           - ContextFilter calls WebAppUtil.setAttributesFromRequestBody, which reads an
-             application/json body of ANY size into a String and then into a Map before a servlet
-             method is dispatched. Terminating the chain first means an anonymous caller cannot reach
-             that parser through these paths at all, and the servlet itself refuses any request
-             that merely announces a body, from Content-Length and Transfer-Encoding, without reading
-             it. What is then left of an unread body is bounded by the connector, whose Tomcat default
-             maxSwallowSize discards at most 2MB before closing the connection.
-         A request whose path is not exactly one of the two probe paths is passed through untouched,
-         so this filter cannot affect anything else in the webapp.
+         The <filter-mapping> is declared FIRST so the container builds the chain with this filter
+         ahead of ControlFilter, CacheFilter, ContextFilter and SameSiteFilter. It answers a probe and
+         does not call chain.doFilter, so none of them is entered: ControlFilter and ContextFilter
+         both call getSession() unconditionally, and ContextFilter hands an application/json request
+         body to WebAppUtil.setAttributesFromRequestBody. A request whose path is not exactly one of
+         the two probe paths is passed through untouched.
 
-         The servlet mapping is kept as well: it is what makes the container resolve these two paths
-         to this component rather than to the default servlet, and it keeps the probes off /control/*
-         and therefore outside the OFBTOOLS/WEBTOOLS base permission. No <load-on-startup>, so the
-         servlet initialises lazily and cannot affect boot ordering.
-
-         NOTE - the probe paths are deliberately NOT in the ControlFilter allowedPaths list below,
-         because ControlFilter matches that list with startsWith and a bare /health entry would grant
-         anonymous passage to every /health* spelling, not only to the two probes. None is needed
-         either: the filter above short-circuits the chain before ControlFilter ever sees a probe.
-
-         Liveness always returns 200. Readiness returns 200 when the entity engine can COMPLETE a count
-         of SequenceValueItem - whatever that count returns - and 503 otherwise: no delegator, or a
-         count that did not complete, which is what an unreachable datasource and a database with no
-         schema applied both produce. A completed count of zero rows is a reachable datasource and is
-         reported ready, with an advisory log line, because SequenceValueItem is filled on demand by the
-         sequencer and a probe performs no write. See the health and readiness endpoint section of
-         DOCKER.adoc. -->
+         The servlet mapping is required as well: it is what makes the container resolve these two
+         paths to this component rather than to the default servlet, and it keeps the probes off
+         /control/* and therefore outside the OFBTOOLS/WEBTOOLS base permission. -->
     <filter>
         <display-name>HealthCheckFilter</display-name>
         <filter-name>HealthCheckFilter</filter-name>
@@ -159,16 +132,6 @@ under the License.
         <url-pattern>/control/*</url-pattern>
     </servlet-mapping>
 
-    <!-- Health and readiness endpoints for load-balancer target-group probes. The full rationale,
-         including why the same class is also registered as the first filter, is documented with the
-         HealthCheckFilter declaration above. Carrying both url-patterns in a single mapping element
-         has been legal since Servlet 2.5 and this descriptor declares 4.0, so each of the two roles is
-         mapped exactly once. Because both patterns are EXACT, no other path under /health/ reaches the
-         servlet at all: a near miss such as /health/bogus or /health/LIVE matches nothing here and is
-         answered by this webapp's ordinary handling of an unmapped path, which is the control servlet's
-         302 redirect to /webtools/control/main. What matters for a probe is that no near miss is ever
-         answered 200; the servlet's own 404 branch covers the case of it being mapped with a prefix
-         pattern instead. -->
     <servlet>
         <description>Health and readiness check servlet for load balancer probes</description>
         <display-name>HealthCheckServlet</display-name>
