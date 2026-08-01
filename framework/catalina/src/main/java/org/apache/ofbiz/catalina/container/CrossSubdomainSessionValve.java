@@ -50,15 +50,19 @@ public class CrossSubdomainSessionValve extends ValveBase {
 
         // The load-balancer health probes are exempt from everything this valve does.
         //
-        // This valve is installed at ENGINE scope, so it runs before any webapp's filter chain and
-        // before the servlet that answers a probe without ever touching a session - the probe endpoint
-        // is a servlet and nothing else. Creating the session below therefore used to defeat that design
-        // whenever enable-cross-subdomain-sessions was switched on: every probe minted an HttpSession
-        // and a JSESSIONID, and a probe client never returns a cookie, so each one produced a session
-        // that lived until it expired. A target group polls every few seconds, per instance, forever, so
-        // that is an unbounded number of sessions - with their listeners, their expiry bookkeeping and
-        // their heap - created by an anonymous caller, plus a Set-Cookie header on a response that is
-        // documented as carrying none.
+        // What the exemption is worth, stated exactly. This valve is installed at ENGINE scope, so it
+        // runs before any webapp's filter chain, and getSession(true) below would create a session for
+        // every request it sees. The probe endpoint is a servlet reached through the webtools chain, and
+        // ControlFilter in that chain calls getSession() unconditionally, so a probe answered there is
+        // preceded by a session whether this valve runs or not - the exemption does not make a probe
+        // session-free, and nothing here should be read as claiming it does.
+        //
+        // Two things it does buy, both of them narrow and both of them real. A probe path can be
+        // addressed to ANY context - a mis-pointed target group, or a proxy rewriting the prefix - and a
+        // context whose chain neither allow-lists nor maps the path would otherwise have a session minted
+        // for it here, at engine scope, for a request that is going to be refused anyway. And this valve
+        // rewrites the JSESSIONID cookie onto a wider domain, which is a cross-subdomain cookie on a
+        // response that a probe client never reads and never returns.
         //
         // Skipping straight to the next valve is the whole exemption. Nothing is lost by it: a probe has
         // no session to share across subdomains, which is the only thing this valve exists to arrange.
@@ -90,7 +94,7 @@ public class CrossSubdomainSessionValve extends ValveBase {
      * <p>The two paths are not restated here. {@link HealthCheckServlet#isProbePath(String)} owns them,
      * so this valve and the endpoint itself can never disagree about what a probe is - a second copy of
      * the literals would be a copy that drifts, and a valve exempting a stale spelling would quietly
-     * resume creating a session for every probe.
+     * resume creating a session at engine scope for every probe.
      *
      * <p>The mapped path is tried first, using the same two accessors {@code HealthCheckServlet} uses,
      * so both arrive at the identical string for either mapping style. They are populated even at engine
@@ -101,12 +105,13 @@ public class CrossSubdomainSessionValve extends ValveBase {
      * <p>The decoded request URI is then tried as a fallback, with the context path removed, so the
      * exemption does not depend on the probe servlet being mapped in the context that received the
      * request. Only {@code webtools} declares the probe mapping, yet a probe path can be addressed to
-     * any context - a mis-pointed target group, or a proxy rewriting the prefix - and such a request
-     * must not mint a session either. Refusing a session to anything spelt like a probe is the safe
-     * direction: the worst it costs is one cross-subdomain cookie that a probe client never wanted.
+     * any context - a mis-pointed target group, or a proxy rewriting the prefix - and such a request must
+     * not have a session minted for it here, at engine scope, when the context it lands in is going to
+     * refuse it anyway. Exempting anything spelt like a probe is the safe direction: the worst it costs
+     * is one cross-subdomain cookie that a probe client never wanted.
      *
      * @param request the request being processed
-     * @return {@code true} if this request is a health probe and must not be given a session
+     * @return {@code true} if this request is a health probe and must be passed straight through
      */
     private static boolean isHealthProbe(Request request) {
         StringBuilder mapped = new StringBuilder();

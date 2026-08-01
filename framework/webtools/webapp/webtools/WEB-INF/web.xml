@@ -41,31 +41,18 @@ under the License.
         <param-value>component://webtools/widget/CommonScreens.xml</param-value>
     </context-param>
 
-    <!-- Load-balancer health probes. HealthCheckServlet is mapped both as this filter and as the
-         servlet declared further down, on the same two exact paths.
-
-         The <filter-mapping> is declared FIRST so the container builds the chain with this filter
-         ahead of ControlFilter, CacheFilter, ContextFilter and SameSiteFilter. It answers a probe and
-         does not call chain.doFilter, so none of them is entered: ControlFilter and ContextFilter
-         both call getSession() unconditionally, and ContextFilter hands an application/json request
-         body to WebAppUtil.setAttributesFromRequestBody. A request whose path is not exactly one of
-         the two probe paths is passed through untouched.
-
-         The servlet mapping is required as well: it is what makes the container resolve these two
-         paths to this component rather than to the default servlet, and it keeps the probes off
-         /control/* and therefore outside the OFBTOOLS/WEBTOOLS base permission. -->
-    <filter>
-        <display-name>HealthCheckFilter</display-name>
-        <filter-name>HealthCheckFilter</filter-name>
-        <filter-class>org.apache.ofbiz.webapp.control.HealthCheckServlet</filter-class>
-    </filter>
     <filter>
         <display-name>ControlFilter</display-name>
         <filter-name>ControlFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.ControlFilter</filter-class>
+        <!-- /health is what lets a load balancer reach HealthCheckServlet (declared below) without a
+             login: an unlisted path is redirected to /control/main, which no anonymous probe can
+             follow. allowedPaths is matched with startsWith, so this one entry admits every /health*
+             spelling to the chain; only the two exact paths the servlet-mapping below declares reach
+             the servlet, and the container answers anything else. -->
         <init-param>
             <param-name>allowedPaths</param-name>
-            <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp</param-value>
+            <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp:/health</param-value>
         </init-param>
         <init-param>
             <param-name>redirectPath</param-name>
@@ -87,13 +74,6 @@ under the License.
         <filter-name>SameSiteFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.SameSiteFilter</filter-class>
     </filter>
-    <!-- Declared first on purpose: the chain is built in this order, and the probes must be answered
-         before any filter that creates a session or parses the request body is reached. -->
-    <filter-mapping>
-        <filter-name>HealthCheckFilter</filter-name>
-        <url-pattern>/health/live</url-pattern>
-        <url-pattern>/health/ready</url-pattern>
-    </filter-mapping>
     <filter-mapping>
         <filter-name>ControlFilter</filter-name>
         <url-pattern>/*</url-pattern>
@@ -132,6 +112,10 @@ under the License.
         <url-pattern>/control/*</url-pattern>
     </servlet-mapping>
 
+    <!-- Load-balancer health probes, mapped outside /control/* so they carry neither the OFBTOOLS nor
+         the WEBTOOLS base permission, and reached anonymously through the /health entry in
+         ControlFilter's allowedPaths above. The servlet takes no init-param and is loaded on demand:
+         nothing it holds is created until the first probe arrives. -->
     <servlet>
         <description>Health and readiness check servlet for load balancer probes</description>
         <display-name>HealthCheckServlet</display-name>

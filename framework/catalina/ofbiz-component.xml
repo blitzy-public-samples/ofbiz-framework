@@ -134,14 +134,15 @@ under the License.
                  Enable it only when instances are served under several sub-domains of one parent domain and a
                  shared session cookie is genuinely required - the valve calls request.getSession(true), so it
                  forces a session for every request it handles.
-                 The valve exempts the two health probe paths and passes them straight down the pipeline without
-                 touching a session, because it is installed at ENGINE scope and would otherwise create and then
-                 rewrite the cookie of a session for every load balancer and orchestrator probe. Those requests
-                 carry no session to share, are unauthenticated by design and arrive continuously from every
-                 health-check node, so forcing a session for each of them would accumulate short-lived sessions
-                 in the manager for as long as the instance lives. The paths it exempts are the servlet's own
-                 published HealthCheckServlet.isProbePath contract, not a copy of the literals, so the exemption
-                 cannot drift from what the endpoint serves. -->
+                 The valve exempts the two health probe paths and passes them straight down the pipeline. Read
+                 that exemption precisely: it does NOT make a probe session-free, because the webtools chain
+                 that answers a probe reaches ControlFilter, which calls getSession() unconditionally. What the
+                 exemption avoids is narrower - this valve runs at ENGINE scope, above every context, so a probe
+                 path addressed to a context that neither allow-lists nor maps it would otherwise have a session
+                 minted here for a request that context is going to refuse anyway, and no domain-widened session
+                 cookie is rewritten onto a response that a probe client never reads. The paths it exempts are
+                 the servlet's own published HealthCheckServlet.isProbePath contract, not a copy of the literals,
+                 so the exemption cannot drift from what the endpoint serves. -->
             <property name="enable-cross-subdomain-sessions" value="false"/>
         </property>
         <property name="ajp-connector" value="connector">

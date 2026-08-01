@@ -84,11 +84,8 @@ import org.mockito.InOrder;
 import org.mockito.MockedStatic;
 
 import jakarta.servlet.Filter;
-import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletConfig;
 import jakarta.servlet.ServletContext;
-import jakarta.servlet.ServletRequest;
-import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpServletResponseWrapper;
@@ -97,20 +94,21 @@ import jakarta.servlet.http.HttpServletResponseWrapper;
  * Behavioural contract of {@link HealthCheckServlet}, the unauthenticated liveness and readiness
  * probe served at {@code /health/live} and {@code /health/ready}.
  *
- * <p>Every test invokes a production entry point - the {@code service} gate, the {@code doFilter}
- * short-circuit, or {@code doGet} and {@code doHead} where a container would dispatch to them
- * directly - and asserts the observable response: status code, exact JSON document, content type,
- * character encoding, cache header and, where it matters, the
- * {@code Allow} header. Mocks only supply the collaborators; no assertion is ever made against a
- * value a mock was configured to return. The static seams the class depends on,
+ * <p>Every test invokes a production entry point - the {@code service} gate, or {@code doGet} and
+ * {@code doHead} where a container would dispatch to them directly - and asserts the observable
+ * response: status code, exact JSON document, content type, character encoding, cache header and,
+ * where it matters, the {@code Allow} header. Mocks only supply the collaborators; no assertion is
+ * ever made against a value a mock was configured to return. The static seams the class depends on,
  * {@link WebAppUtil#getDelegator} and {@link Debug}, are replaced with scoped static mocks inside
  * try-with-resources so nothing leaks into another test, and no test opens a database connection,
  * reads configuration or touches the network.
  *
  * <p>Four properties are pinned here that the probes' exposure depends on, since they answer
- * anonymous callers: a probe is answered from the first position in the filter chain without the
- * chain being called at all, the request body is never read, no method other than GET or HEAD is
- * served, and a readiness failure never writes an internal detail to the log.
+ * anonymous callers: only the two mapped paths are served and everything else is 404, the request
+ * body is never read, no method other than GET or HEAD is served, and a readiness failure never
+ * writes an internal detail to the log. The descriptor half of the integration - the servlet mapping
+ * and the {@code /health} allow-list entry that makes a probe reachable without a login - is asserted
+ * by {@code HealthEndpointRegistrationTests} against the real webtools descriptor.
  */
 public final class HealthCheckServletTests {
 
@@ -458,50 +456,47 @@ public final class HealthCheckServletTests {
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
     }
 
+    /**
+     * A reachable database that reports zero rows is not ready.
+     *
+     * <p>The rule is the one the {@code ping} service of {@code CommonServices} applies to the very same query,
+     * which the AAP names as "the database-connectivity model for the readiness probe" (AAP 0.2.1) and specifies
+     * this handler as "mirroring the ping service's {@code SequenceValueItem} count check" (AAP 0.4.1). That
+     * service returns {@code CommonPingDatasourceInvalidCount} for a zero count rather than success, so a zero
+     * count is not a usable datasource here either and the probe answers 503.
+     *
+     * <p>It is reported under its own event code rather than under the datasource-unavailable code, because the
+     * two states call for different operator actions: the database answered, so what is missing is a sequence
+     * bank, not a reachable server.
+     */
     @Test
-    public void readyGetReturnsUpWhenTheReachableDatabaseReportsZeroRows() throws Exception {
+    public void readyGetReturnsDownWhenTheReachableDatabaseReportsZeroRows() throws Exception {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(0L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
 
             servlet.service(request, response);
+
+            ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
+            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
+            assertEquals(EMPTY_EVENT_CODE, lines.getValue(),
+                    "a reachable database with an empty sequence table needs its own code");
         }
-        // The count COMPLETED, which is the database connectivity this dimension measures, so the
-        // instance is ready. The value is not part of the verdict: SequenceValueItem is filled on
-        // demand by the sequencer rather than by a data load, and a probe creates no session and
-        // performs no write, so requiring a row would hold a correctly initialised instance in front of
-        // a cold database out of service forever - the only thing able to fill the table is the traffic
-        // that readiness is what admits. This is the one rule readiness does not take from the ping
-        // service, which reports CommonPingDatasourceInvalidCount for a zero count as an interactive
-        // diagnostic rather than as a target-group verdict.
-        //
-        // AUTHORISATION. An earlier revision of this suite expected 503 here. The AAP specifies this
-        // dimension as "readiness (delegator/DB connectivity -> 200/503)" (AAP 0.4.1) and names ping's
-        // count as "the database-connectivity model for the readiness probe" (AAP 0.2.1) - the model
-        // for connectivity, not for row population - and it exists to serve "health/readiness
-        // endpoints for load-balancer target-group checks" (AAP 0.1.1, Goal 5), which AAP 0.7.3 gates
-        // on "health/readiness endpoints respond correctly". A probe that a correctly provisioned
-        // instance can never satisfy does not respond correctly, so the AAP authorises - and here
-        // requires - a completed count to be the verdict. The safety property the 503 expectation was
-        // reaching for, that a database whose schema has not been applied must not be routed to, is
-        // preserved and asserted directly by
-        // anUnprovisionedSchemaIsStillReportedNotReadyByTheRuleThatCatchesIt.
-        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+        assertWindowStillOpen("READINESS_LOG_LAST_AT",
+                "an empty sequence table must not consume the window an unavailable datasource needs");
+        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
 
     /**
-     * A database whose schema has never been applied is still held out of service - by the rule that
-     * catches it for what it is.
+     * A database whose schema has never been applied is held out of service by the rule that catches it for what
+     * it is, rather than by the zero-count rule above.
      *
-     * <p>This is the safety property behind the prior "zero rows means not ready" expectation, stated as the
-     * condition it was actually protecting against rather than as a proxy for it. A row count of zero and an
-     * unapplied schema are different states that the earlier rule could not tell apart: the first is a correctly
-     * provisioned instance in front of a cold database, which must be routed to, and the second is an instance
-     * that cannot serve a single request, which must not be. Counting rows conflated them and so had to be wrong
-     * about one of the two; failing on the relation itself separates them, and this test pins the half that must
-     * still refuse.
+     * <p>An empty sequence table and an unapplied schema are different states and are reported under different
+     * codes, because the operator action differs: the first needs a sequenced write to reach the database, the
+     * second needs the schema init to have run at all. Both answer 503; this test pins which code carries it.
      *
      * <p>The failure is the one an unprovisioned PostgreSQL schema actually produces - the count throwing because
      * the relation is absent - which is the state the gated one-shot schema init (AAP 0.6.4) exists to leave
@@ -591,9 +586,9 @@ public final class HealthCheckServletTests {
     @Test
     public void readyGetReturnsDownWhenTheRequestCannotSupplyAServletContext() throws Exception {
         givenProbePath("/health/ready", null);
-        // The context is read from the request, which is the only source available when this class
-        // runs as a filter. A container that cannot supply one has to be absorbed by the readiness
-        // contract rather than escaping to the container as a 500.
+        // The context is read from the request rather than from getServletConfig(), so the check stays
+        // static and free of instance state. A container that cannot supply one has to be absorbed by
+        // the readiness contract rather than escaping to the container as a 500.
         when(request.getServletContext()).thenThrow(new IllegalStateException("no servlet context"));
 
         servlet.service(request, response);
@@ -605,9 +600,8 @@ public final class HealthCheckServletTests {
     public void readinessIsAnsweredWithoutTheServletHavingBeenInitialised() throws Exception {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(1L);
-        // No init(ServletConfig): this is the state the instance is in when the container drives it
-        // through the filter lifecycle, where there is no ServletConfig at all. Readiness must still
-        // work, which is exactly why the context comes from the request.
+        // No init(ServletConfig): a probe may arrive before the container has initialised the servlet,
+        // and it must be answered anyway - which is exactly why the context comes from the request.
         HealthCheckServlet uninitialised = new HealthCheckServlet();
 
         try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
@@ -1552,196 +1546,50 @@ public final class HealthCheckServletTests {
     }
 
     /*
-     * Filter role: a probe is answered ahead of the webapp's filter chain
+     * Behind the webapp's ordinary filter chain
      *
-     * The same class is registered twice - as a Filter on the two exact probe paths, mapped FIRST, and
-     * as a servlet on those same two paths. The filter registration is what keeps a probe out of the
-     * ordinary chain, and the two things that chain would otherwise do to every probe of every instance
-     * are why it matters: ControlFilter and ContextFilter both call getSession() unconditionally, so
-     * each anonymous probe minted a session that lived until it expired, and ContextFilter calls
-     * WebAppUtil.setAttributesFromRequestBody, which reads a declared application/json body of any size
-     * into a String and then into a Map before any servlet is reached.
+     * This class is a servlet and nothing else. The webtools descriptor declares it once, maps it to the
+     * two exact probe paths and carries /health in ControlFilter's allowedPaths so that an anonymous
+     * probe is passed down the chain instead of being redirected to the login-protected controller.
+     * HealthEndpointRegistrationTests asserts that shape from the descriptor itself and drives a real
+     * ControlFilter with it; what is asserted here is the half that belongs to this class - that a probe
+     * is answered from the servlet entry points alone, and that nothing outside the two mapped paths is
+     * answered at all.
      *
-     * These tests therefore assert the two halves of the short-circuit: a probe is answered here and
-     * chain.doFilter is NOT called, and everything else is passed down the chain untouched. The probe
-     * paths are deliberately NOT in ControlFilter's allowedPaths - that list is matched with startsWith,
-     * so a /health entry would grant passage to every /health* spelling - which HealthEndpointRegistration
-     * Tests asserts from the descriptor itself.
+     * Two consequences of running behind the chain belong to the filters rather than to this class and
+     * are deliberately not asserted here: ControlFilter and ContextFilter both call getSession()
+     * unconditionally, so a probe is preceded by a session this class neither creates nor reads, and
+     * allowedPaths is matched with startsWith, so every /health* spelling reaches the chain and is then
+     * answered by the container because no servlet-mapping claims it.
      */
 
-    @ParameterizedTest(name = "{0} is answered by the filter without the chain being called")
-    @ValueSource(strings = {"/health/live", "/health/ready"})
-    public void aProbeIsAnsweredFromTheFilterWithoutTheChainEverBeingCalled(String probePath) throws Exception {
-        givenProbePath(probePath, null);
-        // A verdict inside the fresh window, so readiness answers without a datasource and this measures
-        // the short-circuit alone.
-        givenEstablishedVerdict(true, 0L);
-        FilterChain chain = mock(FilterChain.class);
-
-        servlet.doFilter(request, response, chain);
-
-        // The whole point of the filter registration: nothing downstream of it runs for a probe.
-        verifyNoInteractions(chain);
-        assertProbeResponse(HttpServletResponse.SC_OK, "/health/live".equals(probePath) ? LIVE_UP : READY_UP);
-    }
-
     @Test
-    public void aProbeAnsweredFromTheFilterTouchesNothingButThePathTheMethodAndTheBodyHeaders() throws Exception {
+    public void anOrdinaryLivenessProbeWritesNothingToTheLog() throws Exception {
         givenProbePath("/health/live", null);
-        FilterChain chain = mock(FilterChain.class);
-
-        servlet.doFilter(request, response, chain);
-
-        // The exhaustive list of what the filter role is allowed to look at, closed by
-        // verifyNoMoreInteractions. A session, a principal, a role, an attribute, a parameter or an
-        // input stream appearing here later fails this test - and a session is exactly what the chain
-        // this filter replaces was creating for every anonymous probe.
-        verify(request).getServletPath();
-        verify(request).getPathInfo();
-        // Once, not twice: the filter role calls the shared handler directly, so HttpServlet.service
-        // never runs and never re-reads the method to choose a dispatch.
-        verify(request).getMethod();
-        verify(request).getContentLengthLong();
-        verify(request).getHeader("Transfer-Encoding");
-        verifyNoMoreInteractions(request);
-        verifyNoInteractions(chain);
-        // No cookie either. A probe client returns nothing, so anything set here would be minted afresh
-        // on every poll of every target-group health-check node.
-        verify(response, never()).addCookie(any());
-        assertProbeResponse(HttpServletResponse.SC_OK, LIVE_UP);
-    }
-
-    @Test
-    public void anOrdinaryProbeAnsweredFromTheFilterWritesNothingToTheLog() throws Exception {
-        givenProbePath("/health/live", null);
-        FilterChain chain = mock(FilterChain.class);
 
         try (MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            servlet.doFilter(request, response, chain);
+            servlet.service(request, response);
 
-            // A continuously polled endpoint that logged a line per probe would be the log amplifier,
-            // and a probe traversing the chain reaches the exception ControlFilter raises for a path
-            // no request map knows. Answering here means there is nothing to log.
+            // A continuously polled endpoint that logged a line per probe would be the log amplifier of
+            // the deployment: one line per probe, per node of the target group, per instance.
             debug.verifyNoInteractions();
         }
-        verifyNoInteractions(chain);
         assertProbeResponse(HttpServletResponse.SC_OK, LIVE_UP);
     }
 
-    @ParameterizedTest(name = "{0} is passed down the chain rather than answered")
-    @CsvSource(nullValues = "NULL", value = {
-        "/health, NULL",
-        "/health/, NULL",
-        "/health/live/, NULL",
-        "/health/liveness, NULL",
-        "/healthz/live, NULL",
-        "/health//live, NULL",
-        "/HEALTH/LIVE, NULL",
-        "/control/main, NULL",
-        "/health, /bogus" })
-    public void aRequestThatIsNotAProbeIsPassedStraightDownTheChainUntouched(String servletPath, String pathInfo)
-            throws Exception {
-        givenProbePath(servletPath, pathInfo);
-        FilterChain chain = mock(FilterChain.class);
-
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            servlet.doFilter(request, response, chain);
-
-            webAppUtil.verifyNoInteractions();
-        }
-        // Passed on unchanged, so a path this filter's mapping happens to cover but that is not one of
-        // the two probes is served by whatever the descriptor says should serve it.
-        verify(chain).doFilter(request, response);
-        verifyNoMoreInteractions(chain);
-        // Nothing is written, so the filter cannot commit a response the rest of the chain then tries to
-        // add to, and the decision is taken from the path alone - the method is not even consulted.
-        verifyNoInteractions(response);
-        verify(request, never()).getMethod();
-        assertEquals("", responseBody.toString(), "a request the filter passes on must have no body written by it");
-    }
-
     @Test
-    public void anExchangeThatIsNotHttpIsPassedDownTheChainUntouched() throws Exception {
-        // A filter is declared against a url-pattern, not against a protocol, so the container may drive
-        // it with a plain ServletRequest. This class has nothing to say about one, and casting blindly
-        // would turn it into a ClassCastException on a path that is not even a probe.
-        ServletRequest plainRequest = mock(ServletRequest.class);
-        ServletResponse plainResponse = mock(ServletResponse.class);
-        FilterChain chain = mock(FilterChain.class);
-
-        servlet.doFilter(plainRequest, plainResponse, chain);
-
-        verify(chain).doFilter(plainRequest, plainResponse);
-        verifyNoMoreInteractions(chain);
-        verifyNoInteractions(plainRequest);
-        verifyNoInteractions(plainResponse);
-    }
-
-    @ParameterizedTest(name = "{0} /health/live -> 405 from the filter, chain untouched")
-    @ValueSource(strings = {"POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT", "get", "Head", "PROPFIND"})
-    public void theMethodGateIsEnforcedInTheFilterRoleToo(String method) throws Exception {
-        givenProbePath("/health/live", null);
-        givenMethod(method);
-        FilterChain chain = mock(FilterChain.class);
-
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            servlet.doFilter(request, response, chain);
-
-            webAppUtil.verifyNoInteractions();
-        }
-        // The gate is the shared one, so the filter role cannot answer a method the servlet role refuses -
-        // and refusing it here rather than passing it on keeps a POST to a probe path out of the chain
-        // too, which is where the unbounded body read lives.
-        verifyNoInteractions(chain);
-        verify(response).setHeader(ALLOW_HEADER, ALLOW_VALUE);
-        assertProbeResponse(HttpServletResponse.SC_METHOD_NOT_ALLOWED, UNKNOWN);
-    }
-
-    @Test
-    public void aBodyBearingProbeIsRefusedByTheFilterFromItsHeadersAndNeverPassedOn() throws Exception {
+    public void aBodyBearingProbeIsRefusedFromItsHeadersWithoutTheDatasourceBeingTouched() throws Exception {
         givenProbePath("/health/ready", null);
         when(request.getContentLengthLong()).thenReturn(1L);
-        FilterChain chain = mock(FilterChain.class);
 
         try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            servlet.doFilter(request, response, chain);
+            servlet.service(request, response);
 
-            // Refused before the datasource is reached, from a header lookup, and not handed to the
-            // chain - where setAttributesFromRequestBody would have read it into the heap in full.
+            // Refused from a header lookup, before the delegator is resolved and before any part of the
+            // body is read, so an anonymous caller cannot make a probe path do work by announcing one.
             webAppUtil.verifyNoInteractions();
         }
-        verifyNoInteractions(chain);
         assertProbeResponse(HttpServletResponse.SC_BAD_REQUEST, UNKNOWN);
-    }
-
-    @ParameterizedTest(name = "the filter and the servlet answer {0} identically")
-    @ValueSource(strings = {"/health/live", "/health/ready"})
-    public void theTwoRegistrationsAnswerTheSameProbeIdentically(String probePath) throws Exception {
-        givenProbePath(probePath, null);
-        givenEstablishedVerdict(true, 0L);
-
-        // The filter role first, against the shared response mock, so assertProbeResponse's full set of
-        // status, document, header and never-touched assertions applies to it.
-        servlet.doFilter(request, response, mock(FilterChain.class));
-        assertProbeResponse(HttpServletResponse.SC_OK, "/health/live".equals(probePath) ? LIVE_UP : READY_UP);
-
-        // Then the servlet role, against its own response, and the two answers are compared rather than
-        // restated: a divergence between the registrations fails here whichever way it goes.
-        HttpServletResponse second = mock(HttpServletResponse.class);
-        StringWriter secondBody = new StringWriter();
-        when(second.getWriter()).thenReturn(new PrintWriter(secondBody));
-        givenEstablishedVerdict(true, 0L);
-
-        servlet.service(request, second);
-
-        ArgumentCaptor<Integer> filterStatus = ArgumentCaptor.forClass(Integer.class);
-        verify(response).setStatus(filterStatus.capture());
-        ArgumentCaptor<Integer> servletStatus = ArgumentCaptor.forClass(Integer.class);
-        verify(second).setStatus(servletStatus.capture());
-        assertEquals(filterStatus.getValue(), servletStatus.getValue(),
-                "the filter and the servlet must answer " + probePath + " with the same status");
-        assertEquals(responseBody.toString(), secondBody.toString(),
-                "the filter and the servlet must answer " + probePath + " with the same document");
     }
 
     /*
@@ -2324,31 +2172,6 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void anUnpopulatedSchemaIsReportedUnderItsOwnCodeWithoutHoldingTheInstanceOutOfService()
-            throws Exception {
-        givenProbePath("/health/ready", null);
-        Delegator delegator = delegatorCountingRows(0L);
-
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-
-            servlet.service(request, response);
-
-            ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
-            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
-            // The operator question differs from an outage - why has no sequenced write reached this
-            // database - so the condition may not be reported as a datasource failure.
-            assertEquals(EMPTY_EVENT_CODE, lines.getValue(), "a reachable but empty schema needs its own code");
-        }
-        assertWindowStillOpen("READINESS_LOG_LAST_AT",
-                "an empty schema must not consume the rate-limit window an unavailable datasource needs");
-        // Advisory, not a verdict. The count completed, so the datasource dimension is satisfied and the
-        // instance is routable; the line is what tells an operator the sequence table is still empty.
-        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
-    }
-
-    @Test
     public void anAlreadyPublishedDelegatorIsUsedWithoutAskingTheFactoryForOne() throws Exception {
         // ContextFilter.init() publishes the delegator on the ServletContext when the webapp is
         // deployed. Observing it there is what keeps a probe from asking DelegatorFactory for a
@@ -2609,12 +2432,11 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void anUnpopulatedSchemaDoesNotMaskTheCoherenceDimension() throws Exception {
-        // The empty sequence table is an advisory, so it cannot stand in for a verdict - and it must not
-        // stop the second dimension from being measured either. Before the datasource dimension was
-        // corrected to assert only that the count completes, this combination reported the empty schema
-        // and returned, which left an instance that genuinely could not participate in fleet cache
-        // coherence diagnosed as "empty schema" and sent the operator to the wrong subsystem.
+    public void anUnpopulatedSchemaIsReportedAloneWithoutTheCoherenceDimensionBeingMeasured() throws Exception {
+        // The datasource dimension is measured first and decides the verdict on its own, so a zero count
+        // ends the check: the transport is never consulted and its code is never written. Reporting both
+        // would name two subsystems for one 503 and send an operator to the wrong one first - the
+        // instance cannot serve a request at all, whatever the broker is doing.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(0L);
         LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of());
@@ -2627,12 +2449,14 @@ public final class HealthCheckServletTests {
             servlet.service(request, response);
 
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
-            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(2));
-            assertEquals(List.of(EMPTY_EVENT_CODE, TRANSPORT_EVENT_CODE), lines.getAllValues(),
-                    "the advisory is emitted first and the dimension that actually decided the verdict "
-                            + "is emitted after it, in the order the two dimensions are measured");
+            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
+            assertEquals(List.of(EMPTY_EVENT_CODE), lines.getAllValues(),
+                    "an empty sequence table is the whole verdict, so no second code may be written for it");
         }
-        // And the verdict comes from the transport, which is the dimension that failed.
+        // Nothing at all was asked of the dispatcher: the check ended in the dimension before it.
+        verifyNoInteractions(dispatcher);
+        assertWindowStillOpen("READINESS_TRANSPORT_LOG_LAST_AT",
+                "the transport window must be untouched when the transport was never measured");
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
 
@@ -2734,30 +2558,26 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void theClassIsBothTheServletAndTheFilterThatShortCircuitsTheChain() throws Exception {
-        // Both roles are required, and by the same class, because a probe has to be answered BEFORE the
-        // webapp's ordinary filters run - see the filter-role section above for what ControlFilter and
-        // ContextFilter would otherwise do to every probe of every instance - while the servlet mapping
-        // is what makes the container resolve these paths to this component at all.
+    public void theClassIsAServletAndNothingElse() throws Exception {
+        // The specified integration is two edits to a deployment descriptor: one servlet-mapping on the
+        // two probe paths, and /health in ControlFilter's allowedPaths. A filter role would be a third,
+        // unspecified integration that re-orders the webapp's chain, so this class must not be
+        // registrable as one.
         assertTrue(jakarta.servlet.http.HttpServlet.class.isAssignableFrom(HealthCheckServlet.class),
                 "the probe must be registrable as a servlet");
-        assertTrue(Filter.class.isAssignableFrom(HealthCheckServlet.class),
-                "the probe must be registrable as a filter, or it cannot short-circuit the chain");
+        assertFalse(Filter.class.isAssignableFrom(HealthCheckServlet.class),
+                "the probe must not be registrable as a filter: the allow-list entry is what makes it reachable");
 
-        // Declared on this class rather than inherited: Filter.doFilter has no default, so a class that
-        // merely implemented the interface without overriding it would not compile - but a doFilter that
-        // was moved to a superclass or replaced by a differently-shaped helper would still satisfy
-        // isAssignableFrom above while no longer being the chain entry point the container calls.
-        Method doFilter = HealthCheckServlet.class.getDeclaredMethod("doFilter",
-                ServletRequest.class, ServletResponse.class, FilterChain.class);
-        assertTrue(Modifier.isPublic(doFilter.getModifiers()),
-                "the container calls doFilter through the Filter interface, so it must be public");
-        assertFalse(Modifier.isStatic(doFilter.getModifiers()),
-                "the container calls doFilter on the instance it created");
+        // isAssignableFrom above would still pass if the interface were dropped while a doFilter method
+        // shaped like the container's entry point stayed behind, so the method itself is asserted absent
+        // under any signature.
+        for (Method method : HealthCheckServlet.class.getDeclaredMethods()) {
+            assertFalse("doFilter".equals(method.getName()),
+                    "no doFilter may remain: the chain is entered, not short-circuited");
+        }
 
-        // The two roles must not be able to answer the same request differently, which is why the method
-        // gate and the handler are shared rather than restated. Both are private and static, so neither
-        // role can be given its own copy without that showing up here.
+        // One gate and one handler, both private and static, so the GET and the HEAD dispatch cannot be
+        // given their own copy and answer the same request differently.
         for (String shared : List.of("methodRefused", "handleProbe")) {
             List<Method> declared = new ArrayList<>();
             for (Method method : HealthCheckServlet.class.getDeclaredMethods()) {
@@ -2766,10 +2586,10 @@ public final class HealthCheckServletTests {
                 }
             }
             assertEquals(1, declared.size(),
-                    shared + " must exist exactly once, so the servlet role and the filter role cannot diverge");
+                    shared + " must exist exactly once, so the GET and the HEAD dispatch cannot diverge");
             int modifiers = declared.get(0).getModifiers();
             assertTrue(Modifier.isPrivate(modifiers) && Modifier.isStatic(modifiers),
-                    shared + " must be a private static helper shared by both roles");
+                    shared + " must be a private static helper shared by both dispatch methods");
         }
     }
 

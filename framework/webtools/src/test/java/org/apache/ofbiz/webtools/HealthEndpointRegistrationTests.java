@@ -43,7 +43,8 @@ import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -77,17 +78,26 @@ import jakarta.servlet.http.HttpSession;
  * {@link HealthCheckServlet}. That is what makes the tests fail if a url-pattern, the filter
  * ordering or the allow-list is ever changed.
  *
- * <p>The registration is the same class twice: as {@code HealthCheckFilter} on the two exact probe
- * paths, whose {@code filter-mapping} is declared FIRST, and as {@code HealthCheckServlet} on those
- * same two paths. Four properties carry the weight and are pinned here: the health
- * {@code filter-mapping} is the first in the descriptor, so a probe is answered ahead of every filter
- * that would create a session or parse the request body; the legacy filter chain is otherwise
- * untouched, keeping its classes, its {@code /*} pattern and its relative order; the
- * {@code ControlFilter} allow-list is exactly the list it was before this work, with no
- * {@code /health} entry added, because that list is matched with {@code startsWith} and a bare
- * {@code /health} entry would grant anonymous passage to every {@code /health*} spelling rather than
- * to the two probes; and the two exact url-patterns confine the anonymous surface, so any other
- * spelling under the prefix is answered by neither role.
+ * <p>The registration is a single {@code servlet} plus a single {@code servlet-mapping}, which is what
+ * the Agent Action Plan prescribes: register {@code HealthCheckServlet} with a no-authentication
+ * {@code servlet}/{@code servlet-mapping} modelled on the {@code ControlServlet} registration
+ * (AAP 0.2.1 and 0.4.1). The probe class is therefore NOT declared as a filter, and no
+ * {@code filter-mapping} references it: the legacy four-filter chain is exactly what it was, and a
+ * probe travels through it like any other request. Four properties carry the weight and are pinned
+ * here: the probe class is declared once, as a servlet, and no filter is backed by it; the legacy
+ * filter chain keeps its classes, its {@code /*} pattern and its order, with nothing inserted ahead of
+ * it; the {@code ControlFilter} allow-list is the legacy list plus one {@code /health} entry, which is
+ * what lets an unauthenticated probe reach the chain at all; and the two exact servlet url-patterns
+ * confine what the probe handler answers, so any other spelling under the prefix is admitted by the
+ * allow-list's {@code startsWith} match but is claimed by no mapping and never becomes a probe.
+ *
+ * <p>The {@code startsWith} breadth of that one allow-list entry is an accepted, documented cost of
+ * the servlet-only integration rather than an oversight, and it is asserted in both directions below:
+ * every {@code /health*} spelling clears {@code ControlFilter}, and none of them except the two mapped
+ * paths is recognised by {@link HealthCheckServlet#isProbePath(String)} or answered as a probe. The
+ * second accepted cost is that {@code ControlFilter.doFilter} calls {@code getSession()}
+ * unconditionally before it consults the allow-list, so each probe mints a session in the container;
+ * the probe handler itself still creates none, reads no body and sets no cookie.
  *
  * <p>No network access takes place: the descriptor's schema hint points at a remote XSD, so the
  * document is parsed structurally with secure processing enabled and external DTD loading switched
@@ -110,11 +120,22 @@ public final class HealthEndpointRegistrationTests {
             "/ping.txt", "/error", "/control", "/select", "/index.html", "/index.jsp",
             "/default.html", "/default.jsp");
 
-    /** The filter names the descriptor must map, in chain order: the health probe first, then the legacy four. */
-    private static final List<String> EXPECTED_FILTER_ORDER = List.of(
-            HEALTH_FILTER_NAME, CONTROL_FILTER_NAME, "CacheFilter", "ContextFilter", "SameSiteFilter");
+    /** The single entry the probe work appends, which is what admits an unauthenticated probe to the chain. */
+    private static final String HEALTH_ALLOWED_PATH = "/health";
 
-    /** The legacy filters, in the relative order they had before the probe work added one ahead of them. */
+    /**
+     * The allow-list the descriptor must declare: the legacy eight, in their original order, followed by
+     * the one probe entry. Order is asserted because it is the descriptor's own text, and appending
+     * rather than inserting is what keeps every pre-existing entry byte-identical.
+     */
+    private static final List<String> EXPECTED_ALLOWED_PATHS = Stream
+            .concat(LEGACY_ALLOWED_PATHS.stream(), Stream.of(HEALTH_ALLOWED_PATH))
+            .collect(Collectors.toUnmodifiableList());
+
+    /**
+     * The filters the descriptor must map, in chain order. The probe work inserted nothing ahead of them
+     * and reordered none of them, so this is both the legacy order and the whole expected order.
+     */
     private static final List<String> LEGACY_FILTER_ORDER = List.of(
             CONTROL_FILTER_NAME, "CacheFilter", "ContextFilter", "SameSiteFilter");
 
@@ -171,17 +192,15 @@ public final class HealthEndpointRegistrationTests {
     }
 
     @Test
-    public void healthServletStartsLazilyAndNeitherRoleTakesConfiguration() throws Exception {
+    public void healthServletStartsLazilyAndTakesNoConfiguration() throws Exception {
         Element healthServlet = servletsByName(HEALTH_SERVLET_NAME).get(0);
 
         // No load-on-startup: the probe servlet must never participate in boot ordering, and it
         // resolves its delegator per request so readiness can flip without a restart.
         assertEquals(List.of(), childElements(healthServlet, "load-on-startup"), "load-on-startup elements");
+        // No init-param either, so a descriptor mistake cannot turn the probe endpoint into a webapp
+        // that refuses to start; every setting the handler needs it reads from the running system.
         assertEquals(List.of(), childElements(healthServlet, "init-param"), "init-param elements");
-        // The filter role takes no configuration either. It is the first thing in the chain, so a
-        // required init-param would turn a descriptor mistake into a webapp that refuses to start.
-        assertEquals(List.of(), childElements(filtersByName(HEALTH_FILTER_NAME).get(0), "init-param"),
-                "filter init-param elements");
     }
 
     @Test
@@ -199,71 +218,60 @@ public final class HealthEndpointRegistrationTests {
         assertEquals(1, healthMappings.size(), "number of servlet-mapping elements for " + HEALTH_SERVLET_NAME);
         for (String pattern : PROBE_PATHS) {
             // A wildcard such as /health/* would map every spelling under the prefix onto the
-            // unauthenticated handler; exact patterns keep the anonymous surface at exactly these two
-            // resources, and the same is asserted of the filter mapping.
+            // unauthenticated handler. Exact patterns keep the surface the handler answers at exactly
+            // these two resources, which matters more now than it did under a filter registration: the
+            // allow-list entry that admits them is a prefix grant, so the servlet mapping is the only
+            // thing that decides what actually becomes a probe.
             assertTrue(!pattern.contains("*"), "probe url-pattern must be an exact path, found " + pattern);
-        }
-        for (String pattern : filterUrlPatternsFor(HEALTH_FILTER_NAME)) {
-            assertTrue(!pattern.contains("*"), "probe filter url-pattern must be an exact path, found " + pattern);
         }
     }
 
     /*
-     * The class is registered twice, and the filter registration is first in the chain
+     * The class is registered as a servlet and as nothing else
      */
 
     @Test
-    public void theHealthClassIsRegisteredOnceAsAFilterAndOnceAsAServlet() throws Exception {
-        // Exactly one declaration of each role, both backed by the same class. Two declarations of
-        // either would let the two drift apart, and a second class answering a probe path would be a
-        // second anonymous surface.
-        assertEquals(1, filtersByName(HEALTH_FILTER_NAME).size(), "filter declarations");
-        assertEquals(HEALTH_SERVLET_CLASS, filterClass(HEALTH_FILTER_NAME), "filter-class");
+    public void theHealthClassIsRegisteredOnlyAsAServlet() throws Exception {
+        // Exactly one servlet declaration, backed by the probe class. Two would let the declarations
+        // drift apart, and a second class answering a probe path would be a second anonymous surface.
         assertEquals(1, servletsByName(HEALTH_SERVLET_NAME).size(), "servlet declarations");
         assertEquals(HEALTH_SERVLET_CLASS, childText(servletsByName(HEALTH_SERVLET_NAME).get(0), "servlet-class"),
                 "servlet-class");
 
-        // And no OTHER filter is backed by the probe class, which would put a second copy of it in the
-        // chain under a name nothing here checks.
+        // And NO filter is declared for the probe class, under any name. The AAP asks for a servlet and a
+        // servlet-mapping modelled on the ControlServlet registration; a second registration as a filter
+        // would be a second integration point, with its own ordering to keep right and its own copy of
+        // the probe logic in the chain.
         for (Element filter : childElements(webApp(), "filter")) {
             String declaredName = childText(filter, "filter-name");
-            if (!HEALTH_FILTER_NAME.equals(declaredName)) {
-                assertNotEquals(HEALTH_SERVLET_CLASS, childText(filter, "filter-class"),
-                        "filter " + declaredName + " must not be backed by " + HEALTH_SERVLET_CLASS);
-            }
+            assertNotEquals(HEALTH_FILTER_NAME, declaredName, "no filter may be declared for the probe endpoint");
+            assertNotEquals(HEALTH_SERVLET_CLASS, childText(filter, "filter-class"),
+                    "filter " + declaredName + " must not be backed by " + HEALTH_SERVLET_CLASS);
         }
+        // The descriptor and the class have to agree: the class does not implement Filter, so declaring
+        // it as one could only ever fail at deployment time.
+        assertFalse(Filter.class.isAssignableFrom(HealthCheckServlet.class),
+                HEALTH_SERVLET_CLASS + " must not implement Filter");
     }
 
     @Test
-    public void theHealthFilterIsMappedFirstOnExactlyTheTwoProbePaths() throws Exception {
-        List<String> order = filterMappingOrder();
-
-        // FIRST is the whole point. The servlet specification builds the chain in the order the
-        // url-pattern mappings appear in this descriptor, so a health mapping declared anywhere else
-        // would let ControlFilter and ContextFilter run ahead of it - which is exactly the session
-        // creation and the unbounded body read the short-circuit exists to prevent.
-        assertEquals(HEALTH_FILTER_NAME, order.get(0),
-                "the health filter must be the first mapping in the chain, found " + order);
-        // Exact paths, and only those two: a /health/* pattern would put every spelling under the
-        // prefix through the probe handler.
-        assertEquals(PROBE_PATHS, filterUrlPatternsFor(HEALTH_FILTER_NAME), "health filter url-patterns");
-        assertEquals(1, mappingsForFilter(HEALTH_FILTER_NAME).size(),
-                "one filter-mapping element must carry both probe paths, so they cannot drift apart");
-        // And the two roles must cover the same set. A path the servlet mapping resolved but the filter
-        // mapping did not would be served through the ordinary chain - a session per probe again - while
-        // the reverse would answer a path the container never routed to this component.
-        assertEquals(urlPatternsFor(HEALTH_SERVLET_NAME), filterUrlPatternsFor(HEALTH_FILTER_NAME),
-                "the filter and the servlet must be mapped to exactly the same paths");
+    public void noFilterMappingIsDeclaredForTheProbeEndpoint() throws Exception {
+        // Nothing references a probe filter, so nothing short-circuits the chain and the ordering of the
+        // legacy mappings is the only ordering there is.
+        assertEquals(List.of(), mappingsForFilter(HEALTH_FILTER_NAME),
+                "no filter-mapping may reference " + HEALTH_FILTER_NAME);
+        assertFalse(filterMappingOrder().contains(HEALTH_FILTER_NAME),
+                "the chain must contain no probe filter, found " + filterMappingOrder());
+        // The probe paths are carried by the servlet mapping alone.
+        assertEquals(PROBE_PATHS, urlPatternsFor(HEALTH_SERVLET_NAME), "health servlet url-patterns");
     }
 
     @Test
-    public void theLegacyFilterChainIsUnchangedBehindTheProbeFilter() throws Exception {
-        // The probe work added one filter, ahead of the others, and reordered none: the four
-        // pre-existing filters keep their classes, their /* pattern and their relative order, so every
-        // request that is not one of the two probes is processed exactly as before.
-        assertEquals(EXPECTED_FILTER_ORDER, filterMappingOrder(), "filter-mapping order");
-        assertEquals(LEGACY_FILTER_ORDER, filterMappingOrder().subList(1, filterMappingOrder().size()),
-                "the legacy filters must keep their relative order behind the probe filter");
+    public void theLegacyFilterChainIsExactlyWhatItWas() throws Exception {
+        // The probe work added no filter and reordered none: the four pre-existing filters keep their
+        // classes, their /* pattern and their order, so every request - the two probes included - is
+        // processed by exactly the chain that was there before.
+        assertEquals(LEGACY_FILTER_ORDER, filterMappingOrder(), "filter-mapping order");
         assertEquals("org.apache.ofbiz.webapp.control.ControlFilter", filterClass(CONTROL_FILTER_NAME), "ControlFilter class");
         assertEquals("org.apache.ofbiz.base.util.CacheFilter", filterClass("CacheFilter"), "CacheFilter class");
         assertEquals("org.apache.ofbiz.webapp.control.ContextFilter", filterClass("ContextFilter"), "ContextFilter class");
@@ -296,21 +304,26 @@ public final class HealthEndpointRegistrationTests {
     }
 
     @Test
-    public void theAllowListIsExactlyTheLegacyListAndReservesNoHealthPrefix() throws Exception {
+    public void theAllowListIsTheLegacyListPlusExactlyOneHealthEntry() throws Exception {
         List<String> declared = declaredAllowedPaths();
 
-        // Unchanged, entry for entry and in order: the probes are not allow-listed at all, so they cost
-        // no pre-existing path its anonymous or gated status and add none of their own.
-        assertEquals(LEGACY_ALLOWED_PATHS, declared, "ControlFilter allowedPaths");
+        // The eight legacy entries are byte-identical and still in their original order, and the probe
+        // entry is APPENDED rather than inserted, so no pre-existing path changed its anonymous or gated
+        // status. Without this entry the probes would be redirected to /control/main and a target group
+        // would read the 302 as an unhealthy target: with the servlet-only registration, ControlFilter is
+        // reached by every request, so the allow-list is what makes the probes anonymous.
+        assertEquals(EXPECTED_ALLOWED_PATHS, declared, "ControlFilter allowedPaths");
+        assertEquals(LEGACY_ALLOWED_PATHS, declared.subList(0, LEGACY_ALLOWED_PATHS.size()),
+                "the legacy entries must keep their order ahead of the appended probe entry");
         assertEquals("/control/main", initParameter(CONTROL_FILTER_NAME, "redirectPath"), "ControlFilter redirectPath");
-        // ControlFilter matches its list with startsWith, so an allow-list entry is a PREFIX grant. A
-        // /health entry would therefore hand anonymous passage to every /health* spelling - including
-        // ones no url-pattern maps - rather than to the two probes, and none is needed: the probe filter
-        // terminates the chain before ControlFilter is reached at all.
-        for (String entry : declared) {
-            assertFalse(entry.startsWith("/health"),
-                    "the allow-list must reserve no /health prefix, found " + entry);
-        }
+        // ControlFilter matches its list with startsWith, so an allow-list entry is a PREFIX grant: this
+        // one entry admits every /health* spelling to the chain, not just the two probes. That breadth is
+        // accepted and bounded elsewhere - only the two exact servlet url-patterns are claimed by the
+        // probe handler, so any other spelling is answered by the container - and it is pinned to exactly
+        // one entry here so the grant cannot quietly widen further.
+        List<String> healthEntries = declared.stream().filter(entry -> entry.startsWith(HEALTH_ALLOWED_PATH)).toList();
+        assertEquals(List.of(HEALTH_ALLOWED_PATH), healthEntries,
+                "exactly one allow-list entry may open the /health prefix, found " + healthEntries);
     }
 
     /*
@@ -324,77 +337,49 @@ public final class HealthEndpointRegistrationTests {
 
         filter.doFilter(request, response, chain);
 
-        // The long-standing anonymous endpoint is exercised to check that adding a filter ahead of
-        // ControlFilter disturbed none of the paths that were already allow-listed.
+        // The long-standing anonymous endpoint is exercised to check that appending one allow-list entry
+        // disturbed none of the paths that were already allow-listed.
         verify(chain).doFilter(request, response);
         verify(response, never()).sendRedirect(anyString());
         verify(response, never()).sendError(anyInt(), anyString());
         verify(response, never()).sendError(anyInt());
     }
 
-    @ParameterizedTest(name = "{0} is answered by the first filter and never reaches ControlFilter")
-    @ValueSource(strings = {"/health/live", "/health/ready"})
-    public void bothProbePathsAreAnsweredByTheFirstFilterAndNeverReachControlFilter(String probePath) throws Exception {
-        // The chain is assembled in the descriptor's own order from real instances of the descriptor's
-        // own classes: the health filter, then ControlFilter configured with the descriptor's own
-        // allowedPaths, then a mock standing in for everything behind them.
-        Filter healthFilter = healthFilterFromDescriptor();
-        ControlFilter controlFilter = controlFilterFromDescriptor();
-        AtomicBoolean controlFilterEntered = new AtomicBoolean(false);
-        FilterChain behindTheProbeFilter = (downstreamRequest, downstreamResponse) -> {
-            controlFilterEntered.set(true);
-            controlFilter.doFilter(downstreamRequest, downstreamResponse, chain);
-        };
-        HttpServletRequest probeRequest = mock(HttpServletRequest.class);
-        when(probeRequest.getServletPath()).thenReturn(probePath);
-        when(probeRequest.getMethod()).thenReturn("GET");
-        when(probeRequest.getRequestURI()).thenReturn(CONTEXT_PATH + probePath);
-        when(probeRequest.getContextPath()).thenReturn(CONTEXT_PATH);
-        HttpServletResponse probeResponse = mock(HttpServletResponse.class);
-        StringWriter probeBody = new StringWriter();
-        when(probeResponse.getWriter()).thenReturn(new PrintWriter(probeBody));
-
-        healthFilter.doFilter(probeRequest, probeResponse, behindTheProbeFilter);
-
-        // The probe is answered where it arrives. Nothing behind the first mapping runs, which is what
-        // keeps a probe out of ControlFilter and ContextFilter - and out of the getSession() call and
-        // the request-body parser they contain.
-        assertFalse(controlFilterEntered.get(),
-                "a probe must be answered before ControlFilter is reached, or every probe mints a session");
-        verify(chain, never()).doFilter(any(), any());
-        verify(probeResponse, never()).sendRedirect(anyString());
-        verify(probeResponse, never()).sendError(anyInt(), anyString());
-        verify(probeResponse, never()).sendError(anyInt());
-        verify(probeRequest, never()).getSession();
-        verify(probeRequest, never()).getSession(anyBoolean());
-        verify(probeRequest, never()).getInputStream();
-        verify(probeRequest, never()).getReader();
-        verify(probeResponse, never()).addCookie(any());
-        // Answered as a probe, with the endpoint's own document: liveness 200, readiness 503 because no
-        // delegator is reachable from a unit test. What matters here is that a verdict was written at
-        // all, and that it is not the 404 an unmapped path would get.
-        verify(probeResponse).setStatus(anyInt());
-        verify(probeResponse, never()).setStatus(HttpServletResponse.SC_NOT_FOUND);
-        assertTrue(probeBody.toString().startsWith("{\"status\":"),
-                "the probe filter must write the endpoint's own document, found " + probeBody);
-    }
-
-    @ParameterizedTest(name = "{0} would be redirected if it ever reached ControlFilter")
+    @ParameterizedTest(name = "{0} clears ControlFilter unauthenticated and reaches the chain")
     @ValueSource(strings = {"/webtools/health/live", "/webtools/health/ready"})
-    public void aProbePathReachingControlFilterWouldBeRedirectedWhichIsWhyTheProbeFilterIsFirst(String requestUri)
-            throws Exception {
+    public void bothProbePathsClearControlFilterUnauthenticatedAndReachTheChain(String requestUri) throws Exception {
+        // A real ControlFilter, configured from the descriptor's own allowedPaths, with no userLogin in
+        // the session: that is the state a load balancer probes in.
         ControlFilter filter = controlFilterFromDescriptor();
         when(request.getRequestURI()).thenReturn(requestUri);
 
         filter.doFilter(request, response, chain);
 
-        // Stated as the consequence it is, rather than left implicit: because the probes are not
-        // allow-listed, a probe that did reach ControlFilter would be redirected to /control/main, and a
-        // target group would read the 302 as an unhealthy target. The ordering asserted above - the
-        // health filter-mapping first - is the only thing standing between a probe and this outcome, so
-        // moving that mapping breaks readiness rather than merely making it slower.
-        verify(chain, never()).doFilter(request, response);
-        verify(response).sendRedirect(CONTEXT_PATH + "/control/main");
+        // The probe is passed on rather than gated. This is the whole reason the /health entry exists:
+        // with the servlet-only registration a probe travels the ordinary chain, so without the entry it
+        // would be redirected to /control/main and a target group would read the 302 as an unhealthy
+        // target. Nothing here authenticates and nothing here 401s or 403s.
+        verify(chain).doFilter(request, response);
+        verify(response, never()).sendRedirect(anyString());
+        verify(response, never()).sendError(anyInt(), anyString());
+        verify(response, never()).sendError(anyInt());
+    }
+
+    @Test
+    public void aProbeMintsASessionInTheChainWhichIsTheAcceptedCostOfTheServletOnlyRegistration() throws Exception {
+        ControlFilter filter = controlFilterFromDescriptor();
+        when(request.getRequestURI()).thenReturn("/webtools/health/live");
+
+        filter.doFilter(request, response, chain);
+
+        // Asserted rather than left as a footnote, because it is the one behavioural cost of registering
+        // the probe as a servlet only: ControlFilter.doFilter calls getSession() unconditionally, at the
+        // top, before it consults the allow-list. Each probe therefore mints a session in the container.
+        // The AAP prescribes the servlet/servlet-mapping registration (0.2.1, 0.4.1), so this is the
+        // accepted trade rather than something to work around; the probe handler itself still creates no
+        // session of its own, which the servlet tests below assert directly.
+        verify(request).getSession();
+        verify(chain).doFilter(request, response);
     }
 
     @ParameterizedTest(name = "{0} is redirected by ControlFilter")
@@ -406,44 +391,42 @@ public final class HealthEndpointRegistrationTests {
 
         filter.doFilter(request, response, chain);
 
-        // The allow-list is matched with startsWith on the exact bytes, so it is case-sensitive and a
-        // near miss stays gated: /HEALTH/live and /healt/live get the ordinary redirect.
+        // The allow-list is matched with startsWith on the exact bytes, so the one /health entry is
+        // case-sensitive and grants nothing outside its own prefix: /HEALTH/live, /healt/live,
+        // /heal/th/live and the bare /live and /ready all still get the ordinary redirect. This is the
+        // upper bound on how far the appended entry reaches.
         verify(chain, never()).doFilter(request, response);
         verify(response).sendRedirect(CONTEXT_PATH + "/control/main");
     }
 
-    @ParameterizedTest(name = "{0} is passed on by the probe filter and then gated by ControlFilter")
+    @ParameterizedTest(name = "{0} is admitted by the prefix grant but is claimed by no mapping")
     @ValueSource(strings = {"/webtools/health", "/webtools/healthz/live", "/webtools/health/live/",
         "/webtools/health/liveness", "/webtools/health/ready2"})
-    public void everyNearMissUnderTheHealthPrefixIsPassedOnAndThenGatedByControlFilter(String requestUri)
+    public void everyNearMissUnderTheHealthPrefixIsAdmittedByThePrefixGrantAndClaimedByNoMapping(String requestUri)
             throws Exception {
         String pathWithinWebapp = requestUri.substring(CONTEXT_PATH.length());
-        // First the probe filter, which compares the path exactly: a near miss is passed on rather than
-        // answered, so nothing under the prefix becomes a probe by looking like one.
-        Filter healthFilter = healthFilterFromDescriptor();
-        HttpServletRequest nearMiss = mock(HttpServletRequest.class);
-        when(nearMiss.getServletPath()).thenReturn(pathWithinWebapp);
-        FilterChain behindTheProbeFilter = mock(FilterChain.class);
-
-        healthFilter.doFilter(nearMiss, response, behindTheProbeFilter);
-
-        verify(behindTheProbeFilter).doFilter(nearMiss, response);
-        for (String probePath : urlPatternsFor(HEALTH_SERVLET_NAME)) {
-            assertNotEquals(probePath, pathWithinWebapp, "must not be one of the mapped probe paths");
-        }
-        assertFalse(HealthCheckServlet.isProbePath(pathWithinWebapp), "must not be recognised as a probe path");
-
-        // Then ControlFilter, which is what it reaches next - and because no /health prefix is
-        // allow-listed, it is gated exactly like any other unauthenticated path. This is the direction
-        // the earlier /health allow-list entry got wrong: with it, every spelling here cleared the
-        // authentication gate for nothing.
         ControlFilter controlFilter = controlFilterFromDescriptor();
         when(request.getRequestURI()).thenReturn(requestUri);
 
         controlFilter.doFilter(request, response, chain);
 
-        verify(chain, never()).doFilter(request, response);
-        verify(response).sendRedirect(CONTEXT_PATH + "/control/main");
+        // This is the exact breadth of the /health allow-list entry, asserted rather than assumed:
+        // startsWith admits every spelling under the prefix - /healthz/live included, since the entry is
+        // a byte prefix and not a path segment - so none of these is redirected any more.
+        verify(chain).doFilter(request, response);
+        verify(response, never()).sendRedirect(anyString());
+        verify(response, never()).sendError(anyInt());
+
+        // And here is what bounds that breadth. None of these paths is one of the two exact
+        // servlet-mapping patterns, so the container routes none of them to the probe handler, and the
+        // handler does not recognise any of them as a probe either. What they reach instead is the
+        // webapp's default servlet, which answers 404 - never a probe verdict. The fail-closed direction
+        // is asserted directly further down: should a mapping ever be widened to /health/*, the handler
+        // answers 404 rather than a misleading 200.
+        for (String probePath : urlPatternsFor(HEALTH_SERVLET_NAME)) {
+            assertNotEquals(probePath, pathWithinWebapp, "must not be one of the mapped probe paths");
+        }
+        assertFalse(HealthCheckServlet.isProbePath(pathWithinWebapp), "must not be recognised as a probe path");
     }
 
     @Test
@@ -452,9 +435,11 @@ public final class HealthEndpointRegistrationTests {
         when(request.getRequestURI()).thenReturn("/webtools/health/live/../secret");
 
         // ControlFilter's own URI-normalisation guard refuses this before the allow-list is consulted,
-        // which is a stronger outcome than a redirect. It is asserted here so that the guard staying in
-        // force is part of the probe contract: at runtime the container has already normalised the URI,
-        // so a traversal can never reach the exact path comparison in the probe handler either.
+        // which is a stronger outcome than a redirect and matters directly now that /health is allow-
+        // listed: without the guard, a URI whose raw bytes start with /health would clear the prefix
+        // grant and only then be normalised. Asserting it here makes the guard staying in force part of
+        // the probe contract; at runtime the container has already normalised the URI, so a traversal
+        // can never reach the exact path comparison in the probe handler either.
         assertThrows(RuntimeException.class, () -> filter.doFilter(request, response, chain));
         verify(chain, never()).doFilter(request, response);
     }
@@ -477,11 +462,12 @@ public final class HealthEndpointRegistrationTests {
 
             new HealthCheckServlet().service(probeRequest, probeResponse);
 
-            // The real class in its servlet role, driven with the descriptor's own patterns: each mapped
-            // path is answered by a probe handler - liveness 200, readiness 503 with no delegator
-            // available in a unit test - and the handler itself creates no session, reads no body and
-            // sets no cookie of its own. In a deployment the filter role answers first, so this is what the
-            // servlet mapping does on its own, for a webapp that declares only the servlet.
+            // The real class, driven with the descriptor's own patterns: each mapped path is answered by a
+            // probe handler - liveness 200, readiness 503 with no delegator available in a unit test - and
+            // the handler itself creates no session, reads no body and sets no cookie. ControlFilter has
+            // already minted a session by the time the request arrives here, which is asserted above as
+            // the accepted cost of the registration; what this pins is that the handler adds nothing of
+            // its own on top of it, so a probe carries no per-probe state beyond that one session.
             verify(probeRequest, never()).getSession();
             verify(probeRequest, never()).getSession(anyBoolean());
             verify(probeRequest, never()).getInputStream();
@@ -530,9 +516,11 @@ public final class HealthEndpointRegistrationTests {
 
         new HealthCheckServlet().service(request, response);
 
-        // Neither role is mapped to such a path today, so this is the fail-closed direction should either
-        // mapping ever be widened to a /health/* prefix: 404 rather than a misleading 200 that would keep
-        // a broken instance in a target group.
+        // No mapping routes such a path to the handler today, so this is the fail-closed direction should
+        // the servlet-mapping ever be widened to a /health/* prefix: 404 rather than a misleading 200 that
+        // would keep a broken instance in a target group. It matters more under the servlet-only
+        // registration than it did before, because the allow-list entry already admits every /health*
+        // spelling as far as the chain - the mapping is the only thing left deciding what is a probe.
         verify(response).setStatus(HttpServletResponse.SC_NOT_FOUND);
         verify(request, never()).getSession();
     }
@@ -551,24 +539,6 @@ public final class HealthEndpointRegistrationTests {
         when(config.getInitParameter("allowedPaths")).thenReturn(initParameter(CONTROL_FILTER_NAME, "allowedPaths"));
         when(config.getInitParameter("redirectPath")).thenReturn(initParameter(CONTROL_FILTER_NAME, "redirectPath"));
         ControlFilter filter = new ControlFilter();
-        filter.init(config);
-        return filter;
-    }
-
-    /**
-     * Instantiates the probe filter by the {@code filter-class} the descriptor itself carries and takes
-     * it through the {@link Filter} lifecycle a container uses, so the behavioural assertions exercise
-     * the shipped declaration rather than a hard-coded class reference.
-     */
-    private Filter healthFilterFromDescriptor() throws Exception {
-        String declaredClass = filterClass(HEALTH_FILTER_NAME);
-        Object instance = Class.forName(declaredClass).getDeclaredConstructor().newInstance();
-        assertTrue(instance instanceof Filter, declaredClass + " is declared as a filter but does not implement Filter");
-        Filter filter = (Filter) instance;
-        FilterConfig config = mock(FilterConfig.class);
-        when(config.getInitParameter(anyString())).thenReturn(null);
-        // The descriptor declares no init-param for this filter, which the lazy-initialisation test
-        // asserts for the servlet role; init is still called because that is what a container does.
         filter.init(config);
         return filter;
     }

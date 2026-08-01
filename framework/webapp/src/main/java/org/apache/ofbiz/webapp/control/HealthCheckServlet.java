@@ -31,12 +31,8 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
-import jakarta.servlet.Filter;
-import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletContext;
 import jakarta.servlet.ServletException;
-import jakarta.servlet.ServletRequest;
-import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -76,10 +72,11 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  * <p>Readiness measures two dimensions, in this order:
  *
  * <ol>
- * <li><em>Datasource.</em> The {@code SequenceValueItem} count must complete - the query the
- *     {@code ping} service of {@code org.apache.ofbiz.common.CommonServices} performs. A count that
- *     completes proves connectivity whatever number it returns, so a zero count is logged as an
- *     advisory rather than treated as a failure; see {@link #runReadinessCheck}.</li>
+ * <li><em>Datasource.</em> The {@code SequenceValueItem} count must complete and must not be zero -
+ *     the query, and the rule applied to its result, of the {@code ping} service of
+ *     {@code org.apache.ofbiz.common.CommonServices}, which reports
+ *     {@code CommonPingDatasourceInvalidCount} for a zero count rather than success; see
+ *     {@link #runReadinessCheck}.</li>
  * <li><em>Cache coherence.</em> When - and only when - this instance's delegator has distributed
  *     cache clear enabled, the entity-cache invalidation transport must have a connected subscriber,
  *     which is why a single-node deployment is unaffected by it; see {@link #isCacheTransportReady}
@@ -105,29 +102,41 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  *
  * <h2>How the probes are reached anonymously</h2>
  *
- * <p>The class is registered twice in a deployment descriptor, as a {@link Filter} on the two exact
- * probe paths and as a servlet on the same two paths, with the {@code filter-mapping} declared FIRST
- * so that the container builds the chain with it ahead of every other filter.
+ * <p>This class is a servlet and nothing else. A deployment descriptor declares it once and maps it to
+ * the two exact probe paths, and the webapp's {@code ControlFilter} allow-list carries {@code /health}
+ * so that an unauthenticated probe is passed down the chain instead of being redirected to the
+ * login-protected controller. Those two edits are the whole integration; there is no filter role, so
+ * the webapp's own chain is not re-ordered and nothing this class does can affect a request that is
+ * not addressed to a mapped probe path.
  *
- * <p>{@link #doFilter} answers a probe and does not call {@code chain.doFilter}, so no other filter
- * is entered for a probe request. That matters because {@code ControlFilter} and {@code ContextFilter}
- * both call {@code getSession()} unconditionally, so a probe that reached them would mint an
- * {@code HttpSession} that a load-balancer target group does not return, and because
- * {@code ContextFilter} hands the request to {@code WebAppUtil.setAttributesFromRequestBody}, which
- * reads an {@code application/json} body into a String and then into a Map; terminating the chain
- * first puts both out of reach of these paths. A request whose path is not exactly one of the two
- * probe paths is passed down the chain untouched, so the filter cannot affect anything else in the
- * webapp. The probe paths are deliberately NOT added to {@code ControlFilter}'s
- * {@code allowedPaths}: that filter matches its list with {@code startsWith}, so a {@code /health}
- * entry would grant anonymous passage to every {@code /health*} spelling rather than to the two
- * probes.
+ * <p>The servlet mapping is what makes the container resolve these two paths to this component rather
+ * than to its own default servlet, and it keeps the probes off {@code /control/*} and therefore
+ * outside the OFBTOOLS and WEBTOOLS base permissions. This class performs no login, no permission
+ * check, no session access and no service-engine invocation.
  *
- * <p>The servlet registration is kept as well. It is what makes the container resolve these two paths
- * to this component rather than to its own default servlet, it keeps the probes off
- * {@code /control/*} and therefore outside the OFBTOOLS and WEBTOOLS base permissions, and it is the
- * role a webapp that maps the servlet alone still gets. Both roles apply the same method gate and the
- * same handler, so the answer does not depend on which one served it. In neither role does this class
- * perform a login, a permission check, a session access or a service-engine invocation.
+ * <p>Three consequences of running behind the ordinary chain are worth knowing, because they belong to
+ * the filters rather than to this class and none of them can be answered from inside it.
+ *
+ * <ol>
+ * <li>{@code ControlFilter} and {@code ContextFilter} both call {@code getSession()} unconditionally,
+ * {@code ControlFilter} before it consults its allow-list, so a probe answered here is preceded by an
+ * {@code HttpSession} that a load-balancer target group never returns and that expires on its own. The
+ * session carries nothing and holds no database row, and this class neither reads nor writes it.</li>
+ * <li>{@code ControlFilter} calls {@code UtilHttp.getParameterMap} and {@code ContextFilter} calls
+ * {@code WebAppUtil.setAttributesFromRequestBody}, so a request body that arrives on a mapped probe path
+ * has already been parsed by the time the {@code 400} below is written. The header-only decision this
+ * class makes is therefore what THIS class reads, not what the deployment reads: bound a probe body at
+ * the load balancer and at the connector, as the container documentation says, rather than relying on
+ * the endpoint to leave it on the wire.</li>
+ * <li>{@code ControlFilter} matches {@code allowedPaths} with {@code startsWith}, so the single
+ * {@code /health} entry admits every {@code /health*} spelling to the chain. A spelling that is not
+ * exactly one of the two mapped paths still reaches no probe handler: no {@code servlet-mapping} claims
+ * it, so the container answers it, and {@link #isProbePath} - which the request never reaches - is
+ * unaffected by it.</li>
+ * </ol>
+ *
+ * <p>All three are the accepted cost of the two-edit servlet registration the Agent Action Plan
+ * prescribes, which leaves the webapp's filter chain and its ordering exactly as they were.
  *
  * <p>Every field is a private constant or a thread-safe counter, so the single instance the container
  * creates is safe to serve concurrently, and the class is inert until a webapp deployment descriptor
@@ -141,7 +150,7 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  * delegator lookup - least of all while an unreachable datasource is the condition being reported.
  */
 @SuppressWarnings("serial")
-public class HealthCheckServlet extends HttpServlet implements Filter {
+public class HealthCheckServlet extends HttpServlet {
 
     private static final String MODULE = HealthCheckServlet.class.getName();
 
@@ -232,10 +241,13 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
     private static final String REFERRER_POLICY_HEADER = "Referrer-Policy";
     private static final String REFERRER_POLICY_VALUE = "no-referrer-when-downgrade";
 
-    // Stable event codes, one per readiness cause, that distinguish a dependency failure from an
-    // advisory so a log consumer keys its alert off the token rather than off wording, an exception
-    // message or any other internal detail.
+    // Stable event codes, one per readiness cause, so a log consumer keys its alert off the token
+    // rather than off wording, an exception message or any other internal detail. Every one of them
+    // accompanies a 503; they exist to tell the causes apart, not to grade them.
     private static final String EVENT_READINESS_UNAVAILABLE = "HEALTH-READINESS-DATASOURCE-UNAVAILABLE";
+    // The count completed and returned zero, which the ping service this dimension mirrors reports as
+    // an invalid datasource count. Kept apart from the code above because the datasource answered:
+    // what is missing is a usable sequence bank, not a reachable database.
     private static final String EVENT_READINESS_SCHEMA_EMPTY = "HEALTH-READINESS-SCHEMA-EMPTY";
     private static final String EVENT_READINESS_SHED = "HEALTH-READINESS-PROBE-SHED";
     private static final String EVENT_READINESS_WAITERS_FULL = "HEALTH-READINESS-WAITERS-FULL";
@@ -417,41 +429,7 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
     }
 
     /*
-     * Answers a probe from the FIRST position in the webapp's filter chain, ahead of every filter that
-     * would create a session or parse the request body, and passes everything else straight through.
-     *
-     * The path is compared exactly, with isProbePath, so a request this filter's mapping happens to
-     * cover but that is not one of the two probes continues down the chain untouched rather than being
-     * answered here. A non-HTTP request is passed through for the same reason: this filter has nothing
-     * to say about it.
-     *
-     * Answering here means chain.doFilter is not called, which is what keeps ControlFilter and
-     * ContextFilter out of a probe - see the class comment for what each of them would otherwise do to
-     * every probe of every instance. The method gate and the handler are the same ones the servlet role
-     * uses, so the two registrations cannot answer the same request differently.
-     */
-    @Override
-    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
-            throws IOException, ServletException {
-        if (!(request instanceof HttpServletRequest) || !(response instanceof HttpServletResponse)) {
-            chain.doFilter(request, response);
-            return;
-        }
-        HttpServletRequest httpRequest = (HttpServletRequest) request;
-        String path = resolveProbePath(httpRequest);
-        if (!isProbePath(path)) {
-            chain.doFilter(request, response);
-            return;
-        }
-        HttpServletResponse httpResponse = (HttpServletResponse) response;
-        if (methodRefused(httpRequest, httpResponse)) {
-            return;
-        }
-        handleProbe(httpRequest, httpResponse, path);
-    }
-
-    /*
-     * The method gate, shared by both registrations so one rule is enforced from one implementation.
+     * The method gate, applied once for every method rather than per doXxx override.
      *
      * Everything this endpoint serves is a GET or a HEAD. Refusing every other method here keeps
      * HttpServlet's own defaults out of reach, and they are all unusable for a probe endpoint: doTrace
@@ -497,8 +475,8 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
     }
 
     /*
-     * Shared by both entry points, so each enforces one contract from one implementation; static
-     * because it needs nothing from the instance.
+     * Shared by the GET and the HEAD dispatch, so each enforces one contract from one implementation;
+     * static because it needs nothing from the instance.
      *
      * The body guard runs before the routing and does not read the request body: Content-Length and
      * Transfer-Encoding are headers, so an oversized or chunked body is refused for the cost of a
@@ -827,14 +805,14 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
      *
      * The datasource dimension counts SequenceValueItem, the query the "ping" service of
      * CommonServices performs, without invoking the service itself, so no dispatcher, service engine
-     * or localisation is dragged into what has to stay a cheap probe. A count that COMPLETES is the
-     * connectivity proof and the number it returns is no part of it; a count that THROWS is not ready,
-     * which covers an unresolvable delegator, an unreachable datasource, an exhausted pool and a
-     * relation that does not exist because no schema has been applied. A zero count is therefore an
-     * advisory under its own event code rather than a verdict: SequenceValueItem is filled on demand
-     * by the sequencer rather than by a data load, and a probe performs no write, so requiring a row
-     * would hold a correctly provisioned instance out of service until traffic it cannot receive
-     * arrives.
+     * or localisation is dragged into what has to stay a cheap probe. The rule applied to the result is
+     * the rule that service applies: a count that THROWS is not ready - which covers an unresolvable
+     * delegator, an unreachable datasource, an exhausted pool and a relation that does not exist
+     * because no schema has been applied - and a count that completes at ZERO is not ready either,
+     * because "ping" reports CommonPingDatasourceInvalidCount for it rather than success. A zero count
+     * carries its own event code so that a log distinguishes it from a datasource that could not be
+     * reached, but it is a verdict and not an advisory. Nothing else about the number is inspected: any
+     * non-zero count is the connectivity proof, whatever it is.
      *
      * The cache-coherence dimension follows, because the delegator the first dimension resolves is
      * what says whether the second applies at all, and because an instance that cannot reach its
@@ -861,7 +839,7 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
      * error page on what is deliberately an unauthenticated path. The context is taken from the
      * request rather than from getServletContext(); that is the same object for a request dispatched
      * into this webapp, and reading it from the request keeps the check static and free of instance
-     * state, so both entry points share one implementation.
+     * state, so the GET and the HEAD dispatch share one implementation.
      */
     private static boolean runReadinessCheck(ServletContext context) {
         try {
@@ -873,9 +851,13 @@ public class HealthCheckServlet extends HttpServlet implements Filter {
             long rows = delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator,
                     delegator.getModelReader().getModelEntity(READINESS_ENTITY), null, null, null);
             if (rows == 0L) {
-                // A completed zero count means the datasource is reachable; it is noteworthy enough
-                // for its own event code but does not change readiness.
+                // Not ready, under its own event code so that this state is distinguishable in a log
+                // from a datasource that could not be reached at all. The rule is taken from the ping
+                // service of org.apache.ofbiz.common.CommonServices, which this dimension mirrors: it
+                // reports CommonPingDatasourceInvalidCount for a zero count rather than success, so a
+                // zero count is not proof of a usable datasource here either.
                 logRateLimitedWarning(EVENT_READINESS_SCHEMA_EMPTY, READINESS_EMPTY_LOG_LAST_AT, READINESS_EMPTY_LOG_SUPPRESSED);
+                return false;
             }
             // Second dimension. The datasource has answered, so what remains is whether this instance
             // is fit to be one member of a coherent fleet - see isCacheTransportReady, which is inert

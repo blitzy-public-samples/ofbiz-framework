@@ -717,7 +717,7 @@ CONTENT_STORE_DEFAULT_PROVIDER='database'
 # Bounds of the object-store identifiers, taken from the stores' own naming rules rather than invented
 # here. A bucket name must be 3 to 63 characters of lower case letters, digits, '.' and '-', beginning
 # and ending with a letter or digit; a region identifier is lower case letters, digits and '-'. Both are
-# checked so that a typo is reported at start up instead of surfacing later as a failed upload.
+# checked so that a typo is reported at start up instead of surfacing later as a failed content read.
 # The bucket bounds are the stores' own. The region bounds are this script's: S3ContentStore requires
 # only that a region be non-blank and no store publishes a maximum, so the bound here is a shape check
 # that catches an empty or obviously wrong value - an endpoint or a whole URL pasted into the region
@@ -914,9 +914,17 @@ POSTGRES_INIT_IDENTITY_VARIABLES=(
 # through /proc by anything sharing the PID namespace, and inherited by every hook and child process -
 # for the life of the instance.
 #
-# The set is closed at seven because S3ContentStore reads exactly these seven properties. A variable
+# The set is closed at seven because these are the seven settings a deployment can only supply from
+# outside: which backend to use, where the store is and what to authenticate to it as. A variable
 # rendered into a property no provider reads would be configuration this image promises to honour and
 # then silently ignores, so nothing is rendered that the Java side does not consume.
+#
+# The Java side reads more content.store.* properties than these seven - the read bound, the local
+# fallback, the object-key prefix and the s3 deadlines and retry cap - and deliberately no variable
+# carries them. Each has a committed default every deployment can run on, none is a secret, and each
+# is overridable per instance through a SystemProperty row without a restart, so adding a variable
+# for it would only add a way for the two layers to disagree. They are documented in
+# applications/content/config/content.properties beside the values themselves.
 CONTENT_STORE_VARIABLES=(
   OFBIZ_CONTENT_STORE_PROVIDER
   OFBIZ_S3_BUCKET
@@ -5553,7 +5561,7 @@ render_content_store_configuration() {
 
   if [ "$provider" = "s3" ]; then
     if [ -z "$bucket" ]; then
-      config_fatal "OFBIZ_S3_BUCKET is required when OFBIZ_CONTENT_STORE_PROVIDER=s3. The provider has no bucket to store an object in, and would fail at the first upload rather than at start up."
+      config_fatal "OFBIZ_S3_BUCKET is required when OFBIZ_CONTENT_STORE_PROVIDER=s3. The provider has no bucket to read an object from, and would fail at the first content read rather than at start up."
     fi
     if [ -z "$region" ]; then
       config_fatal "OFBIZ_S3_REGION is required when OFBIZ_CONTENT_STORE_PROVIDER=s3. Supply the store's region identifier - S3-compatible stores that have no regions of their own conventionally accept us-east-1."
@@ -5637,7 +5645,7 @@ render_content_store_configuration() {
   # exists: the shell validated its own copy of each value, and what the application acts on is whatever
   # java.util.Properties makes of the rendered line. A renamed or duplicated anchor in the committed
   # source would leave a value unsubstituted or shadowed, and the only symptom would be content quietly
-  # going to the wrong backend - or, for the provider itself, an exception at the first upload.
+  # going to the wrong backend - or, for the provider itself, an exception at the first content read.
   local index
   for index in "${!CONTENT_STORE_PROPERTIES[@]}"; do
     local property="${CONTENT_STORE_PROPERTIES[$index]}"
@@ -5769,7 +5777,7 @@ render_content_url_configuration() {
 # S3ContentStore.requireClient/buildClient's, the refusal of a one-sided credential pair is
 # S3ContentStore.requireCredentialPair's, and the endpoint rules are
 # S3ContentStore.validatedEndpoint's. The difference is only WHEN the refusal happens: here it happens
-# at container start up, with the variable named, instead of on the first upload a user attempts.
+# at container start up, with the variable named, instead of on the first content read a page attempts.
 ###############################################################################
 
 ###############################################################################
@@ -5797,8 +5805,8 @@ trim_configuration_value() {
 # Require a value that is a valid object-store bucket name.
 #
 # The S3 naming rules are enforced here rather than left to the store, because the store reports a
-# malformed bucket name as a failure on the first request - by which time an upload has already been
-# accepted from a user - whereas this reports it at start up with the variable named. The rules are the
+# malformed bucket name as a failure on the first request - by which time a page is already trying to
+# render content to a user - whereas this reports it at start up with the variable named. The rules are the
 # published ones: 3 to 63 characters of lower case letters, digits, '.' and '-', beginning and ending
 # with a letter or a digit. Consecutive dots and dot-hyphen pairs are refused as well, because a bucket
 # name containing them cannot be used with virtual-host-style addressing or TLS at all.
@@ -5916,7 +5924,7 @@ require_object_store_endpoint() {
 
   # A space survives reject_unsafe_value - it is not a control character - and would make the value
   # unparseable as a URI, so it is refused here with the rest of the shape rather than reaching the
-  # SDK as a request that fails at the first upload.
+  # SDK as a request that fails at the first content read.
   case "$value" in
   *[[:space:]]*)
     config_fatal "$name must not contain whitespace."
@@ -6163,7 +6171,7 @@ resolve_content_store_configuration() {
 # a different principal, with potentially different permissions on potentially different data - so a
 # half-configured pair is refused instead. This is the same rule S3ContentStore.requireCredentialPair
 # applies; enforcing it here means the deployment is refused at start up rather than at the first
-# upload.
+# content read.
 #
 # Takes the pair as arguments so that the render and the resolve path share one owner of the rule; the
 # caller decides which values to hand over and what to record about the outcome.

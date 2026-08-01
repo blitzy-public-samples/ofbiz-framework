@@ -29,23 +29,53 @@ import org.apache.ofbiz.base.util.GeneralException;
  * horizontally scaled deployment can reach.
  *
  * <p>Five operations, and deliberately no more: store, read whole, read as a stream, test and
- * remove. That is exactly what the one integration seam in
- * {@link org.apache.ofbiz.content.data.DataResourceWorker} needs, and holding the contract to it
- * keeps every provider trivially substitutable. Listing, copying, metadata, presigned URLs,
- * batching and multipart controls are deliberately absent; a deployment that needs object
- * expiry uses the object store's own lifecycle rules, which needs no code here at all.
+ * remove. Listing, copying, metadata, presigned URLs, batching and multipart controls are
+ * deliberately absent; a deployment that needs object expiry uses the object store's own lifecycle
+ * rules, which needs no code here at all.
  *
- * <p><strong>Keys.</strong> A key is an opaque, provider-relative location, expressed with
- * {@code /} separators and carrying no leading separator, no {@code .} or {@code ..} component
- * and no control character. The caller derives it deterministically from the
- * {@code DataResource} type and its recorded {@code objectInfo}, so the same resource always
- * maps to the same key on every instance. A provider must refuse a key it cannot confine to the
- * one tree or bucket it owns rather than resolve it somewhere else.
+ * <p><strong>Keys.</strong> A key is an opaque, provider-relative location expressed with {@code /}
+ * separators. It carries no leading separator, no {@code .} or {@code ..} component and no control
+ * character, and it is at most {@link #MAX_KEY_LENGTH_BYTES} bytes when encoded as UTF-8 - the
+ * limit an object store imposes, applied to every provider so that a key one provider accepts is a
+ * key all of them accept. A key is never invented by a caller: it comes from
+ * {@link ContentStoreFactory#storeKey}, which derives it from what the active provider needs - the
+ * {@code ofbiz.home}-relative path for a path-keyed provider, and namespace, tenant scope and
+ * {@code dataResourceId} for the object store - so the same resource maps to the same key on every
+ * instance and no two tenants map to one key. A provider validates the grammar again at its own
+ * boundary and refuses a key it cannot confine to the one tree or bucket it owns rather than
+ * resolve it somewhere else.
+ *
+ * <p><strong>Bounded reads.</strong> {@link #get(String)} materialises whole content and is
+ * therefore bounded by {@link ContentStoreFactory#maxObjectSize}: content larger than the
+ * configured ceiling is refused rather than allocated, so one oversized object cannot exhaust the
+ * heap of the instance that reads it. {@link #openStream(String)} is the unbounded operation, and it
+ * is unbounded in the sense that matters - it never holds the content in the heap in full - which is
+ * why it, and not {@code get}, is what content of a size an uploader chose is served through.
  *
  * <p><strong>Absence.</strong> {@link #get(String)} and {@link #openStream(String)} throw
  * {@link java.io.FileNotFoundException} for a key that holds nothing; they never return
  * {@code null}. {@link #exists(String)} answers the same question without throwing, and
- * {@link #delete(String)} is idempotent, so removing content that is not there succeeds.
+ * {@link #delete(String)} is idempotent, so removing content that is not there succeeds. Absence is
+ * the one condition a provider must report as absence: a store it cannot reach, a bucket that is
+ * not there and a credential that is refused are failures, and reporting any of them as "nothing
+ * stored here" would turn an outage into silently missing content.
+ *
+ * <p><strong>What the integration seam uses, and what it cannot.</strong> The seam in
+ * {@link org.apache.ofbiz.content.data.DataResourceWorker} reads content through this contract. It
+ * does not write through it, and the reason is in the write path this refactor may not change: the
+ * services that create or update file-backed content resolve the target themselves and write the
+ * bytes themselves - {@code createFileMethod} writes to the path it builds, and
+ * {@code createBinaryFileMethod} and {@code updateBinaryFileMethod} write to the file the seam
+ * resolves for them - so there is no moment inside the seam at which content bytes are handed over.
+ * There is no removal flow either: nothing in those services deletes a backing file. Publishing an
+ * upload from inside the seam would therefore have to happen outside the transaction that records
+ * the {@code DataResource} row, which is a conflict this contract cannot resolve on its own, so it
+ * is reported here rather than worked around: those services are business logic the plan places
+ * out of scope (plan section 0.2.2), and the seam is confined to the file-resolution methods the
+ * plan names (plan sections 0.2.1 and 0.6.3). {@link #put(String, byte[])} and
+ * {@link #delete(String)} are consequently part of the contract - the plan freezes the five
+ * operations (plan section 0.4.1) - and are what an out-of-band ingest or migration performs, and
+ * what the provider tests exercise, rather than operations a request reaches.
  *
  * <p><strong>Provider selection.</strong> Instances are obtained from
  * {@link ContentStoreFactory}, never constructed by callers. A {@code null} store is the
@@ -58,14 +88,30 @@ import org.apache.ofbiz.base.util.GeneralException;
 public interface ContentStore {
 
     /**
+     * The greatest length of a storage key, in bytes of its UTF-8 encoding.
+     *
+     * <p>1024 is the object-store limit on an object key. Applying it to every provider is what
+     * keeps a key portable between them: content stored while one provider was configured is
+     * addressable by the same key after a deployment changes provider.
+     */
+    int MAX_KEY_LENGTH_BYTES = 1024;
+
+    /**
      * Stores the supplied content under the supplied key, creating the entry when it is absent
      * and replacing it in full when it already exists.
      *
-     * <p>Implementations create whatever intermediate structure they need on demand, create it
-     * with owner-only permissions where the store is local, and make the replacement of
-     * existing content all-or-nothing: a concurrent reader sees either the whole previous
-     * content or the whole new content, and a write that fails part-way leaves the previous
-     * content intact.
+     * <p>Implementations create whatever intermediate structure they need on demand, and create it
+     * with owner-only permissions where the store is local.
+     *
+     * <p>Creating content that was not there is all-or-nothing: it becomes visible complete or not at
+     * all, and it is private from the instant it exists. Replacing content that was already there is
+     * all-or-nothing only where the store makes it so - an object store replaces an object in one
+     * operation, while the filesystem provider rewrites the existing file in place, deliberately,
+     * because in that provider the storage tree is the deployment's own content tree and the file's
+     * identity, timestamps and permissions are part of what has to be preserved. A caller must
+     * therefore not assume that a concurrent reader of content being replaced sees only the whole old
+     * or the whole new bytes; it must assume only that the content it stored is what a later read
+     * returns.
      *
      * @param key the opaque, provider-relative storage key; neither null nor empty, and must
      *     resolve inside the provider's own storage root
@@ -85,11 +131,14 @@ public interface ContentStore {
      * content whose size an uploader chose, so that it is streamed rather than held in the heap
      * in full.
      *
+     * <p>Bounded: content larger than {@link ContentStoreFactory#maxObjectSize} is refused before
+     * anything is allocated for it, so a single oversized object cannot exhaust the heap.
+     *
      * @param key the opaque, provider-relative storage key; neither null nor empty
      * @return the complete stored content, never null; a zero-length array means the stored
      *     content is empty
-     * @throws GeneralException if the key is null, empty, refused by the provider, or the
-     *     provider configuration is incomplete
+     * @throws GeneralException if the key is null, empty, refused by the provider, the provider
+     *     configuration is incomplete, or the stored content is larger than the configured maximum
      * @throws IOException if the content cannot be read; in particular
      *     {@link java.io.FileNotFoundException} when the key holds nothing, so that this
      *     method never returns null

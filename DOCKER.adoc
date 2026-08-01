@@ -363,21 +363,22 @@ rather than restarted when a readiness dependency is lost.
 
 Readiness has two dimensions, checked in this order:
 
-. *Datasource* - the entity engine can *complete* a count of
-`+SequenceValueItem+`. This is the query the framework's own `+ping+`
-service makes, and completing it is the database connectivity readiness
-measures. The value the count returns is not part of the verdict: a
-completed count of zero rows is the same proof of a reachable datasource
-and a working query path as a count of a thousand, so it is reported ready
-and logged as an advisory under `+HEALTH-READINESS-SCHEMA-EMPTY+` below.
-A failure means the database cannot be reached at all - no delegator, an
-unreachable server, an exhausted connection pool - or that no schema has
-been applied to it, which the count reports by failing on a relation that
-does not exist. `+ping+` additionally treats a zero count as a failure;
-readiness deliberately does not, because `+SequenceValueItem+` is filled
-on demand by the sequencer rather than by a data load and a probe performs
-no write, so requiring a row would leave a correctly initialised fleet in
-front of a cold database permanently unroutable.
+. *Datasource* - the entity engine can complete a count of
+`+SequenceValueItem+` *and that count is not zero*. This is exactly the
+check the framework's own `+ping+` service makes, including its verdict on
+the value: `+ping+` reports `+CommonPingDatasourceInvalidCount+` rather
+than success for a zero count, and readiness applies the same rule, so the
+two can never disagree about whether a datasource is usable. Three
+situations therefore fail the
+dimension, each under its own event code below: the database cannot be
+reached at all - no delegator, an unreachable server, an exhausted
+connection pool; no schema has been applied to it, which the count reports
+by failing on a relation that does not exist; or the count completes and
+returns zero, which is `+HEALTH-READINESS-SCHEMA-EMPTY+`. The last of
+these is the one that needs planning for, because
+`+SequenceValueItem+` is filled on demand by the sequencer rather than by
+the data load - see _An empty sequence table_ below for which
+`+OFBIZ_DATA_LOAD+` tiers leave it empty and what to do about it.
 . *Cache coherence* - when `+OFBIZ_DISTRIBUTED_CACHE_CLEAR=true+`, the
 instance's invalidation subscriber is connected to the broker. This
 dimension is *inert* on a delegator that does not enable distributed cache
@@ -411,42 +412,52 @@ served:
   configured to pass it through, so assert on the `+405+` rather than on
   the `+Allow+` value if a probe exercises `+TRACE+`;
 * a request that announces an entity body - a `+Content-Length+` above
-  zero or a chunked `+Transfer-Encoding+` - is `+400+`, decided from the
-  headers so that no part of the body is ever read;
-* only these two exact paths are served. They are reached anonymously
-  because the probe class is registered twice in the webtools descriptor:
-  as the *first* filter, mapped to those two exact `+url-pattern+`
-  values, and as a servlet on the same two. The servlet specification
-  builds the chain in the order the mappings appear, so the probe filter
-  runs ahead of `+ControlFilter+`, answers the probe and does not call
-  the rest of the chain - which is why no `+allowedPaths+` entry is
-  needed for a probe. It is deliberately *not* added to that list either:
-  `+ControlFilter+` matches `+allowedPaths+` with `+startsWith+`, so a
-  bare `+/health+` entry would hand anonymous passage to every
-  `+/health*+` spelling rather than to the two probes. A near miss under
-  the prefix - `+/webtools/health+`, `+/webtools/health/live/+`,
-  `+/webtools/healthz/live+` - is compared exactly, so the probe filter
-  passes it on untouched and it is then gated by `+ControlFilter+` and
-  redirected to the login-protected controller exactly as any other
-  unknown path is, mints a `+JSESSIONID+` in doing so, and reaches no
-  probe handler. A spelling outside the prefix,
-  `+/webtools/HEALTH/live+` included - the match is case-sensitive - is
-  treated identically. Copy the two paths above into the
-  target group verbatim and configure the check to expect `+200+` and the
-  JSON body rather than merely "not `+5xx+`", so that a typo fails the
-  check instead of passing it on a redirect;
-* a probe creates no session and reads no request body, because the
-  webapp's ordinary filter chain is not entered at all. That is what the
-  filter registration above is for: `+ControlFilter+` and
-  `+ContextFilter+` both call `+getSession()+` unconditionally, so every
-  probe would otherwise mint an `+HttpSession+` and a `+JSESSIONID+` that
-  a target group never returns, and `+ContextFilter+` parses a declared
-  `+application/json+` body of any size into memory before a servlet
-  method is dispatched. Terminating the chain first removes both from the
-  probe path; the handler itself then holds no state and reads none: no
-  session, no cookie, no principal, no role, no parameter and no
-  attribute. A probe answer therefore carries no `+JSESSIONID+`, which is
-  what makes continuous anonymous polling free of per-probe server state;
+  zero or a chunked `+Transfer-Encoding+` - is `+400+`, decided by the
+  endpoint from the headers alone, so the endpoint itself reads no part of
+  it. Read that as a property of the endpoint and not of the deployment:
+  the filters ahead of it do parse a body - `+ControlFilter+` builds a
+  parameter map and `+ContextFilter+` reads a declared
+  `+application/json+` body into request attributes - so the two limits
+  below, at the balancer and at the connector, are what actually bound a
+  body sent to a probe path;
+* only these two exact paths are served. The integration is two edits to
+  the webtools descriptor and nothing more: one `+servlet+` with one
+  `+servlet-mapping+` carrying those two exact `+url-pattern+` values, and
+  `+/health+` appended to `+ControlFilter+`'s `+allowedPaths+`. The probe
+  class is *not* also registered as a filter, so the webapp's four-filter
+  chain is exactly what it was and a probe travels through it like any
+  other request; the allow-list entry is what keeps that journey
+  anonymous, since without it `+ControlFilter+` would redirect the probe to
+  the login-protected controller and a target group would read the `+302+`
+  as an unhealthy target. Know the shape of that entry: `+ControlFilter+`
+  matches `+allowedPaths+` with `+startsWith+`, so `+/health+` admits every
+  `+/health*+` spelling as far as the chain - `+/webtools/health+`,
+  `+/webtools/health/live/+` and `+/webtools/healthz/live+` included. What
+  bounds it is the `+servlet-mapping+`: only the two exact paths are routed
+  to the probe handler, so every other spelling reaches the webapp's
+  default servlet and is answered `+404+`, never with a probe verdict. A
+  spelling outside the prefix - `+/webtools/HEALTH/live+` included, the
+  match is case-sensitive - is redirected exactly as any other
+  unauthenticated path is. Copy the two paths above into the target group
+  verbatim and configure the check to expect `+200+` and the JSON body
+  rather than merely "not `+5xx+`", so that a typo fails the check instead
+  of passing it on a redirect;
+* the probe handler itself holds no state and reads none: no session, no
+  cookie, no principal, no role, no parameter and no attribute, and it
+  never reads the request body. Two costs of running behind the ordinary
+  chain belong to the filters rather than to the endpoint and are worth
+  knowing when sizing a probe interval. `+ControlFilter+` and
+  `+ContextFilter+` both call `+getSession()+` unconditionally, before any
+  allow-list check, so each probe mints an `+HttpSession+` and a
+  `+JSESSIONID+` that a target group never returns; the session carries
+  nothing, holds no database row - the framework's session listener creates
+  no `+Visit+` - and expires on its own, so the steady-state cost is
+  roughly `+session-timeout+` divided by the probe interval per instance,
+  a few hundred empty sessions at a five-second interval. Each one also
+  writes one `+Creating session+` line at `+INFO+`, which is the noise to
+  expect in a probed instance's log. This is the trade the two-edit servlet
+  registration makes deliberately, in exchange for leaving the filter chain
+  and its ordering untouched;
 * every answer, a rejection included, still carries the framework's safe
   response headers - `+X-Content-Type-Options: nosniff+`,
   `+X-Frame-Options: sameorigin+` and
@@ -458,13 +469,14 @@ served:
   engine, which a probe must not depend on, and they carry no meaning on
   a plaintext poll inside the load balancer's own network.
 
-Two limits belong to the layers above the application and are worth
-setting explicitly. Cap the request body the load balancer will forward
-to a probe path, and keep the Tomcat connector's `+maxPostSize+`,
-`+maxSwallowSize+` and `+maxHttpHeaderSize+` at or below their defaults
-(2MB, 2MB and 8KB); those are what bound a body that the endpoint has
-already refused to read. The connector attributes are listed, commented
-out at their default values, in `+framework/catalina/ofbiz-component.xml+`.
+Two limits belong to the layers above the application and, because the
+webapp's filters parse a body before the endpoint's `+400+` is written,
+they are the ones that actually bound it. Cap the request body the load
+balancer will forward to a probe path, and keep the Tomcat connector's
+`+maxPostSize+`, `+maxSwallowSize+` and `+maxHttpHeaderSize+` at or below
+their defaults (2MB, 2MB and 8KB). The connector attributes are listed,
+commented out at their default values, in
+`+framework/catalina/ofbiz-component.xml+`.
 
 Exactly one readiness check queries the datasource at a time, and its
 verdict is shared with every probe that overlaps it. A verdict answers
@@ -536,12 +548,17 @@ cap, and that is a flood rather than polling.
 Probes are also exempt from the cross-subdomain session valve. With
 `+OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS=true+` that valve runs at Tomcat
 engine scope - before any webapp's filters - and calls
-`+request.getSession(true)+` on every request, which would otherwise mint a
-session and a `+JSESSIONID+` for every probe and defeat the no-session
-design above. It recognises the two probe paths and passes them straight
-through untouched, so switching the valve on does not change what a probe
-costs. Nothing is lost by the exemption: a probe has no session to share
-across sub-domains in the first place.
+`+request.getSession(true)+` on every request it sees. It recognises the two
+probe paths and passes them straight through untouched, so switching the
+valve on does not change what a probe costs. That exemption does not make a
+probe session-free - `+ControlFilter+` mints one inside the webapp, as
+above - but it does two narrower things: a probe path addressed to a
+context that neither allow-lists nor maps it, by a mis-pointed target group
+or a proxy rewriting the prefix, has no session minted for it at engine
+scope for a request that is going to be refused anyway; and no
+domain-widened `+JSESSIONID+` cookie is written onto a response a probe
+client never reads. Nothing is lost by the exemption: a probe has no
+session to share across sub-domains in the first place.
 
 Readiness stays a live signal despite the sharing, because a verdict is
 never honoured for longer than the second above: a datasource that fails
@@ -553,9 +570,9 @@ at any interval, since they share one check instead of competing for the
 datasource. `+/webtools/health/live+` performs no database access at all
 and can likewise be polled at any rate.
 
-A readiness failure - and the one advisory below that is not a failure -
-is logged once per minute per instance as a stable event code, with the
-occurrences suppressed in between counted into the next line. A count still outstanding when the condition stops is written
+A readiness failure is logged once per minute per instance as a stable
+event code, with the occurrences suppressed in between counted into the
+next line. A count still outstanding when the condition stops is written
 out by the next readiness probe once that minute has elapsed, so the
 tail of a burst - and a burst that ends inside its own minute - is
 accounted for rather than lost. There are six codes, each with its own
@@ -565,16 +582,16 @@ another or report another's occurrences as its own:
 * `+HEALTH-READINESS-DATASOURCE-UNAVAILABLE+` - the datasource could not
   be reached, or the count did not complete. The database needs
   attention;
-* `+HEALTH-READINESS-SCHEMA-EMPTY+` - an *advisory*, not a failure: the
-  count completed, so the instance is reported *ready*, but
-  `+SequenceValueItem+` held no rows. It is the one code that can appear
-  on a `+200+` verdict. The table is filled on demand by the sequencer
-  rather than by the data load, so a database initialised with
-  `+OFBIZ_DATA_LOAD=seed+` or `+none+` reports it until something performs
-  the first sequenced write - see _An empty sequence table_ below. Nothing
-  needs doing about it while it is only the first few minutes of a fleet's
-  life; investigate it if it persists, since it says no sequenced write has
-  reached this database at all;
+* `+HEALTH-READINESS-SCHEMA-EMPTY+` - the count completed but
+  `+SequenceValueItem+` held no rows, which is `+503+` like every other
+  code here. It has its own code rather than sharing
+  `+...-DATASOURCE-UNAVAILABLE+` because the two call for different action:
+  this one says the database answered, so look at what was loaded into it
+  rather than at whether it can be reached. The table is filled on demand
+  by the sequencer rather than by the data load, so a database initialised
+  with `+OFBIZ_DATA_LOAD=seed+` or `+none+` reports it until something
+  performs the first sequenced write - see _An empty sequence table_ below,
+  which is where the fix belongs;
 * `+HEALTH-READINESS-CACHE-TRANSPORT-UNAVAILABLE+` - the datasource is
   fine and the instance requires cache coherence, but no invalidation
   subscriber is connected: no dispatcher has been published yet, no
@@ -623,33 +640,40 @@ depends on which data tier was loaded, not on whether the load succeeded:
 * `+OFBIZ_DATA_LOAD=seed+` and `+none+` leave it *empty*, on a schema that
   is complete and seed data that is present.
 
-*Readiness is `+200+` in both cases.* What the datasource dimension
-measures is whether the count completes, and a completed count of zero
-rows proves the same reachable database and the same working query path as
-any other number, so a `+seed+`-loaded fleet is routable from its first
-probe and needs no manual pre-warming. The empty table is reported as an
-advisory - `+HEALTH-READINESS-SCHEMA-EMPTY+`, once a minute per instance -
-and nothing else. It clears by itself as soon as anything performs a
-sequenced write; one ordinary request is enough, since serving a page
-records a `+Visit+` whose identifier is sequenced, after which every
-instance sharing that database stops logging it, with no restart, because
-the row lives in the database rather than in an instance.
+*Readiness is `+200+` for `+demo+` and `+503+` for `+seed+` and `+none+`
+until something fills the table.* Readiness applies the same rule as the
+framework's `+ping+` service, whose query it shares: `+ping+` reports a zero
+count as `+CommonPingDatasourceInvalidCount+` rather than success, so
+readiness does not report it as ready either. The `+503+` is logged as
+`+HEALTH-READINESS-SCHEMA-EMPTY+`, once a minute per instance, which is the
+code that distinguishes it from a database that could not be reached at
+all.
 
-This is the one place readiness deliberately departs from the framework's
-`+ping+` service, whose query it otherwise shares. `+ping+` is an
-interactive administrative diagnostic and reports a zero count as
-`+CommonPingDatasourceInvalidCount+`; a target-group probe cannot adopt
-that rule, because probes create no session and perform no write, so an
-instance held out of service for an empty sequence table could never
-receive the traffic that is the only thing able to fill it. If the
-advisory is unwanted at all, load `+demo+` data in the initialization step
-or let one sequenced write happen before the instances are registered.
+*Plan for it, because it decides whether a `+seed+`-loaded fleet is
+routable.* Two ways to clear it, either of which is enough:
 
-A database with *no schema applied* is a different matter and is still
-reported `+503+`: the count fails on a relation that does not exist, which
-is `+HEALTH-READINESS-DATASOURCE-UNAVAILABLE+`. Run the schema
-initialization step described under _Database_ before starting a serving
-instance.
+* load `+demo+` data in the initialization step, which fills the table
+  during the import;
+* or perform one sequenced write against the database before registering
+  the instances - one authenticated request through any webapp is enough,
+  since serving a page records a `+Visit+` whose identifier is sequenced.
+  The `+ping+` service itself, run once from `+webtools+` or from the
+  service engine, is the smallest deliberate way to see the same verdict a
+  probe sees.
+
+Either way the table stays filled: the row lives in the database rather
+than in an instance, so every instance sharing that database reports ready
+from its next probe, with no restart. On a fleet whose database is
+initialized once and then serves many instances - which is the
+`+OFBIZ_SCHEMA_INIT+` shape described under _Database_ - this is a
+one-time step in the initialization job, not something each instance has to
+wait out.
+
+A database with *no schema applied* is a different matter and is also
+reported `+503+`, under `+HEALTH-READINESS-DATASOURCE-UNAVAILABLE+`,
+because the count fails on a relation that does not exist rather than
+returning zero. Run the schema initialization step described under
+_Database_ before starting a serving instance.
 
 Never point a target group at `+/webtools/health/live+` in place of the
 readiness path: liveness answers `+200+` while the datasource is
@@ -868,11 +892,13 @@ had.
 
 A fleet also needs somewhere to put content that every instance can
 reach. Leave `+OFBIZ_CONTENT_STORE_PROVIDER+` at its default of
-`+database+`, or set it to `+s3+` with a bucket every instance shares.
-Do *not* select `+filesystem+` for a fleet: that backend writes into the
-instance's own `+runtime/uploads+` tree, so a file uploaded through one
-instance is missing from every other one and is lost when that instance
-is replaced. See _Object storage for content_ below.
+`+database+`, or set it to `+s3+` with a bucket every instance shares and
+an out-of-band way to place uploaded content into it. Do *not* select
+`+filesystem+` for a fleet unless every instance mounts the same shared
+volume: that backend reads and writes the instance's own
+`+runtime/uploads+` tree, so a file uploaded through one instance is
+missing from every other one and is lost when that instance is replaced.
+See _Object storage for content_ below.
 
 ====== Sessions do not survive the instance that created them
 
@@ -918,10 +944,12 @@ draining discipline below is what it needs.
 
 What this does *not* compromise is the statelessness the rest of this
 document describes. An instance holds no *durable* state: the database
-holds the data, the object store holds the content when
-`+OFBIZ_CONTENT_STORE_PROVIDER=s3+`, the schema is applied by the separate
-initialization run, and the entity caches are kept coherent by distributed
-cache clear. That is what makes an instance freely replaceable. A session
+holds the data, the object store holds the file-backed content that has
+been placed in it when `+OFBIZ_CONTENT_STORE_PROVIDER=s3+`, the schema is
+applied by the separate initialization run, and the entity caches are kept
+coherent by distributed cache clear. That is what makes an instance freely
+replaceable, and reads through the store leave nothing on local disk to
+account for. A session
 is the one piece of state that is not durable, and it is recoverable by
 signing in again - which durable state is not.
 
@@ -946,8 +974,11 @@ an external session store - and it is deliberately not part of this image.
 An instance that keeps content on its own disk is not replaceable: a
 document uploaded through one instance is invisible to every other one
 and is lost when that container is replaced. Selecting an S3-compatible
-object store instead gives every instance the same content, so whatever
-one of them still holds locally is a copy another can fetch for itself.
+object store instead makes every instance *read* file-backed content from
+one bucket, so no instance depends on a file only it holds. Content is
+placed into that bucket out of band rather than by the upload itself -
+_How content reaches and leaves the object store_ below states exactly
+which operations the provider serves, and what that leaves you to arrange.
 
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
@@ -2183,8 +2214,12 @@ volume for `+/ofbiz/runtime+` if you use it.
 
 `+s3+`::
 An S3-compatible object store - Amazon S3, MinIO, Ceph or anything else
-that speaks the same API. Every instance reads and writes the same
-bucket, so this is the backend to use behind a load balancer.
+that speaks the same API. Every instance *reads* file-backed content from
+the same bucket, so no instance depends on a file only it happens to hold,
+which is what makes it the backend to use behind a load balancer. Content
+is *placed* into the bucket out of band rather than by the upload itself -
+see _How content reaches and leaves the object store_ below for exactly
+which operations the provider serves and which it does not.
 
 The `+s3+` provider needs a bucket and a region, and takes an endpoint, a
 credential pair and an addressing style. On Amazon S3 with an instance
@@ -2238,6 +2273,26 @@ the container uses the `+content.properties+` shipped in the
 distribution - which selects `+database+`. That is what keeps an
 unconfigured container working with no object store and no S3 credential
 in sight.
+
+Object storage has a few more settings than these seven, and they
+deliberately have no environment variable of their own:
+`+content.store.max.object.size+` bounds what one read may hold in
+memory, `+content.store.local.fallback+` opens the migration mode in
+which a store miss is answered from the content an instance still holds
+locally, `+content.store.s3.key.prefix+` places every object key under a
+prefix so one bucket can hold several deployments, and
+`+content.store.s3.api.timeout.millis+`,
+`+content.store.s3.attempt.timeout.millis+` and
+`+content.store.s3.max.retries+` bound how long a storage call may take
+and how often it is retried. Each has a committed default every
+deployment can run on, none of them is a secret, and each can be
+overridden per instance through a `+SystemProperty+` row without a
+restart - so a variable for it would add nothing but a second place for
+the two layers to disagree. They are documented beside their values in
+`+applications/content/config/content.properties+`, and the whole file is
+rendered into `+/ofbiz/config/content.properties+` when any of the seven
+variables above is set, so the defaults reach a configured container
+unchanged.
 
 Values are validated before anything is written, so a mistake is reported
 at start up rather than at the first upload an end user attempts:
@@ -2316,60 +2371,74 @@ for what that means for content written before one.
 
 ===== How content reaches and leaves the object store
 
-Uploads and content writes are ordinary local file writes as far as the
-Content component is concerned; the provider turns them into object
-storage operations underneath. Five things follow that are worth knowing
-when you operate a fleet.
+The provider serves *reads* of file-backed content. It is not wired into
+the write path, and that is deliberate rather than unfinished: the
+services that write `+DataResource+` content are business logic, which
+this change set does not modify (see section 0.2.2 of the technical
+specification, which excludes all service implementations), and every one
+of them writes to a `+java.io.File+` it obtained beforehand rather than
+handing its bytes to anything that could route them elsewhere. Seven
+things follow that are worth knowing when you operate a fleet.
 
-*An upload is published when its transaction commits.* The directory an
-upload is written to is the same numbered `+runtime/uploads+`
-subdirectory as ever, because its path becomes the
-`+DataResource.objectInfo+` of the row that names the content and so has
-to outlive the request. What changes is that the directory is restricted
-to the account OFBiz runs as, and that whatever the transaction writes
-into it is copied into the bucket once that transaction has committed -
-after which the local file is removed, so nothing durable is left behind.
-Files that were already in the directory when the transaction started are
-left strictly alone, which is what makes this safe in a directory shared
-by every concurrent upload.
+*Exactly two operations reach the store.* Rendering text content into a
+screen or a template, and streaming binary content to a browser, read the
+object from the bucket every time - so an instance never serves a version
+another instance has replaced, and it never depends on a file only it
+holds. Nothing else in the running system contacts the store: no upload,
+no content write and no deletion.
 
-*Publication cannot fail a commit, and a failed publication never loses
-content.* The copy into the bucket happens after the commit rather than
-before it, so a bucket that is briefly unreachable does not roll back work
-the database has already accepted. The consequence is the one to plan for:
-a publication that fails logs an error and leaves the upload on that
-instance's local disk, where it is then the only copy. Alert on
-`+DataResourceWorker+` errors mentioning the content store, and treat an
-instance that has reported one as holding content that must be copied to
-the bucket before the instance is replaced.
+*The path that hands out a `+java.io.File+` stays local, because it is a
+write target.* `+DataResourceWorker.getContentFile()+` is called by
+`+createFile+`, `+createBinaryFile+` and `+updateBinaryFile+` to obtain
+the file they are about to *write to*, as often as it is called to locate
+something to read. Fetching the object into that location first would
+hand a writer a stale copy and then lose the write it made, so this path
+resolves the local location and nothing more, exactly as it always has.
 
-*A published upload is held in memory once, so it is size limited.* An
-upload larger than an eighth of the JVM heap is not published: it is
-logged as an error and left on local disk for an out-of-band copy. Size
-`+-Xmx+` for the largest upload you accept rather than the average one.
+*Content is placed into the bucket out of band.* Because writes are not
+intercepted, an upload lands in this instance's own numbered
+`+runtime/uploads+` subdirectory - the path that becomes the
+`+DataResource.objectInfo+` of the row naming it - and it is yours to copy
+into the bucket, keyed as described below. Do that with a sidecar that
+watches the upload tree, with a scheduled reconciliation job, or by
+placing content into the bucket directly; a shared volume for
+`+/ofbiz/runtime+` is the other way to make an upload readable
+immediately. Until content is in the bucket, only the instance that
+received it can read it - which is the state the `+filesystem+` provider
+leaves a fleet in permanently.
 
-*Reads go to the bucket, except where a local file already answers them.*
-Rendering text content and streaming binary content to a browser read the
-object from the bucket every time, so an instance never serves a version
-another instance has replaced. The one path that cannot work that way is
-the one that hands other code a `+java.io.File+`: it fetches the object
-into the location `+objectInfo+` names and returns that, and while that
-file exists it answers later requests without going to the bucket. Those
-files are the only durable local state an instance keeps, every one of
-them can be fetched again from the bucket, and none of them has to survive
-a replacement - unlike the `+filesystem+` provider above, where the local
-copy *is* the content.
+*An object is addressed by identity, not by the path in `+objectInfo+`.*
+The key is `+dataresource/<scope>/<dataResourceId>+`, where `+<scope>+` is
+the delegator's base name, and `+<base>~<tenant>+` on a tenanted
+delegator. Two deployments - or two tenants of one deployment - that
+recorded the same upload path therefore address different objects, and
+renaming or relocating an upload directory does not orphan content that
+is already stored. `+content.store.s3.key.prefix+` places the whole
+namespace under a prefix of your choosing, so one bucket can hold several
+deployments. Two things are never provider-backed and always read from
+local disk: `+CONTEXT_FILE+` content, which ships inside the image, is
+identical on every instance and would otherwise have to be uploaded
+before an instance could serve its own static files; and any location
+outside the deployment's own tree, which no key can be derived for.
 
-*What is published, precisely.* Every registered service that writes
-file-backed content requires an `+objectInfo+` that its caller has already
-obtained from the upload-path allocation described above, and that
-allocation is what arranges publication; the upload flows that ship with
-OFBiz all work that way and are therefore covered end to end. A caller
-that supplies an `+objectInfo+` of its own - an integration calling
-`+updateFile+` directly against content uploaded in an earlier
-transaction, for example - writes to the location without allocating it
-again, and that write is not published. Re-upload the content, or copy it
-into the bucket out of band, if you drive the file services that way.
+*Content the store does not hold is refused, not silently answered from
+local disk.* If the bucket holds no object for a resource and this
+instance happens to hold a file at the recorded path, the read fails with
+an error naming `+content.store.local.fallback+`. Serving the local copy
+instead is how one instance quietly returns content another has already
+replaced. Set `+content.store.local.fallback+` to _true_ while you are
+migrating existing content into the bucket: it lets a store miss be
+answered from the local copy, so a fleet can be switched to `+s3+` before
+every object has been copied, and it should be turned off once the copy
+is complete. Content that exists neither in the store nor on disk is
+reported as absent exactly as it always was.
+
+*A read writes nothing and leaves nothing behind.* No staging file, no
+spool file and no local cache of a fetched object: a read holds the object
+in memory, bounded by `+content.store.max.object.size+`, and hands it
+straight to its consumer. So there is nothing for a rolled-back
+transaction to leave stranded and nothing for an operator to clean up, and
+an instance keeps no durable local state on account of the store.
 
 *Deleting content does not delete the object.* Removing a
 `+DataResource+` row removes the row and nothing else, exactly as it
