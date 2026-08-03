@@ -77,6 +77,15 @@ import org.xml.sax.SAXParseException;
  * <p>The descriptor declares two containers whose property trees are near identical. Everything here
  * selects them STRUCTURALLY, by {@code name} plus {@code loaders} among the {@code <container>} children
  * of the root, never by a line number or a substring scan that could match the wrong one.
+ *
+ * <p>This class is deliberately confined to the committed declarations and to what the production parser
+ * resolves them to. Whether the container entry point actually PRODUCES those declarations from an
+ * environment - non-default values, invalid values, rotation, withdrawal, and the scoping that keeps the test
+ * container out of it - is established by executing the real renderer in
+ * {@link CatalinaConfigurationRenderingTests}. Neither half is sufficient on its own: a correct declaration
+ * that no renderer writes, and a correct render into a declaration nothing reads, fail in the same silent way.
+ *
+ * @see CatalinaConfigurationRenderingTests
  */
 public final class CatalinaContainerDescriptorTests {
 
@@ -458,6 +467,188 @@ public final class CatalinaContainerDescriptorTests {
                 "CATALINA_DEFAULT_CROSS_SUBDOMAIN_SESSIONS must equal the " + CROSS_SUBDOMAIN_SESSIONS
                         + " value declared in " + DESCRIPTOR);
     }
+
+    /**
+     * The accelerator port is validated against the ports the instance will actually BIND, offset included.
+     *
+     * <p>A connector port declared here is not the port the instance listens on: {@code CatalinaContainer}
+     * binds each one at {@code declared + Config.getPortOffset()}, while {@code SslAcceleratorValve} compares
+     * {@code request.getLocalPort()} against {@code ssl-accelerator-port} with no offset applied. So with
+     * {@code --portoffset=100} a descriptor declaring 8080 listens on 8180, and 8180 is both the only value
+     * the valve can ever match and the port the load balancer's target group is pointed at - which is why the
+     * variable is documented as "the LOCAL port this instance receives the proxy's forwarded traffic on".</p>
+     *
+     * <p>The entry point compared against the declared number, so with any nonzero offset it accepted the one
+     * value that could not work (8080, matching nothing at request time, leaving every forwarded request
+     * marked insecure) and refused the one that could. Both directions are asserted, at both offsets, because
+     * the fix must not change the ordinary zero-offset deployment: {@code declared + 0} is the declared port.</p>
+     *
+     * @throws Exception if the entry point could not be executed, which fails the test rather than being handled
+     */
+    @Test
+    public void theAcceleratorPortIsValidatedAgainstThePortsTheInstanceWillActuallyBind() throws Exception {
+        Path workDir = Files.createTempDirectory("catalina-offset");
+        String declaredHttpPort = propertyChild(containerProperty(PRODUCTION_CONTAINER, HTTP_CONNECTOR), "port")
+                .getAttribute("value");
+        int declared = Integer.parseInt(declaredHttpPort);
+        int offset = 100;
+        String offsetPort = String.valueOf(declared + offset);
+
+        // Zero offset: the declared port is the bound port, so nothing about the existing contract moves.
+        RenderRun withoutOffset = renderCatalina(workDir, declaredHttpPort, 0);
+        assertEquals(0, withoutOffset.exitCode(), "the declared connector port must be accepted with no offset."
+                + " Output was:\n" + withoutOffset.output());
+        assertEquals(declaredHttpPort, renderedProductionValue(withoutOffset.descriptor(), SSL_ACCELERATOR_PORT),
+                "the accepted port must be the value rendered into the descriptor");
+
+        RenderRun offsetPortWithoutOffset = renderCatalina(workDir, offsetPort, 0);
+        assertFalse(offsetPortWithoutOffset.exitCode() == 0, "with no offset the instance binds " + declared
+                + ", so " + offsetPort + " matches nothing it listens on and must be refused. Output was:\n"
+                + offsetPortWithoutOffset.output());
+
+        // Nonzero offset: the bound port is what must be accepted, and the declared number must not be.
+        RenderRun withOffset = renderCatalina(workDir, offsetPort, offset);
+        assertEquals(0, withOffset.exitCode(), "with an offset of " + offset + " the instance binds " + offsetPort
+                + ", which is the only value SslAcceleratorValve can match and therefore the only one that may"
+                + " be accepted. Output was:\n" + withOffset.output());
+        assertEquals(offsetPort, renderedProductionValue(withOffset.descriptor(), SSL_ACCELERATOR_PORT),
+                "the offset port must be rendered verbatim: the valve applies no offset of its own");
+
+        RenderRun declaredWithOffset = renderCatalina(workDir, declaredHttpPort, offset);
+        assertFalse(declaredWithOffset.exitCode() == 0, "with an offset of " + offset + " nothing listens on "
+                + declared + ", so accepting it would install a valve that marks no request secure while every"
+                + " check reported success. Output was:\n" + declaredWithOffset.output());
+        assertTrue(declaredWithOffset.output().contains(offsetPort), "the refusal must name the port the instance"
+                + " really binds, or the operator has no way to know what would have been accepted. Output"
+                + " was:\n" + declaredWithOffset.output());
+        assertTrue(declaredWithOffset.output().contains("port offset of " + offset), "the refusal must say that"
+                + " an offset is in force, because the descriptor's own numbers then look correct and are not."
+                + " Output was:\n" + declaredWithOffset.output());
+    }
+
+    /**
+     * A duplicated load-balancer property is refused, because {@code ContainerConfig} would use the other one.
+     *
+     * <p>{@code ContainerConfig.Configuration} puts each {@code <property>} into a map as it reads the
+     * container, so a duplicate means the LAST declaration decides what the container runs with. The entry
+     * point edited and verified the FIRST match, so a second declaration added after it - by a hook, a patch
+     * applied twice, or a hand edit on the writable layer - was the one Catalina actually used while the start
+     * up reported the value it had just written. For {@code ssl-accelerator-port} that is the difference
+     * between marking forwarded requests secure and not; for {@code jvm-route} it is a replacement instance
+     * answering with the identity of the instance it replaced.</p>
+     *
+     * <p>The duplicate is refused rather than reconciled: with two declarations there is no value the start up
+     * can honestly say the container will use, and silently rewriting both would hide a descriptor that has
+     * been edited by something the deployment does not know about.</p>
+     *
+     * @throws Exception if the entry point could not be executed, which fails the test rather than being handled
+     */
+    @Test
+    public void aDuplicatedLoadBalancerPropertyIsRefusedBecauseTheParserWouldUseTheOtherOne() throws Exception {
+        Path workDir = Files.createTempDirectory("catalina-duplicate");
+        String committed = Files.readString(repositoryRoot().resolve(DESCRIPTOR));
+
+        for (String property : List.of(JVM_ROUTE, SSL_ACCELERATOR_PORT, CROSS_SUBDOMAIN_SESSIONS)) {
+            Matcher declaration = Pattern.compile("([ \\t]*)<property name=\"" + Pattern.quote(property)
+                    + "\" value=\"[^\"]*\"/>").matcher(committed);
+            assertTrue(declaration.find(), DESCRIPTOR + " must declare " + property + " for this case to duplicate");
+            // The duplicate is placed immediately AFTER the committed declaration and inside the same block,
+            // which is exactly the shape ContainerConfig resolves to the second value.
+            String duplicated = new StringBuilder(committed)
+                    .insert(declaration.end(), System.lineSeparator() + declaration.group(1)
+                            + "<property name=\"" + property + "\" value=\"duplicate\"/>")
+                    .toString();
+
+            RenderRun refused = renderCatalina(workDir, "", 0, duplicated);
+
+            assertFalse(refused.exitCode() == 0, "a second declaration of " + property + " inside the production"
+                    + " block must be refused: ContainerConfig keeps the last one, so the start up would verify"
+                    + " a value the container does not use. Output was:\n" + refused.output());
+            assertTrue(refused.output().contains(property), "the refusal must name the duplicated property."
+                    + " Output was:\n" + refused.output());
+        }
+
+        // Non-vacuity: the very same driver accepts the committed descriptor, so the refusals above are
+        // caused by the duplicate and not by anything about the way the renderer is being driven.
+        RenderRun accepted = renderCatalina(workDir, "", 0, committed);
+        assertEquals(0, accepted.exitCode(), "the committed descriptor must still render. Output was:\n"
+                + accepted.output());
+    }
+
+    /**
+     * Runs the entry point's Catalina renderer against a private copy of the descriptor.
+     *
+     * @param workDir a temporary directory for the generated library, driver and descriptor copy
+     * @param acceleratorPort the value to supply in {@code OFBIZ_SSL_ACCELERATOR_PORT}
+     * @param offset the port offset to put on the OFBiz command
+     * @return the exit status, output and the descriptor the run left behind
+     * @throws Exception if the driver could not be written or executed
+     */
+    private static RenderRun renderCatalina(Path workDir, String acceleratorPort, int offset) throws Exception {
+        return renderCatalina(workDir, acceleratorPort, offset,
+                Files.readString(repositoryRoot().resolve(DESCRIPTOR)));
+    }
+
+    /**
+     * As above, against a descriptor whose content the case supplies, so a malformed shape can be driven.
+     *
+     * @param workDir a temporary directory for the generated library, driver and descriptor copy
+     * @param acceleratorPort the value to supply in {@code OFBIZ_SSL_ACCELERATOR_PORT}
+     * @param offset the port offset to put on the OFBiz command
+     * @param descriptorContent the descriptor the renderer is pointed at
+     * @return the exit status, output and the descriptor the run left behind
+     * @throws Exception if the driver could not be written or executed
+     */
+    private static RenderRun renderCatalina(Path workDir, String acceleratorPort, int offset,
+            String descriptorContent) throws Exception {
+        Path library = workDir.resolve("entrypoint-library.sh");
+        if (!Files.exists(library)) {
+            List<String> sourced = new ArrayList<>();
+            for (String line : Files.readAllLines(repositoryRoot().resolve(ENTRY_POINT))) {
+                if (!"_main \"$@\"".equals(line)) {
+                    sourced.add(line);
+                }
+            }
+            Files.write(library, sourced);
+        }
+        Path descriptor = Files.createTempFile(workDir, "ofbiz-component", ".xml");
+        Files.writeString(descriptor, descriptorContent);
+
+        Path driver = Files.createTempFile(workDir, "render-catalina", ".sh");
+        Files.writeString(driver, "#!/usr/bin/env bash\n"
+                + ". '" + library + "'\n"
+                + "CATALINA_COMPONENT_DESCRIPTOR='" + descriptor + "'\n"
+                + "resolve_port_offset bin/ofbiz --portoffset=" + offset + "\n"
+                + "render_catalina_configuration\n");
+
+        ProcessBuilder builder = new ProcessBuilder("bash", driver.toString());
+        builder.directory(workDir.toFile());
+        builder.redirectErrorStream(true);
+        Map<String, String> environment = builder.environment();
+        for (String name : new ArrayList<>(environment.keySet())) {
+            if (name.startsWith("OFBIZ_")) {
+                environment.remove(name);
+            }
+        }
+        environment.put("OFBIZ_SSL_ACCELERATOR_PORT", acceleratorPort);
+
+        Process process = builder.start();
+        String output = new String(process.getInputStream().readAllBytes());
+        assertTrue(process.waitFor(120, java.util.concurrent.TimeUnit.SECONDS),
+                "the Catalina renderer did not terminate");
+        return new RenderRun(process.exitValue(), output, descriptor);
+    }
+
+    /** Reads one production-engine property value out of a rendered descriptor. */
+    private static String renderedProductionValue(Path descriptor, String property) throws Exception {
+        Matcher declaration = Pattern.compile("<property name=\"" + Pattern.quote(property)
+                + "\" value=\"([^\"]*)\"/>").matcher(Files.readString(descriptor));
+        assertTrue(declaration.find(), descriptor + " must declare " + property);
+        return declaration.group(1);
+    }
+
+    /** What one black-box execution of the entry point's Catalina renderer produced. */
+    private record RenderRun(int exitCode, String output, Path descriptor) { }
 
     @Test
     public void theEntryPointContainerPatternsCannotConfuseTheTwoContainers() throws Exception {

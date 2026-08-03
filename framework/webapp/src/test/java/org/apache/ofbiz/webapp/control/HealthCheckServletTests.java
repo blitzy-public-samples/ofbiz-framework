@@ -23,7 +23,6 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -33,7 +32,6 @@ import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -65,14 +63,20 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.entity.Delegator;
+import org.apache.ofbiz.entity.condition.EntityCondition;
+import org.apache.ofbiz.entity.DelegatorFactory;
 import org.apache.ofbiz.entity.GenericEntityException;
 import org.apache.ofbiz.entity.datasource.GenericHelper;
 import org.apache.ofbiz.entity.model.ModelEntity;
 import org.apache.ofbiz.entity.model.ModelReader;
 import org.apache.ofbiz.service.LocalDispatcher;
+import org.apache.ofbiz.service.ServiceContainer;
+import org.apache.ofbiz.service.config.ServiceConfigUtil;
+import org.apache.ofbiz.service.config.model.JmsService;
+import org.apache.ofbiz.service.config.model.Server;
+import org.apache.ofbiz.service.config.model.ServiceEngine;
 import org.apache.ofbiz.service.jms.GenericMessageListener;
 import org.apache.ofbiz.service.jms.JmsListenerFactory;
-import org.apache.ofbiz.webapp.WebAppUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -99,7 +103,7 @@ import jakarta.servlet.http.HttpServletResponseWrapper;
  * response: status code, exact JSON document, content type, character encoding, cache header and,
  * where it matters, the {@code Allow} header. Mocks only supply the collaborators; no assertion is
  * ever made against a value a mock was configured to return. The static seams the class depends on,
- * {@link WebAppUtil#getDelegator} and {@link Debug}, are replaced with scoped static mocks inside
+ * {@link DelegatorFactory#getDelegator} and {@link Debug}, are replaced with scoped static mocks inside
  * try-with-resources so nothing leaks into another test, and no test opens a database connection,
  * reads configuration or touches the network.
  *
@@ -145,9 +149,6 @@ public final class HealthCheckServletTests {
     /** The stable event code a readiness failure must log, in place of any internal detail. */
     private static final String EVENT_CODE = "HEALTH-READINESS-DATASOURCE-UNAVAILABLE";
 
-    /** The stable event code a reachable but unpopulated schema must log - deliberately its own. */
-    private static final String EMPTY_EVENT_CODE = "HEALTH-READINESS-SCHEMA-EMPTY";
-
     /**
      * The stable event code a probe must log when it could obtain no verdict at all - deliberately not
      * one of the two above, because the operator action differs and because a probe that repeats an
@@ -179,8 +180,40 @@ public final class HealthCheckServletTests {
      */
     private static final String TRANSPORT_EVENT_CODE = "HEALTH-READINESS-CACHE-TRANSPORT-UNAVAILABLE";
 
-    /** The ServletContext attribute a deployed webapp publishes its service dispatcher under. */
-    private static final String DISPATCHER_ATTRIBUTE = "dispatcher";
+    /**
+     * The context-params the probe resolves its delegator and dispatcher from, and the values this
+     * webapp declares for them.
+     *
+     * <p>Deliberately NOT the ServletContext "delegator" and "dispatcher" attributes the probe used to
+     * read: those are replaced by ContextFilter whenever a multitenant request selects a tenant, so an
+     * anonymous probe could be steered at another tenancy's database. A context-param is deployment
+     * descriptor configuration and no request can change it.
+     */
+    private static final String DELEGATOR_NAME_PARAMETER = "entityDelegatorName";
+    private static final String DISPATCHER_NAME_PARAMETER = "localDispatcherName";
+    private static final String DELEGATOR_NAME = "default";
+    private static final String DISPATCHER_NAME = "webtools";
+
+    /** The one jms-service whose listeners carry entity-cache invalidation. */
+    private static final String CACHE_TRANSPORT_SERVICE = "serviceMessenger";
+
+    /**
+     * The key JmsListenerFactory registers a serviceMessenger listener under: the JNDI server name, the
+     * connection-factory JNDI name and the topic, joined with colons. Built from the same three values
+     * the declaration below carries, so the fixture and the expectation cannot drift apart.
+     */
+    private static final String TRANSPORT_JNDI_SERVER = "default";
+    private static final String TRANSPORT_JNDI_NAME = "jms/TopicConnectionFactory";
+    private static final String TRANSPORT_TOPIC = "jms/OFBTopic";
+    private static final String TRANSPORT_LISTENER_KEY =
+            TRANSPORT_JNDI_SERVER + ":" + TRANSPORT_JNDI_NAME + ":" + TRANSPORT_TOPIC;
+
+    /**
+     * The key of a listener that belongs to some other jms-service, which the coherence dimension must
+     * ignore in both directions: connected, it may not make a broken serviceMessenger look healthy;
+     * disconnected, it may not take an instance whose invalidation works out of service.
+     */
+    private static final String UNRELATED_LISTENER_KEY = "default:jms/QueueConnectionFactory:jms/OtherQueue";
 
     /** The framework-tier entity the readiness probe counts, mirroring {@code CommonServices.ping}. */
     private static final String READINESS_ENTITY = "SequenceValueItem";
@@ -200,7 +233,17 @@ public final class HealthCheckServletTests {
      * answer in a single long.
      */
     private static final List<Class<?>> IMMUTABLE_FIELD_TYPES =
-            List.of(String.class, java.util.Set.class, int.class, long.class);
+            List.of(String.class, java.util.Set.class, int.class, long.class, EntityCondition.class);
+
+    /**
+     * The bound the readiness query carries, as a value equal to the servlet's own constant.
+     *
+     * <p>{@code EntityWhereString.equals} compares the SQL text, so stubbing and verifying with this
+     * asserts more than {@code any(EntityCondition.class)} would: the count the servlet issues has to be
+     * the one that can match no row, which is what keeps readiness constant work whatever the table grows
+     * to and what stops a probe reading rows it has no interest in.
+     */
+    private static final EntityCondition READINESS_BOUND = EntityCondition.makeConditionWhere("1=0");
 
     /**
      * Ceiling on how long a worker thread started by this class may take to answer its probe, and on
@@ -256,6 +299,16 @@ public final class HealthCheckServletTests {
     private StringWriter responseBody;
     private ServletContext servletContext;
     private HealthCheckServlet servlet;
+    /**
+     * The static seams the cache-coherence dimension reads, opened only by the tests that need them and
+     * closed on the way out by {@link #tearDown()}.
+     *
+     * <p>Held as fields rather than opened in a try-with-resources inside each test because they are
+     * installed by a fixture helper: a {@code MockedStatic} has to be closed on the thread that opened
+     * it, and the readiness check runs inline for these tests, so the request thread owns both.
+     */
+    private MockedStatic<ServiceConfigUtil> serviceConfiguration;
+    private MockedStatic<ServiceContainer> serviceContainer;
 
     @BeforeEach
     public void setUp() throws Exception {
@@ -267,6 +320,11 @@ public final class HealthCheckServletTests {
         responseBody = new StringWriter();
         when(response.getWriter()).thenReturn(new PrintWriter(responseBody));
         servletContext = mock(ServletContext.class);
+        // The two context-params the probe resolves its delegator and its dispatcher from. A deployed
+        // webtools declares exactly these, and reading them - rather than the mutable ServletContext
+        // attributes ContextFilter rewrites for a tenant - is what binds a probe to this instance.
+        when(servletContext.getInitParameter(DELEGATOR_NAME_PARAMETER)).thenReturn(DELEGATOR_NAME);
+        when(servletContext.getInitParameter(DISPATCHER_NAME_PARAMETER)).thenReturn(DISPATCHER_NAME);
         when(request.getServletContext()).thenReturn(servletContext);
         ServletConfig servletConfig = mock(ServletConfig.class);
         when(servletConfig.getServletContext()).thenReturn(servletContext);
@@ -306,6 +364,17 @@ public final class HealthCheckServletTests {
     @AfterEach
     public void tearDown() throws Exception {
         HealthCheckServlet.installCheckExecutorForTesting(null);
+        HealthCheckServlet.installBaseDelegatorForTesting(null);
+        // Closed in the reverse order they are installed, and unconditionally, so a failing test cannot
+        // leave a static mock in force for whatever class this Gradle worker runs next.
+        if (serviceContainer != null) {
+            serviceContainer.close();
+            serviceContainer = null;
+        }
+        if (serviceConfiguration != null) {
+            serviceConfiguration.close();
+            serviceConfiguration = null;
+        }
         resetReadinessLogState();
     }
 
@@ -317,12 +386,12 @@ public final class HealthCheckServletTests {
     public void liveGetReturnsUpWithoutAnyDatabaseAccess() throws Exception {
         givenProbePath("/health/live", null);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
             servlet.service(request, response);
 
             // Liveness must stay answerable while the datasource is unavailable, so neither the
             // delegator lookup nor the entity engine may be reached at all.
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_OK, LIVE_UP);
     }
@@ -343,9 +412,9 @@ public final class HealthCheckServletTests {
 
         servlet.service(request, response);
 
-        // The exhaustive list of what a liveness probe is allowed to look at: the path, the method
-        // and the two headers that announce a body. No session, no principal, no role, no attribute,
-        // no parameter, no input stream. Any future login, permission or session access fails here,
+        // The exhaustive list of what a liveness probe is allowed to look at: the path, the method, the
+        // two headers that announce a body, and whether a session already exists. No principal, no role,
+        // no attribute, no parameter, no input stream. Any future login or permission access fails here,
         // because verifyNoMoreInteractions closes the list.
         verify(request).getServletPath();
         verify(request).getPathInfo();
@@ -355,6 +424,12 @@ public final class HealthCheckServletTests {
         verify(request, times(2)).getMethod();
         verify(request).getContentLengthLong();
         verify(request).getHeader("Transfer-Encoding");
+        // The one session interaction, and it is the NON-creating form. The endpoint asks whether
+        // something in front of it already minted a session for this probe so it can discard it; with
+        // nothing there - which is the shipped arrangement, where HealthProbeFilter keeps a probe off the
+        // session-creating filters - the answer is null and nothing further happens. getSession() and
+        // getSession(true) are absent from this list, and verifyNoMoreInteractions is what keeps them out.
+        verify(request).getSession(false);
         verifyNoMoreInteractions(request);
     }
 
@@ -406,17 +481,17 @@ public final class HealthCheckServletTests {
         when(delegator.getModelReader()).thenReturn(modelReader);
         when(modelReader.getModelEntity(READINESS_ENTITY)).thenReturn(modelEntity);
         when(delegator.getEntityHelper(READINESS_ENTITY)).thenReturn(helper);
-        when(helper.findCountByCondition(delegator, modelEntity, null, null, null)).thenReturn(42L);
+        when(helper.findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null)).thenReturn(42L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
             // The probe must count the framework-tier entity the ping service uses, nothing else.
             verify(modelReader).getModelEntity(READINESS_ENTITY);
             verify(delegator).getEntityHelper(READINESS_ENTITY);
-            verify(helper).findCountByCondition(delegator, modelEntity, null, null, null);
+            verify(helper).findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null);
         }
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
     }
@@ -431,8 +506,8 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorFailingWith(new GenericEntityException("datasource unreachable"));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
@@ -448,8 +523,8 @@ public final class HealthCheckServletTests {
         givenMethod("HEAD");
         Delegator delegator = delegatorCountingRows(1L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -457,71 +532,30 @@ public final class HealthCheckServletTests {
     }
 
     /**
-     * A reachable database that reports zero rows is not ready.
+     * A database whose schema has never been applied is held out of service, by the only rule left that
+     * can catch it: the count throwing because the relation is absent.
      *
-     * <p>The rule is the one the {@code ping} service of {@code CommonServices} applies to the very same query,
-     * which the AAP names as "the database-connectivity model for the readiness probe" (AAP 0.2.1) and specifies
-     * this handler as "mirroring the ping service's {@code SequenceValueItem} count check" (AAP 0.4.1). That
-     * service returns {@code CommonPingDatasourceInvalidCount} for a zero count rather than success, so a zero
-     * count is not a usable datasource here either and the probe answers 503.
-     *
-     * <p>It is reported under its own event code rather than under the datasource-unavailable code, because the
-     * two states call for different operator actions: the database answered, so what is missing is a sequence
-     * bank, not a reachable server.
+     * <p>This is the state the gated one-shot schema init (AAP 0.6.4) exists to leave behind exactly once,
+     * and which every serving instance therefore has to survive being started before. It is a datasource
+     * FAILURE, which is exactly what separates it from a zero count: a zero count means the table is there
+     * and empty, and that is a database an instance can serve from.
      */
     @Test
-    public void readyGetReturnsDownWhenTheReachableDatabaseReportsZeroRows() throws Exception {
-        givenProbePath("/health/ready", null);
-        Delegator delegator = delegatorCountingRows(0L);
-
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
-                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
-
-            servlet.service(request, response);
-
-            ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
-            debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
-            assertEquals(EMPTY_EVENT_CODE, lines.getValue(),
-                    "a reachable database with an empty sequence table needs its own code");
-        }
-        assertWindowStillOpen("READINESS_LOG_LAST_AT",
-                "an empty sequence table must not consume the window an unavailable datasource needs");
-        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
-    }
-
-    /**
-     * A database whose schema has never been applied is held out of service by the rule that catches it for what
-     * it is, rather than by the zero-count rule above.
-     *
-     * <p>An empty sequence table and an unapplied schema are different states and are reported under different
-     * codes, because the operator action differs: the first needs a sequenced write to reach the database, the
-     * second needs the schema init to have run at all. Both answer 503; this test pins which code carries it.
-     *
-     * <p>The failure is the one an unprovisioned PostgreSQL schema actually produces - the count throwing because
-     * the relation is absent - which is the state the gated one-shot schema init (AAP 0.6.4) exists to leave
-     * behind exactly once, and which every serving instance therefore has to survive being started before.
-     */
-    @Test
-    public void anUnprovisionedSchemaIsStillReportedNotReadyByTheRuleThatCatchesIt() throws Exception {
+    public void anUnprovisionedSchemaIsReportedAsADatasourceFailure() throws Exception {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorFailingWith(
                 new GenericEntityException("ERROR: relation \"sequence_value_item\" does not exist"));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
-            // Reported as the datasource dimension failing, under that code - not as an empty schema,
-            // which is the advisory for a database that IS provisioned and merely has no sequence bank.
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
             debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
-            assertEquals(EVENT_CODE, lines.getValue(), "an unapplied schema is a datasource failure, not an advisory");
+            assertEquals(EVENT_CODE, lines.getValue(), "an unapplied schema is a datasource failure");
         }
-        assertWindowStillOpen("READINESS_EMPTY_LOG_LAST_AT",
-                "and it must not consume the window the empty-schema advisory needs");
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
 
@@ -530,8 +564,8 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorFailingWith(new GenericEntityException("datasource unreachable"));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -544,8 +578,8 @@ public final class HealthCheckServletTests {
         // An exhausted connection pool surfaces as an unchecked exception; it must not escape.
         Delegator delegator = delegatorFailingWith(new IllegalStateException("pool exhausted"));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -556,15 +590,16 @@ public final class HealthCheckServletTests {
     public void readyGetReturnsDownWhenTheDelegatorLookupYieldsNull() throws Exception {
         givenProbePath("/health/ready", null);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            // WebAppUtil.getDelegator only logs and returns null when the delegator factory fails.
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            // DelegatorFactory.getDelegator logs and returns null when construction fails, and it caches
+            // the failed Future, which is why the probe throttles this resolution.
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(null);
 
             servlet.service(request, response);
 
             // No count may be attempted against a null delegator.
-            webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext));
-            webAppUtil.verifyNoMoreInteractions();
+            delegatorFactory.verify(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME));
+            delegatorFactory.verifyNoMoreInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
@@ -573,8 +608,8 @@ public final class HealthCheckServletTests {
     public void readyGetReturnsDownWhenTheDelegatorLookupThrows() throws Exception {
         givenProbePath("/health/ready", null);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(any(ServletContext.class)))
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(anyString()))
                     .thenThrow(new IllegalStateException("delegator factory failure"));
 
             servlet.service(request, response);
@@ -604,8 +639,8 @@ public final class HealthCheckServletTests {
         // and it must be answered anyway - which is exactly why the context comes from the request.
         HealthCheckServlet uninitialised = new HealthCheckServlet();
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             uninitialised.service(request, response);
         }
@@ -677,11 +712,11 @@ public final class HealthCheckServletTests {
         // What a burst lands on: a verdict another probe established a few hundred milliseconds ago.
         givenEstablishedVerdict(true, TimeUnit.MILLISECONDS.toNanos(200L));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
             // Not even the published-delegator lookup runs: the verdict is the whole answer.
             verify(servletContext, never()).getAttribute(anyString());
             debug.verify(() -> Debug.logWarning(anyString(), anyString()), never());
@@ -696,11 +731,11 @@ public final class HealthCheckServletTests {
         // probe - without the check, and without the event code being written once per probe.
         givenEstablishedVerdict(false, TimeUnit.MILLISECONDS.toNanos(200L));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
             debug.verify(() -> Debug.logWarning(anyString(), anyString()), never());
         }
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
@@ -712,20 +747,20 @@ public final class HealthCheckServletTests {
         Delegator delegator = mock(Delegator.class);
         ModelEntity modelEntity = givenReadinessModel(delegator);
         GenericHelper helper = delegator.getEntityHelper(READINESS_ENTITY);
-        when(helper.findCountByCondition(delegator, modelEntity, null, null, null)).thenReturn(7L);
+        when(helper.findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null)).thenReturn(7L);
         // Older than the window a verdict answers on its own, which is the state every probe of a
         // normal load-balancer polling interval arrives in.
         givenEstablishedVerdict(true, readinessConstant("READINESS_VERDICT_FRESH_NANOS")
                 + TimeUnit.MILLISECONDS.toNanos(50L));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
             // The datasource was measured again rather than the stale verdict being repeated: a
             // verdict that could outlive its window would stop readiness being a live signal.
-            verify(helper).findCountByCondition(delegator, modelEntity, null, null, null);
+            verify(helper).findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null);
         }
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
     }
@@ -739,12 +774,12 @@ public final class HealthCheckServletTests {
         givenEstablishedVerdict(true, readinessConstant("READINESS_VERDICT_FRESH_NANOS")
                 + TimeUnit.MILLISECONDS.toNanos(100L));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             servlet.service(request, response);
 
             // No second query while one is already running, and no event code: this is a normal answer.
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
             verify(servletContext, never()).getAttribute(anyString());
             debug.verify(() -> Debug.logWarning(anyString(), anyString()), never());
         }
@@ -760,14 +795,14 @@ public final class HealthCheckServletTests {
         givenEstablishedVerdict(true, readinessConstant("READINESS_VERDICT_GRACE_NANOS")
                 + TimeUnit.SECONDS.toNanos(1L));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             servlet.service(request, response);
 
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
             debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
             assertEquals(SHED_EVENT_CODE, lines.getValue(), "a verdict too old to repeat needs its own code");
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
@@ -808,19 +843,19 @@ public final class HealthCheckServletTests {
         Delegator delegator = mock(Delegator.class);
         ModelEntity modelEntity = givenReadinessModel(delegator);
         GenericHelper helper = delegator.getEntityHelper(READINESS_ENTITY);
-        when(helper.findCountByCondition(delegator, modelEntity, null, null, null))
+        when(helper.findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null))
                 .thenThrow(new GenericEntityException("datasource unreachable"));
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
             // The future-dated verdict was discarded and the datasource measured instead, which is the
             // whole difference: repeating it would have reported this instance ready for as long as the
             // clock step lasted, and a load balancer would have kept sending it traffic.
-            verify(helper).findCountByCondition(delegator, modelEntity, null, null, null);
+            verify(helper).findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null);
             debug.verify(() -> Debug.logWarning(eq(EVENT_CODE), anyString()));
         }
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
@@ -842,9 +877,9 @@ public final class HealthCheckServletTests {
         givenEstablishedVerdict(false, -step);
         Delegator delegator = delegatorCountingRows(7L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
@@ -891,8 +926,8 @@ public final class HealthCheckServletTests {
                 "a probe that gave up without a verdict must report itself under the probe-shed code");
         assertWindowStillOpen("READINESS_LOG_LAST_AT",
                 "it must not consume the window an unavailable datasource needs, having never consulted one");
-        assertWindowStillOpen("READINESS_EMPTY_LOG_LAST_AT",
-                "nor the window an unpopulated schema needs");
+        assertWindowStillOpen("READINESS_TRANSPORT_LOG_LAST_AT",
+                "nor the window an absent cache-invalidation transport needs");
         verify(request, never()).getServletContext();
         verify(servletContext, never()).getAttribute(anyString());
     }
@@ -905,11 +940,11 @@ public final class HealthCheckServletTests {
         long waitMillis = readinessConstant("READINESS_CHECK_WAIT_NANOS") / NANOS_PER_MILLI;
 
         long startedAt = System.nanoTime();
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
             debug.verify(() -> Debug.logError(anyString(), anyString()), never());
         }
         long elapsedMillis = (System.nanoTime() - startedAt) / NANOS_PER_MILLI;
@@ -1050,11 +1085,11 @@ public final class HealthCheckServletTests {
         long waitMillis = readinessConstant("READINESS_CHECK_WAIT_NANOS") / NANOS_PER_MILLI;
 
         long startedAt = System.nanoTime();
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
             // Debug is mocked for two reasons, and this states the second one. The first is that the log
             // write happens inside the interval being measured, so a real appender would be timed along
             // with the probe. The second is that being refused a slot is a capacity condition rather than
@@ -1092,11 +1127,11 @@ public final class HealthCheckServletTests {
         // check it is not allowed to wait for is refreshing a verdict that has not been refuted.
         givenEstablishedVerdict(ready, readinessConstant("READINESS_VERDICT_FRESH_NANOS") * 2L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
             verify(servletContext, never()).getAttribute(anyString());
             // Repeating a verdict is a normal answer, so nothing is logged - a full waiter set is not
             // by itself an event, and reporting it as one would turn a flood into log amplification.
@@ -1116,7 +1151,7 @@ public final class HealthCheckServletTests {
         givenReadinessCheckRunning();
         givenNoEstablishedVerdict();
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             servlet.service(request, response);
 
@@ -1126,7 +1161,7 @@ public final class HealthCheckServletTests {
                     "a probe refused a waiter slot needs its own code: the operator action is to find out what is"
                             + " sending that many simultaneous probes, not to look at the database");
             debug.verify(() -> Debug.logError(anyString(), anyString()), never());
-            webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext), never());
+            delegatorFactory.verify(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME), never());
             verify(servletContext, never()).getAttribute(anyString());
         }
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
@@ -1139,7 +1174,7 @@ public final class HealthCheckServletTests {
         givenReadinessCheckRunning();
         Delegator healthy = delegatorCountingRows(7L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             for (int probe = 0; probe < 3; probe++) {
                 givenNoEstablishedVerdict();
@@ -1151,14 +1186,13 @@ public final class HealthCheckServletTests {
                     "none of them may be counted onto the probe-shed line, no probe having waited");
             assertEquals(0L, readinessLogCounter("READINESS_LOG_SUPPRESSED").get(),
                     "nor onto the datasource line, the datasource having never been consulted");
-            assertEquals(0L, readinessLogCounter("READINESS_EMPTY_LOG_SUPPRESSED").get(), "nor onto the empty-schema line");
 
             // The flood stops and the instance is healthy again, so no further refusal will ever carry
             // the count. A later probe still has to account for it once the window has elapsed.
             readinessLogCounter("READINESS_WAITERS").set(0L);
             readinessLogCounter("READINESS_CHECK_RUNNING").set(0L);
             reopenWindow("READINESS_WAITERS_LOG_LAST_AT");
-            when(servletContext.getAttribute("delegator")).thenReturn(healthy);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(healthy);
             givenNoEstablishedVerdict();
             servlet.service(request, response);
 
@@ -1167,10 +1201,11 @@ public final class HealthCheckServletTests {
             assertEquals(WAITERS_FULL_EVENT_CODE, lines.getAllValues().get(0), "the first line of a flood");
             assertEquals(WAITERS_FULL_EVENT_CODE + " (2 further occurrences suppressed)", lines.getAllValues().get(1),
                     "the recovered probe must write out what this code's limit held back");
-            // States why WebAppUtil is mocked here: the three refused probes resolve no delegator at all, and
-            // the recovered one takes the delegator the servlet context publishes, so the lookup that would
-            // touch the component container is never reached on any of the four.
-            webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext), never());
+            // States why DelegatorFactory is mocked here: the three refused probes are answered before any
+            // delegator is resolved - which is the point, a refused probe consults nothing - and only the
+            // recovered one resolves one, so the lookup that would touch the component container is
+            // reached exactly once across the four.
+            delegatorFactory.verify(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME), times(1));
         }
         assertEquals(0L, readinessLogCounter("READINESS_WAITERS_LOG_SUPPRESSED").get(),
                 "the flushed count must be cleared, so it can never be reported twice");
@@ -1206,14 +1241,15 @@ public final class HealthCheckServletTests {
         Delegator delegator = mock(Delegator.class);
         ModelEntity modelEntity = givenReadinessModel(delegator);
         AtomicReference<String> countingThread = new AtomicReference<>(null);
-        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, null, null, null))
+        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null))
                 .thenAnswer(invocation -> {
                     countingThread.set(Thread.currentThread().getName());
                     return 7L;
                 });
-        // Published on the ServletContext the way ContextFilter.init() publishes it, so the check needs
-        // no per-thread seam - which a check running on another thread could not see in any case.
-        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+        // Installed through the base-delegator seam rather than stubbed on DelegatorFactory: this test
+        // runs the check on the production thread, and a static mock cannot be replaced on a thread the
+        // test did not create - which is the same reason the executor seam exists.
+        HealthCheckServlet.installBaseDelegatorForTesting(delegator);
         String probeThread = Thread.currentThread().getName();
 
         servlet.service(request, response);
@@ -1236,13 +1272,13 @@ public final class HealthCheckServletTests {
         ModelEntity modelEntity = givenReadinessModel(delegator);
         CountDownLatch wedged = new CountDownLatch(1);
         CountDownLatch counting = new CountDownLatch(1);
-        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, null, null, null))
+        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null))
                 .thenAnswer(invocation -> {
                     counting.countDown();
                     wedged.await();
                     return 7L;
                 });
-        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+        HealthCheckServlet.installBaseDelegatorForTesting(delegator);
         long deadlineMillis = readinessConstant("READINESS_CHECK_DEADLINE_MILLIS");
 
         long startedAt = System.nanoTime();
@@ -1266,6 +1302,17 @@ public final class HealthCheckServletTests {
             assertTrue(readinessCheckPermitHeld(), "an outstanding check must keep the permit it holds");
         } finally {
             wedged.countDown();
+            // Released AND awaited. This test runs on the PRODUCTION executor - it has to, because the
+            // deadline it measures is the one a real check is subject to - so the task it wedges outlives
+            // the probe by design. Releasing it without waiting lets it finish at some point after this
+            // method returns, and what it does when it finishes is publish a verdict and release the
+            // permit into the very static state that tearDown has by then reset. The next test in this JVM
+            // would start against a verdict and a permit count it never established, failing or passing
+            // for a reason nowhere in its own body and only when the scheduling lands that way. Waiting
+            // here is what confines this test's task to this test.
+            assertTrue(awaitReadinessCheckCompletion(), "the wedged check must finish before this test"
+                    + " returns, otherwise it publishes its verdict and its permit into the state tearDown"
+                    + " has already reset");
         }
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
@@ -1337,7 +1384,7 @@ public final class HealthCheckServletTests {
     public void aCheckThatFinishesReleasesThePermitItselfSoTheNextProbeCanMeasureAgain() throws Exception {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(7L);
-        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+        HealthCheckServlet.installBaseDelegatorForTesting(delegator);
 
         servlet.service(request, response);
 
@@ -1351,7 +1398,7 @@ public final class HealthCheckServletTests {
     public void aFailingCheckAlsoReleasesThePermitSoAnOutageCanBeObservedToEnd() throws Exception {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorFailingWith(new GenericEntityException("datasource unreachable"));
-        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+        HealthCheckServlet.installBaseDelegatorForTesting(delegator);
 
         servlet.service(request, response);
 
@@ -1411,10 +1458,10 @@ public final class HealthCheckServletTests {
         // decades, discard a verdict that is microseconds old and measure the datasource again.
         givenEstablishedVerdict(true, 0L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
             verify(servletContext, never()).getAttribute(anyString());
         }
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
@@ -1424,7 +1471,7 @@ public final class HealthCheckServletTests {
     public void aRateLimitWindowIsAgedOnTheMonotonicClockAndNotOnTheWallClock() throws Exception {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorFailingWith(new GenericEntityException("datasource unreachable"));
-        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+        HealthCheckServlet.installBaseDelegatorForTesting(delegator);
         // A window claimed at this instant, recorded the way the servlet records it. An implementation
         // that aged it against the wall clock would see a whole epoch elapse, reopen the window and
         // write a line per probe - which is the amplification the rate limit exists to prevent.
@@ -1447,13 +1494,13 @@ public final class HealthCheckServletTests {
         // occurrence closes exactly the window that reported it.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorFailingWith(new GenericEntityException("datasource unreachable"));
-        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+        HealthCheckServlet.installBaseDelegatorForTesting(delegator);
         assertWindowStillOpen("READINESS_LOG_LAST_AT", "a freshly reset window must be open");
 
         servlet.service(request, response);
 
         assertWindowClaimed("READINESS_LOG_LAST_AT", "the reported occurrence must have claimed its window");
-        assertWindowStillOpen("READINESS_EMPTY_LOG_LAST_AT", "and must not have claimed another code's window");
+        assertWindowStillOpen("READINESS_TRANSPORT_LOG_LAST_AT", "and must not have claimed another code's window");
     }
 
     @ParameterizedTest(name = "deadline property [{0}] resolves to {1}")
@@ -1535,10 +1582,10 @@ public final class HealthCheckServletTests {
     public void unmappedSubPathReturnsNotFoundAndNeverTouchesTheDatabase(String servletPath, String pathInfo) throws Exception {
         givenProbePath(servletPath, pathInfo);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
         }
         // A mis-configured probe must fail visibly instead of reporting a false 200, which would
         // keep a broken instance in a load-balancer target group.
@@ -1582,12 +1629,12 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         when(request.getContentLengthLong()).thenReturn(1L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
             servlet.service(request, response);
 
             // Refused from a header lookup, before the delegator is resolved and before any part of the
             // body is read, so an anonymous caller cannot make a probe path do work by announcing one.
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_BAD_REQUEST, UNKNOWN);
     }
@@ -1634,10 +1681,10 @@ public final class HealthCheckServletTests {
         // this measures path recognition alone.
         givenEstablishedVerdict(true, 0L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
         }
 
         ArgumentCaptor<Integer> status = ArgumentCaptor.forClass(Integer.class);
@@ -1677,11 +1724,11 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/live", null);
         givenMethod(method);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
             servlet.service(request, response);
 
             // A refused method must cost nothing at all: no delegator, no query, no body read.
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
         }
         // The method comparison is case-sensitive on purpose: HTTP method tokens are case-sensitive,
         // so "get" is not GET and must not be served either.
@@ -1696,10 +1743,10 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         givenMethod("POST");
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_METHOD_NOT_ALLOWED, UNKNOWN);
     }
@@ -1724,10 +1771,10 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         when(request.getContentLengthLong()).thenReturn(contentLength);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verifyNoInteractions();
         }
         assertProbeResponse(HttpServletResponse.SC_BAD_REQUEST, UNKNOWN);
     }
@@ -1784,8 +1831,8 @@ public final class HealthCheckServletTests {
         // entity engine, which both slows the test down and makes it write to the shared log.
         Delegator delegator = delegatorCountingRows(42L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -1832,8 +1879,8 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(42L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -1858,8 +1905,8 @@ public final class HealthCheckServletTests {
         givenProbePath(probePath, null);
         Delegator delegator = delegatorCountingRows(1L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             recorder.service(request, response);
         }
@@ -1877,8 +1924,8 @@ public final class HealthCheckServletTests {
         givenMethod("HEAD");
         Delegator delegator = delegatorCountingRows(1L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             recorder.service(request, response);
         }
@@ -1922,8 +1969,8 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(1L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.doHead(request, response);
         }
@@ -1980,9 +2027,9 @@ public final class HealthCheckServletTests {
     public void repeatedFailuresAreRateLimitedIntoASingleCountedLine() throws Exception {
         givenProbePath("/health/ready", null);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(null);
 
             for (int probe = 0; probe < 25; probe++) {
                 // Ageing the verdict out between probes is what the polling interval does at runtime,
@@ -2003,9 +2050,9 @@ public final class HealthCheckServletTests {
     public void theSuppressedOccurrencesAreCountedIntoTheNextLine() throws Exception {
         givenProbePath("/health/ready", null);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(null);
 
             // Three probe rounds of an outage - the verdict ages out between them, as the polling
             // interval makes it - so three checks fail and two of them are held back by the limit.
@@ -2036,9 +2083,9 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         Delegator healthy = delegatorCountingRows(7L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(null);
 
             givenNoEstablishedVerdict();
             servlet.service(request, response);
@@ -2050,9 +2097,13 @@ public final class HealthCheckServletTests {
                     "two of the three failures must have been held back by the rate limit");
 
             // The datasource recovers, so no further occurrence will ever carry the count. The next
-            // probe still has to account for it once the window has elapsed. The recovered delegator
-            // arrives on the ServletContext, which is where a deployed webapp publishes it.
-            when(servletContext.getAttribute("delegator")).thenReturn(healthy);
+            // probe still has to account for it once the window has elapsed. The recovered delegator is
+            // what the declared name now resolves to.
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(healthy);
+            // The resolution throttle is reopened too. Three failed resolutions claimed its window, and
+            // holding a resolution back is exactly what that throttle is for - but it is not what this
+            // test is about, so it is reset alongside the log window it stands beside.
+            reopenWindow("DELEGATOR_LOOKUP_LAST_AT");
             reopenReadinessLogWindow();
             givenNoEstablishedVerdict();
             servlet.service(request, response);
@@ -2076,9 +2127,9 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(7L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             for (int probe = 0; probe < 25; probe++) {
                 givenNoEstablishedVerdict();
@@ -2100,7 +2151,7 @@ public final class HealthCheckServletTests {
         givenReadinessCheckRunning();
         givenNoEstablishedVerdict();
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             servlet.service(request, response);
 
@@ -2112,7 +2163,7 @@ public final class HealthCheckServletTests {
             debug.verify(() -> Debug.logError(anyString(), anyString()), never());
             // A second query is never issued while one is already running - that is what bounds what
             // the datasource sees, and it is why waiting costs no pooled connection.
-            webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext), never());
+            delegatorFactory.verify(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME), never());
             verify(servletContext, never()).getAttribute(anyString());
         }
 
@@ -2128,7 +2179,7 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         givenReadinessCheckRunning();
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
             givenNoEstablishedVerdict();
             servlet.service(request, response);
@@ -2138,15 +2189,15 @@ public final class HealthCheckServletTests {
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
             debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
             assertEquals(SHED_EVENT_CODE, lines.getValue(), "the first line of a check that is not completing");
-            webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext), never());
+            delegatorFactory.verify(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME), never());
         }
 
         assertEquals(1L, readinessLogCounter("READINESS_SHED_LOG_SUPPRESSED").get(),
                 "the second occurrence must be counted onto its own code");
         assertEquals(0L, readinessLogCounter("READINESS_LOG_SUPPRESSED").get(),
                 "it must never be reported on the datasource line as if it were a failure");
-        assertEquals(0L, readinessLogCounter("READINESS_EMPTY_LOG_SUPPRESSED").get(),
-                "nor on the empty-schema line");
+        assertEquals(0L, readinessLogCounter("READINESS_TRANSPORT_LOG_SUPPRESSED").get(),
+                "nor on the cache-transport line");
     }
 
     @Test
@@ -2154,9 +2205,9 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(7L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
             // Verbose diagnostics on is the demanding case: the row count of a healthy schema is
             // itself information about the deployment and must not be written per anonymous probe.
             debug.when(Debug::verboseOn).thenReturn(true);
@@ -2172,19 +2223,52 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void anAlreadyPublishedDelegatorIsUsedWithoutAskingTheFactoryForOne() throws Exception {
-        // ContextFilter.init() publishes the delegator on the ServletContext when the webapp is
-        // deployed. Observing it there is what keeps a probe from asking DelegatorFactory for a
-        // delegator, which is the call that logs a throwable and its stack when construction fails and
-        // then re-logs it on every later call because the failed Future is cached.
+    public void aDelegatorPublishedOnTheServletContextIsIgnoredInFavourOfTheDeclaredOne() throws Exception {
+        // The security property of the resolution, asserted directly. ContextFilter publishes a delegator
+        // on the ServletContext and REPLACES it whenever a multitenant request selects a tenant from the
+        // Host header or from a userTenantId parameter, so the attribute belongs to whichever tenancy asked
+        // last. A probe that read it would report on that tenancy's database - and an anonymous caller
+        // would choose which. So the attribute is never read: the delegator comes from the webapp's
+        // declared entityDelegatorName, which no request can change.
         givenProbePath("/health/ready", null);
-        Delegator delegator = delegatorCountingRows(3L);
-        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+        // The two are told apart by their ANSWER rather than by counting interactions on a mock: the
+        // published one cannot be reached at all, so a probe that read the attribute would answer 503.
+        Delegator tenantsDelegator = delegatorFailingWith(
+                new GenericEntityException("the tenant datasource must never be consulted by a probe"));
+        when(servletContext.getAttribute("delegator")).thenReturn(tenantsDelegator);
+        Delegator declared = delegatorCountingRows(5L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(declared);
+
             servlet.service(request, response);
 
-            webAppUtil.verifyNoInteractions();
+            delegatorFactory.verify(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME));
+        }
+        verify(servletContext, never()).getAttribute(anyString());
+        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
+    }
+
+    @Test
+    public void aTenantedDeclaredNameStillResolvesToTheInstancesOwnBaseDelegator() throws Exception {
+        // A descriptor is free to declare a tenanted delegator name. A probe reports on the INSTANCE, so
+        // whatever is resolved is reduced to its base: the readiness of a fleet member is a property of the
+        // datasource it serves from, not of one tenancy of it.
+        givenProbePath("/health/ready", null);
+        // Again told apart by the answer: the tenanted delegator would fail the count, so only a probe
+        // that reduced it to its base can answer 200.
+        Delegator tenanted = delegatorFailingWith(
+                new GenericEntityException("the tenant datasource must never be consulted by a probe"));
+        when(tenanted.getDelegatorName()).thenReturn("default#DEMO1");
+        when(tenanted.getDelegatorBaseName()).thenReturn(DELEGATOR_NAME);
+        Delegator base = delegatorCountingRows(7L);
+        when(servletContext.getInitParameter(DELEGATOR_NAME_PARAMETER)).thenReturn("default#DEMO1");
+
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator("default#DEMO1")).thenReturn(tenanted);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(base);
+
+            servlet.service(request, response);
         }
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
     }
@@ -2197,8 +2281,8 @@ public final class HealthCheckServletTests {
         // stream of stack traces from below this class, outside its rate limit.
         givenProbePath("/health/ready", null);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(null);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(null);
 
             for (int probe = 0; probe < 25; probe++) {
                 // Ageing the verdict out between probes makes all 25 run a check of their own, so it
@@ -2207,7 +2291,7 @@ public final class HealthCheckServletTests {
                 servlet.service(request, response);
             }
 
-            webAppUtil.verify(() -> WebAppUtil.getDelegator(servletContext), times(1));
+            delegatorFactory.verify(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME), times(1));
         }
         // Every one of the 25 probes still got the same fail-closed verdict.
         verify(response, times(25)).setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
@@ -2232,26 +2316,80 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorCountingRows(7L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
-            // Inertness is not merely "answers UP": nothing about the transport is even looked at.
-            verify(servletContext, never()).getAttribute(DISPATCHER_ATTRIBUTE);
+            // Inertness is not merely "answers UP": nothing about the transport is even looked at - no
+            // dispatcher is resolved and the service configuration is never read.
+            verify(servletContext, never()).getInitParameter(DISPATCHER_NAME_PARAMETER);
+            verify(servletContext, never()).getAttribute(anyString());
         }
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
     }
 
     @Test
-    public void readyReturnsDownWhenCoherenceIsRequiredButNoDispatcherIsPublished() throws Exception {
-        // An absent dispatcher attribute means this webapp has not finished coming up. For a readiness
-        // probe that is the truth, and holding traffic off is the correct answer.
+    public void readyReturnsDownWhenCoherenceIsRequiredButNoDispatcherCanBeResolved() throws Exception {
+        // No dispatcher means this webapp has not finished coming up. For a readiness probe that is the
+        // truth, and holding traffic off is the correct answer.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(7L);
+        givenPublishedDispatcher(null);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
+
+            servlet.service(request, response);
+        }
+        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
+    }
+
+    @Test
+    public void readyReturnsDownWhenNoServiceMessengerIsDeclaredAtAll() throws Exception {
+        // The configuration declares a jms-service, but not the one the distributedClearCache* services
+        // are located against, so this instance cannot invalidate a peer's cache however healthy that
+        // other listener is. Iterating the whole listener map - which this dimension used to do - reported
+        // exactly this configuration as ready.
+        givenProbePath("/health/ready", null);
+        Delegator delegator = delegatorRequiringCoherence(7L);
+        Server listening = mock(Server.class);
+        when(listening.getListen()).thenReturn(true);
+        when(listening.getJndiServerName()).thenReturn(TRANSPORT_JNDI_SERVER);
+        when(listening.getJndiName()).thenReturn(TRANSPORT_JNDI_NAME);
+        when(listening.getTopicQueue()).thenReturn("jms/SomeOtherTopic");
+        givenDeclaredJmsServices("someOtherMessenger", listening);
+        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of(TRANSPORT_LISTENER_KEY, subscriber(true),
+                UNRELATED_LISTENER_KEY, subscriber(true)));
+        serviceContainer = mockStatic(ServiceContainer.class);
+        serviceContainer.when(() -> ServiceContainer.getLocalDispatcher(eq(DISPATCHER_NAME), any(Delegator.class)))
+                .thenReturn(dispatcher);
+
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
+
+            servlet.service(request, response);
+        }
+        assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
+    }
+
+    @Test
+    public void readyReturnsDownWhenTheServiceMessengerDeclaresNoListeningServer() throws Exception {
+        // A serviceMessenger declared with listen="false" registers no listener at all, so nothing on this
+        // instance receives a peer's invalidation. Fail-closed, and for the reason that matters: there is
+        // no key to look for, not that the map happened to be empty.
+        givenProbePath("/health/ready", null);
+        Delegator delegator = delegatorRequiringCoherence(7L);
+        Server sendOnly = mock(Server.class);
+        when(sendOnly.getListen()).thenReturn(false);
+        givenDeclaredJmsServices(CACHE_TRANSPORT_SERVICE, sendOnly);
+        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of(TRANSPORT_LISTENER_KEY, subscriber(true)));
+        serviceContainer = mockStatic(ServiceContainer.class);
+        serviceContainer.when(() -> ServiceContainer.getLocalDispatcher(eq(DISPATCHER_NAME), any(Delegator.class)))
+                .thenReturn(dispatcher);
+
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -2260,19 +2398,18 @@ public final class HealthCheckServletTests {
 
     @Test
     public void theProbeNeverBuildsADispatcherToAnswerAReadinessCheck() throws Exception {
-        // WebAppUtil.getDispatcher CONSTRUCTS a dispatcher when the attribute is absent, which starts a
-        // service engine and, with JMS enabled, a listener factory thread. A probe must observe
-        // readiness, not create the machinery it reports on - the same rule resolveDelegator states.
+        // The dispatcher is looked up under the name the webapp declares, bound to the base delegator -
+        // the pair ContextFilter.init() already registered - so a running deployment answers from the
+        // ServiceContainer cache. A probe must observe readiness, not create the machinery it reports on,
+        // which is the same rule baseDelegator states.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(7L);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
-            webAppUtil.verify(() -> WebAppUtil.getDispatcher(servletContext), never());
-            webAppUtil.verify(() -> WebAppUtil.makeWebappDispatcher(any(), any()), never());
         }
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
     }
@@ -2285,10 +2422,10 @@ public final class HealthCheckServletTests {
         Delegator delegator = delegatorRequiringCoherence(7L);
         LocalDispatcher dispatcher = mock(LocalDispatcher.class);
         when(dispatcher.getJMSListeneFactory()).thenReturn(null);
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -2305,10 +2442,10 @@ public final class HealthCheckServletTests {
         // Built before the stubbing below rather than inside it: the helper stubs its own mocks, and a
         // stubbing started while another is unfinished is a Mockito misuse.
         LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of());
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -2316,18 +2453,23 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void readyReturnsDownWhenASingleSubscriberIsDisconnected() throws Exception {
+    public void readyReturnsDownWhenTheServiceMessengerSubscriberIsDisconnected() throws Exception {
         // JmsListenerFactory registers a listener in its map BEFORE calling load(), so a listener that
         // could not reach the broker is present and reports false - and AbstractJmsListener.onException
-        // sets the flag false the moment an established connection drops. One disconnected subscriber
-        // is enough: the invalidation this instance publishes would not reach the whole fleet.
+        // sets the flag false the moment an established connection drops. The invalidation this instance
+        // publishes would not reach the fleet, so it must leave the target group.
+        //
+        // An UNRELATED listener that is perfectly connected is in the map too, and it must not rescue the
+        // verdict: iterating every listener - which this dimension used to do - made a broken
+        // serviceMessenger look healthy the moment any other jms-service happened to be up.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(7L);
-        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of("first", subscriber(true), "second", subscriber(false)));
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of(TRANSPORT_LISTENER_KEY, subscriber(false),
+                UNRELATED_LISTENER_KEY, subscriber(true)));
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -2335,17 +2477,22 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void readyReturnsUpWhenEverySubscriberIsConnected() throws Exception {
+    public void readyReturnsUpWhenTheServiceMessengerSubscriberIsConnected() throws Exception {
         // JmsTopicListener.load() reports connected only after the JNDI context, the connection factory
         // and topic lookups, the connection, the session, the subscriber registration and the start all
         // succeed - so this is strictly stronger evidence than a TCP probe of the broker.
+        //
+        // An UNRELATED listener that is disconnected is in the map too, and it must not spoil the verdict:
+        // iterating every listener took an instance whose cache invalidation was working out of service
+        // because some other jms-service was down, which is not a statement about cache coherence.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(7L);
-        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of("first", subscriber(true), "second", subscriber(true)));
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of(TRANSPORT_LISTENER_KEY, subscriber(true),
+                UNRELATED_LISTENER_KEY, subscriber(false)));
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -2363,12 +2510,12 @@ public final class HealthCheckServletTests {
         JmsListenerFactory listenerFactory = mock(JmsListenerFactory.class);
         GenericMessageListener listener = mock(GenericMessageListener.class);
         when(listener.isConnected()).thenReturn(true);
-        when(listenerFactory.getJMSListeners()).thenReturn(Map.of("only", listener));
+        when(listenerFactory.getJMSListeners()).thenReturn(Map.of(TRANSPORT_LISTENER_KEY, listener));
         when(dispatcher.getJMSListeneFactory()).thenReturn(listenerFactory);
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
         }
@@ -2376,6 +2523,9 @@ public final class HealthCheckServletTests {
         verify(listenerFactory).getJMSListeners();
         verify(listener).isConnected();
         verifyNoMoreInteractions(dispatcher, listenerFactory, listener);
+        // And the probe never read a ServletContext attribute to find any of them: the dispatcher was
+        // resolved by declared name, which is what a tenant selection cannot redirect.
+        verify(servletContext, never()).getAttribute(anyString());
         assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
     }
 
@@ -2386,12 +2536,12 @@ public final class HealthCheckServletTests {
         // be written either: the path is anonymous and polled.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(7L);
-        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of("only", subscriber(false)));
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of(TRANSPORT_LISTENER_KEY, subscriber(false)));
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
@@ -2415,11 +2565,11 @@ public final class HealthCheckServletTests {
         Delegator delegator = delegatorFailingWith(new GenericEntityException("datasource unreachable"));
         when(delegator.useDistributedCacheClear()).thenReturn(true);
         LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of());
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
@@ -2432,32 +2582,54 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void anUnpopulatedSchemaIsReportedAloneWithoutTheCoherenceDimensionBeingMeasured() throws Exception {
-        // The datasource dimension is measured first and decides the verdict on its own, so a zero count
-        // ends the check: the transport is never consulted and its code is never written. Reporting both
-        // would name two subsystems for one 503 and send an operator to the wrong one first - the
-        // instance cannot serve a request at all, whatever the broker is doing.
+    public void anEmptySequenceTableDoesNotStopTheCoherenceDimensionBeingMeasured() throws Exception {
+        // A zero count is a COMPLETED count, so the datasource dimension is satisfied and the check goes
+        // on to the next one. Reporting 503 for it - which this dimension used to do, borrowing the rule
+        // from the ping service - held a correctly provisioned fleet out of service until something else
+        // wrote to the database, and in a rolling deployment against a freshly initialised schema that is
+        // a fleet that never comes up. Here the verdict is decided by the transport instead, which is the
+        // dimension that is genuinely missing.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(0L);
         LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of());
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             servlet.service(request, response);
 
             ArgumentCaptor<String> lines = ArgumentCaptor.forClass(String.class);
             debug.verify(() -> Debug.logWarning(lines.capture(), anyString()), times(1));
-            assertEquals(List.of(EMPTY_EVENT_CODE), lines.getAllValues(),
-                    "an empty sequence table is the whole verdict, so no second code may be written for it");
+            assertEquals(List.of(TRANSPORT_EVENT_CODE), lines.getAllValues(),
+                    "a zero count is not a datasource failure, so the transport is what this 503 reports");
         }
-        // Nothing at all was asked of the dispatcher: the check ended in the dimension before it.
-        verifyNoInteractions(dispatcher);
-        assertWindowStillOpen("READINESS_TRANSPORT_LOG_LAST_AT",
-                "the transport window must be untouched when the transport was never measured");
+        // The transport WAS measured, which is the whole point: the check did not stop at the count.
+        verify(dispatcher).getJMSListeneFactory();
+        assertWindowStillOpen("READINESS_LOG_LAST_AT",
+                "a completed count must not consume the window an unavailable datasource needs");
         assertProbeResponse(HttpServletResponse.SC_SERVICE_UNAVAILABLE, READY_DOWN);
+    }
+
+    @Test
+    public void aZeroCountOnItsOwnIsReady() throws Exception {
+        // The plain statement of the rule, with the coherence dimension out of the picture: a database
+        // whose schema has just been initialised holds no SequenceValueItem row until the first
+        // identifier is allocated, and an instance pointed at it can serve - the engine's sequencer
+        // creates the row it needs on demand.
+        givenProbePath("/health/ready", null);
+        Delegator delegator = delegatorCountingRows(0L);
+
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
+                MockedStatic<Debug> debug = mockStatic(Debug.class)) {
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
+
+            servlet.service(request, response);
+
+            debug.verify(() -> Debug.logWarning(anyString(), anyString()), never());
+        }
+        assertProbeResponse(HttpServletResponse.SC_OK, READY_UP);
     }
 
     @Test
@@ -2467,12 +2639,12 @@ public final class HealthCheckServletTests {
         // window, not on one it borrows from another code.
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorRequiringCoherence(7L);
-        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of("only", subscriber(false)));
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of(TRANSPORT_LISTENER_KEY, subscriber(false)));
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             for (int probe = 0; probe < 20; probe++) {
                 // Ageing the verdict out between probes is what the polling interval does at runtime.
@@ -2501,12 +2673,12 @@ public final class HealthCheckServletTests {
         Delegator delegator = delegatorRequiringCoherence(7L);
         GenericMessageListener listener = mock(GenericMessageListener.class);
         when(listener.isConnected()).thenReturn(false);
-        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of("only", listener));
-        when(servletContext.getAttribute(DISPATCHER_ATTRIBUTE)).thenReturn(dispatcher);
+        LocalDispatcher dispatcher = dispatcherWithSubscribers(Map.of(TRANSPORT_LISTENER_KEY, listener));
+        givenPublishedDispatcher(dispatcher);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
 
             for (int probe = 0; probe < 3; probe++) {
                 givenNoEstablishedVerdict();
@@ -2558,22 +2730,23 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void theClassIsAServletAndNothingElse() throws Exception {
-        // The specified integration is two edits to a deployment descriptor: one servlet-mapping on the
-        // two probe paths, and /health in ControlFilter's allowedPaths. A filter role would be a third,
-        // unspecified integration that re-orders the webapp's chain, so this class must not be
-        // registrable as one.
+    public void theClassIsRegistrableAsAServletAndAsNothingElse() throws Exception {
+        // One class, one role. The servlet-mapping on the two probe paths is the contract; keeping probe
+        // traffic off the webapp's chain is a separate responsibility and lives in HealthProbeFilter, which
+        // forwards to this servlet by name. Asserting that this class is NOT a filter is what stops the two
+        // from being merged again: a class that is both is a class a descriptor can map twice, and two
+        // mappings of one handler are two orderings to keep right.
         assertTrue(jakarta.servlet.http.HttpServlet.class.isAssignableFrom(HealthCheckServlet.class),
                 "the probe must be registrable as a servlet");
         assertFalse(Filter.class.isAssignableFrom(HealthCheckServlet.class),
-                "the probe must not be registrable as a filter: the allow-list entry is what makes it reachable");
+                "the probe must NOT be a filter as well: HealthProbeFilter is the class that routes to it,"
+                        + " and HealthEndpointRegistrationTests asserts the descriptor accordingly");
 
-        // isAssignableFrom above would still pass if the interface were dropped while a doFilter method
-        // shaped like the container's entry point stayed behind, so the method itself is asserted absent
-        // under any signature.
+        // And no doFilter of its own, so there is exactly one way into this class and the servlet role
+        // cannot answer a request differently from a filter role that no longer exists.
         for (Method method : HealthCheckServlet.class.getDeclaredMethods()) {
-            assertFalse("doFilter".equals(method.getName()),
-                    "no doFilter may remain: the chain is entered, not short-circuited");
+            assertNotEquals("doFilter", method.getName(),
+                    "the probe must have no filter entry point of its own");
         }
 
         // One gate and one handler, both private and static, so the GET and the HEAD dispatch cannot be
@@ -2723,8 +2896,9 @@ public final class HealthCheckServletTests {
      */
     private static Delegator delegatorCountingRows(long rows) throws Exception {
         Delegator delegator = mock(Delegator.class);
+        givenBaseIdentity(delegator);
         ModelEntity modelEntity = givenReadinessModel(delegator);
-        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, null, null, null))
+        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null))
                 .thenReturn(rows);
         return delegator;
     }
@@ -2732,8 +2906,9 @@ public final class HealthCheckServletTests {
     /** Builds a delegator whose {@code SequenceValueItem} count fails with the given throwable. */
     private static Delegator delegatorFailingWith(Throwable failure) throws Exception {
         Delegator delegator = mock(Delegator.class);
+        givenBaseIdentity(delegator);
         ModelEntity modelEntity = givenReadinessModel(delegator);
-        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, null, null, null))
+        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null))
                 .thenThrow(failure);
         return delegator;
     }
@@ -2748,6 +2923,61 @@ public final class HealthCheckServletTests {
         Delegator delegator = delegatorCountingRows(rows);
         when(delegator.useDistributedCacheClear()).thenReturn(true);
         return delegator;
+    }
+
+    /**
+     * Declares a listening {@code serviceMessenger} and makes the given dispatcher what the probe resolves
+     * for the base delegator.
+     *
+     * <p>Both halves are needed, and neither is the ServletContext attribute the probe used to read. The
+     * declaration is what tells the probe WHICH listener keys carry cache invalidation - it reproduces the
+     * key {@code JmsListenerFactory.loadListeners} registers, so the fixture and the production code agree
+     * by construction - and the dispatcher lookup is the pair {@code ContextFilter.init()} registers in a
+     * deployed webapp, resolved by name and bound to the base delegator so a tenant selection cannot
+     * redirect it.
+     *
+     * @param dispatcher the dispatcher the probe must observe, or null for a webapp that has none yet
+     */
+    private void givenPublishedDispatcher(LocalDispatcher dispatcher) {
+        givenDeclaredCacheTransport();
+        serviceContainer = mockStatic(ServiceContainer.class);
+        serviceContainer.when(() -> ServiceContainer.getLocalDispatcher(eq(DISPATCHER_NAME), any(Delegator.class)))
+                .thenReturn(dispatcher);
+    }
+
+    /** Declares one {@code serviceMessenger} with one listening topic server, as the documented example does. */
+    private void givenDeclaredCacheTransport() {
+        Server server = mock(Server.class);
+        when(server.getListen()).thenReturn(true);
+        when(server.getJndiServerName()).thenReturn(TRANSPORT_JNDI_SERVER);
+        when(server.getJndiName()).thenReturn(TRANSPORT_JNDI_NAME);
+        when(server.getTopicQueue()).thenReturn(TRANSPORT_TOPIC);
+        givenDeclaredJmsServices(CACHE_TRANSPORT_SERVICE, server);
+    }
+
+    /**
+     * Declares the given jms-service, under the given name, as the whole service configuration.
+     *
+     * @param serviceName the jms-service name to declare
+     * @param servers the servers it declares, in order
+     */
+    private void givenDeclaredJmsServices(String serviceName, Server... servers) {
+        JmsService service = mock(JmsService.class);
+        when(service.getName()).thenReturn(serviceName);
+        when(service.getServers()).thenReturn(List.of(servers));
+        // send-mode is the PUBLISHER half of the transport: JmsServiceEngine.serverList yields no server
+        // for "none", and every declared server for "all", so a declaration that cannot publish is not a
+        // usable transport however healthy its listeners are. Declared here as the documented example
+        // declares it, so a fixture cannot pass a check the shipped configuration would fail.
+        when(service.getSendMode()).thenReturn("all");
+        ServiceEngine engine = mock(ServiceEngine.class);
+        when(engine.getJmsServices()).thenReturn(List.of(service));
+        // Both lookups are stubbed because both are used: the readiness check resolves the transport BY
+        // NAME, exactly as JmsServiceEngine does, and the listener keys are rebuilt from the servers of
+        // the service that name resolves to.
+        when(engine.getJmsServiceByName(serviceName)).thenReturn(service);
+        serviceConfiguration = mockStatic(ServiceConfigUtil.class);
+        serviceConfiguration.when(ServiceConfigUtil::getServiceEngine).thenReturn(engine);
     }
 
     /**
@@ -2772,6 +3002,20 @@ public final class HealthCheckServletTests {
         return listener;
     }
 
+    /**
+     * Declares a delegator to be the base delegator of the name the webapp configures.
+     *
+     * <p>The probe reduces whatever it resolved to its base name, so that a descriptor naming a tenanted
+     * delegator still yields the instance's own datasource. A mock whose two names agree is the ordinary
+     * untenanted case and is returned unchanged.
+     *
+     * @param delegator the delegator mock to give an identity to
+     */
+    private static void givenBaseIdentity(Delegator delegator) {
+        when(delegator.getDelegatorName()).thenReturn(DELEGATOR_NAME);
+        when(delegator.getDelegatorBaseName()).thenReturn(DELEGATOR_NAME);
+    }
+
     /** Wires the model reader and the entity helper the readiness count resolves through. */
     private static ModelEntity givenReadinessModel(Delegator delegator) throws Exception {
         ModelReader modelReader = mock(ModelReader.class);
@@ -2792,9 +3036,9 @@ public final class HealthCheckServletTests {
         givenProbePath("/health/ready", null);
         Delegator delegator = delegatorFailingWith(failure);
 
-        try (MockedStatic<WebAppUtil> webAppUtil = mockStatic(WebAppUtil.class);
+        try (MockedStatic<DelegatorFactory> delegatorFactory = mockStatic(DelegatorFactory.class);
                 MockedStatic<Debug> debug = mockStatic(Debug.class)) {
-            webAppUtil.when(() -> WebAppUtil.getDelegator(servletContext)).thenReturn(delegator);
+            delegatorFactory.when(() -> DelegatorFactory.getDelegator(DELEGATOR_NAME)).thenReturn(delegator);
             debug.when(Debug::verboseOn).thenReturn(verbose);
 
             servlet.service(request, response);
@@ -2827,10 +3071,6 @@ public final class HealthCheckServletTests {
     private static void resetReadinessLogState() throws Exception {
         reopenWindow("READINESS_LOG_LAST_AT");
         readinessLogCounter("READINESS_LOG_SUPPRESSED").set(0L);
-        // Each event code owns its window and its suppressed count, so each has to be reset: an empty
-        // schema must not leak into the next test any more than an unavailable datasource may.
-        reopenWindow("READINESS_EMPTY_LOG_LAST_AT");
-        readinessLogCounter("READINESS_EMPTY_LOG_SUPPRESSED").set(0L);
         // The bookkeeping for a probe that could obtain no verdict is separate state, and it must not
         // leak from one test into the next any more than a suppressed log line may.
         reopenWindow("READINESS_SHED_LOG_LAST_AT");
@@ -2962,6 +3202,34 @@ public final class HealthCheckServletTests {
     /** Reports whether the permit that admits one check at a time is currently held. */
     private static boolean readinessCheckPermitHeld() throws Exception {
         return readinessLogCounter("READINESS_CHECK_RUNNING").get() != 0L;
+    }
+
+    /**
+     * Waits for an outstanding readiness check to finish, so a test that let one outlive its probe does
+     * not leave it running past its own teardown.
+     *
+     * <p>The permit is the observable: a check releases it in a {@code finally}, as the last thing it
+     * does, so a released permit means the task has published whatever it was going to publish and has
+     * nothing left to do. That makes it a completion signal for a task the test never held a
+     * {@link java.util.concurrent.Future} for - which is the situation whenever a test drives the
+     * PRODUCTION executor rather than an injected one.
+     *
+     * <p>Polled rather than awaited on a latch because the signal belongs to the servlet, not to the
+     * test: a latch would have to be counted down by production code that has no reason to know a test
+     * is watching. Bounded, and reports rather than throws, so the caller can assert on it and say why.
+     *
+     * @return true if the check finished within {@link #WORKER_TIMEOUT_SECONDS}
+     * @throws Exception if the servlet's state cannot be read, which would mean it had changed shape
+     */
+    private static boolean awaitReadinessCheckCompletion() throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(WORKER_TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            if (!readinessCheckPermitHeld()) {
+                return true;
+            }
+            Thread.sleep(10L);
+        }
+        return !readinessCheckPermitHeld();
     }
 
     /**
@@ -3117,13 +3385,13 @@ public final class HealthCheckServletTests {
         Delegator delegator = mock(Delegator.class);
         ModelEntity modelEntity = givenReadinessModel(delegator);
         AtomicLong datasourceChecks = new AtomicLong(0L);
-        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, null, null, null))
+        when(delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator, modelEntity, READINESS_BOUND, null, null))
                 .thenAnswer(invocation -> {
                     datasourceChecks.incrementAndGet();
                     Thread.sleep(checkMillis);
                     return rows;
                 });
-        when(servletContext.getAttribute("delegator")).thenReturn(delegator);
+        HealthCheckServlet.installBaseDelegatorForTesting(delegator);
         List<HttpServletResponse> responses = new ArrayList<>();
         List<StringWriter> bodies = new ArrayList<>();
         List<Callable<Void>> probeCalls = new ArrayList<>();
@@ -3287,9 +3555,18 @@ public final class HealthCheckServletTests {
         verify(response, never()).sendError(anyInt(), anyString());
         verify(response, never()).sendRedirect(anyString());
 
-        // The endpoint is polled continuously, so it must stay session-free and anonymous.
+        // The endpoint is polled continuously, so it must stay session-free and anonymous. Neither
+        // accessor that CREATES a session is called: not getSession(), and not getSession(true).
+        //
+        // getSession(false) is deliberately permitted, and is called. It is how the endpoint discovers a
+        // session that something in front of it minted for the probe - ControlFilter and ContextFilter
+        // both call getSession() unconditionally, so a webapp that registers this servlet without
+        // HealthProbeFilter puts one there - and having found one, the endpoint invalidates it and
+        // suppresses its cookie rather than leaving a target group's probe to accumulate sessions. The
+        // non-creating form cannot itself bring a session into being, which is the property this asserts;
+        // what the endpoint does with one it finds is asserted directly in its own tests.
         verify(request, never()).getSession();
-        verify(request, never()).getSession(anyBoolean());
+        verify(request, never()).getSession(true);
         verify(request, never()).getUserPrincipal();
         verify(request, never()).getRemoteUser();
         verify(request, never()).isUserInRole(anyString());

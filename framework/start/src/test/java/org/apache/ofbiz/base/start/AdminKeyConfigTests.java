@@ -42,9 +42,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.TimeZone;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
+import org.apache.ofbiz.base.test.ShellDriver;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -421,6 +421,79 @@ public final class AdminKeyConfigTests {
                 "a flat config/start.properties must not be written");
     }
 
+    /**
+     * The shared secret reaches the mode 0600 override and NOTHING ELSE - in particular not the source-tree
+     * {@code start.properties} in the image's writable layer.
+     *
+     * <p>The override under {@code /ofbiz/config} is the authoritative copy: {@link Config} reads the
+     * resource package qualified, so that file is what the JVM resolves, and
+     * {@code docker/send_ofbiz_stop_signal.sh} consults {@code OFBIZ_ADMIN_KEY} first and then exactly that
+     * path. A second copy in the source tree is therefore redundant, and it is redundant in the one place
+     * where it is most exposed: {@code /ofbiz} is the image's writable layer rather than a declared volume,
+     * so {@code docker commit}, {@code docker export} and any layer-diffing scan capture a live production
+     * secret from an image that is expected to contain none, while the override lives on a volume those
+     * operations do not include.</p>
+     *
+     * <p>The second leg is the upgrade path, and it is why writing nothing is not sufficient on its own. A
+     * container started from a persistent {@code /ofbiz} that an EARLIER version of this image wrote already
+     * has the key in the source-tree copy, and simply not writing it again would leave that copy in place
+     * for the rest of the container's life. The active declaration is therefore returned to the commented
+     * anchor the distribution ships, the removal is verified, and a removal that cannot be performed aborts
+     * the start rather than reporting success - the key would otherwise stay in the writable layer while the
+     * log claimed it had been withdrawn.</p>
+     *
+     * @param tempDir a per-test temporary directory
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    @Test
+    public void theSharedSecretIsNeverPersistedIntoTheSourceTreeAndAnOlderCopyIsWithdrawn(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareEntryPointSandbox(tempDir);
+        Path shipped = sandbox.resolve(START_PROPERTIES);
+
+        EntryPointRun run = renderAdminKeyConfiguration(tempDir, sandbox,
+                Map.of("OFBIZ_PROFILE", "prod", "OFBIZ_ADMIN_KEY", INJECTED_KEY));
+
+        assertEquals(0, run.getExitCode(), "the render must succeed, output was:\n" + run.getOutput());
+        assertEquals(INJECTED_KEY, loadProperties(sandbox.resolve(ADMIN_KEY_OVERRIDE)).getProperty(ADMIN_KEY_PROPERTY),
+                "the authoritative override must carry the supplied key");
+        String sourceTree = Files.readString(shipped, StandardCharsets.UTF_8);
+        assertFalse(sourceTree.contains(INJECTED_KEY),
+                "the shared secret must not be written into the image's writable layer, file was:\n" + sourceTree);
+        assertTrue(sourceTree.contains(ANCHOR_LINE),
+                "the source-tree copy must still carry the shipped commented anchor, file was:\n" + sourceTree);
+        assertNull(loadProperties(shipped).getProperty(ADMIN_KEY_PROPERTY),
+                "the source-tree copy must declare no admin key at all");
+
+        // The upgrade leg: a live key an earlier version of this image wrote is withdrawn, not tolerated.
+        String legacyKey = "legacy/Key+From$AnOlderImage";
+        Files.writeString(shipped, sourceTree.replace(ANCHOR_LINE, ADMIN_KEY_PROPERTY + "=" + legacyKey),
+                StandardCharsets.UTF_8);
+
+        EntryPointRun upgraded = renderAdminKeyConfiguration(tempDir, sandbox,
+                Map.of("OFBIZ_PROFILE", "prod", "OFBIZ_ADMIN_KEY", INJECTED_KEY));
+
+        assertEquals(0, upgraded.getExitCode(),
+                "a container upgraded over an older /ofbiz must still start, output was:\n" + upgraded.getOutput());
+        String withdrawn = Files.readString(shipped, StandardCharsets.UTF_8);
+        assertFalse(withdrawn.contains(legacyKey),
+                "the key an older image left in the source tree must be withdrawn, file was:\n" + withdrawn);
+        assertTrue(withdrawn.contains(ANCHOR_LINE),
+                "the withdrawal must restore the commented anchor rather than delete the line, file was:\n"
+                        + withdrawn);
+        assertNull(loadProperties(shipped).getProperty(ADMIN_KEY_PROPERTY),
+                "the source-tree copy must declare no admin key after the withdrawal");
+        assertEquals(SHIPPED_ADMIN_PORT, loadProperties(shipped).getProperty(ADMIN_PORT_PROPERTY),
+                "withdrawing the key must not disturb the active ofbiz.admin.port assignment");
+        assertTrue(upgraded.getOutput().contains(START_PROPERTIES),
+                "the withdrawal must be reported and must name the file, output was:\n" + upgraded.getOutput());
+        assertFalse(upgraded.getOutput().contains(legacyKey),
+                "the withdrawn key must not be echoed, output was:\n" + upgraded.getOutput());
+        assertEquals(INJECTED_KEY, loadProperties(sandbox.resolve(ADMIN_KEY_OVERRIDE)).getProperty(ADMIN_KEY_PROPERTY),
+                "the override must still carry the supplied key after the withdrawal");
+    }
+
     @Test
     public void entryPointGeneratesAStableAdminKeyInTheDevProfile(@TempDir Path tempDir) throws Exception {
         assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
@@ -545,17 +618,20 @@ public final class AdminKeyConfigTests {
      * later start to load in preference to the committed defaults - a start that supplies no configuration
      * at all would otherwise run on a value that has already been refused.</p>
      *
-     * <p>That reasoning stops at {@code start.properties} itself, which is the one file verified here that
-     * the entry point does not own. It is rendered from ITSELF, because it is what {@code bin/ofbiz} reads
-     * to authenticate a shutdown request, and it is also the anchor every one of these renders is built
-     * from. Deleting it would destroy that anchor: the next start would abort on a missing source file
-     * rather than on the real problem, and recovery would mean restoring a distribution file instead of
-     * correcting the environment. Nothing reads the rejected value in the meantime, because every caller
-     * aborts the start immediately afterwards - so the removal buys nothing here and costs the anchor.</p>
+     * <p>That reasoning stops at {@code start.properties} itself, which the entry point does not own. It is
+     * the ANCHOR every one of these renders is built from, and the only file outside {@code config/} the
+     * script writes at all - {@code restore_source_admin_key_anchor} renders it from itself to comment out
+     * an active {@code ofbiz.admin.key} an older version of this image left behind. Deleting it would
+     * destroy that anchor: the next start would abort on a missing source file rather than on the real
+     * problem, and recovery would mean restoring a distribution file instead of correcting the environment.
+     * Nothing reads the rejected value in the meantime, because every caller aborts the start immediately
+     * afterwards - so the removal buys nothing here and costs the anchor.</p>
      *
-     * <p>The two verifiers are driven directly rather than through {@code render_admin_key_configuration}.
-     * The renderer writes both destinations from a single sed program and checks the override first, so the
-     * two files always carry the same content and can only be told apart by naming the one under test.</p>
+     * <p>The two verifiers are driven directly rather than through {@code render_admin_key_configuration},
+     * which verifies only the override it renders. Driving them directly is what lets the rule be asserted
+     * for BOTH kinds of subject from one place: the scoping is a property of
+     * {@code discard_untrustworthy_render} itself, so it has to hold for any file a future verification is
+     * pointed at, not only for the one destination the renderer happens to have today.</p>
      *
      * @param tempDir a per-test temporary directory
      * @throws Exception if the entry point cannot be read or the shell cannot be run
@@ -976,26 +1052,17 @@ public final class AdminKeyConfigTests {
                 + "cd " + shellQuote(sandbox) + " || exit 1\n"
                 + invocation + "\n", StandardCharsets.UTF_8);
 
-        ProcessBuilder builder = new ProcessBuilder("bash", driver.toString());
-        builder.directory(sandbox.toFile());
-        builder.redirectErrorStream(true);
-        Map<String, String> processEnvironment = builder.environment();
-        // Both routes to tracing are scrubbed, because stderr is merged into the stream these tests
-        // assert against and a value exported into the build's own environment must not be able to turn
-        // tracing on inside a case that did not ask for it. SHELLOPTS is read by bash at start up, so an
-        // inherited value containing xtrace would switch tracing on before the entry point is even
-        // sourced; OFBIZ_TRACE is the entry point's own switch. A case that WANTS tracing puts it back
-        // through the environment map below.
-        for (String name : List.of("SHELLOPTS", "OFBIZ_TRACE", "OFBIZ_PROFILE", "OFBIZ_ADMIN_KEY",
-                "OFBIZ_LOGIN_SECRET_KEY", "OFBIZ_JWT_TOKEN_KEY", "OFBIZ_HOST")) {
-            processEnvironment.remove(name);
-        }
-        processEnvironment.putAll(environment);
-
-        Process process = builder.start();
-        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertTrue(process.waitFor(120, TimeUnit.SECONDS), "the entry point renderer did not terminate");
-        return new EntryPointRun(process.exitValue(), output);
+        // Both routes to tracing are scrubbed by the shared driver, because stderr is merged into the
+        // stream these tests assert against and a value exported into the build's own environment must not
+        // be able to turn tracing on inside a case that did not ask for it: it drops SHELLOPTS and BASHOPTS,
+        // which bash reads at start up, along with every OFBIZ_ variable including the entry point's own
+        // OFBIZ_TRACE switch. A case that WANTS tracing puts it back through the environment map.
+        //
+        // It also waits on the process before collecting its output, and destroys a child that outruns its
+        // deadline; draining first, as this used to, made the deadline unreachable.
+        ShellDriver.Run run = ShellDriver.run(driver, sandbox, environment);
+        assertFalse(run.timedOut(), "the entry point renderer did not terminate, output was:\n" + run.output());
+        return new EntryPointRun(run.exitCode(), run.output());
     }
 
     /**
@@ -1016,26 +1083,23 @@ public final class AdminKeyConfigTests {
                 + "cat > " + shellQuote(payloadFile) + "\n", StandardCharsets.UTF_8);
         assertTrue(stub.toFile().setExecutable(true), "could not make the curl stub executable");
 
-        ProcessBuilder builder = new ProcessBuilder("bash", repositoryRoot().resolve(STOP_SCRIPT).toString());
-        builder.directory(repositoryRoot().toFile());
-        builder.redirectErrorStream(true);
-        Map<String, String> environment = builder.environment();
+        Map<String, String> environment = new LinkedHashMap<>();
         environment.put("PATH", binDir + java.io.File.pathSeparator + System.getenv("PATH"));
         environment.put("OFBIZ_START_PROPERTIES", startProperties.toString());
-        if (injectedKey == null) {
-            environment.remove("OFBIZ_ADMIN_KEY");
-        } else {
+        // No explicit removal of OFBIZ_ADMIN_KEY for the null case: the shared driver drops every inherited
+        // OFBIZ_ variable before applying this map, so "not supplied" really is not supplied.
+        if (injectedKey != null) {
             environment.put("OFBIZ_ADMIN_KEY", injectedKey);
         }
 
-        Process process = builder.start();
-        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertTrue(process.waitFor(120, TimeUnit.SECONDS), "the stop script did not terminate");
+        ShellDriver.Run run = ShellDriver.run(repositoryRoot().resolve(STOP_SCRIPT), repositoryRoot(), environment);
+        assertFalse(run.timedOut(), "the stop script did not terminate, output was:\n" + run.output());
+        String output = run.output();
         String payload = Files.exists(payloadFile)
                 ? Files.readString(payloadFile, StandardCharsets.UTF_8).stripTrailing()
                 : null;
         String arguments = Files.exists(argumentsFile) ? Files.readString(argumentsFile, StandardCharsets.UTF_8) : null;
-        return new StopScriptRun(process.exitValue(), output, payload, arguments);
+        return new StopScriptRun(run.exitCode(), output, payload, arguments);
     }
 
     /** Single-quotes a path for safe interpolation into the generated stub. */
@@ -1051,16 +1115,16 @@ public final class AdminKeyConfigTests {
         return properties;
     }
 
+    /**
+     * Whether a POSIX shell can be executed, so the shell-driven assertions can be skipped if not.
+     *
+     * <p>Delegated to the shared driver rather than repeated: this probe has to start a process, wait
+     * for it and close its output, and every copy of it was one more place to get that wrong.
+     *
+     * @return true when {@code bash} can be run
+     */
     private static boolean isBashAvailable() {
-        try {
-            Process process = new ProcessBuilder("bash", "-c", "exit 0").start();
-            return process.waitFor(60, TimeUnit.SECONDS) && process.exitValue() == 0;
-        } catch (IOException e) {
-            return false;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
+        return ShellDriver.isBashAvailable();
     }
 
     private static Path repositoryRoot() {

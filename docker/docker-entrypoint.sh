@@ -59,6 +59,8 @@
 # OFBIZ_PROFILE
 # OFBIZ_SKIP_INIT
 # OFBIZ_SCHEMA_INIT
+# OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING
+# OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED
 # OFBIZ_DATA_LOAD
 # OFBIZ_DISABLE_COMPONENTS
 # OFBIZ_HOOK_SECRET_ALLOWLIST
@@ -105,8 +107,8 @@
 # OFBIZ_DB_POOL_MAX
 # OFBIZ_DB_POOL_WAIT
 # OFBIZ_DB_POOL_TEST_ON_BORROW
-# OFBIZ_DB_FLEET_SIZE
-# OFBIZ_DB_MAX_CONNECTIONS
+# OFBIZ_DB_FLEET_SIZE            (mandatory in the prod profile - see require_fleet_capacity_inputs)
+# OFBIZ_DB_MAX_CONNECTIONS       (mandatory in the prod profile - see require_fleet_capacity_inputs)
 #
 # Schema-initialisation identity. Read only by an OFBIZ_SCHEMA_INIT=true run, so that the roles the
 # fleet serves with need no privilege to create, alter or drop anything. Setting check-on-start and
@@ -123,7 +125,9 @@
 # profile, because the services that carry the invalidations are dispatched over JMS and a dispatch with
 # no active serviceMessenger rolls back the entity write that triggered it. Either let the OFBIZ_JMS_
 # names below render config/serviceengine.xml and config/jndi.properties, or supply
-# config/serviceengine.xml directly.
+# config/serviceengine.xml directly. In the prod profile the transport must be TLS, must verify the
+# broker's hostname, must authenticate, and its topic must be acknowledged as least-privilege - see
+# require_secure_jms_transport - whichever of those two ways it is configured.
 # OFBIZ_DISTRIBUTED_CACHE_CLEAR
 # OFBIZ_JMS_INITIAL_CONTEXT_FACTORY
 # OFBIZ_JMS_PROVIDER_URL
@@ -133,6 +137,8 @@
 # OFBIZ_JMS_USERNAME
 # OFBIZ_JMS_PASSWORD
 # OFBIZ_JMS_CONNECT_TIMEOUT
+# OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION
+# OFBIZ_JMS_TOPIC_ACL_ACKNOWLEDGED
 #
 # Load balancer and reverse proxy. Each of these restores the committed value when it is not supplied,
 # so withdrawing one from a restarted container really does withdraw the setting rather than leave the
@@ -278,6 +284,17 @@ ADMIN_MARKER_DEMO_PAYLOAD='admin=demo-data'
 # database", and so an init run is recorded separately from the generic data_loaded state.
 CONTAINER_SCHEMA_INITIALISED="$CONTAINER_STATE_DIR/schema_initialised"
 
+# The file whose kernel lock makes the schema initialisation single-flight, and the descriptor the lock is
+# held on. See acquire_schema_init_lock for what this does and does not exclude.
+#
+# It is a lock file rather than a lock directory because flock's lock lives in the kernel, attached to the
+# open file, and is therefore released when the holding process exits for ANY reason - including SIGKILL,
+# which no trap can catch. A mkdir-based lock would survive that and leave a stale lock that the next init
+# job would have to guess about, and guessing wrong in either direction is worse than the race: reclaim it
+# too eagerly and the lock excludes nothing, too cautiously and a legitimate retry can never run.
+CONTAINER_SCHEMA_INIT_LOCK="$CONTAINER_STATE_DIR/schema_init.lock"
+SCHEMA_INIT_LOCK_FD=""
+
 # Identifies THIS execution of the entry point. The schema-init receipt records it, and the exit check
 # requires the receipt to carry exactly this value, so a receipt left by an earlier run - or by a run
 # against a different database - can never be mistaken for evidence that this run did the work. The PID
@@ -362,15 +379,86 @@ SCHEMA_INIT_DDL_FAILURE_SIGNATURES=(
 # statement from the database catalogue that the applying pass did not finish the job.
 #
 # Deliberately limited to tables and columns. The engine's foreign key and index residuals - "No
-# Foreign Key Constraint [x] found" and "No Index [x] found" - are NOT completeness evidence: they are
-# governed by the three check-*-on-start flags that ship disabled, and DatabaseUtil's own source
-# records that the foreign key comparison "ISN'T working for Postgres or MySQL", so treating them as
-# failures would make a correctly initialised PostgreSQL database look incomplete. Table and column
-# presence, by contrast, is read straight from the catalogue through getTableNames and getColumnInfo,
-# which is exactly what the fleet needs to be true before it serves a request.
+# Foreign Key Constraint [x] found" and "No Index [x] found" - are NOT completeness evidence, and that
+# is MEASURED rather than inferred from the comment in DatabaseUtil that says its foreign key
+# comparison "ISN'T working for Postgres or MySQL". A full initialisation was run against PostgreSQL
+# 13.23 with pgJDBC 42.7.13 and the three check-*-on-start flags forced on. The database ended up
+# holding 865 tables, 1970 foreign key constraints and 4600 indexes - the engine's own per group
+# summaries reported "==== TOTAL Foreign Keys Created: 1956/9/5" - and yet the same run logged
+# "There are 0 indices in the database", 1970 "No Foreign Key Constraint [" residuals and 3940
+# "Could not create foreign key " failures, because the comparison looks for upper case object names in
+# a catalogue that stores them in lower case. Treating either residual as evidence would therefore fail
+# every correct initialisation of this image. Table and column presence, by contrast, is read straight
+# from the catalogue through getTableNames and getColumnInfo, and the same run logged not one of these
+# residuals in its verifying pass.
 SCHEMA_INIT_RESIDUAL_SIGNATURES=(
   '] has no table in the database'
   '] is missing its corresponding '
+)
+
+# The schema is present but does NOT MATCH THE ENTITY MODEL. Every one of these is a comparison
+# DatabaseUtil performs between the model and the live catalogue, per column, using the same
+# getColumnInfo read that the residual signatures above rely on - so they are exactly as trustworthy,
+# and until now they were ignored. A verifying pass that reports any of them has proved that the
+# database is NOT the one the entity model describes: the engine's generated SQL would read or write a
+# column whose type, width, scale or key membership is not what the model says, which fails at runtime,
+# silently truncates, or - for a primary key - lets duplicate business keys in.
+#
+# All four are refused unconditionally, with no operator override, because none of them can be harmless:
+# a column of the wrong type is wrong in every deployment. That they cannot fire on a correct schema is
+# measured, not assumed - the live PostgreSQL 13.23 initialisation described above logged ZERO
+# occurrences of all four across 865 entities and 8970 fields, in both passes.
+#
+# THE PRIMARY KEY COMPARISON IS DELIBERATELY NOT AMONG THEM, and that decision is the reason this list
+# was measured before it was written. DatabaseUtil does compare primary key membership, in both
+# directions - check-pks-on-start defaults to TRUE in entity-config.xsd, so the messages are emitted
+# without any configuration at all - but on PostgreSQL it has nothing to compare against. In the same
+# live initialisation, the verifying pass logged "Reviewed 0 primary key fields from database." for each
+# of the three databases, having first asked getPrimaryKeys with a "%" table name and then fallen back to
+# asking for each of the 852 tables individually, and it then reported, 1691 times - once for very nearly
+# every primary key column in the model -
+#   "IS NOT a primary key in the database, but IS a primary key in the entity definition"
+# The message is quoted in full, on one line, because the exclusion is counter-intuitive and this
+# measurement is the whole of its justification; the build's gating test reads it back from here. The catalogue meanwhile held 852 primary key constraints over 1674
+# columns, every one of them created by that same run. The comparison reads nothing, exactly as the
+# foreign key and index comparison reads nothing, so treating its output as evidence would refuse every
+# correct initialisation of this image. Primary key correctness is established instead the only way that
+# is available here: by proving the schema was created from the entity model by this run - see
+# schema_init_freshness_verdict.
+#
+# EACH FRAGMENT IS ALSO CONTIGUOUS IN THE ENGINE SOURCE, not merely in the message the engine prints.
+# DatabaseUtil builds these messages by concatenation - "...] is of type [" + typeName + "] in the
+# database, but is " + "defined as type [" - so a fragment that spans one of those joins exists only at
+# run time and could not be pinned to the class that emits it. The build's gating test requires every
+# fragment here to appear inside a string literal of DatabaseUtil.java, which is what makes a rewording
+# upstream a failed build instead of a refusal that silently stops firing.
+SCHEMA_INIT_MISMATCH_SIGNATURES=(
+  '] is of type ['
+  'but is defined to have a column size of ['
+  'but is defined to have a decimalDigits of ['
+  '] which is not found in the field type definitions'
+)
+
+# The schema carries something the entity model does not describe, and whether that is harmless CANNOT
+# BE DECIDED from anything the engine reports.
+#
+# A column the model has no field for is harmless if it is nullable or has a default - the engine names
+# every column it writes, so it simply never mentions that one - and it breaks EVERY insert into that
+# table if it is NOT NULL without a default, because the engine will not supply a value for it.
+# DatabaseUtil captures the nullability of every column it reads (ColumnCheckInfo.isNullable) and never
+# compares it or logs it, and the entity engine is outside this refactor's scope, so this execution has
+# no way to tell the two apart. The field-count difference is the same fact reached from the other side.
+#
+# Refused by default and waived only by OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true, which is the operator
+# stating that the difference is deliberate - most often a field withdrawn from the model by an upgrade,
+# whose column the engine never drops. The waiver is announced in the log every time it is used, and it
+# does not weaken SCHEMA_INIT_MISMATCH_SIGNATURES above.
+#
+# An extra TABLE is deliberately NOT here: the engine names every table it uses, so a table no entity
+# describes cannot affect a single statement it issues.
+SCHEMA_INIT_UNPROVEN_SIGNATURES=(
+  'exists in the database but has no corresponding field'
+  ' fields but table ['
 )
 
 # Secrets generated by this script when OFBIZ_PROFILE=dev and the operator supplied none. Storing
@@ -389,6 +477,16 @@ LIB_EXTRA_DIR="/ofbiz/lib-extra"
 # separate edits target it: the connector address insertion and the three Objective 5 rewrites.
 CATALINA_COMPONENT_DESCRIPTOR="/ofbiz/framework/catalina/ofbiz-component.xml"
 
+# The OFBiz installation root, and the boundary every path in OFBIZ_DISABLE_COMPONENTS must resolve
+# inside. Held as a constant rather than written into each path, because the containment check in
+# require_component_descriptor_path compares against it: a boundary that is spelt out at each use site is
+# one that can be spelt differently at one of them. The stylesheet is named relative to it for the same
+# reason - the two always belong to the same installation.
+# Named without the OFBIZ_ prefix on purpose: that namespace is the operator-facing environment in this
+# script, and this is an internal constant no deployment sets.
+COMPONENT_ROOT_DIR="/ofbiz"
+DISABLE_COMPONENT_STYLESHEET="$COMPONENT_ROOT_DIR/disable-component.xslt"
+
 # The values the committed descriptor declares for the three load-balancer properties.
 #
 # They are held here, and written back whenever the corresponding variable is absent, because this
@@ -404,6 +502,22 @@ CATALINA_COMPONENT_DESCRIPTOR="/ofbiz/framework/catalina/ofbiz-component.xml"
 # third state the descriptor never has in the repository.
 CATALINA_DEFAULT_JVM_ROUTE="jvm1"
 CATALINA_DEFAULT_SSL_ACCELERATOR_PORT=""
+
+###############################################################################
+# The port offset the OFBiz command this container was given asks for, resolved by resolve_port_offset.
+#
+# It exists because a connector port declared in the Catalina descriptor is NOT the port the instance
+# listens on. CatalinaContainer binds each connector at 'declared + Start.getInstance().getConfig()
+# .getPortOffset()', while SslAcceleratorValve compares request.getLocalPort() against the
+# ssl-accelerator-port property with NO offset applied. So with '--portoffset=100' a descriptor declaring
+# 8080 listens on 8180, and the only value of ssl-accelerator-port that can ever match is 8180 - which is
+# also the port the load balancer's target group is pointed at, and therefore the port an operator
+# naturally supplies. Validating against the declared 8080 accepted the one value that could not work and
+# refused the one that could, so with any nonzero offset no accepted value marked a single request secure.
+#
+# Zero is the value for every container that passes no offset, and every comparison below reduces to the
+# declared port in that case, so the ordinary deployment is unaffected.
+RESOLVED_PORT_OFFSET="0"
 CATALINA_DEFAULT_CROSS_SUBDOMAIN_SESSIONS="false"
 
 # The two container blocks the descriptor declares. Every edit below is confined to the production one:
@@ -427,6 +541,29 @@ CATALINA_CONNECTOR_ADDRESS_ANCHOR='<property name="address" value='
 ENTITY_ENGINE_SOURCE="framework/entity/config/entityengine.xml"
 ENTITY_ENGINE_TEMPLATE="templates/postgres-entityengine.xml"
 ENTITY_ENGINE_OVERRIDE="config/entityengine.xml"
+
+# The ownership marker every entity engine configuration THIS SCRIPT renders carries, and the only thing
+# that entitles this script to replace or delete the file at ENTITY_ENGINE_OVERRIDE.
+#
+# WHY OWNERSHIP HAS TO BE RECORDED IN THE FILE. /ofbiz/config is a declared volume and it precedes
+# ofbiz.jar on the class path, which is exactly why the documented way to run OFBiz against a database
+# this image does not parameterise - MySQL, Oracle, or PostgreSQL with pgJDBC properties the template
+# does not carry - is to mount an entityengine.xml there and leave OFBIZ_POSTGRES_HOST unset
+# (framework/entity/config/entityengine.xml states that contract next to the localpostgres* definitions).
+# That is the same path this script renders into, so "a file is present at ENTITY_ENGINE_OVERRIDE" has two
+# completely different meanings: a render this script owns and must keep current, or a deployment's own
+# configuration that it must not touch. Without a marker the two are indistinguishable and the script
+# deleted both, which silently withdrew the operator's database configuration and started the fleet on the
+# committed embedded H2 file instead.
+#
+# The marker is a comment, so it changes nothing about how the Entity Engine reads the file, and it is
+# inserted immediately after the XML declaration by both renderers. It is deliberately not a separate
+# sidecar file: a sidecar can be lost, copied or left behind independently of the file it describes,
+# whereas a marker inside the artifact travels with it and cannot outlive it.
+ENTITY_ENGINE_GENERATED_MARKER="OFBIZ-CONTAINER-GENERATED-ENTITY-ENGINE-CONFIGURATION"
+# The comment inserted into every render. The wording is addressed to whoever finds the file on the
+# volume, because that is the only context in which it is ever read.
+ENTITY_ENGINE_GENERATED_COMMENT="<!-- $ENTITY_ENGINE_GENERATED_MARKER: rendered by docker/docker-entrypoint.sh on container start. Every edit made here is discarded on the next start; configure the deployment through the documented environment variables instead. To supply your own entity engine configuration, remove this file, mount your own entityengine.xml at this path WITHOUT this marker comment, and leave OFBIZ_POSTGRES_HOST and OFBIZ_DISTRIBUTED_CACHE_CLEAR unset - an unmarked file is treated as yours and is never replaced or removed. See DOCKER.adoc. -->"
 
 # The delegators whose cache-clear flag OFBIZ_DISTRIBUTED_CACHE_CLEAR applies to. "test" is excluded on
 # purpose: it is the single-JVM integration-test delegator, so it must neither publish nor consume
@@ -549,20 +686,42 @@ JNDI_SERVERS_CANDIDATES=(
 # into. Java expands the 'dir/*' form itself, so the entries must stay quoted wherever this is used.
 TRANSPORT_CLASS_PATH="lib/*:lib-extra/*"
 
-# Marker written into every file this script generates under /ofbiz/config for the transport, and the
-# reason it exists. /ofbiz/config is a declared VOLUME, so a render performed by an earlier start
-# outlives the container: withdrawing the transport variables has to REMOVE the override, or the
-# instance keeps publishing invalidations to a broker nobody configured any more. But an operator is
-# equally entitled to author config/serviceengine.xml by hand - that has always been the supported way
-# to supply a JMS provider - and such a file must never be deleted. The marker is what distinguishes the
-# two: only a file carrying it is ever removed.
-RENDERED_TRANSPORT_MARKER='GENERATED BY docker-entrypoint.sh - DO NOT EDIT'
+# Marker written into every file this script generates under /ofbiz/config that it must later be able to
+# REMOVE, and the reason it exists. /ofbiz/config is a declared VOLUME, so a render performed by an
+# earlier start outlives the container: withdrawing the variables that produced an override has to remove
+# it, or the instance keeps running on configuration nobody asks for any more - publishing invalidations
+# to a decommissioned broker, or connecting to a database that has since been destroyed. But an operator
+# is equally entitled to author config/serviceengine.xml or config/entityengine.xml by hand - that has
+# always been the supported way to supply a JMS provider, and the documented way to state a JDBC
+# parameter this image does not template - and such a file must never be deleted. The marker is what
+# distinguishes the two: only a file carrying it is ever removed, and a file NOT carrying it is never
+# rendered over.
+#
+# One text for both groups, deliberately, so an operator who opens either file reads the same notice. The
+# two names below exist because the groups are removed by different functions at different points, not
+# because the marker differs.
+RENDERED_FILE_MARKER='GENERATED BY docker-entrypoint.sh - DO NOT EDIT'
+RENDERED_TRANSPORT_MARKER="$RENDERED_FILE_MARKER"
+RENDERED_ENTITY_ENGINE_MARKER="$RENDERED_FILE_MARKER"
 
 # The jms-service name the entityext cache-clear services are wired to. All five distributed cache
 # services in framework/entityext/servicedef/services.xml are declared engine="jms"
 # location="serviceMessenger", so the element this script renders MUST carry exactly that name. It is not
 # configurable, because changing it would disconnect the transport from the services that use it.
 JMS_SERVICE_NAME='serviceMessenger'
+
+# The send-mode the rendered jms-service carries, and it is not configurable either.
+#
+# JmsServiceEngine.serverList accepts exactly two values: "none" yields no server and therefore publishes
+# nothing, and "all" yields every server declared on the element. Anything else raises. So "all" is not a
+# preference, it is the only setting under which an invalidation is actually published to the broker.
+#
+# HealthCheckServlet reads the same attribute when it decides whether the cache transport is ready: an
+# element that is not send-mode="all" with at least one server is reported as a publisher that cannot
+# send, and the instance is held out of the load balancer. The rendered value and the readiness contract
+# therefore have to agree, which is why require_rendered_transport_declarations verifies it rather than
+# trusting the substitution.
+JMS_SEND_MODE='all'
 
 # The jndi-server the rendered jms-service names, and the shipped name it deliberately is NOT.
 #
@@ -636,10 +795,26 @@ DB_POOL_WAIT_MAX=300000
 # subtracted from the stated max_connections before the comparison, for the slots PostgreSQL keeps for
 # superusers, for the one-shot schema-init execution and for operational tooling - a fleet that fills
 # the server to exactly max_connections leaves an operator no way in to diagnose it.
+# The default applies to the dev profile only. In prod BOTH inputs are mandatory - see
+# require_fleet_capacity_inputs - because a default of one instance makes the capacity arithmetic report a
+# conclusion about a fleet that does not exist: six replicas each allowed the default pool maximum demand
+# 6 x 250 x 3 = 4500 connections, and validating them as though there were one instance passes a
+# configuration that exhausts any ordinary managed database the moment the second replica starts.
 DB_FLEET_SIZE_DEFAULT=1
 DB_FLEET_SIZE_LIMIT=1000
 DB_MAX_CONNECTIONS_LIMIT=100000
 DB_CONNECTION_RESERVE=10
+
+# The share of the usable capacity above which the fleet's demand is reported even though it fits.
+#
+# Fitting is not the same as having headroom, and three ordinary events consume the difference: a rolling
+# deployment briefly runs more instances than the steady-state replica count, the one-shot schema-init
+# execution opens its own connections, and an operator diagnosing a saturated database needs a session of
+# their own. A fleet sized to 95% of usable capacity satisfies the hard check and then fails the first
+# time any of those happens, which is the failure this alert exists to pre-empt. It is a warning rather
+# than a refusal because the arithmetic is legitimate - it is the headroom that is thin, and how much
+# headroom a deployment needs is the operator's decision, not this script's.
+DB_CAPACITY_ALERT_PERCENT=75
 
 # The pgJDBC network deadlines, their defaults and the ranges accepted. Every one of these is in
 # SECONDS, which is the unit pgJDBC uses for all of them.
@@ -705,12 +880,20 @@ CONTENT_PROPERTIES_SOURCE="applications/content/config/content.properties"
 CONTENT_PROPERTIES_OVERRIDE="config/content.properties"
 
 # The storage backends ContentStoreFactory recognises, and the one an unconfigured deployment gets.
-# ContentStoreFactory compares the configured value case-insensitively after trimming it, and an
-# unrecognised value is logged as a warning and then treated as the database default rather than
-# refused - a mis-spelled provider must never stop a fleet member from starting. This script mirrors
-# that contract exactly: a value outside this set is reported here as a warning and rendered as
-# 'database', so the entry point and the factory reach the same decision from the same input.
-# The set therefore serves as the vocabulary the warning quotes, not as an admission gate.
+#
+# ContentStoreFactory compares the configured value case-insensitively after trimming it, defaults an
+# ABSENT or BLANK selector to the database backend, and REFUSES anything else - naming the value, the
+# property and this set - rather than falling back. This script mirrors that contract exactly, so the
+# entry point and the factory reach the same decision from the same input, and the set is an admission
+# gate on both sides.
+#
+# Falling back on a value the operator did spell out is the one thing neither layer may do: which backend
+# holds durable content is not a detail an instance may decide for itself. 'OFBIZ_CONTENT_STORE_PROVIDER=S£'
+# accepted as 'database' means uploads land on the instance's own filesystem while the deployment believes
+# they are in the object store, and content written to the wrong backend is not something a later restart
+# can put right - the container is replaced and the content is gone. A refusal at start up costs one
+# legible error; the fallback costs data. An ABSENT selector is different in kind and still defaults,
+# because that is the unconfigured checkout the whole design keeps working.
 CONTENT_STORE_PROVIDERS=(database filesystem s3)
 CONTENT_STORE_DEFAULT_PROVIDER='database'
 
@@ -819,6 +1002,79 @@ POSTGRES_SSL_DEFAULT_MODE='verify-full'
 
 OFBIZ_PROFILES=(dev prod)
 
+# Transport policy for the cache-invalidation broker in the prod profile.
+#
+# This transport is not a side channel. It carries the entity name and primary key of every cached row
+# a write invalidates, and each message is dispatched into the generic service listener as a service
+# invocation, so whoever can publish to the topic can move the fleet's caches - and whoever can read it
+# watches the deployment's write traffic go past. A plaintext, anonymous broker connection is therefore
+# not "internal network only": it is an unauthenticated remote-invocation channel.
+#
+# TLS schemes accepted on every endpoint. The list is by scheme rather than by broker product because a
+# scheme is what the client library actually keys its socket factory on. The Artemis-style spelling -
+# tcp:// with sslEnabled=true in the query - is accepted separately, per endpoint, further down.
+JMS_TLS_SCHEMES=(ssl tls ssl+nio nio+ssl amqps amqpwss mqtts wss https stomp+ssl stomp+nio+ssl)
+
+# Wrappers that introduce a LIST of endpoints rather than an endpoint. Each one is unwrapped so that
+# every member of a failover list is held to the same policy - a list whose first member is TLS and whose
+# second is plaintext fails over from a secure connection to an insecure one on the first broker restart,
+# which is the moment nobody is watching.
+JMS_URL_WRAPPERS=(failover discovery fanout masterslave)
+
+# How a query parameter spells on and off. Both vocabularies are needed because the policy reads the same
+# concern in both directions: 'verifyHost=false' disables it and 'verifyHost=true' enables it.
+JMS_TRUE_VALUES=(true 1 yes on)
+JMS_FALSE_VALUES=(false 0 no off)
+
+# Verification parameters are classified BY SHAPE rather than enumerated by exact spelling.
+#
+# An enumeration was the first attempt and it is the wrong instrument: every broker family spells this
+# differently, options nest behind arbitrary prefixes ('socket.', 'transport.', 'nested.', 'daemon.'), and
+# a name this script has not heard of is waved through - which is a policy that silently does not apply.
+# 'sslDisableHostnameVerification=true' is a real ActiveMQ and Artemis option that no reasonable list of
+# 'name=value' literals contains. Matching the SHAPE of the parameter instead means an unfamiliar spelling
+# of a familiar idea is still caught, and the classifier is the same one in both directions.
+#
+# Names that identify a parameter as being about verifying the peer at all. Deliberately narrow: 'hostname'
+# and 'cert' on their own are NOT here, because 'hostname=broker' and 'certAlias=x' are ordinary settings.
+JMS_VERIFICATION_MARKERS=(verif hostnamecheck checkhostname checkserveridentity serveridentitycheck)
+
+# Names that negate whatever else they mention, so that TRUE means off and FALSE means on.
+JMS_NEGATION_MARKERS=(disable skip ignore nocheck noverif nohostname without)
+
+# The broader set a negated name may be about. 'disableCertificateValidation=true' and
+# 'sslDisableHostnameVerification=true' both have to be caught, and both only make sense together with a
+# negation, which is why 'hostname' and 'cert' are usable here but not above.
+JMS_NEGATABLE_MARKERS=(verif hostname cert validation serveridentity trust)
+
+# Names that switch off certificate checking wholesale when they are TRUE. Trusting every certificate is
+# not verification with a wider trust anchor, it is no verification.
+JMS_TRUST_EVERYTHING_MARKERS=(trustall allowall acceptany trustany allowselfsigned insecure ignoressl
+  ignorecert nocerts)
+
+# The JSSE spelling, which is a value rather than a switch: an EMPTY or 'none' endpoint identification
+# algorithm is exactly how hostname verification is turned off on a JSSE-based client, and any other value
+# ('https', 'ldaps') is how it is turned on.
+JMS_JSSE_IDENTIFICATION_MARKER='endpointidentification'
+
+# Spellings named in the refusal message as examples of what would satisfy the requirement. This is a
+# message aid only - the classifier above accepts far more than these - so it must never be used as the
+# set that is actually matched against.
+JMS_VERIFICATION_EXAMPLE_PARAMETERS=(
+  'verifyHost=true'
+  'verifyHostName=true'
+  'sslVerifyHostName=true'
+  'hostnameVerificationEnabled=true'
+  'endpointIdentificationAlgorithm=HTTPS'
+)
+
+# The one value OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION accepts. Hostname verification cannot be read off a
+# URL for every client - some verify by default and offer no parameter at all - so prod accepts either
+# positive evidence in the URL or this explicit statement that the client's own default verifies. It is a
+# fixed token rather than a boolean so that it cannot be set to 'false': there is no way to say "do not
+# verify" here, only "the client already does".
+JMS_HOSTNAME_VERIFICATION_ACKNOWLEDGEMENT='client-default'
+
 # Admin password rules for the prod profile. The admin user holds every OFBiz permission, so the
 # floors match those applied to a database password, and the values published in this repository - in
 # DOCKER.adoc, in the demo data and in this script's own former default - are refused outright.
@@ -830,6 +1086,12 @@ RETIRED_ADMIN_PASSWORDS=(ofbiz admin password ofbizdemo)
 # from the environment of an initialisation hook (a hook may enable shell tracing, as the shipped
 # example does, and a traced command line would publish them to the container log), and as the
 # authoritative list of what an operator may re-admit through OFBIZ_HOOK_SECRET_ALLOWLIST.
+#
+# Every name here is a value this script CONSUMES and the JVM never needs in its environment, which is
+# why capture_secret_environment may demote all of them before the first fork. The SDK's own credential
+# inputs are deliberately NOT in this list for exactly that reason - see
+# AWS_CREDENTIAL_ENVIRONMENT_VARIABLES below - but they are scrubbed around hooks and children just the
+# same, through HOOK_SCRUBBED_VARIABLES.
 SECRET_ENVIRONMENT_VARIABLES=(
   OFBIZ_ADMIN_PASSWORD
   OFBIZ_ADMIN_KEY
@@ -844,6 +1106,43 @@ SECRET_ENVIRONMENT_VARIABLES=(
   OFBIZ_S3_ACCESS_KEY_ID
   OFBIZ_S3_SECRET_ACCESS_KEY
   OFBIZ_JMS_PASSWORD
+)
+
+# The SDK's OWN credential and token inputs.
+#
+# They carry live cloud credentials, or the means to fetch them, and they are the one group this script
+# neither consumes nor renders: the AWS SDK resolves them INSIDE THE JVM, which is how an instance
+# profile, an ECS task role or an EKS service account supplies short-lived credentials to the object-store
+# provider. So they must survive to the exec at the end of _main - which is why they are not in
+# SECRET_ENVIRONMENT_VARIABLES, whose names are demoted out of the exported environment for good - and
+# they must not be visible to anything BEFORE it: a hook is operator code that may enable tracing, and an
+# initialisation child is a JVM that lives for minutes with its environment readable through
+# /proc/<pid>/environ. They are therefore taken away around a hook and around a child and put back
+# afterwards.
+#
+# AWS_REGION, AWS_MAX_ATTEMPTS and AWS_RETRY_MODE are deliberately absent: they carry no credential, and a
+# hook that calls the AWS CLI for an unrelated purpose has no reason to lose them.
+AWS_CREDENTIAL_ENVIRONMENT_VARIABLES=(
+  AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY
+  AWS_SESSION_TOKEN
+  AWS_SECURITY_TOKEN
+  AWS_WEB_IDENTITY_TOKEN_FILE
+  AWS_CONTAINER_AUTHORIZATION_TOKEN
+  AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
+  AWS_CONTAINER_CREDENTIALS_FULL_URI
+  AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+)
+
+# Everything removed from the environment of an initialisation hook, and the authoritative list of what
+# an operator may re-admit to one through OFBIZ_HOOK_SECRET_ALLOWLIST.
+#
+# The two groups above joined: what this script injects, and what the SDK resolves. A hook sees neither
+# unless it is named in the allowlist, and the difference between the groups - whether the value is put
+# back for the exec - is a property of the group rather than of the scrub.
+HOOK_SCRUBBED_VARIABLES=(
+  "${SECRET_ENVIRONMENT_VARIABLES[@]}"
+  "${AWS_CREDENTIAL_ENVIRONMENT_VARIABLES[@]}"
 )
 
 # Variables removed from the environment of every initialisation child this script starts.
@@ -861,6 +1160,15 @@ SECRET_ENVIRONMENT_VARIABLES=(
 # secret through the package qualified start.properties override, the object-store credentials through
 # config/content.properties and the broker password through config/serviceengine.xml. The admin
 # password is only ever used by this shell, which hashes it and passes the hash in a mode 0600 file.
+#
+# The AWS_ credential and token inputs are removed from a child as well, and they are taken from
+# AWS_CREDENTIAL_ENVIRONMENT_VARIABLES rather than written out again, so that a name added there cannot
+# be scrubbed from a hook and forgotten here. A data-load JVM authenticates to no object store - content
+# storage is read by the serving instance, not by the loader - so it needs none of them, and leaving them
+# in place published a set of live cloud credentials through /proc/<child pid>/environ for the whole life
+# of that JVM. They are removed from the CHILD's environment only, inside the subshell that starts it, so
+# the serving process this script later exec's still inherits them and the SDK's default credential chain
+# keeps working.
 CHILD_SANITISED_VARIABLES=(
   OFBIZ_ADMIN_KEY
   OFBIZ_ADMIN_PASSWORD
@@ -875,6 +1183,7 @@ CHILD_SANITISED_VARIABLES=(
   OFBIZ_S3_ACCESS_KEY_ID
   OFBIZ_S3_SECRET_ACCESS_KEY
   OFBIZ_JMS_PASSWORD
+  "${AWS_CREDENTIAL_ENVIRONMENT_VARIABLES[@]}"
 )
 
 # The three entity groups that have a managed datasource, as the infix of their environment variable
@@ -920,10 +1229,14 @@ POSTGRES_INIT_IDENTITY_VARIABLES=(
 # then silently ignores, so nothing is rendered that the Java side does not consume.
 #
 # The Java side reads more content.store.* properties than these seven - the read bound, the local
-# fallback, the object-key prefix and the s3 deadlines and retry cap - and deliberately no variable
-# carries them. Each has a committed default every deployment can run on, none is a secret, and each
-# is overridable per instance through a SystemProperty row without a restart, so adding a variable
-# for it would only add a way for the two layers to disagree. They are documented in
+# fallback, the object-key prefix, the two s3 call deadlines and the retry cap - and deliberately no
+# variable carries them. Each has a committed default every deployment can run on, none is a secret,
+# and each is overridable per instance through a SystemProperty row without a restart, so adding a
+# variable for them would only add a way for the two layers to disagree.
+# content.store.s3.insecure.endpoint.allowed is the exception in the other direction: it is DERIVED by
+# this script from OFBIZ_PROFILE rather than supplied, and the Java side reads it - like every other
+# deployment-defining storage value - from the rendered property file alone, precisely so that a
+# database row cannot switch off transport encryption. They are documented in
 # applications/content/config/content.properties beside the values themselves.
 CONTENT_STORE_VARIABLES=(
   OFBIZ_CONTENT_STORE_PROVIDER
@@ -944,6 +1257,25 @@ CONTENT_STORE_PROPERTIES=(
   content.store.s3.path.style
 )
 
+# The content.properties settings this script renders that are DERIVED rather than supplied, with the
+# variable each one is derived from, named in a read-back failure. Kept apart from the two arrays above
+# because those are parallel and index together: a name here has no environment variable of its own, so
+# adding it there would make the group's own census - variable_was_supplied, the withdrawal list and the
+# advertised count of seven - report a variable no operator can set.
+#
+# content.store.s3.insecure.endpoint.allowed is what lets S3ContentStore accept a plaintext endpoint to a
+# host other than its own. It is not an operator input BECAUSE the profile already decides it: prod
+# refuses an http endpoint outright, before the JVM starts, so the only deployment that can reach the
+# question is a development one - and rendering the answer here is what keeps the two layers agreeing.
+# Without it a developer pointing at 'http://minio.test:9000' would pass every check in this script and
+# then be refused by the provider on the first content read, with the container reporting success.
+CONTENT_STORE_DERIVED_PROPERTIES=(
+  content.store.s3.insecure.endpoint.allowed
+)
+CONTENT_STORE_DERIVED_SOURCES=(
+  OFBIZ_PROFILE
+)
+
 # Link-local addresses that answer with cloud instance credentials: the EC2/GCE/Azure instance metadata
 # service, its IPv6 form, and the ECS task metadata endpoint. An object-store endpoint pointing at one
 # of these is refused in every profile, with no override.
@@ -956,13 +1288,21 @@ CONTENT_STORE_PROPERTIES=(
 #
 # S3ContentStore carries the same list and applies the same refusal, so the endpoint is rejected whether
 # it arrives through this entry point or is written straight into content.properties.
-INSTANCE_METADATA_HOSTS=(
-  169.254.169.254
-  '[fd00:ec2::254]'
-  fd00:ec2::254
-  169.254.170.2
+# Host NAMES that answer with instance credentials. These are refused by name, whether or not they
+# resolve, because the address checks below need a resolver and a container may be started before one
+# is reachable. No legitimate object store sits behind any of them.
+INSTANCE_METADATA_NAMES=(
   metadata.google.internal
+  metadata.goog
+  instance-data
+  instance-data.ec2.internal
 )
+
+# The one unique-local address that answers with instance credentials: the IPv6 form of the EC2
+# metadata service, written out in full so a normalised endpoint can be compared with it directly.
+# Only this address, not the surrounding fd00::/8, which is legitimate private space an object store
+# may well sit in.
+METADATA_IPV6_ADDRESS='fd00:ec2:0:0:0:0:0:254'
 
 # Every variable whose ONLY effect is the configuration rendering and the initialisation this script
 # performs. None of them is read by the OFBiz JVM: each one reaches the application by being written
@@ -1038,12 +1378,20 @@ RUNTIME_APPLIED_VARIABLES=(
 
 # The variables this script consumes WITHOUT rendering them into anything.
 #
-# Three kinds, and none of them reaches the application through a file:
-#  - OFBIZ_TRACE, OFBIZ_SKIP_INIT, OFBIZ_SCHEMA_INIT and OFBIZ_PROFILE steer this script: what it
-#    traces, whether it initialises, whether it applies DDL, and how strictly it validates.
+# Four kinds, and none of them reaches the application through a file:
+#  - OFBIZ_TRACE, OFBIZ_SKIP_INIT, OFBIZ_SCHEMA_INIT, OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING,
+#    OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED and OFBIZ_PROFILE steer this script: what it traces,
+#    whether it initialises, whether it applies DDL, what it will release a schema on the strength of,
+#    what it requires acknowledged before it does, and how strictly it validates.
 #  - OFBIZ_DB_FLEET_SIZE and OFBIZ_DB_MAX_CONNECTIONS are capacity assertions it CHECKS the rendered
-#    pool sizes against. Neither is substituted into any file, which is why they belong here rather than
-#    in the inventory above.
+#    pool sizes against, and both are mandatory in the prod profile. Neither is substituted into any
+#    file, which is why they belong here rather than in the inventory above.
+#  - OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION, OFBIZ_JMS_TOPIC_ACL_ACKNOWLEDGED and
+#    OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED are statements about things this container cannot inspect -
+#    what the broker client library does by default, what the broker's authorization rules say, and
+#    whether the orchestration launches one init job or two. Each is read by the check that requires it
+#    and by nothing else, and substituting one into a file would misrepresent an operator's assertion as
+#    a setting.
 #  - OFBIZ_HOOK_SECRET_ALLOWLIST names which secrets an initialisation hook may see, and
 #    OFBIZ_SKIP_DB_DRIVER_DOWNLOAD is an accepted no-op kept so an older deployment's environment does
 #    not become an error.
@@ -1056,9 +1404,13 @@ CONTAINER_CONTROL_VARIABLES=(
   OFBIZ_PROFILE
   OFBIZ_SKIP_INIT
   OFBIZ_SCHEMA_INIT
+  OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING
+  OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED
   OFBIZ_HOOK_SECRET_ALLOWLIST
   OFBIZ_DB_FLEET_SIZE
   OFBIZ_DB_MAX_CONNECTIONS
+  OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION
+  OFBIZ_JMS_TOPIC_ACL_ACKNOWLEDGED
   OFBIZ_SKIP_DB_DRIVER_DOWNLOAD
 )
 
@@ -1187,10 +1539,17 @@ restore_trace() {
 # this script as well, and copying each value into a second variable would leave the secret in two
 # places instead of one.
 #
-# The list is SECRET_ENVIRONMENT_VARIABLES, which is also what run_hook_scrubbed removes around a hook
-# and what OFBIZ_HOOK_SECRET_ALLOWLIST is validated against, so the policy is stated once. The restore
-# in run_hook_scrubbed reads each variable's export attribute before it removes it and puts back what
-# it found, so a variable demoted here is restored demoted.
+# The list is SECRET_ENVIRONMENT_VARIABLES, the names this script CONSUMES: each one reaches the
+# application through a rendered mode 0600 file, so none of them has any business in the environment the
+# serving JVM inherits and the demotion can be permanent. run_hook_scrubbed removes a wider set around a
+# hook - HOOK_SCRUBBED_VARIABLES, which adds the SDK's own credential inputs - and restores each variable
+# with the export attribute it found, so a variable demoted here is restored demoted while one the SDK
+# needs is restored exported.
+#
+# THE SDK'S CREDENTIAL INPUTS ARE NOT DEMOTED HERE, deliberately: they are resolved inside the JVM this
+# script exec's, so taking the export attribute away would break the instance profile, task role and
+# service account credentials that are the recommended production configuration. They are hidden from
+# hooks and from initialisation children instead, where nothing needs them.
 #
 # TWO residuals this cannot close, both deliberate:
 #   * this process's OWN original environment, which the kernel captured before the script ran and
@@ -1293,24 +1652,20 @@ reject_unsafe_value() {
 }
 
 ###############################################################################
-# Reject a value that java.util.Properties would not read back as it was written.
+# Reject a value whose LEADING whitespace java.util.Properties would discard.
 #
-# The shell validates the value it was given; the application reads the value the property FILE
-# yields, and those two differ when the value starts with whitespace. Properties.load discards every
-# space, tab and form feed between the '=' and the first non-blank character, so '   ' followed by 61
-# characters passes a 64 character minimum here and arrives as a 61 character key there - shorter, and
-# different, from the value that was checked. For a signing key that means JWTManager rejecting it at
-# the first token; for the admin key it means a shared secret nobody can reproduce; for the content URL
-# prefix it means every generated content URL pointing at a different origin.
-#
-# The refused set is exactly the set Properties.load discards, form feed included. Form feed is also a
-# control character, so every caller that runs reject_unsafe_value or secret_is_usable first already
-# refuses it - but this function is the one that owns the Properties round-trip guarantee, so it does
-# not depend on the call order to keep it.
+# Properties.load skips every space, tab and form feed between the separator and the first non-blank
+# character, so '   ' followed by 61 characters passes a 64 character minimum here and arrives as a 61
+# character value there. The value written to the file and the value the application loads are then
+# different, and nothing downstream can tell.
 #
 # Rejecting the value is preferred over escaping it (Properties accepts '\ ' for a leading space)
-# because a secret whose first characters are invisible is a configuration mistake in its own right:
-# it cannot be typed back reliably and it is almost always an accident of shell quoting.
+# because a value whose first characters are invisible is a configuration mistake in its own right: it
+# cannot be typed back reliably and it is almost always an accident of shell quoting.
+#
+# This is the rule for a FREE FORM value whose consumer-visible form is still the operator's intent once
+# the blanks at the end are gone - the content URL prefix is the only one. reject_edge_whitespace is the
+# rule for everything else; see the comment there for why the two ends are not equivalent.
 # $1 - variable name (named in the error message)
 # $2 - value (never printed)
 reject_leading_whitespace() {
@@ -1319,6 +1674,78 @@ reject_leading_whitespace() {
     config_fatal "$1 must not start with a space, a tab or a form feed. java.util.Properties discards those leading characters, so the value the application would read is not the value that was validated. Remove the leading whitespace - it is almost always a shell quoting accident."
     ;;
   esac
+}
+
+###############################################################################
+# Reject a value the application would not read back as it was written, at EITHER end.
+#
+# The shell validates the value it was given; the application reads the value the property FILE yields
+# THROUGH UtilProperties, and those two differ when the value has whitespace at either end.
+#
+# LEADING whitespace is discarded by java.util.Properties itself - reject_leading_whitespace owns that
+# half, and this function starts by delegating to it so there is one wording for one mistake.
+#
+# TRAILING whitespace survives Properties.load - the value runs to the end of the line - but
+# UtilProperties.getPropertyValue returns value.trim(), and that is what every consumer of these
+# particular properties calls: LoginWorker for login.secret_key_string, JWTManager for
+# security.token.key, Config for ofbiz.admin.key, UtilMisc.getHostHeadersAllowed for
+# host-headers-allowed, ContentStoreFactory for every content.store.* setting. A secret with a trailing
+# space therefore validates here at its full length and reaches the application one character shorter,
+# which is a value nobody can reproduce; an object-store credential trimmed the same way is a credential
+# the store rejects, and the deployment cannot tell that from a wrong key. For host-headers-allowed the
+# consumer's own contract is "no spaces" (UtilMisc.getHostHeadersAllowed splits on ',' and does not trim
+# the parts), and an S3 bucket, region or endpoint cannot contain a blank at all.
+#
+# So for those values both ends are refused, and the refused set at each end is exactly what the two
+# layers discard, form feed included. Form feed is also a control character, so every caller that runs
+# reject_unsafe_value or secret_is_usable first already refuses it - but this function is the one that
+# owns the round-trip guarantee, so it does not depend on the call order to keep it.
+#
+# A value that legitimately tolerates a trailing blank - one whose trimmed form is still exactly what the
+# operator asked for - uses reject_leading_whitespace instead and relies on
+# require_rendered_property_value, which compares the value AS UtilProperties WILL NORMALISE IT, to prove
+# the application reads what was validated. Refusing a trailing blank everywhere would be an arbitrary
+# restriction on such a value; accepting one on a secret would silently change the secret.
+# $1 - variable name (named in the error message)
+# $2 - value (never printed)
+reject_edge_whitespace() {
+  reject_leading_whitespace "$1" "$2"
+  case "$2" in
+  *[[:blank:]] | *$'\f')
+    config_fatal "$1 must not end with a space, a tab or a form feed, because UtilProperties trims the value it hands the application and it would read a shorter value than the one that was checked. Remove the trailing whitespace - it is almost always a shell quoting accident."
+    ;;
+  esac
+}
+
+###############################################################################
+# Emit, on stdout, the value UtilProperties would hand the application for a property value.
+#
+# UtilProperties.getPropertyValue - the accessor every consumer of the properties this script renders
+# uses - returns value.trim(), so whatever java.util.Properties loaded is not quite what the application
+# receives. Any comparison that means "the application will read this" therefore has to be made on this
+# form of the value, which is what require_rendered_property_value does.
+#
+# String.trim removes every character up to and including a space at both ends. Control characters are
+# refused for every value this script renders, so in practice the removed set is a space, a tab and a
+# form feed - exactly the set reject_edge_whitespace refuses outright for a secret - and matching
+# [[:space:]] here covers all of them plus the line terminators, none of which can reach this point.
+#
+# The value may be a secret, so tracing is suspended and the result goes to stdout for the caller to
+# capture rather than into a global. Both expansions are shell builtins, so nothing reaches the process
+# table.
+# $1 - value
+utilproperties_normalised() {
+  hide_secrets
+  local value="$1"
+
+  # Leading run of blanks, then the trailing one. The inner expansion produces the run itself, which the
+  # outer one then removes; an all-blank value leaves the inner expansion equal to the value and so
+  # normalises to empty, which is what trim() returns for it.
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+
+  printf '%s' "$value"
+  restore_trace
 }
 
 ###############################################################################
@@ -2110,6 +2537,40 @@ datasource_attributes() {
 }
 
 ###############################################################################
+# Print the datasource names the SERVING delegators actually map, one per line, without duplicates.
+#
+# The serving datasources of a configuration are whatever its 'default' and 'default-no-eca' delegators
+# name, and nothing else: a datasource DEFINITION that no serving delegator maps is inert, and the
+# committed file defines twenty-three of them. Deriving the list from the mappings rather than from a
+# fixed list of three names is what makes the DDL-posture gate below hold for a configuration that serves
+# from datasources of its own naming - a mounted MySQL or Oracle file, which AAP 0.7.1 keeps selectable -
+# instead of passing over it because it declares no 'localpostgres'.
+#
+# Both serving delegators are read, because they map the same three entity groups and either of them may
+# be the one a component's delegator name resolves to; the test delegator is deliberately NOT read, since
+# it is single-JVM dev and test only and keeps its startup DDL on purpose.
+# $1 - the entity configuration to read
+serving_datasource_names() {
+  local configFile="$1"
+  local delegatorName
+
+  if [ ! -f "$configFile" ]; then
+    return 0
+  fi
+  for delegatorName in "${CACHE_CLEAR_DELEGATORS[@]}"; do
+    # The delegator block is isolated first because 'default' is a prefix of 'default-no-eca': the
+    # trailing [^-] is what stops the shorter name from matching the longer element, exactly as
+    # effective_default_delegator_group_maps and the cache-clear checks do it.
+    sed --quiet "/<delegator name=\"$delegatorName\"[^-]/,/<\/delegator>/p" "$configFile" \
+      | awk '/<group-map/ {
+          if (match($0, /datasource-name="[^"]*"/)) {
+            print substr($0, RSTART + 17, RLENGTH - 18)
+          }
+        }'
+  done | sort --unique
+}
+
+###############################################################################
 # Refuse to serve from an entity configuration whose managed datasources would issue startup DDL.
 #
 # This is the guarantee AAP 0.6.4 rests on: the serving fleet performs no startup DDL and therefore
@@ -2150,13 +2611,40 @@ require_serving_mode_ddl_safety() {
     origin="rendered override"
   fi
 
-  local datasourceName attributes
-  for datasourceName in "${MANAGED_DATASOURCE_NAMES[@]}"; do
+  # Derived from the delegators' own group-maps rather than from MANAGED_DATASOURCE_NAMES, so the gate
+  # holds for every dialect and every naming. The three names in that array are the ones this script's own
+  # template renders; a configuration an operator mounted serves from whatever it maps, and reading the
+  # fixed list passed over exactly that case - the one where nothing else has checked the posture.
+  local servingDatasources
+  servingDatasources=$(serving_datasource_names "$authoritative")
+  if [ -z "$servingDatasources" ]; then
+    printf '%s\n' "WARNING: no group-map could be read from the serving delegators of $authoritative ($origin), so the startup DDL posture of the datasources this instance serves from could not be established. Check that file: a serving instance must have check-on-start=\"false\" on every datasource its 'default' and 'default-no-eca' delegators map." >&2
+    return 0
+  fi
+
+  local datasourceName attributes element uri
+  while IFS= read -r datasourceName; do
+    if [ -z "$datasourceName" ]; then
+      continue
+    fi
     attributes=$(datasource_attributes "$authoritative" "$datasourceName")
     if [ -z "$attributes" ]; then
-      # Not declared in this file. The embedded profile's committed configuration declares all three, so
-      # this only happens for a hand written file that serves from datasources of its own naming, whose
-      # DDL posture this script cannot reason about and does not guess at.
+      # Mapped but not defined in this file. require_prod_external_datasource refuses that combination in
+      # the prod profile, where it matters; here there is no posture to read, so there is nothing to judge.
+      continue
+    fi
+
+    # An EMBEDDED datasource keeps its startup DDL and is not judged here. That is not an exception to the
+    # guarantee but the shape of it: an embedded database is a file on this container's own volume, so it is
+    # single-instance by construction, it is never part of a fleet, and applying the entity model to it on
+    # every boot is what makes an unconfigured checkout run with nothing configured (AAP 0.6.4, 0.7.1). The
+    # hazard this gate exists for is a SHARED database several instances would issue CREATE and ALTER
+    # against, which is every non-embedded one - a JNDI datasource included, since the container supplying
+    # it is not this one.
+    element=$(datasource_element "$authoritative" "$datasourceName")
+    uri=$(printf '%s' "$element" | grep --only-matching 'jdbc-uri="[^"]*"' | head --lines=1 \
+      | sed --expression='s,^jdbc-uri=",,' --expression='s,"$,,')
+    if [ -n "$uri" ] && jdbc_uri_is_embedded "$uri"; then
       continue
     fi
 
@@ -2172,8 +2660,8 @@ require_serving_mode_ddl_safety() {
       ;;
     esac
 
-    printf '%s\n' "WARNING: $authoritative ($origin) does not set check-on-start=\"false\" on the '$datasourceName' datasource. No DDL is issued because add-missing-on-start is not \"true\", but the engine reads the whole schema on every boot, which needs metadata privileges and delays start up. AAP run mode expects both flags to be \"false\"." >&2
-  done
+    printf '%s\n' "WARNING: $authoritative ($origin) does not set check-on-start=\"false\" on the '$datasourceName' datasource, which its serving delegators map. No DDL is issued because add-missing-on-start is not \"true\", but the engine reads the whole schema on every boot, which needs metadata privileges and delays start up. AAP run mode expects both flags to be \"false\"." >&2
+  done <<<"$servingDatasources"
 }
 
 ###############################################################################
@@ -2324,6 +2812,23 @@ secret_is_usable() {
     esac
   fi
 
+  # Refused for the reason reject_edge_whitespace refuses it, and refused HERE as well because this is
+  # the test a PRE-PROVISIONED value passes through: UtilProperties.getPropertyValue trims the value it
+  # hands the application, and java.util.Properties discards leading blanks before that, so a value with
+  # whitespace at either end is validated at one length here and delivered at another there. For a
+  # provisioned file that difference is invisible - the file looks right - and every sign-in, shutdown
+  # request or object-store call then fails against a value nobody can reproduce.
+  if [ -z "$SECRET_REJECTION_REASON" ]; then
+    case "$value" in
+    [[:blank:]]* | $'\f'*)
+      SECRET_REJECTION_REASON="must not begin with a space, a tab or a form feed, because java.util.Properties discards them and the application would read a shorter value than the one checked"
+      ;;
+    *[[:blank:]] | *$'\f')
+      SECRET_REJECTION_REASON="must not end with a space, a tab or a form feed, because UtilProperties trims the value it hands the application and it would read a shorter value than the one checked"
+      ;;
+    esac
+  fi
+
   if [ -z "$SECRET_REJECTION_REASON" ] && [ -n "$forbidden" ]; then
     case "$value" in
     *["$forbidden"]*)
@@ -2351,6 +2856,35 @@ validate_secret_strength() {
   hide_secrets
   if ! secret_is_usable "$2" "$3" "$4"; then
     config_fatal "$1 $SECRET_REJECTION_REASON. Supply a random, high entropy value."
+  fi
+  restore_trace
+}
+
+###############################################################################
+# Require that a value KEPT from a pre-provisioned configuration is one this profile may run on.
+#
+# The renderers accept key material from /ofbiz/config on the OFBIZ_SKIP_INIT path, where it may have
+# been provisioned by an earlier start or by another container rather than supplied to this one. A kept
+# value never passes through resolve_secret, so nothing else tests it - and the test has to be applied to
+# the value IN HAND rather than to the file, because the file is what a second reader could read
+# differently. This is the "revalidate what is actually rendered" half of the guarantee; the file-based
+# pre-flight in require_preprovisioned_runtime_configuration is the other half and reports the whole set
+# at once.
+#
+# The profile decides the consequence, exactly as it does for an absent secret: a deployed profile refuses
+# to start, while a development profile reports it and continues, which keeps a developer's
+# pre-provisioned container working. Neither path prints the value; the reason published by
+# secret_is_usable describes it without containing it.
+#
+# $1 - variable name that would normally supply it, $2 - property name, $3 - file it was read from,
+# $4 - value (never printed), $5 - minimum length, $6 - forbidden characters (may be empty)
+require_preprovisioned_value_usable() {
+  hide_secrets
+  if ! secret_is_usable "$4" "$5" "$6"; then
+    if [ "${OFBIZ_PROFILE:-}" = 'prod' ]; then
+      config_fatal "The $2 already provisioned in $3 $SECRET_REJECTION_REASON, and it is the value this start would render and run on. Replace it in that file, or supply $1 through the environment. See DOCKER.adoc."
+    fi
+    printf '%s\n' "WARNING: the $2 already provisioned in $3 $SECRET_REJECTION_REASON. It is being kept because OFBIZ_PROFILE is not prod; a deployed profile refuses to start on it." >&2
   fi
   restore_trace
 }
@@ -2432,33 +2966,73 @@ generate_password_salt() {
   hide_secrets
   RESOLVED_PASSWORD_SALT=""
 
+  generate_random_alphanumeric "$ADMIN_PASSWORD_SALT_LENGTH" 'the admin password salt'
+  RESOLVED_PASSWORD_SALT="$RESOLVED_RANDOM_ALPHANUMERIC"
+  RESOLVED_RANDOM_ALPHANUMERIC=""
+  restore_trace
+}
+
+###############################################################################
+# The random value produced by the most recent generate_random_alphanumeric call.
+#
+# A global rather than stdout, for the reason resolve_secret documents: a command substitution runs the
+# function in a subshell, where config_fatal's 'exit' would end only that subshell and the caller would
+# continue with an unchecked - possibly empty - value.
+RESOLVED_RANDOM_ALPHANUMERIC=""
+
+###############################################################################
+# Generate exactly $1 random alphanumeric characters in RESOLVED_RANDOM_ALPHANUMERIC, or abort.
+#
+# THE ONE CHECKED ENTROPY PIPELINE, used by every value in this script that has to be random letters and
+# digits: the admin password salt and the container marker salt. Two copies of it existed, and the second
+# was the unchecked one - 'tr </dev/urandom | head', whose status nobody looked at and whose output
+# nobody measured.
+#
+# FAILS CLOSED, in three respects, and each one is a real failure mode rather than a hypothetical:
+#
+#   * THE READ IS BOUNDED FIRST AND FILTERED SECOND, which is the reverse of the historical
+#     'tr </dev/urandom | head' ordering. With 'head' downstream, 'tr' is killed by SIGPIPE as soon as
+#     'head' has its bytes, so a genuine failure of the entropy source is indistinguishable from normal
+#     termination. Reading a bounded block from the device and letting 'tr' run to end-of-file means both
+#     stages exit 0 on success.
+#   * BOTH STAGE STATUSES ARE CAPTURED, through 'pipefail' inside the command substitution's subshell -
+#     which cannot be enabled for this script as a whole, because other pipelines here rely on the
+#     default behaviour of ignoring an upstream command terminated by SIGPIPE.
+#   * THE RESULT IS MEASURED, exactly: the requested length, and nothing outside [A-Za-z0-9]. A short or
+#     empty read would otherwise be accepted silently, and a salt is not something a caller re-checks -
+#     it is folded into a stored password hash or into a state marker and never looked at again
+#     (CWE-330 / CWE-252).
+#
+# 1024 random bytes yield roughly 248 alphanumeric characters, comfortably more than any caller asks for,
+# and the length check still fails closed if they somehow do not.
+# $1 - number of characters required, $2 - what the value is, named in a failure
+generate_random_alphanumeric() {
+  hide_secrets
+  RESOLVED_RANDOM_ALPHANUMERIC=""
+
+  local length="$1"
+  local what="$2"
   local entropy
   local generated
-  # The read is bounded first and filtered second, which is the reverse of the historical
-  # 'tr </dev/urandom | head' pipeline. That ordering matters: with 'head' downstream, 'tr' is killed
-  # by SIGPIPE as soon as 'head' has its bytes, so a genuine failure of the entropy source is
-  # indistinguishable from normal termination. Reading a bounded 1024 bytes from the device and
-  # letting 'tr' run to end-of-file means both stages exit 0 on success, so 'pipefail' inside the
-  # substitution's subshell reliably reports a real failure. 1024 random bytes yield roughly 248
-  # alphanumeric characters, far more than required, and the length check below still fails closed.
+
   if ! entropy=$(
     set -o pipefail
     head --bytes=1024 /dev/urandom | tr --delete --complement A-Za-z0-9
   ); then
-    config_fatal "Failed to generate the admin password salt: the /dev/urandom read or the character filter failed."
+    config_fatal "Failed to generate $what: the /dev/urandom read or the character filter failed."
   fi
-  generated="${entropy:0:$ADMIN_PASSWORD_SALT_LENGTH}"
+  generated="${entropy:0:$length}"
 
-  if [ "${#generated}" -ne "$ADMIN_PASSWORD_SALT_LENGTH" ]; then
-    config_fatal "Failed to generate the admin password salt: expected exactly $ADMIN_PASSWORD_SALT_LENGTH characters but produced ${#generated}."
+  if [ "${#generated}" -ne "$length" ]; then
+    config_fatal "Failed to generate $what: expected exactly $length characters but produced ${#generated}."
   fi
   case "$generated" in
   *[!A-Za-z0-9]*)
-    config_fatal "Failed to generate the admin password salt: the generated value is not $ADMIN_PASSWORD_SALT_LENGTH alphanumeric characters."
+    config_fatal "Failed to generate $what: the generated value is not $length alphanumeric characters."
     ;;
   esac
 
-  RESOLVED_PASSWORD_SALT="$generated"
+  RESOLVED_RANDOM_ALPHANUMERIC="$generated"
   restore_trace
 }
 
@@ -2871,6 +3445,12 @@ resolve_entity_engine_flags() {
   RESOLVED_DISTRIBUTED_CACHE_CLEAR=$(require_boolean OFBIZ_DISTRIBUTED_CACHE_CLEAR \
     "${OFBIZ_DISTRIBUTED_CACHE_CLEAR:-false}") \
     || config_fatal "OFBIZ_DISTRIBUTED_CACHE_CLEAR must be a boolean: true or false."
+  # The operator's acceptance of a schema this run cannot prove it created. Resolved here with the other
+  # two so that a mistyped value fails the start rather than being read as "false" and refusing a
+  # deliberate re-initialisation for a reason the operator never sees. It has no effect outside init mode.
+  RESOLVED_SCHEMA_INIT_ACCEPT_EXISTING=$(require_boolean OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING \
+    "${OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING:-false}") \
+    || config_fatal "OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING must be a boolean: true or false."
 
   # Refused rather than tolerated. The Entity Engine has no standalone DDL command - the schema is
   # applied when the data loader creates a delegator - so the data load IS the schema application.
@@ -2880,6 +3460,10 @@ resolve_entity_engine_flags() {
   if [ "$RESOLVED_SCHEMA_INIT" = "true" ] && [ "$RESOLVED_SKIP_INIT" = "true" ]; then
     config_fatal "OFBIZ_SCHEMA_INIT=true cannot be combined with OFBIZ_SKIP_INIT=true: the data load is what applies the entity-model schema, so skipping it would exit successfully without creating a single table. Set OFBIZ_SKIP_INIT=false for the init run."
   fi
+
+  # Checked with the flag rather than inside initialise_schema, so that a deployment which has not made
+  # the singleton decision is refused before the configuration is rendered and before a JVM is started.
+  require_schema_init_singleton_acknowledged
 
   # Checked here, with the flag, and therefore also when the data initialisation is skipped: an instance
   # started with the flag on and no transport rolls back entity writes whether or not this container is
@@ -3075,9 +3659,24 @@ jndi_properties_value() {
 # through. Published as globals rather than returned, because a fail-fast resolver cannot report through
 # a command substitution: config_fatal's exit would only end the subshell.
 RESOLVED_TRANSPORT_CONFIGURATION_FILE=""
+RESOLVED_TRANSPORT_SERVICE_TAG=""
 RESOLVED_TRANSPORT_SERVER_TAG=""
 RESOLVED_TRANSPORT_FACTORY_CLASS=""
 RESOLVED_TRANSPORT_PROVIDER_URL=""
+
+###############################################################################
+# What the reachability probe actually established, as the clause the acceptance message reads out.
+#
+# A separate result rather than a boolean, and it exists because the acceptance message used to state
+# that "a broker endpoint accepted a TCP connection" whether or not one had been probed at all: a
+# provider URL naming no host and port produced a warning and then a success line claiming the opposite
+# of what had happened. An operator reading only the success line would take an unprobed transport for a
+# probed one - and the whole purpose of the probe is that a named-but-unreachable broker rolls back the
+# entity write that triggers each invalidation.
+#
+# So require_transport_reachable publishes the finding here, in the words the summary uses, and there is
+# no phrasing of the summary that can claim a probe that did not happen.
+RESOLVED_TRANSPORT_PROBE_RESULT=""
 
 ###############################################################################
 # Work out, exactly as JNDIContextFactory does, which broker client class and which provider URL the
@@ -3092,6 +3691,7 @@ RESOLVED_TRANSPORT_PROVIDER_URL=""
 # the broker OFBiz will actually contact rather than about a host this script guessed.
 resolve_authoritative_transport_settings() {
   RESOLVED_TRANSPORT_CONFIGURATION_FILE=""
+  RESOLVED_TRANSPORT_SERVICE_TAG=""
   RESOLVED_TRANSPORT_SERVER_TAG=""
   RESOLVED_TRANSPORT_FACTORY_CLASS=""
   RESOLVED_TRANSPORT_PROVIDER_URL=""
@@ -3109,6 +3709,8 @@ resolve_authoritative_transport_settings() {
     return 1
   fi
 
+  RESOLVED_TRANSPORT_SERVICE_TAG=$(printf '%s' "$element" \
+    | grep --only-matching --extended-regexp '<jms-service[^>]*>' | head --lines=1) || true
   RESOLVED_TRANSPORT_SERVER_TAG=$(printf '%s' "$element" \
     | grep --only-matching --extended-regexp '<server[^>]*>' | head --lines=1) || true
 
@@ -3147,6 +3749,27 @@ resolve_authoritative_transport_settings() {
 require_transport_listener_enabled() {
   if [ "$(xml_attribute_value "$RESOLVED_TRANSPORT_SERVER_TAG" 'listen')" != "true" ]; then
     config_fatal "The active jms-service named $JMS_SERVICE_NAME in $RESOLVED_TRANSPORT_CONFIGURATION_FILE does not declare listen=\"true\" on its server element, so this instance would publish cache invalidations without subscribing to the ones other instances publish, and its caches would silently drift. Add listen=\"true\", or let this script render the transport by setting OFBIZ_JMS_INITIAL_CONTEXT_FACTORY and OFBIZ_JMS_PROVIDER_URL. See DOCKER.adoc."
+  fi
+}
+
+###############################################################################
+# Refuse a transport whose element does not publish as well as subscribe.
+#
+# The mirror of the check above, and it has to be explicit rather than assumed, because
+# JmsServiceEngine.serverList reads send-mode with three outcomes and only one of them works: "all"
+# returns every server, "none" returns an EMPTY list so the invalidation is published to nobody, and
+# anything else - including an ABSENT attribute, whose XSD default is "none" and whose raw DOM value is
+# the empty string - throws GenericServiceException inside ServiceDispatcher.runAsync, which rolls back
+# the entity write that triggered it.
+#
+# HealthCheckServlet reads the same attribute for the publisher half of its cache-transport readiness
+# report, so an element that is not send-mode="all" also holds the instance out of the load balancer
+# indefinitely. Both outcomes are worth a start up refusal that names the attribute.
+require_transport_publish_enabled() {
+  local sendMode
+  sendMode=$(xml_attribute_value "$RESOLVED_TRANSPORT_SERVICE_TAG" 'send-mode')
+  if [ "$sendMode" != "$JMS_SEND_MODE" ]; then
+    config_fatal "The active jms-service named $JMS_SERVICE_NAME in $RESOLVED_TRANSPORT_CONFIGURATION_FILE declares send-mode=\"$sendMode\" but \"$JMS_SEND_MODE\" is required. \"none\" publishes each cache invalidation to an empty list of servers, an absent or unrecognised value makes the service engine raise on the code path that rolls back the caller's transaction, and neither is reported as a ready cache transport, so the instance would also never be admitted by the load balancer. Add send-mode=\"$JMS_SEND_MODE\", or let this script render the transport by setting OFBIZ_JMS_INITIAL_CONTEXT_FACTORY and OFBIZ_JMS_PROVIDER_URL. See DOCKER.adoc."
   fi
 }
 
@@ -3205,6 +3828,49 @@ transport_endpoints() {
 }
 
 ###############################################################################
+# Print one line for every authority in the provider URL $1 that is not a usable host, or host and port.
+#
+# transport_endpoints answers "which endpoints can be probed"; this answers the different question
+# "is anything here broken", and the two are not complements. A URL may legitimately name no TCP endpoint
+# - 'vm://localhost' is an in-JVM broker and 'discovery:(multicast://default)' finds its own - so an empty
+# endpoint list cannot be treated as an error. But 'tcp://', 'tcp://:61616' and 'tcp://fd00::1:61616' name
+# nothing a client can connect to either, and those produced exactly the same empty list: the start up
+# warned that it could not probe anything and carried on, when what it had was a URL that cannot work at
+# all. Separating the two means a malformed URL is refused with the offending text named, while a
+# deliberately non-TCP transport is reported as unprobed and left to the operator.
+#
+# The authority is the run of characters after '://' up to the next delimiter - '/', ',', ')', '?', '#' or
+# whitespace - which covers the composite forms ActiveMQ and Artemis use. An authority is usable when it
+# is a bracketed IPv6 literal or a plain host name, each optionally followed by ':' and a decimal port.
+# $1 - provider URL
+transport_malformed_authorities() {
+  # A URL naming no '://' at all yields no matches, which is not a failure here: require_transport_reachable
+  # has already refused an empty URL, and a URL in some other shape is reported as unprobed.
+  printf '%s' "$1" \
+    | { grep --only-matching --extended-regexp '://[^/,)?#[:space:]]*' || true; } \
+    | awk '{
+        authority = substr($0, 4)
+        if (authority == "") {
+          if (!seen["(empty)"]++) {
+            print "(empty)"
+          }
+          next
+        }
+        host = authority
+        sub(/:[0-9]+$/, "", host)
+        if (host ~ /^\[[0-9A-Fa-f:.]+\]$/) {
+          next
+        }
+        if (host ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/) {
+          next
+        }
+        if (!seen[authority]++) {
+          print authority
+        }
+      }'
+}
+
+###############################################################################
 # Attempt one bounded TCP connection to $1:$2, giving up after $3 seconds. Returns 0 when the connection
 # was established, 124 when the deadline expired, and any other non-zero status when the connection was
 # refused or the name could not be resolved.
@@ -3245,9 +3911,21 @@ require_transport_reachable() {
     config_fatal "The active jms-service named $JMS_SERVICE_NAME in $RESOLVED_TRANSPORT_CONFIGURATION_FILE resolves through the jndi-server it names, but neither that server nor any jndi.properties on the class path declares a provider URL, so there is no broker to connect to. Set OFBIZ_JMS_PROVIDER_URL to have this script render a dedicated jndi-server, or add context-provider-url to the jndi-server that element names in $JNDI_SERVERS_OVERRIDE. Declaring java.naming.provider.url in jndi.properties would be found too, but it replaces the JVM-wide default that Tomcat's global naming context and the RMI service container are built from, so scope it to the jndi-server instead. See DOCKER.adoc."
   fi
 
+  # A URL that cannot work at all is refused before the probe, rather than reported as unprobeable. See
+  # transport_malformed_authorities for why the two are different findings.
+  local malformed
+  malformed=$(transport_malformed_authorities "$url")
+  if [ -n "$malformed" ]; then
+    config_fatal "The cache-invalidation transport's provider URL names the unusable endpoint(s) $(printf '%s' "$malformed" | tr '\n' ' '), so no client could connect to a broker through it and no invalidation could be published. Each authority must be a host name or a bracketed IPv6 literal, optionally followed by ':' and a port - for example tcp://broker.internal:61616 or tcp://[fd00::1]:61616. Correct OFBIZ_JMS_PROVIDER_URL, or the context-provider-url of the jndi-server in $JNDI_SERVERS_OVERRIDE. See DOCKER.adoc."
+  fi
+
   local endpoints
   endpoints=$(transport_endpoints "$url")
   if [ -z "$endpoints" ]; then
+    # NOT a pass, and the acceptance message must not read as one. The URL is well formed but names no TCP
+    # endpoint - an in-JVM or discovery transport - so nothing here has established that a broker answers,
+    # and the finding is published for the summary to state in exactly those terms.
+    RESOLVED_TRANSPORT_PROBE_RESULT="names no TCP endpoint that this start up could probe, so NOTHING here has confirmed that a broker answers"
     printf '%s\n' "WARNING: the cache-invalidation transport's provider URL names no host and port, so start up cannot confirm that a broker is reachable. An in-JVM or discovery transport is not a cache-coherent fleet unless every instance really does reach the same broker. Verify it independently." >&2
     return 0
   fi
@@ -3266,6 +3944,7 @@ require_transport_reachable() {
       continue
     fi
     if probe_tcp_endpoint "$host" "$port" "$deadline"; then
+      RESOLVED_TRANSPORT_PROBE_RESULT="names the broker endpoint [$host:$port], which accepted a TCP connection within ${deadline}s"
       printf '%s\n' "Cache-invalidation transport: broker endpoint [$host:$port] accepted a TCP connection within ${deadline}s, so this instance can reach it."
       return 0
     fi
@@ -3273,6 +3952,43 @@ require_transport_reachable() {
   done <<<"$endpoints"
 
   config_fatal "The cache-invalidation transport names the broker endpoint(s) ${unreachable[*]}, and none of them accepted a TCP connection within ${deadline}s from this instance. Every instance of the fleet must reach the broker: an unreachable one makes each cache invalidation roll back the entity write that triggered it. Check the URL, the broker, and the network path, raise OFBIZ_JMS_CONNECT_TIMEOUT if the path is merely slow, or set OFBIZ_DISTRIBUTED_CACHE_CLEAR=false to run this instance on a local cache. See DOCKER.adoc."
+}
+
+###############################################################################
+# Hold an operator-supplied transport to the same TLS, hostname-verification and authentication policy
+# as one this script renders.
+#
+# resolve_cache_transport_configuration already applies that policy to everything this script renders, so
+# this covers the one configuration it cannot see beforehand: a serviceengine.xml the operator mounted
+# themselves. Without it the policy would be advice rather than a requirement - a deployment could get an
+# anonymous plaintext subscription simply by writing the file by hand.
+#
+# The credential source comes from the server element's username attribute because that is the only place
+# the OFBiz JMS stack takes a broker principal from: JmsServiceEngine and JmsTopicListener both call
+# createTopicConnection(userName, password) with exactly those two attributes, so an element that carries
+# neither authenticates as nobody. Only the presence of the attribute is examined; neither value is read
+# into a message.
+#
+# Nothing is checked when the URL is absent, because require_transport_reachable refuses that case with a
+# message that names both places a provider URL can be declared, which is more use than 'names no
+# endpoint' would be.
+require_authoritative_transport_secure() {
+  if [ "$RESOLVED_JMS_MANAGED" = 'true' ]; then
+    return 0
+  fi
+  if [ -z "$RESOLVED_TRANSPORT_PROVIDER_URL" ]; then
+    return 0
+  fi
+
+  local credentialSource='anonymous'
+  if [ -n "$(xml_attribute_value "$RESOLVED_TRANSPORT_SERVER_TAG" 'username')" ]; then
+    credentialSource='configured'
+  fi
+
+  require_secure_jms_transport \
+    "the jms-service named $JMS_SERVICE_NAME in $RESOLVED_TRANSPORT_CONFIGURATION_FILE" \
+    "$RESOLVED_TRANSPORT_PROVIDER_URL" "$credentialSource" \
+    "Add username and password attributes to that jms-service's server element, or unset it and let this script render the transport from OFBIZ_JMS_INITIAL_CONTEXT_FACTORY, OFBIZ_JMS_PROVIDER_URL, OFBIZ_JMS_USERNAME and OFBIZ_JMS_PASSWORD."
 }
 
 ###############################################################################
@@ -3288,16 +4004,18 @@ require_transport_reachable() {
 # rollback: the entity write that triggered the invalidation is rolled back too, a bulk operation such
 # as the seed data load aborts, and the start up dies a long way from the cause.
 #
-# Four things are therefore required, in the order in which they fail earliest and most cheaply: an
-# active jms-service; a server element that DECLARES it subscribes as well as publishes; a client class
-# that can actually be loaded; and a broker endpoint that answers a TCP connection. Each failure is
-# fatal in EVERY profile. A development-profile warning here would rest on the idea that a developer
-# might want the flag on without a broker, but there is no such state: the flag with no
-# transport is not a degraded fleet, it is an instance that rolls back its own writes, and a warning in
-# a start up log is not a defence against that. A developer who wants a local cache sets the flag to
-# false, which is also the default.
+# Six things are therefore required, in the order in which they fail earliest and most cheaply: an active
+# jms-service; a server element that DECLARES it subscribes; an element that publishes rather than
+# discarding what it is given; a transport that meets the TLS, hostname-verification and authentication
+# policy; a client class that can actually be loaded; and a broker endpoint that answers a TCP connection.
+# Each failure is fatal in EVERY profile, except the parts of the transport policy that are explicitly
+# scoped to the prod profile. A development-profile warning in place of the others would rest on the idea
+# that a developer might want the flag on without a broker, but there is no such state: the flag with no
+# transport is not a degraded fleet, it is an instance that rolls back its own writes, and a warning in a
+# start up log is not a defence against that. A developer who wants a local cache sets the flag to false,
+# which is also the default.
 #
-# What these four do not establish. They are the failures that can be detected from configuration and
+# What these six do not establish. They are the failures that can be detected from configuration and
 # from the network before the JVM starts, and they are necessary conditions only. No JNDI context is
 # created here, nothing is looked up in one, no credentials are authenticated, no subscriber or
 # publisher is constructed and nothing is published, so this function cannot and does not establish
@@ -3312,19 +4030,25 @@ validate_distributed_cache_transport() {
     return 0
   fi
 
-  # Resolved rather than merely counted, because the four checks that follow all have to interrogate the
+  # Resolved rather than merely counted, because the six checks that follow all have to interrogate the
   # SAME configuration: whichever file is authoritative on this start - the override this script rendered
   # or one the operator supplied - is what publishes RESOLVED_TRANSPORT_CONFIGURATION_FILE and the
-  # settings the listener, client and reachability checks read.
+  # settings the listener, send-mode, policy, client and reachability checks read.
   if ! resolve_authoritative_transport_settings; then
     config_fatal "OFBIZ_DISTRIBUTED_CACHE_CLEAR=true but no active jms-service named $JMS_SERVICE_NAME was found in ${SERVICE_ENGINE_CANDIDATES[*]}, so no transport carries cache invalidations. This is not a cache-coherent fleet, and the first entity write that triggers an invalidation would be rolled back. Set OFBIZ_JMS_INITIAL_CONTEXT_FACTORY and OFBIZ_JMS_PROVIDER_URL to have this script render the transport, supply $SERVICE_ENGINE_OVERRIDE yourself, or set OFBIZ_DISTRIBUTED_CACHE_CLEAR=false to run this instance on a local cache. See DOCKER.adoc."
   fi
 
   require_transport_listener_enabled
+  require_transport_publish_enabled
+  require_authoritative_transport_secure
   require_transport_client_available
   require_transport_reachable
 
-  printf '%s\n' "OFBIZ_DISTRIBUTED_CACHE_CLEAR=true and an active jms-service named $JMS_SERVICE_NAME was found in $RESOLVED_TRANSPORT_CONFIGURATION_FILE. It declares listen=\"true\", names a client class that resolves on the class path, and names a broker endpoint that accepted a TCP connection. These are the transport's necessary preconditions, checked from the configuration and the network; they are not evidence that an invalidation reaches another instance, which this start up does not and cannot test - no JNDI lookup, authentication, subscription or publication is performed. Every instance of the fleet must use the same physical topic, and propagation must be confirmed against a second instance. See DOCKER.adoc."
+  # The reachability clause is READ OUT of RESOLVED_TRANSPORT_PROBE_RESULT rather than written here, so
+  # that this line can only ever describe the probe that actually happened. It used to state that an
+  # endpoint had accepted a connection unconditionally, which for a URL naming no host and port was the
+  # opposite of the warning printed moments earlier - and this is the line an operator reads.
+  printf '%s\n' "OFBIZ_DISTRIBUTED_CACHE_CLEAR=true and an active jms-service named $JMS_SERVICE_NAME was found in $RESOLVED_TRANSPORT_CONFIGURATION_FILE. It declares listen=\"true\" and send-mode=\"$JMS_SEND_MODE\", meets this profile's transport policy, names a client class that resolves on the class path, and $RESOLVED_TRANSPORT_PROBE_RESULT. These are the transport's necessary preconditions, checked from the configuration and the network; they are not evidence that an invalidation reaches another instance, which this start up does not and cannot test - no JNDI lookup, authentication, subscription or publication is performed. Every instance of the fleet must use the same physical topic, and propagation must be confirmed against a second instance. See DOCKER.adoc."
 }
 
 ###############################################################################
@@ -3583,14 +4307,25 @@ container_marker_is_complete() {
 }
 
 ###############################################################################
+# Length of the salt mixed into the admin marker payload.
+CONTAINER_ADMIN_MARKER_SALT_LENGTH=32
+
+###############################################################################
 # The salt mixed into the admin marker payload, created on first use.
 container_admin_marker_salt() {
   if [ ! -f "$CONTAINER_ADMIN_MARKER_SALT" ]; then
     local temporary
+    # Generated and MEASURED before anything is written, through the one checked entropy pipeline this
+    # script has. The previous 'tr </dev/urandom | head --bytes=32 >file' checked neither stage's status
+    # nor the result, so an entropy source that produced nothing left an empty salt file in place - and a
+    # salt is never looked at again once written: an empty one makes the admin marker's digest depend on
+    # the credential alone, so a rotated password could be inferred by comparing markers.
+    generate_random_alphanumeric "$CONTAINER_ADMIN_MARKER_SALT_LENGTH" 'the container admin marker salt'
     mkdir --parents "$CONTAINER_STATE_DIR"
     temporary=$(mktemp "$CONTAINER_ADMIN_MARKER_SALT.XXXXXXXX")
     chmod 600 "$temporary"
-    tr --delete --complement A-Za-z0-9 </dev/urandom | head --bytes=32 >"$temporary"
+    printf '%s' "$RESOLVED_RANDOM_ALPHANUMERIC" >"$temporary"
+    RESOLVED_RANDOM_ALPHANUMERIC=""
     mv --force "$temporary" "$CONTAINER_ADMIN_MARKER_SALT"
   fi
   cat "$CONTAINER_ADMIN_MARKER_SALT"
@@ -3679,14 +4414,14 @@ require_hook_secret_allowlist() {
   local requested known matched
   for requested in "${allowlist[@]}"; do
     matched='false'
-    for known in "${SECRET_ENVIRONMENT_VARIABLES[@]}"; do
+    for known in "${HOOK_SCRUBBED_VARIABLES[@]}"; do
       if [ "$requested" = "$known" ]; then
         matched='true'
         break
       fi
     done
     if [ "$matched" != 'true' ]; then
-      config_fatal "OFBIZ_HOOK_SECRET_ALLOWLIST names '$requested', which is not one of the secret variables this script removes from a hook's environment (${SECRET_ENVIRONMENT_VARIABLES[*]}). Correct the name; as written, the hook would receive nothing."
+      config_fatal "OFBIZ_HOOK_SECRET_ALLOWLIST names '$requested', which is not one of the secret variables this script removes from a hook's environment (${HOOK_SCRUBBED_VARIABLES[*]}). Correct the name; as written, the hook would receive nothing."
     fi
   done
 }
@@ -3752,7 +4487,7 @@ run_hook_scrubbed() {
   local -A ofbizHookSavedExported=()
   local -a ofbizHookGranted=()
   local ofbizHookName ofbizHookDeclaration ofbizHookAttributes
-  for ofbizHookName in "${SECRET_ENVIRONMENT_VARIABLES[@]}"; do
+  for ofbizHookName in "${HOOK_SCRUBBED_VARIABLES[@]}"; do
     if hook_secret_is_allowed "$ofbizHookName"; then
       # AN ALLOWLISTED NAME IS LEFT IN PLACE - BUT 'IN PLACE' IS NOT 'IN THE HOOK'S ENVIRONMENT'.
       # capture_secret_environment demotes every secret with 'export -n' before the first fork, which
@@ -4290,6 +5025,101 @@ schema_init_verification_verdict() {
     printf '%s' "Schema verification found the schema INCOMPLETE: with the startup DDL disabled the engine still reports '$signature' in the log above, so the applying pass did not create everything the entity model declares. Do not start the fleet. The log names every entity and field concerned; fix the cause - most often a database user without rights to create every object - and re-run this init job, which is additive and safe to repeat."
     return 0
   fi
+
+  # PRESENT IS NOT THE SAME AS CORRECT, and this is the half that was missing. Everything above asks
+  # whether each table and column EXISTS; the engine also compares the type, the width and the scale of
+  # every column it finds, and a schema that fails any of those comparisons is not the one the entity
+  # model describes however complete it looks. Refused with no override: see
+  # SCHEMA_INIT_MISMATCH_SIGNATURES for why none of these can be harmless - and for why the engine's
+  # primary key comparison is measurably unusable on PostgreSQL and is not among them.
+  signature=$(schema_init_first_signature_in "$log" "${SCHEMA_INIT_MISMATCH_SIGNATURES[@]}")
+  if [ -n "$signature" ]; then
+    printf '%s' "Schema verification found the schema INCOMPATIBLE with the entity model: the engine reports '$signature' in the log above, so a table exists but does not match the model this deployment runs on. The engine's generated SQL would then read or write a column whose type, width or scale is not what the model declares, which fails at runtime or silently truncates. This is NOT repaired by re-running the init job: the DDL is additive and never alters or drops an existing column. Do not start the fleet. The log names every entity and column concerned; align the column - or the model - and re-run."
+    return 0
+  fi
+
+  # Present, not missing, not mismatched, and not decidable either. Waived only by the explicit operator
+  # acknowledgement, and even then only for this class: see SCHEMA_INIT_UNPROVEN_SIGNATURES.
+  signature=$(schema_init_first_signature_in "$log" "${SCHEMA_INIT_UNPROVEN_SIGNATURES[@]}")
+  if [ -n "$signature" ]; then
+    if [ "${RESOLVED_SCHEMA_INIT_ACCEPT_EXISTING:-false}" != "true" ]; then
+      printf '%s' "Schema verification found the database carries a column the entity model does not describe: the engine reports '$signature' in the log above. Such a column is harmless if it is nullable or has a default, and it breaks EVERY insert into that table if it is NOT NULL without one, because the engine never supplies a value for a column it has no field for. The engine reads each column's nullability and neither logs nor compares it, so this job cannot tell the two apart and will not report a schema as ready that it cannot prove is usable. Drop the column, or add the field to the entity model, or - if the difference is deliberate, which it usually is for a field an upgrade withdrew - set OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true to accept it. See DOCKER.adoc."
+      return 0
+    fi
+    # Accepted, and NOTHING is printed from here: these verdicts print the refusal or nothing at all, which
+    # is what lets the build's gating tests read an empty result as "accepted". The waiver is announced by
+    # initialise_schema, once, before either pass runs - see announce_schema_init_acceptance.
+  fi
+}
+
+###############################################################################
+# State, once and before any pass runs, that this initialisation will accept differences it cannot prove
+# harmless - and exactly which ones it still will not accept.
+#
+# Printed from here rather than from the verdicts because those print their refusal or nothing at all,
+# which is what lets them be read as a boolean. Printed whether or not anything is ultimately waived, so
+# the log of an initialisation always states the posture it ran under rather than only the outcome.
+announce_schema_init_acceptance() {
+  if [ "${RESOLVED_SCHEMA_INIT_ACCEPT_EXISTING:-false}" != "true" ]; then
+    return 0
+  fi
+
+  printf '%s\n' "OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true: this initialisation will accept a schema it did not create in full, and columns the entity model does not describe, as deliberate. STILL REFUSED, because none of these can be harmless: a missing table or column, and a column whose type, width or scale does not match the model. NOT PROVED by this run, and not provable from anything the engine reports on PostgreSQL: whether a column the model does not describe is NOT NULL without a default - which would fail every insert into its table - and whether the primary keys, foreign keys and indexes of the objects this run did not create are the ones the model declares, since the engine reads none of those three from a PostgreSQL catalogue. Verify them against the database before releasing the fleet. See DOCKER.adoc."
+}
+
+###############################################################################
+# Whether the schema this run is about to release was created IN ITS ENTIRETY by this run.
+#
+# WHY THIS IS ASKED AT ALL. Everything else here compares the entity model with what the catalogue
+# reports, and the catalogue is only reported in part: DatabaseUtil reads each column's nullability and
+# never compares or logs it, and its primary key, foreign key and index comparisons read NOTHING on
+# PostgreSQL - all three measured, see SCHEMA_INIT_MISMATCH_SIGNATURES and
+# SCHEMA_INIT_RESIDUAL_SIGNATURES. So for a table this run did not create, four properties are simply
+# unavailable to it: the nullability and defaults of the columns, and the presence of the declared
+# primary keys, foreign keys and indexes. For a table this run DID create they need no checking, because
+# the engine emitted the DDL for them from the entity model in this very execution - which makes proving
+# authorship strictly stronger than any comparison this job could perform.
+#
+# HOW IT IS PROVED, from the engine's own numbers and not from any count restated here. ModelReader logs
+# "Finished loading entities; #Entities=N ..." once per JVM, where N is the number of entities the loaded
+# components declare. DatabaseUtil logs "] has no table in the database" for every entity whose table it
+# did not find, and "Created table [" for every table it created. When all three numbers agree, every
+# entity the model declares was missing when this run started and was created by it, so the schema is
+# this run's own work in full. Both counts come from the APPLYING pass, which is the only pass that
+# creates anything.
+#
+# WHY THE COUNTS ARE COMPARED RATHER THAN JUST THE CREATIONS. "Created table" alone cannot distinguish a
+# fresh database from one where half the tables already existed, and "has no table" alone cannot
+# distinguish a table that was missing and then created from one that was missing and stayed missing. The
+# residual and mismatch verdicts catch the second case as well; requiring all three to agree is what makes
+# this a statement about the WHOLE schema.
+#
+# Measured against a live PostgreSQL 13.23 initialisation of this image: #Entities=865, 865 "has no table
+# in the database" lines and 865 "Created table [" lines, with three entity groups checked - so a correct
+# fresh initialisation satisfies this exactly.
+#
+# Prints the refusal, or nothing when the schema is proved fresh; pure, exactly like the two verdicts.
+# $1 the applying pass's log
+schema_init_freshness_verdict() {
+  local log="$1"
+  local declaredEntities missingTables createdTables
+
+  # The LAST occurrence, and only the number: a JVM logs the line once, and taking the last one keeps a
+  # future second delegator's line from being read as the first one's contradiction.
+  declaredEntities=$(sed --quiet 's/.*#Entities=\([0-9][0-9]*\).*/\1/p' "$log" | tail --lines=1)
+  missingTables=$(grep --count --fixed-strings '] has no table in the database' "$log") || missingTables=0
+  createdTables=$(grep --count --fixed-strings 'Created table [' "$log") || createdTables=0
+
+  if [ -z "$declaredEntities" ]; then
+    printf '%s' "Schema initialisation could not establish how many entities the loaded components declare: the applying pass logged no '#Entities=' line, which ModelReader writes once per JVM at info level. Without it this job cannot prove it created the schema it is about to release, and it will not report a schema as ready on the strength of a log it could not read. Re-run with info logging enabled, or set OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true to release a schema whose authorship is not established. See DOCKER.adoc."
+    return 0
+  fi
+
+  if [ "$missingTables" -eq "$declaredEntities" ] && [ "$createdTables" -eq "$declaredEntities" ]; then
+    return 0
+  fi
+
+  printf '%s' "Schema initialisation did not create this schema in full, so it cannot prove the schema matches the entity model in the dimensions the engine does not report. The entity model declares $declaredEntities entities; this run found $missingTables of them without a table and created $createdTables tables. Everything the engine DOES report has been checked and is correct - every table and column is present, and every column's type, width and scale matches the model. What is not established for the objects this run did not create: the nullability and defaults of their columns, which the engine reads and never reports, and their primary keys, foreign keys and indexes, none of which the engine's comparison reads from a PostgreSQL catalogue. Re-initialising an existing schema is a legitimate thing to do - the DDL is additive and this is how a schema-affecting upgrade is applied - so if that is what this is, set OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true to accept those three unproved dimensions. Against a database that should have been empty, treat these numbers as the finding: something else has already written to it. See DOCKER.adoc."
 }
 
 ###############################################################################
@@ -4392,6 +5222,102 @@ verify_schema_completeness() {
 }
 
 ###############################################################################
+# Require the deployment to state, explicitly, that only one schema-init execution will be launched.
+#
+# WHY AN ACKNOWLEDGEMENT AND NOT A CHECK. Single execution of the init job is a property of the
+# ORCHESTRATION, and nothing inside this container can observe it. The lock taken below excludes a second
+# execution that shares this container's state volume, which is the case an operator can create by
+# accident with a single Job manifest; it cannot see an execution on another host, in another cluster, or
+# against the same managed database from a different deployment altogether. A database-backed advisory
+# lock would see those - but there is no database client in this image (the runtime stage installs
+# xsltproc and nothing else), the lock would have to be held by a long-lived connection for the duration
+# of a JVM this script only supervises, and it would work for PostgreSQL alone while the entity engine's
+# datasource definitions deliberately remain portable. So the honest arrangement is the one the schema
+# initialisation already uses for everything it cannot verify: state the requirement, make the deployment
+# record that it has been met, and refuse to proceed until it has.
+#
+# WHAT A CONCURRENT PAIR ACTUALLY DOES, which is why this is worth refusing over. Two init executions
+# issue the same CREATE and ALTER statements against the same catalogue at the same time. They contend on
+# catalogue locks, and each one's DatabaseUtil reports as a failure every object the OTHER created first -
+# logging the failed statement and continuing to the next entity. Neither execution's verdict then means
+# what it says: the applying pass reports DDL failures for a schema that is in fact complete, or reports
+# success while its own ALTER was rolled back by a deadlock, and an orchestrator gating the fleet roll-out
+# on that exit status cannot tell those apart.
+#
+# Only the prod profile requires the acknowledgement. A developer running the init job by hand against a
+# local database is the single execution by construction, and demanding a variable for it would make the
+# documented local procedure fail for no gain.
+require_schema_init_singleton_acknowledged() {
+  if [ "$RESOLVED_SCHEMA_INIT" != "true" ] || [ "$OFBIZ_PROFILE" != 'prod' ]; then
+    return 0
+  fi
+
+  if [ "${OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED:-}" != 'true' ]; then
+    config_fatal "OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED=true must be set alongside OFBIZ_SCHEMA_INIT=true when OFBIZ_PROFILE=prod. Nothing in this container can see a second init execution launched elsewhere, so this states that the deployment guarantees exactly one - a Job with parallelism 1 and no overlapping retry, or a single one-off task invocation. Two concurrent executions contend on catalogue locks and each reports as failed the objects the other created, so neither one's exit status can be trusted to mean that the schema is ready. See DOCKER.adoc."
+  fi
+}
+
+###############################################################################
+# Take the single-flight lock for the schema initialisation, or refuse to run.
+#
+# NON-BLOCKING ON PURPOSE. Waiting for the other holder and then applying the DDL a second time would
+# succeed - the DDL is additive - and would therefore HIDE the orchestration fault that launched two
+# executions. Refusing surfaces it, at the cost of one failed job the operator can read the reason for.
+#
+# What the lock covers: a second execution that has the same /ofbiz/runtime volume mounted, which is the
+# realistic accident because that volume is where the state records live and is normally shared between
+# the init job and the fleet. What it does not cover is stated in
+# require_schema_init_singleton_acknowledged, and the acknowledgement is what stands in for it.
+#
+# flock is used through its file-descriptor form rather than by wrapping a command, because the lock has
+# to be held across the two JVM passes and released when this process ends - which the descriptor form
+# gives for free, including on a signal that no trap can run. If flock is absent, which it is not in this
+# image but could be in a slimmed derivative, that is reported as an unenforced requirement rather than
+# passed over in silence: the acknowledgement above still applies, and pretending a lock was taken would
+# be worse than saying it was not.
+acquire_schema_init_lock() {
+  if ! command -v flock >/dev/null 2>&1; then
+    printf '%s\n' "WARNING: flock is not present in this image, so the schema initialisation cannot exclude a second execution that shares this state volume. Single execution rests entirely on the deployment guarantee recorded in OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED." >&2
+    return 0
+  fi
+
+  # Created rather than required to exist: this may be the first init execution on a fresh volume. The
+  # mode is the state directory's own - the file holds no secret, only a lock and a record of who took it.
+  if ! exec {SCHEMA_INIT_LOCK_FD}>>"$CONTAINER_SCHEMA_INIT_LOCK"; then
+    config_fatal "Could not open $CONTAINER_SCHEMA_INIT_LOCK to take the schema-initialisation lock. The state directory must be writable by the ofbiz user for the init job to guarantee that it is the only execution applying DDL."
+  fi
+
+  if ! flock --nonblock "$SCHEMA_INIT_LOCK_FD"; then
+    # The holder's own record is read for the message rather than trusted for a decision: it says who
+    # else is running, which is the thing the operator needs, and the lock itself - not this text - is
+    # what actually excluded this execution.
+    local holder
+    holder=$(tail --lines=1 "$CONTAINER_SCHEMA_INIT_LOCK" 2>/dev/null || true)
+    config_fatal "Another schema initialisation is already running against this state volume${holder:+ ($holder)}, so this execution will not apply DDL. Two concurrent executions contend on catalogue locks and each reports as failed the objects the other created, which makes both verdicts untrustworthy. Launch exactly one init job and wait for it to exit. See DOCKER.adoc."
+  fi
+
+  # Written after the lock is held, so the record can only ever describe the execution that owns it. It is
+  # a diagnostic for the message above and nothing reads it as evidence.
+  printf 'schema-init run-token=%s started=%s\n' "$SCHEMA_INIT_RUN_TOKEN" "$(date --utc --iso-8601=seconds)" \
+    >&"$SCHEMA_INIT_LOCK_FD" || true
+
+  printf '%s\n' "Holding the schema-initialisation lock on $CONTAINER_SCHEMA_INIT_LOCK. It excludes a second init execution that shares this state volume, and is released when this process ends."
+}
+
+###############################################################################
+# Release the single-flight lock.
+#
+# Closing the descriptor is what releases the kernel lock. The file is deliberately left in place: it is
+# the lock's identity, and removing it would let a second execution create a NEW file, take a lock on that
+# instead, and exclude nothing.
+release_schema_init_lock() {
+  if [ -n "$SCHEMA_INIT_LOCK_FD" ]; then
+    exec {SCHEMA_INIT_LOCK_FD}>&- || true
+    SCHEMA_INIT_LOCK_FD=""
+  fi
+}
+
+###############################################################################
 # Apply the entity model's schema to the configured database, then return so that _main can exit.
 #
 # This is the one-shot init job of Objective 4, and it is deliberately a branch of its own rather than a
@@ -4436,6 +5362,11 @@ initialise_schema() {
   local fingerprint
   local previous=''
 
+  # FIRST, before the fingerprint is computed and long before a JVM starts. Everything below either reads
+  # or writes shared state - the receipt on the volume, the displaced entity-engine override, the database
+  # catalogue itself - so there is no part of it that is safe to run twice at once.
+  acquire_schema_init_lock
+
   fingerprint=$(database_desired_state_fingerprint "$(resolve_desired_database_mode)")
 
   if [ -s "$CONTAINER_SCHEMA_INITIALISED" ] \
@@ -4468,6 +5399,7 @@ initialise_schema() {
   esac
 
   printf '%s\n' "Applying the entity model schema. This execution has the startup DDL enabled; the serving fleet does not."
+  announce_schema_init_acceptance
 
   # The child's output is captured as well as shown, because its EXIT STATUS ALONE IS NOT SUFFICIENT.
   # A data load with no reader reports "Finished the data load with 0 rows changed" and exits 0 even
@@ -4514,12 +5446,23 @@ initialise_schema() {
   # pass below.
   local helperFailure
   helperFailure=$(schema_init_helper_verdict "$loaderLog")
+  # AUTHORSHIP, decided here for the same reason: it is read from the applying pass's log, and it is what
+  # stands in for the dimensions the engine does not report at all - see schema_init_freshness_verdict.
+  # Waived only by the explicit operator acknowledgement, and the waiver is announced above rather than
+  # inferred from silence here.
+  local freshnessFailure=''
+  if [ "${RESOLVED_SCHEMA_INIT_ACCEPT_EXISTING:-false}" != "true" ]; then
+    freshnessFailure=$(schema_init_freshness_verdict "$loaderLog")
+  fi
   rm --force "$loaderLog"
   if [ -n "$loaderFailure" ]; then
     config_fatal "$loaderFailure"
   fi
   if [ -n "$helperFailure" ]; then
     config_fatal "$helperFailure"
+  fi
+  if [ -n "$freshnessFailure" ]; then
+    config_fatal "$freshnessFailure"
   fi
 
   # THE APPLYING PASS PASSING IS NOT THE SAME AS THE SCHEMA BEING COMPLETE, which is the whole reason
@@ -4550,7 +5493,19 @@ initialise_schema() {
   # previous container left on the same state volume cannot be read as evidence for this run.
   record_schema_init_receipt "$fingerprint"
 
-  printf '%s\n' "Schema applied and verified against the database. Recorded in $CONTAINER_SCHEMA_INITIALISED."
+  # Released only now, after the receipt is on disk, so that a second execution cannot begin while this
+  # one's record of what it did is still being written. Every failure path above exits the process, which
+  # releases the lock through the kernel rather than through this line.
+  release_schema_init_lock
+
+  # The closing statement is deliberately specific about WHICH properties were established, because this
+  # line is what an operator - or a deployment pipeline reading this log - takes as the licence to release
+  # the fleet, and the two postures it can be reached under prove different things.
+  if [ "${RESOLVED_SCHEMA_INIT_ACCEPT_EXISTING:-false}" = "true" ]; then
+    printf '%s\n' "Schema applied and verified against the database: every table and column the entity model declares is present, and every column's type, width and scale matches it. Not established, because OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true accepted a schema this run did not create in full: the nullability and defaults of the columns it did not create, and the primary keys, foreign keys and indexes of the objects it did not create. Recorded in $CONTAINER_SCHEMA_INITIALISED."
+  else
+    printf '%s\n' "Schema applied and verified against the database: this run created every table the entity model declares, so the schema is this execution's own work from that model - nullability, primary keys, foreign keys and indexes included - and the verifying pass then re-read the catalogue and found every table and column present with a matching type, width and scale. Recorded in $CONTAINER_SCHEMA_INITIALISED."
+  fi
 }
 
 
@@ -4636,9 +5591,15 @@ load_admin_user() {
 
   # Convert the ASCII Hex representation of the hash to raw bytes by inserting escape sequences and running
   # through the printf command. Encode the result as URL base 64 and remove padding.
-  # This printf deliberately uses its argument as the format string: the argument is the generated
-  # '\xNN' escape sequence, which is exactly what needs to be interpreted.
   SHA1SUM_ESCAPED_STRING=$(printf '%s' "$SHA1SUM_ASCII_HEX" | sed -e 's/\(..\)\.\?/\\x\1/g')
+  # This printf deliberately uses its argument as the format string, which is what SC2059 warns about:
+  # the argument is the '\xNN' escape sequence generated on the line above, and interpreting it is the
+  # whole point - printf '%s' would emit the literal text '\x2f...' instead of the raw bytes the base 64
+  # encoding has to be taken over. The value is derived from sha1sum output, so the only characters it can
+  # contain are the ones the sed program above produced. Suppressed here rather than only explained,
+  # so that an unfiltered `shellcheck docker/docker-entrypoint.sh` exits zero and a genuinely unintended
+  # format string in this file is not lost among an expected finding.
+  # shellcheck disable=SC2059
   SHA1SUM_BASE64=$(printf "$SHA1SUM_ESCAPED_STRING" | basenc --base64url --wrap=0 | tr --delete '=')
 
   # Concatenate the hash type, salt and hash as the encoded password value.
@@ -4672,11 +5633,92 @@ load_admin_user() {
 # Modify the given ofbiz-component configuration XML file to set the root
 # component's 'enabled' attribute to false.
 # $1 - Path to the XML file to be modified.
+###############################################################################
+# The absolute component descriptor path require_component_descriptor_path accepted.
+#
+# A global rather than a printed result, so that the refusal below runs in the caller's shell: an 'exit'
+# inside a command substitution ends only the subshell, and the whole point of this check is to stop the
+# start rather than to report a value.
+RESOLVED_COMPONENT_DESCRIPTOR=""
+
+###############################################################################
+# Accept only a path that names an ofbiz-component.xml inside /ofbiz, and publish it absolute.
+#
+# OFBIZ_DISABLE_COMPONENTS is a list of paths that this script hands to an XSLT transform which REWRITES
+# each file in place, and the path was previously used as given: '/ofbiz/' with the operator's value
+# appended. A value of '../../etc/some-writable.xml' therefore escaped /ofbiz entirely, and any XML file
+# the container user can write - anywhere on the filesystem, including a mounted volume shared with
+# another workload - was rewritten with an enabled="false" attribute on its root element. That is a path
+# traversal with a write primitive on the end of it (CWE-22), reachable from a variable whose documented
+# purpose is to switch off a plugin.
+#
+# Two conditions are required, and each closes a different half:
+#
+#   * CONTAINMENT, decided AFTER canonicalisation. '..' is resolved before the comparison, because a
+#     lexical check on the supplied text cannot see what the path actually resolves to - and a symlink
+#     inside /ofbiz pointing outward is resolved here as well, which a purely textual check never could.
+#     realpath is used on the PARENT directory with the file name appended, so a path whose final
+#     component does not exist yet still resolves; a non-existent parent is refused as not being in /ofbiz.
+#   * THE FILE NAME, which must be exactly 'ofbiz-component.xml'. The transform is meaningful for no other
+#     file, so accepting any other name could only ever damage something. This turns containment from a
+#     boundary that merely limits the blast radius into one that admits precisely the files the feature
+#     exists to modify.
+#
+# An absolute path is accepted as well as a relative one, provided it satisfies both conditions, because
+# '/ofbiz/plugins/birt/ofbiz-component.xml' and 'plugins/birt/ofbiz-component.xml' name the same file and
+# refusing one of them would be arbitrary.
+# $1 - the path as supplied, relative to /ofbiz or absolute
+require_component_descriptor_path() {
+  local supplied="$1"
+  local candidate="$supplied"
+
+  case "$candidate" in
+  /*) ;;
+  *) candidate="$COMPONENT_ROOT_DIR/$candidate" ;;
+  esac
+
+  case "${candidate##*/}" in
+  ofbiz-component.xml) ;;
+  *)
+    config_fatal "OFBIZ_DISABLE_COMPONENTS names '$supplied', whose file name is not ofbiz-component.xml. This setting disables an OFBiz component by rewriting its component descriptor, and the transform is meaningful for no other file, so any other name could only damage it."
+    ;;
+  esac
+
+  # The parent is canonicalised rather than the whole path so that the check does not depend on the file
+  # existing: disable_component reports a missing descriptor itself, and it must keep doing so rather than
+  # reporting it as an escape. '--canonicalize-missing' would resolve a missing parent lexically, which is
+  # exactly the resolution this must not trust, so a parent that does not exist is refused here instead.
+  local parent resolvedParent
+  parent=$(dirname "$candidate")
+  if ! resolvedParent=$(realpath --canonicalize-existing "$parent" 2>/dev/null); then
+    config_fatal "OFBIZ_DISABLE_COMPONENTS names '$supplied', whose directory does not exist inside the OFBiz installation. Give the path of a component descriptor relative to $COMPONENT_ROOT_DIR, for example plugins/birt/ofbiz-component.xml."
+  fi
+
+  case "$resolvedParent/" in
+  "$COMPONENT_ROOT_DIR"/*) ;;
+  *)
+    config_fatal "OFBIZ_DISABLE_COMPONENTS names '$supplied', which resolves to $resolvedParent/${candidate##*/} - outside the OFBiz installation at $COMPONENT_ROOT_DIR. This setting rewrites the file it names, so a path that escapes the installation would modify something that is not part of this deployment. Give the path relative to $COMPONENT_ROOT_DIR."
+    ;;
+  esac
+
+  RESOLVED_COMPONENT_DESCRIPTOR="$resolvedParent/${candidate##*/}"
+}
+
 disable_component() {
-  XML_FILE="/ofbiz/$1"
+  require_component_descriptor_path "$1"
+  XML_FILE="$RESOLVED_COMPONENT_DESCRIPTOR"
   if [ -f "$XML_FILE" ]; then
     TMPFILE=$(mktemp)
-    xsltproc /ofbiz/disable-component.xslt "$XML_FILE" > "$TMPFILE"
+    # The transform's own status is checked BEFORE its output is used. xsltproc exits non-zero for an
+    # unreadable stylesheet, a document that is not well formed and an I/O failure, and in every one of
+    # those cases the redirection has already truncated $TMPFILE - so an unchecked transform leaves an
+    # EMPTY file that compares unequal to the descriptor and is then moved over it. That silently replaces
+    # a component descriptor with nothing, which OFBiz reads as a component it cannot load at all rather
+    # than as one that was disabled. Refusing here leaves the descriptor exactly as it was.
+    if ! xsltproc "$DISABLE_COMPONENT_STYLESHEET" "$XML_FILE" > "$TMPFILE"; then
+      rm --force "$TMPFILE"
+      config_fatal "The component descriptor $XML_FILE could not be transformed to disable the component. Either the document is not well formed or $DISABLE_COMPONENT_STYLESHEET could not be read; the descriptor has been left exactly as it was. Correct the file named in OFBIZ_DISABLE_COMPONENTS, or remove it from that list."
+    fi
     # Presence-checked: the transformed document is compared with the original and the file is replaced
     # only when the transform actually changed something. The edit was always idempotent in effect -
     # the stylesheet SETS enabled="false" rather than inserting anything, so applying it twice yields
@@ -4776,6 +5818,14 @@ render_security_configuration() {
     printf '%s\n' "OFBIZ_SKIP_INIT is set and no signing key was supplied: keeping the keys already provisioned in $SECURITY_PROPERTIES_OVERRIDE."
     loginKey=$(declared_property_value "$SECURITY_PROPERTIES_OVERRIDE" 'login\.secret_key_string')
     jwtKey=$(declared_property_value "$SECURITY_PROPERTIES_OVERRIDE" 'security\.token\.key')
+    # Revalidated HERE, on the exact value about to be rendered. require_preprovisioned_runtime_configuration
+    # applies the same test later and is what refuses a prod start, but it reads the file a second time: this
+    # tests the value in hand, which is the only one that can actually reach the application, so no reader,
+    # no separator and no duplicate declaration can put those two answers out of step.
+    require_preprovisioned_value_usable OFBIZ_LOGIN_SECRET_KEY 'login.secret_key_string' \
+      "$SECURITY_PROPERTIES_OVERRIDE" "$loginKey" "$SIGNING_KEY_MIN_LENGTH" ''
+    require_preprovisioned_value_usable OFBIZ_JWT_TOKEN_KEY 'security.token.key' \
+      "$SECURITY_PROPERTIES_OVERRIDE" "$jwtKey" "$SIGNING_KEY_MIN_LENGTH" ''
   else
     resolve_secret OFBIZ_LOGIN_SECRET_KEY "$OFBIZ_LOGIN_SECRET_KEY" "$SIGNING_KEY_MIN_LENGTH" ''
     loginKey="$RESOLVED_SECRET"
@@ -4787,8 +5837,8 @@ render_security_configuration() {
   # Refused before rendering: java.util.Properties discards leading blanks, so a key that begins with
   # one arrives at the application shorter than the value validated above - a 64 character check passed
   # by a 61 character key.
-  reject_leading_whitespace OFBIZ_LOGIN_SECRET_KEY "$loginKey"
-  reject_leading_whitespace OFBIZ_JWT_TOKEN_KEY "$jwtKey"
+  reject_edge_whitespace OFBIZ_LOGIN_SECRET_KEY "$loginKey"
+  reject_edge_whitespace OFBIZ_JWT_TOKEN_KEY "$jwtKey"
 
   # Two keys with two different jobs. login.secret_key_string names an EntityKeyStore entry that
   # encrypts the temporary password of the forgot-password flow; security.token.key is the HMAC512 key
@@ -4807,7 +5857,7 @@ render_security_configuration() {
   {
     if [ -n "$OFBIZ_HOST" ]; then
       reject_unsafe_value OFBIZ_HOST "$OFBIZ_HOST"
-      reject_leading_whitespace OFBIZ_HOST "$OFBIZ_HOST"
+      reject_edge_whitespace OFBIZ_HOST "$OFBIZ_HOST"
       printf 's|^host-headers-allowed=.*|host-headers-allowed=%s|\n' \
         "$(sed_escape_replacement "$(properties_escape_value "$OFBIZ_HOST")")"
     fi
@@ -4861,34 +5911,32 @@ render_security_configuration() {
 # behind, and the shipped file declares the property exactly once, so each render produces exactly one
 # active declaration whether it is the first or a rotation.
 #
-# BOTH destinations are written, from the one resolved value:
+# ONE destination, and only one: ADMIN_KEY_OVERRIDE, the package qualified copy under /ofbiz/config on
+# the declared configuration volume. It is what the JVM reads, and it is the only place in the container
+# where the live key exists.
 #
-#   1. ADMIN_KEY_OVERRIDE - the package qualified copy under /ofbiz/config, which is what the JVM
-#      reads. This is the functional injection.
-#   2. START_PROPERTIES_SOURCE - the copy in the source tree, which is what docker/send_ofbiz_stop_signal.sh
-#      reads. That helper resolves start.properties from a candidate list in class path precedence
-#      order and takes the FIRST READABLE one, so it normally finds (1); it falls back to (2) when (1)
-#      is unreadable to it, and it is also what a "docker exec" shutdown finds when /ofbiz/config is
-#      mounted in a way the calling context cannot read. Writing only (1) leaves that fallback holding
-#      the commented anchor, which the helper reports as "the property is not declared" and answers with
-#      Config.java's "NA" default - a value AdminServerContainer compares with String.equals and always
-#      rejects, so "docker stop" would degrade from a clean shutdown to a SIGKILL after the timeout.
-#      Graceful shutdown is existing behaviour, so preserving it is a functional-parity requirement.
+# THE SOURCE-TREE COPY IS DELIBERATELY NOT WRITTEN, and a live key found in it is put back to the
+# commented anchor. That copy lives in the container's writable layer rather than in a declared volume,
+# so a key written there is present in a file that "docker diff" reports as changed, that "docker cp"
+# can read, and that "docker commit" would capture into a new image layer - which means committing or
+# exporting a running container published the key, and any image built that way had to be treated as
+# compromised. It was written to keep "docker stop" graceful, and it is not needed for that:
+# docker/send_ofbiz_stop_signal.sh consults OFBIZ_ADMIN_KEY FIRST, which is set for the trap this script
+# arms, and otherwise takes the first READABLE file from a candidate list whose first entry is exactly
+# the override above - a file this script creates mode 0600 owned by the runtime user, which is the user
+# the container's own "docker exec" runs as. So the fallback existed for a case that does not arise,
+# while the copy it left behind was a live credential in an exportable layer.
 #
-# Both writes go through render_config_from, so each is staged in a tracked mode 0600 file beside its
+# FAIL CLOSED ON THE ONE FILE THAT MATTERS. Because there is no second copy to fall back on, the render
+# is verified: the override must exist, must declare the property exactly once, and must read back the
+# value that was validated. A failure there aborts the start rather than leaving an instance whose
+# shutdown request would be answered with Config.java's "NA" default - a value AdminServerContainer
+# compares with String.equals and always rejects, which would degrade "docker stop" to a SIGKILL after
+# the timeout.
+#
+# The write goes through render_config_from, so it is staged in a tracked mode 0600 file beside its
 # destination and moved into place with a single rename: no reader ever sees a half written file, and a
-# signal delivered mid-render cannot leave a readable copy of the key behind. Both results are then
-# read back and verified, because a silently unsubstituted anchor in EITHER file reintroduces exactly
-# the shutdown failure described above.
-#
-# PERSISTENCE RISK, stated explicitly. Destination (2) is in the container's writable layer rather than
-# in a declared volume, so it does not outlive the container - but for as long as the container exists
-# the admin shared secret is present in a file that "docker diff" reports as changed, that "docker cp"
-# can read, and that "docker commit" would capture into a new image layer. Committing or exporting a
-# running OFBiz container therefore publishes the key, and any image built that way must be treated as
-# compromised. The file is left mode 0600 (render_config_from stages with that mode and the rename
-# preserves it) so that only the runtime user can read it, which is the strongest guarantee available
-# without giving up the graceful shutdown the write exists to preserve.
+# signal delivered mid-render cannot leave a readable copy of the key behind.
 render_admin_key_configuration() {
   hide_secrets
 
@@ -4899,6 +5947,10 @@ render_admin_key_configuration() {
     && config_declares_property "$ADMIN_KEY_OVERRIDE" 'ofbiz\.admin\.key'; then
     printf '%s\n' "OFBIZ_SKIP_INIT is set and OFBIZ_ADMIN_KEY was not supplied: keeping the shared secret already provisioned in $ADMIN_KEY_OVERRIDE."
     adminKey=$(declared_property_value "$ADMIN_KEY_OVERRIDE" 'ofbiz\.admin\.key')
+    # Revalidated on the exact value about to be rendered; see the identical step in
+    # render_security_configuration for why the later file-based gate is not sufficient on its own.
+    require_preprovisioned_value_usable OFBIZ_ADMIN_KEY 'ofbiz.admin.key' "$ADMIN_KEY_OVERRIDE" \
+      "$adminKey" "$ADMIN_KEY_MIN_LENGTH" "$ADMIN_KEY_FORBIDDEN"
   else
     resolve_secret OFBIZ_ADMIN_KEY "$OFBIZ_ADMIN_KEY" "$ADMIN_KEY_MIN_LENGTH" "$ADMIN_KEY_FORBIDDEN"
     adminKey="$RESOLVED_SECRET"
@@ -4908,7 +5960,7 @@ render_admin_key_configuration() {
   # Config.java reads this through java.util.Properties, which discards leading blanks: a key beginning
   # with a space would be truncated on the way in, and AdminServerContainer would then compare requests
   # against a shared secret the operator cannot reproduce - no shutdown would ever succeed.
-  reject_leading_whitespace OFBIZ_ADMIN_KEY "$adminKey"
+  reject_edge_whitespace OFBIZ_ADMIN_KEY "$adminKey"
 
   # One sed program, used for both destinations, so the two files cannot end up carrying different
   # values: the escaping is performed once and the same bytes are substituted into each.
@@ -4921,23 +5973,50 @@ render_admin_key_configuration() {
 
   render_config_from "$ADMIN_KEY_OVERRIDE" "$START_PROPERTIES_SOURCE" --file="$sedScript"
 
-  # Rendered from itself: render_config_from reads the source, stages the result in a separate file and
-  # renames it over the destination, so a source that is also the destination is read completely before
-  # it is replaced. Done after (1) so that the override is always rendered from the shipped anchor.
-  render_config_from "$START_PROPERTIES_SOURCE" "$START_PROPERTIES_SOURCE" --file="$sedScript"
-
   discard_secret_temp_files
 
   require_rendered_declaration "$ADMIN_KEY_OVERRIDE" 'ofbiz\.admin\.key' "$START_PROPERTIES_SOURCE"
   require_rendered_property_value "$ADMIN_KEY_OVERRIDE" 'ofbiz\.admin\.key' OFBIZ_ADMIN_KEY "$adminKey"
-  # The source-tree copy is verified too. It is the file bin/ofbiz reads when a shutdown is
-  # requested, so a failed substitution there would leave the container unable to stop gracefully.
-  # Unlike the override it is never discarded on failure - it is the anchor the next start renders
-  # from, and it is a distribution file rather than something this script owns.
-  require_rendered_declaration "$START_PROPERTIES_SOURCE" 'ofbiz\.admin\.key' "$START_PROPERTIES_SOURCE"
-  require_rendered_property_value "$START_PROPERTIES_SOURCE" 'ofbiz\.admin\.key' OFBIZ_ADMIN_KEY "$adminKey"
+
+  # And the source-tree copy is put back to the commented anchor if anything ever gave it a live value -
+  # an earlier version of this script did, and that container's writable layer still carries it. See the
+  # note above for why a key must not remain there.
+  restore_source_admin_key_anchor
 
   restore_trace
+}
+
+###############################################################################
+# Return the source-tree start.properties to the commented anchor it ships with.
+#
+# The image ships 'ofbiz.admin.key' commented out so that no credential lives in the source tree. An
+# earlier version of this script rendered the live key into that file as well, and a container started
+# from an older image and then restarted on the same writable layer still holds it there; nothing else
+# would ever remove it, and "docker commit" or "docker cp" on such a container publishes it.
+#
+# Rewritten only when there is something to rewrite, so a normal start neither touches the file nor logs
+# about it. The substitution comments the declaration out rather than deleting the line, because the line
+# IS the anchor every render is built from: removing it would make require_rendered_declaration refuse
+# the next start.
+#
+# The value is never read and never printed - only the fact that an active declaration existed is
+# reported - and the rewrite goes through render_config_from, so the file is replaced by a single rename
+# and no reader sees a partial one.
+restore_source_admin_key_anchor() {
+  if ! grep --quiet '^ofbiz\.admin\.key=' "$START_PROPERTIES_SOURCE" 2>/dev/null; then
+    return 0
+  fi
+
+  printf '%s\n' "$START_PROPERTIES_SOURCE carried an active ofbiz.admin.key, which an earlier version of this image wrote there. It has been returned to the commented anchor the distribution ships, so the only copy of the shared secret is the mode 0600 $ADMIN_KEY_OVERRIDE in the configuration volume."
+  # Rendered from itself: render_config_from reads the source, stages the result in a separate file and
+  # renames it over the destination, so a source that is also the destination is read completely before
+  # it is replaced.
+  render_config_from "$START_PROPERTIES_SOURCE" "$START_PROPERTIES_SOURCE" \
+    --expression='s|^ofbiz\.admin\.key=.*|#ofbiz.admin.key=|'
+
+  if grep --quiet '^ofbiz\.admin\.key=' "$START_PROPERTIES_SOURCE" 2>/dev/null; then
+    config_fatal "The active ofbiz.admin.key in $START_PROPERTIES_SOURCE could not be commented out, so the shared secret would remain in the container's writable layer where an export or a commit can capture it. Check the permissions of the OFBiz source tree."
+  fi
 }
 
 ###############################################################################
@@ -4966,13 +6045,14 @@ write_property_substitution() {
 # class path precedence over the distribution, so an artefact that failed validation must not be left
 # behind on a persistent volume for a later start to read in preference to the committed defaults.
 #
-# A file OUTSIDE config/ is deliberately left alone. The only one verified here is the committed
-# start.properties, which is rendered from itself so that bin/ofbiz can authenticate a shutdown request
-# against the same shared secret the server was started with. That file is also the anchor every one of
-# these renders is built from: deleting it would destroy the anchor, so the next start would abort on a
-# missing source file instead of on the real problem, and recovering would mean restoring a distribution
-# file rather than correcting the environment. Nothing reads the rejected value in the meantime, because
-# every caller invokes config_fatal immediately afterwards and the start never proceeds.
+# A file OUTSIDE config/ is deliberately left alone, and the scoping is a rule rather than an
+# observation about today's callers. The committed start.properties is the one file outside config/ that
+# this script writes at all - restore_source_admin_key_anchor renders it from itself to comment out an
+# active ofbiz.admin.key an earlier version of this image left there - and it is also the ANCHOR every
+# render is built from. Deleting it would destroy that anchor: the next start would abort on a missing
+# source file instead of on the real problem, and recovering would mean restoring a distribution file
+# rather than correcting the environment. Nothing reads a rejected value in the meantime, because every
+# caller invokes config_fatal immediately afterwards and the start never proceeds.
 # $1 - rendered file
 discard_untrustworthy_render() {
   case "$1" in
@@ -5036,11 +6116,27 @@ require_rendered_declaration() {
 # anchor - is precisely the failure the length and entropy checks exist to prevent, and it is invisible
 # until the first JWT or the first admin request fails.
 #
-# The comparison reproduces Properties' reading for the encoding this script actually emits: the text
-# after the first '=' with each doubled backslash collapsed back to one. Leading whitespace is refused
-# before rendering (reject_leading_whitespace) and control characters are refused everywhere, so no
-# other Properties transformation can apply. Exactly one declaration is required, so a duplicate cannot
-# decide the effective value.
+# The comparison reproduces what the APPLICATION reads, in two steps, and neither step is optional:
+#
+#   1. effective_property_value - the one reader - yields the value java.util.Properties would load: the
+#      last declaration, whichever separator it uses, without the blanks Properties discards after the
+#      separator and without a trailing carriage return. Reading only the first 'name=' line here would
+#      verify a declaration OFBiz may not use. Each doubled backslash is then collapsed back to one,
+#      which is the only other transformation the encoding this script emits can carry.
+#   2. Both the rendered and the intended value are then normalised THE WAY THE CONSUMER NORMALISES
+#      THEM. Every property verified here is read through UtilProperties.getPropertyValue, which returns
+#      value.trim(), so the blanks at the two ends of the line are not part of the value the application
+#      ever sees. Comparing before that trim reported success for a rendered value the application would
+#      read differently - a trailing space on a signing key passing a length floor it does not meet once
+#      loaded - which is the mismatch this step closes. Comparing AFTER it means the assertion made here
+#      is the one that matters: the application will read exactly the value that was validated.
+#
+# Normalising rather than refusing is what lets a free form value keep a legitimate trailing blank (the
+# content URL prefix) while a secret cannot have one at all: reject_edge_whitespace refuses edge blanks
+# on every secret and every object-store setting BEFORE rendering, so for those the normalisation is a
+# no-op and this comparison is byte exact. Leading whitespace is refused for every caller and control
+# characters are refused everywhere, so no other Properties transformation can apply. Exactly one
+# declaration is required, so a duplicate cannot decide the effective value.
 #
 # A rejected override is DISCARDED before aborting, and that removal is part of the check rather than
 # tidiness. The file was written atomically from a pristine source, so it is complete and loadable, and
@@ -5092,14 +6188,15 @@ require_rendered_property_value() {
   fi
 
   # Guarded as well as pre-checked, because the check above and this read are two separate operations and
-  # a concurrent start can delete the file in between them. sed's own failure would otherwise end the
-  # script with exit status 2 and no ERROR line, which is the one outcome an operator cannot act on.
-  if ! rendered=$(sed --quiet "s|^$property=||p" "$renderedFile" 2>/dev/null); then
+  # a concurrent start can delete the file in between them. A read failure would otherwise leave the
+  # comparison below to run on an empty value, which for a property that is legitimately blank would
+  # report success for a file that could not be read at all.
+  if ! rendered=$(effective_property_value "$renderedFile" "$property"); then
     require_rendered_file_present "$renderedFile"
     config_fatal "Could not read back the rendered $renderedFile to verify the value supplied in $name."
   fi
   rendered=$(printf '%s' "$rendered" | sed 's,\\\\,\\,g')
-  if [ "$rendered" != "$intended" ]; then
+  if [ "$(utilproperties_normalised "$rendered")" != "$(utilproperties_normalised "$intended")" ]; then
     discard_untrustworthy_render "$renderedFile"
     # Worded for every value this function verifies, not only the secrets: it also checks the object-store
     # bucket, region, endpoint, addressing style and key prefix, and the content URL prefix. The risk
@@ -5148,20 +6245,48 @@ rewrite_catalina_property() {
   local escapedValue
   escapedValue=$(sed_escape_replacement "$(xml_escape_value "$value")")
 
-  if ! grep --quiet "<property name=\"$name\" value=\"[^\"]*\"/>" "$descriptor"; then
-    config_fatal "$descriptor does not declare the single-line property '$name'. The anchor the entry point substitutes has been removed or reformatted."
+  # SCOPED TO THE PRODUCTION BLOCK, AND REQUIRED TO BE UNIQUE WITHIN IT.
+  #
+  # ContainerConfig.Configuration puts each <property> into a map as it reads the container, so a DUPLICATE
+  # declaration means the LAST one decides what the container runs with. This edit used to take the first
+  # match in the whole file - correct only because the production block happens to come first - and read the
+  # first match back, so a second declaration added anywhere after it (a hook, a patch applied twice, a
+  # hand edit on the writable layer) would be the one Catalina actually used while this verification
+  # reported the value it had just written. For ssl-accelerator-port that is the difference between marking
+  # forwarded requests secure and not; for jvm-route it is a replacement instance answering with the
+  # identity of the one it replaced.
+  #
+  # Requiring exactly one declaration inside the production block is what makes the question answerable at
+  # all: with one declaration the first, the last and the parser-effective value are the same value, so the
+  # read-back below is unambiguous. Anything else is refused rather than guessed at. The scoping also keeps
+  # the "catalina-container-test" block - which declares its own jvm-route - byte for byte as committed;
+  # require_single_production_container has already established that the production block occurs exactly
+  # once, which is what stops the sed range below from restarting.
+  local declarations
+  declarations=$(catalina_production_block \
+    | grep --count "<property name=\"$name\" value=\"[^\"]*\"/>" || true)
+  declarations=${declarations:-0}
+  if [ "$declarations" = '0' ]; then
+    config_fatal "The '$CATALINA_PRODUCTION_CONTAINER' block of $descriptor does not declare the single-line property '$name'. The anchor the entry point substitutes has been removed or reformatted."
   fi
+  if [ "$declarations" != '1' ]; then
+    config_fatal "The '$CATALINA_PRODUCTION_CONTAINER' block of $descriptor declares the property '$name' $declarations times; exactly one is required. ContainerConfig keeps the LAST declaration of a property, so this start up would rewrite and verify one value while the container ran on another - which for '$name' decides how requests are treated. Remove the duplicate declaration."
+  fi
+
   sed --in-place \
-    "0,\|<property name=\"$name\" value=\"[^\"]*\"/>| s|<property name=\"$name\" value=\"[^\"]*\"/>|<property name=\"$name\" value=\"$escapedValue\"/>|" \
+    "/$CATALINA_PRODUCTION_CONTAINER/,\|</container>| s|<property name=\"$name\" value=\"[^\"]*\"/>|<property name=\"$name\" value=\"$escapedValue\"/>|" \
     "$descriptor"
 
   # Read back rather than trust the substitution: this file decides whether requests are treated as
-  # secure, so a silently failed edit must stop the start up instead of leaving the previous value.
-  local firstValue
-  firstValue=$(grep --only-matching "<property name=\"$name\" value=\"[^\"]*\"/>" "$descriptor" | head -1 |
-    sed "s|<property name=\"$name\" value=\"\\(.*\\)\"/>|\\1|")
-  if [ "$firstValue" != "$(xml_escape_value "$value")" ]; then
-    config_fatal "Rewriting '$name' in $descriptor did not take effect: it still reads '$firstValue'."
+  # secure, so a silently failed edit must stop the start up instead of leaving the previous value. The
+  # LAST declaration in the block is read, because that is the one ContainerConfig would keep - identical
+  # to the first here only because the count above established there is exactly one.
+  local effectiveValue
+  effectiveValue=$(catalina_production_block \
+    | grep --only-matching "<property name=\"$name\" value=\"[^\"]*\"/>" | tail --lines=1 \
+    | sed "s|<property name=\"$name\" value=\"\\(.*\\)\"/>|\\1|")
+  if [ "$effectiveValue" != "$(xml_escape_value "$value")" ]; then
+    config_fatal "Rewriting '$name' in the '$CATALINA_PRODUCTION_CONTAINER' block of $descriptor did not take effect: the declaration ContainerConfig would use still reads '$effectiveValue'."
   fi
 }
 
@@ -5198,6 +6323,73 @@ rewrite_catalina_property() {
 # rewrite_catalina_property proves each one took effect. The 0,/re/ address keeps every edit inside the
 # first container block, so the "catalina-container-test" block further down the file - which declares
 # its own jvm-route - is left byte for byte as committed.
+###############################################################################
+# Resolve the port offset from the OFBiz command this container was given, into RESOLVED_PORT_OFFSET.
+#
+# The offset is a startup OPTION rather than an environment variable - '--portoffset=N', '--portoffset N',
+# '-o N' or '-oN', which is the grammar Commons CLI gives the option StartupCommandUtil declares - so the
+# only place it can be read is the command line this script is about to exec. Config.getPortOffsetValue
+# reads exactly the same option and defaults it to 0, and no property or environment variable supplies it,
+# so this is the complete set of sources.
+#
+# Parsed rather than ignored because the offset changes which port every connector listens on, and the
+# Catalina render has to compare the accelerator port against the ports the instance will ACTUALLY bind.
+# See RESOLVED_PORT_OFFSET.
+#
+# A malformed offset is refused here. StartupCommandUtil refuses it too - it throws for a non-integer or a
+# negative value - but that happens after this script has already rendered the descriptor, so a value this
+# function silently read as 0 would have produced a descriptor validated against the wrong ports and a
+# start that then died on the option anyway, with two unrelated diagnostics.
+# $@ - the command this script was given, exactly as it will be exec'd
+resolve_port_offset() {
+  RESOLVED_PORT_OFFSET="0"
+
+  local argument
+  local offset=''
+  local expectValue='false'
+  for argument in "$@"; do
+    if [ "$expectValue" = 'true' ]; then
+      offset="$argument"
+      expectValue='false'
+      continue
+    fi
+    case "$argument" in
+    --portoffset=* | -o=*) offset="${argument#*=}" ;;
+    --portoffset | -o) expectValue='true' ;;
+    # The attached short form. Matched last so that '-o=' above wins, and anchored on '-o' followed by a
+    # digit so that no other short option beginning with 'o' can be mistaken for it.
+    -o[0-9]*) offset="${argument#-o}" ;;
+    esac
+  done
+
+  if [ "$expectValue" = 'true' ]; then
+    config_fatal "The OFBiz command names the port offset option with no value after it. Pass it as --portoffset=100, or remove the option."
+  fi
+  if [ -z "$offset" ]; then
+    return 0
+  fi
+
+  # The upper bound is what keeps 'declared + offset' a legal port for every connector the descriptor can
+  # declare; the lower bound is the one StartupCommandUtil enforces.
+  require_integer_range "the port offset in the OFBiz command" "$offset" 0 65535
+  RESOLVED_PORT_OFFSET="$offset"
+  if [ "$offset" != '0' ]; then
+    printf '%s\n' "The OFBiz command asks for a port offset of $offset, so every connector this instance binds is its declared port plus $offset. OFBIZ_SSL_ACCELERATOR_PORT, if set, must be the OFFSET port - the one this instance actually receives the proxy's forwarded traffic on."
+  fi
+}
+
+###############################################################################
+# Print one line per port the production Catalina container will actually LISTEN on: each declared
+# connector port plus the resolved offset. See RESOLVED_PORT_OFFSET for why the two differ.
+catalina_effective_ports() {
+  catalina_production_block \
+    | sed --quiet 's|.*<property name="port" value="\([0-9]\{1,\}\)"/>.*|\1|p' \
+    | while read -r declaredPort; do
+        printf '%s\n' "$((declaredPort + RESOLVED_PORT_OFFSET))"
+      done \
+    | sort --numeric-sort --unique
+}
+
 render_catalina_configuration() {
   require_single_production_container
 
@@ -5228,20 +6420,36 @@ render_catalina_configuration() {
   # SslAcceleratorValve out of the pipeline. Only a supplied value is checked.
   if [ -n "$acceleratorPort" ]; then
     require_integer_range OFBIZ_SSL_ACCELERATOR_PORT "$acceleratorPort" 1 65535
-    # Compared against the connectors of the PRODUCTION container alone. Searching the whole descriptor
-    # accepted 8010, which is declared only by the catalina-container-test AJP connector: the serving
-    # container has nothing on that port, so SslAcceleratorValve's request.getLocalPort() comparison
-    # would never match and every forwarded request would be treated as plain http - the value looked
-    # validated and did nothing.
-    if ! catalina_production_block | grep --quiet "<property name=\"port\" value=\"$acceleratorPort\"/>"; then
-      # The ports the serving container DOES declare are named in the refusal. Without them the
-      # message states only that the value matched nothing, which leaves the operator to find the
-      # descriptor and work out what would have been accepted.
-      local declaredPorts
-      declaredPorts=$(catalina_production_block \
-        | sed --quiet 's|.*<property name="port" value="\([0-9]\{1,\}\)"/>.*|\1|p' \
-        | sort --unique | tr '\n' ' ')
-      config_fatal "OFBIZ_SSL_ACCELERATOR_PORT=$acceleratorPort matches no connector port declared by the '$CATALINA_PRODUCTION_CONTAINER' block of $CATALINA_COMPONENT_DESCRIPTOR, which declares: $declaredPorts. It must be the LOCAL port this instance receives the proxy's forwarded traffic on, not the load balancer's public HTTPS port, and not a port declared only by the test container."
+    # Compared against the ports the PRODUCTION container will actually listen on: each connector port it
+    # declares, PLUS the offset the OFBiz command asks for.
+    #
+    # Two mistakes are closed here, and each one made a validated value do nothing. Searching the whole
+    # descriptor accepted 8010, which is declared only by the catalina-container-test AJP connector - the
+    # serving container has nothing on that port, so SslAcceleratorValve's request.getLocalPort()
+    # comparison could never match. And comparing against the DECLARED port ignored '--portoffset': with
+    # an offset of 100 a descriptor declaring 8080 binds 8180, the valve still compares the raw property
+    # against getLocalPort()=8180, so 8080 was the one value accepted and the one value that could not
+    # work, while 8180 - the port the load balancer is actually pointed at - was refused. See
+    # RESOLVED_PORT_OFFSET.
+    #
+    # The list is held one port per line, which is the form 'grep --line-regexp' needs, and is flattened
+    # only for the message below. Matching against a quoted expansion means the comparison never depends
+    # on the shell word splitting an unquoted variable: a port list that arrived with an unexpected
+    # character in it would otherwise change how many arguments printf receives rather than simply
+    # failing to match.
+    local effectivePorts
+    effectivePorts=$(catalina_effective_ports)
+    if ! printf '%s\n' "$effectivePorts" | grep --quiet --line-regexp --fixed-strings "$acceleratorPort"; then
+      # The ports the serving container really binds are named in the refusal. Without them the message
+      # states only that the value matched nothing, which leaves the operator to find the descriptor, work
+      # out what would have been accepted, and remember to add the offset to it.
+      local offsetNote=''
+      if [ "$RESOLVED_PORT_OFFSET" != '0' ]; then
+        offsetNote=" These are the declared connector ports plus the port offset of $RESOLVED_PORT_OFFSET that the OFBiz command asks for; the descriptor's own numbers are $RESOLVED_PORT_OFFSET lower and are NOT what this instance listens on."
+      fi
+      local effectivePortList
+      effectivePortList=$(printf '%s' "$effectivePorts" | tr '\n' ' ')
+      config_fatal "OFBIZ_SSL_ACCELERATOR_PORT=$acceleratorPort matches no port the '$CATALINA_PRODUCTION_CONTAINER' block of $CATALINA_COMPONENT_DESCRIPTOR will listen on, which are: ${effectivePortList% }.${offsetNote} It must be the LOCAL port this instance receives the proxy's forwarded traffic on, not the load balancer's public HTTPS port, and not a port declared only by the test container."
     fi
   fi
   rewrite_catalina_property ssl-accelerator-port "$acceleratorPort"
@@ -5350,27 +6558,33 @@ render_ajp_connector_address() {
     addressPresent="true"
   fi
 
+  # Each branch decides only whether to EDIT, and neither returns early, so the read-back at the end of
+  # this function runs on every path. Returning early when the address was already present - which is what
+  # the idempotence of the insert used to be expressed as - skipped that read-back, and with it the one
+  # check that can see a descriptor arriving with the line already duplicated: exactly the state the
+  # unscoped edit this replaced produced, one appended copy per restart, which a persistent lib volume
+  # written by an older image can still be in. The guard was unreachable on the path that needed it most.
   if [ -n "$OFBIZ_ENABLE_AJP_PORT" ]; then
-    if [ "$addressPresent" = "true" ]; then
-      # Already applied by an earlier start of this same container. Re-inserting would duplicate it.
-      return 0
-    fi
-    # '0,/re/{/re/...}' restricts the append to the FIRST line matching the anchor: the outer range ends
-    # at that line, and the inner address applies the command only to the line that matches. A bare
-    # '0,/re/ a text' would append after every line of the range instead, and an unaddressed '/re/ a text'
-    # after every match in the file - which is what reached the test container.
-    sed --in-place "0,\|$anchor|{\|$anchor| a\\
+    # Skipped, not returned from, when an earlier start of this same container already applied it:
+    # re-inserting would duplicate the line, and returning would skip the read-back that catches a
+    # duplicate which was already there.
+    if [ "$addressPresent" = "false" ]; then
+      # '0,/re/{/re/...}' restricts the append to the FIRST line matching the anchor: the outer range ends
+      # at that line, and the inner address applies the command only to the line that matches. A bare
+      # '0,/re/ a text' would append after every line of the range instead, and an unaddressed '/re/ a text'
+      # after every match in the file - which is what reached the test container.
+      sed --in-place "0,\|$anchor|{\|$anchor| a\\
             <property name=\"address\" value=\"0.0.0.0\"/>
 }" "$descriptor"
-  else
-    if [ "$addressPresent" = "false" ]; then
-      return 0
     fi
-    # Symmetric removal, scoped the same way: the first active address property at or after the AJP
-    # connector anchor. The committed descriptor carries the declaration only as a comment, which this
-    # pattern does not match, so the comment survives and the file returns to its shipped shape.
-    sed --in-place "\|$anchor|,\|^[[:blank:]]*$addressAnchor|{\|^[[:blank:]]*$addressAnchor|d
+  else
+    if [ "$addressPresent" = "true" ]; then
+      # Symmetric removal, scoped the same way: the first active address property at or after the AJP
+      # connector anchor. The committed descriptor carries the declaration only as a comment, which this
+      # pattern does not match, so the comment survives and the file returns to its shipped shape.
+      sed --in-place "\|$anchor|,\|^[[:blank:]]*$addressAnchor|{\|^[[:blank:]]*$addressAnchor|d
 }" "$descriptor"
+    fi
   fi
 
   # Read back rather than trust the edit: this line decides which interfaces the AJP connector answers
@@ -5419,46 +6633,58 @@ render_runtime_configuration() {
 }
 
 ###############################################################################
-# Resolve OFBIZ_CONTENT_STORE_PROVIDER to the backend that will actually be used.
+# The backend RESOLVED_CONTENT_STORE_TOKEN names, set by require_content_store_provider.
 #
-# This is the shell half of one decision that ContentStoreFactory.resolve makes on the Java side, and
-# the two must agree exactly, because this script renders the value the factory then reads. The factory
-# trims the value, folds it to lower case, and - for anything it still does not recognise - logs a
-# warning naming the value and falls back to the database default. It does NOT throw, and it does not
-# poison its cache with the refusal, because a mis-spelled provider must never stop a fleet member from
-# starting: an instance that cannot boot serves nothing, whereas one that boots on database storage
-# serves every request correctly and says in its log that the object store was not selected.
-#
-# So this function mirrors that contract instead of refusing: trim, fold case, accept the three known
-# tokens, and otherwise warn and answer 'database'. Refusing here would reintroduce exactly the failure
-# mode the factory was changed to avoid, one layer earlier - the container would exit before the JVM
-# ever started, and the deployment would see a crash-looping task instead of a warning.
-#
-# The warning goes to stderr and the resolved token to stdout, so a caller can capture the decision in
-# a command substitution without the diagnostic contaminating it.
-# $1 - the supplied value; prints the resolved provider token
-resolve_content_store_provider() {
-  local value="$1"
+# A global rather than a printed result, and that is what makes the refusal below work at all: a value
+# printed on stdout has to be captured in a command substitution, config_fatal's 'exit 1' would then end
+# only the SUBSHELL, and whether the start really stopped would depend on 'set -e' surviving the
+# assignment form the caller happened to use - which it does not for 'local x=$(...)'. Assigning a global
+# in the caller's own shell means the refusal aborts the start from wherever it is reached.
+RESOLVED_CONTENT_STORE_TOKEN=""
 
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  value=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+###############################################################################
+# Resolve OFBIZ_CONTENT_STORE_PROVIDER to the backend that will actually be used, or abort the start.
+#
+# This is the shell half of one decision ContentStoreFactory.resolve makes on the Java side, and the two
+# must agree exactly, because this script renders the value the factory then reads. The factory trims the
+# value, folds it to lower case, defaults an ABSENT or BLANK selector to the database backend, and throws
+# for anything else - naming the value, the property and the accepted set. This function mirrors that:
+# trim, fold case, accept the three known tokens, default the empty one, refuse the rest.
+#
+# The refusal is the point. Accepting a mis-spelled selector as 'database' does not degrade gracefully -
+# it silently relocates every upload and every DataResource file this deployment writes onto storage the
+# operator did not choose. On a container that is what "the instance's own writable layer" means, so the
+# content is destroyed the next time the task is replaced, and nothing in the deployment reports the
+# substitution because both layers believe they honoured the configuration. Refusing costs one legible
+# start-up error naming the variable, the value and the three accepted tokens, which is a fault an
+# operator fixes in seconds. See CONTENT_STORE_PROVIDERS.
+#
+# The resolved token goes into RESOLVED_CONTENT_STORE_TOKEN rather than onto stdout; see that variable.
+# $1 - the supplied value
+require_content_store_provider() {
+  trim_configuration_value "$1"
+  local value
+  value=$(printf '%s' "$TRIMMED_VALUE" | tr '[:upper:]' '[:lower:]')
 
+  # ABSENT or BLANK is not a mistake: it is the unconfigured checkout, which must keep working with no
+  # configuration at all. Only a value the operator actually spelled out can be wrong.
   if [ -z "$value" ]; then
-    printf '%s' "$CONTENT_STORE_DEFAULT_PROVIDER"
+    RESOLVED_CONTENT_STORE_TOKEN="$CONTENT_STORE_DEFAULT_PROVIDER"
     return 0
   fi
 
   local candidate
   for candidate in "${CONTENT_STORE_PROVIDERS[@]}"; do
     if [ "$value" = "$candidate" ]; then
-      printf '%s' "$value"
+      RESOLVED_CONTENT_STORE_TOKEN="$value"
       return 0
     fi
   done
 
-  printf '%s\n' "WARNING: OFBIZ_CONTENT_STORE_PROVIDER is '$value', which is not a storage backend this image recognises. Content will be stored by the '$CONTENT_STORE_DEFAULT_PROVIDER' backend instead. Set it to one of: ${CONTENT_STORE_PROVIDERS[*]}." >&2
-  printf '%s' "$CONTENT_STORE_DEFAULT_PROVIDER"
+  # The value IS quoted, unlike a secret: it is a backend name, it is what the operator has to correct,
+  # and the folded form is quoted rather than the raw one so that a case or whitespace difference between
+  # what was supplied and what was compared is visible in the message.
+  config_fatal "OFBIZ_CONTENT_STORE_PROVIDER is '$value', which is not a storage backend this image recognises, so where durable content would be stored is not established. Set it to one of: ${CONTENT_STORE_PROVIDERS[*]} - or leave it unset for '$CONTENT_STORE_DEFAULT_PROVIDER' storage. ContentStoreFactory refuses the same value, so starting on it would fail at the first content read instead."
 }
 
 
@@ -5522,7 +6748,8 @@ render_content_store_configuration() {
 
   local provider="${OFBIZ_CONTENT_STORE_PROVIDER:-database}"
   reject_unsafe_value OFBIZ_CONTENT_STORE_PROVIDER "$provider"
-  provider=$(resolve_content_store_provider "$provider")
+  require_content_store_provider "$provider"
+  provider="$RESOLVED_CONTENT_STORE_TOKEN"
 
   local bucket="$OFBIZ_S3_BUCKET"
   local region="$OFBIZ_S3_REGION"
@@ -5567,10 +6794,10 @@ render_content_store_configuration() {
       config_fatal "OFBIZ_S3_REGION is required when OFBIZ_CONTENT_STORE_PROVIDER=s3. Supply the store's region identifier - S3-compatible stores that have no regions of their own conventionally accept us-east-1."
     fi
     reject_unsafe_value OFBIZ_S3_BUCKET "$bucket"
-    reject_leading_whitespace OFBIZ_S3_BUCKET "$bucket"
+    reject_edge_whitespace OFBIZ_S3_BUCKET "$bucket"
     require_object_store_bucket OFBIZ_S3_BUCKET "$bucket"
 
-    reject_leading_whitespace OFBIZ_S3_REGION "$region"
+    reject_edge_whitespace OFBIZ_S3_REGION "$region"
     # Delegated to the same validator resolve_content_store_configuration uses, exactly as the bucket
     # above delegates to require_object_store_bucket and the endpoint below to require_object_store_endpoint.
     # One validator owns the whole rule - the accepted character set and the accepted length, each
@@ -5579,7 +6806,7 @@ render_content_store_configuration() {
 
     if [ -n "$endpoint" ]; then
       reject_unsafe_value OFBIZ_S3_ENDPOINT "$endpoint"
-      reject_leading_whitespace OFBIZ_S3_ENDPOINT "$endpoint"
+      reject_edge_whitespace OFBIZ_S3_ENDPOINT "$endpoint"
       require_object_store_endpoint OFBIZ_S3_ENDPOINT "$endpoint"
       # Reported from the caller rather than the validator, which is reached twice per start: one
       # endpoint would otherwise produce two identical warnings and read as a fault in the script.
@@ -5600,14 +6827,28 @@ render_content_store_configuration() {
     require_object_store_credential_pair "$accessKeyId" "$secretAccessKey"
     if [ -n "$accessKeyId" ]; then
       reject_unsafe_value OFBIZ_S3_ACCESS_KEY_ID "$accessKeyId"
-      reject_leading_whitespace OFBIZ_S3_ACCESS_KEY_ID "$accessKeyId"
+      reject_edge_whitespace OFBIZ_S3_ACCESS_KEY_ID "$accessKeyId"
       reject_unsafe_value OFBIZ_S3_SECRET_ACCESS_KEY "$secretAccessKey"
-      reject_leading_whitespace OFBIZ_S3_SECRET_ACCESS_KEY "$secretAccessKey"
+      reject_edge_whitespace OFBIZ_S3_SECRET_ACCESS_KEY "$secretAccessKey"
     fi
   fi
 
   pathStyle=$(require_boolean OFBIZ_S3_PATH_STYLE "${OFBIZ_S3_PATH_STYLE:-false}") \
     || config_fatal "OFBIZ_S3_PATH_STYLE must be a boolean: true or false. It selects path-style addressing, which most S3-compatible stores require and Amazon S3 does not."
+
+  # The one setting this script DERIVES instead of reading. S3ContentStore refuses a plaintext endpoint to
+  # any host but its own unless this says otherwise, and the answer follows entirely from the profile: the
+  # deployed profile has already refused such an endpoint above, so 'true' can only ever be reached by a
+  # development container that chose http itself - which is the developer's own MinIO or test store.
+  # Rendered on every start, in both directions, so a container promoted from dev to prod loses the
+  # permission with the profile rather than inheriting it from a stale override on the config volume.
+  # See CONTENT_STORE_DERIVED_PROPERTIES.
+  local insecureEndpointAllowed='false'
+  if [ "$provider" = 's3' ] && [ "${OFBIZ_PROFILE:-}" != 'prod' ]; then
+    case "$endpoint" in
+    http://*) insecureEndpointAllowed='true' ;;
+    esac
+  fi
 
   # One sed script, written to a mode 0600 temporary file, for the same reason the security.properties
   # render uses one: --expression= would put the secret access key in this script's own command line.
@@ -5619,10 +6860,15 @@ render_content_store_configuration() {
   sedScript=$(mktemp)
   chmod 600 "$sedScript"
   register_secret_temp_file "$sedScript"
+  # The supplied settings and the derived one are rendered and read back from ONE pair of lists, so a
+  # property cannot be substituted without also being verified, or verified without being substituted.
+  local renderedProperties=("${CONTENT_STORE_PROPERTIES[@]}" "${CONTENT_STORE_DERIVED_PROPERTIES[@]}")
+  local renderedSources=("${CONTENT_STORE_VARIABLES[@]}" "${CONTENT_STORE_DERIVED_SOURCES[@]}")
+
   {
     local index
-    for index in "${!CONTENT_STORE_PROPERTIES[@]}"; do
-      local property="${CONTENT_STORE_PROPERTIES[$index]}"
+    for index in "${!renderedProperties[@]}"; do
+      local property="${renderedProperties[$index]}"
       local value
       case "$property" in
       content.store.provider) value="$provider" ;;
@@ -5632,6 +6878,7 @@ render_content_store_configuration() {
       content.store.s3.access.key.id) value="$accessKeyId" ;;
       content.store.s3.secret.access.key) value="$secretAccessKey" ;;
       content.store.s3.path.style) value="$pathStyle" ;;
+      content.store.s3.insecure.endpoint.allowed) value="$insecureEndpointAllowed" ;;
       esac
       printf 's|^%s=.*|%s=%s|\n' "$(properties_key_pattern "$property")" "$property" \
         "$(sed_escape_replacement "$(properties_escape_value "$value")")"
@@ -5647,9 +6894,9 @@ render_content_store_configuration() {
   # source would leave a value unsubstituted or shadowed, and the only symptom would be content quietly
   # going to the wrong backend - or, for the provider itself, an exception at the first content read.
   local index
-  for index in "${!CONTENT_STORE_PROPERTIES[@]}"; do
-    local property="${CONTENT_STORE_PROPERTIES[$index]}"
-    local variableName="${CONTENT_STORE_VARIABLES[$index]}"
+  for index in "${!renderedProperties[@]}"; do
+    local property="${renderedProperties[$index]}"
+    local variableName="${renderedSources[$index]}"
     local expected
     case "$property" in
     content.store.provider) expected="$provider" ;;
@@ -5659,6 +6906,7 @@ render_content_store_configuration() {
     content.store.s3.access.key.id) expected="$accessKeyId" ;;
     content.store.s3.secret.access.key) expected="$secretAccessKey" ;;
     content.store.s3.path.style) expected="$pathStyle" ;;
+    content.store.s3.insecure.endpoint.allowed) expected="$insecureEndpointAllowed" ;;
     esac
     # A non-blank value must be declared with something after the '=': that is the half that catches a
     # renamed anchor, which would otherwise leave the property absent from the render entirely.
@@ -5735,6 +6983,14 @@ render_content_url_configuration() {
     return 0
   fi
 
+  # Only the LEADING blanks are refused here, unlike every secret and every object-store setting. A
+  # prefix is a free form value: 'https://cdn.example/a b' is legal, and 'https://cdn.example ' means the
+  # same origin as 'https://cdn.example' once UtilProperties has trimmed it, so refusing it would be an
+  # arbitrary restriction rather than a protection. What must still be impossible is the application
+  # running on a prefix that was never checked, and require_rendered_property_value establishes that by
+  # comparing the rendered value as UtilProperties will normalise it. Leading blanks are refused because
+  # java.util.Properties drops them before UtilProperties ever sees the value, which would leave the
+  # rendered file and the loaded value disagreeing about the origin itself.
   reject_unsafe_value OFBIZ_CONTENT_URL_PREFIX "$urlPrefix"
   reject_leading_whitespace OFBIZ_CONTENT_URL_PREFIX "$urlPrefix"
 
@@ -5902,7 +7158,8 @@ require_object_store_region() {
 # 1-65535 if one is given, and a host written only with the characters a host is written with. This
 # mirrors S3ContentStore.validatedEndpoint, so a value this script accepts is one the provider accepts.
 #
-# A metadata-service address is refused outright, in every profile. See INSTANCE_METADATA_HOSTS.
+# A metadata-service address is refused outright, in every profile, in every spelling it can be written
+# in. See refuse_credential_disclosing_host, INSTANCE_METADATA_NAMES and METADATA_IPV6_ADDRESS.
 #
 # A plaintext endpoint is refused outright in the deployed profile. Every object PUT carries the store
 # credential and every GET returns content that may not be public, so an http endpoint exposes both to
@@ -5916,6 +7173,355 @@ require_object_store_region() {
 # to catch is an endpoint with a credential embedded in it. Every rejection therefore names the variable
 # and describes the rule instead of echoing what was supplied.
 # $1 - variable name, $2 - value (never printed)
+###############################################################################
+# Parse one part of an IPv4 literal in decimal, octal or hexadecimal, echoing its value.
+#
+# The three bases are the inet_aton grammar the C resolver implements, which is the resolver the AWS
+# SDK's HTTP client ends up using: '0x' introduces hexadecimal, a leading '0' introduces octal, and
+# anything else is decimal. Returns non-zero for a part that is not a number in the base its prefix
+# announces, which is what makes the caller treat the whole host as a name rather than as a literal.
+# $1 - the part as written
+numeric_ipv4_part() {
+  local part="$1"
+
+  case "$part" in
+  '')
+    return 1
+    ;;
+  0x* | 0X*)
+    local hex="${part#0[xX]}"
+    case "$hex" in
+    '' | *[!0-9A-Fa-f]*)
+      return 1
+      ;;
+    esac
+    printf '%s' "$((16#$hex))"
+    ;;
+  0*)
+    local octal="${part#0}"
+    case "$octal" in
+    *[!0-7]*)
+      return 1
+      ;;
+    esac
+    if [ -z "$octal" ]; then
+      printf '0'
+    else
+      printf '%s' "$((8#$octal))"
+    fi
+    ;;
+  *)
+    case "$part" in
+    *[!0-9]*)
+      return 1
+      ;;
+    esac
+    printf '%s' "$((10#$part))"
+    ;;
+  esac
+}
+
+###############################################################################
+# Canonicalise a host written as an IPv4 literal in ANY form, echoing the dotted quad it denotes.
+#
+# This is what makes the metadata refusal a defence rather than a spelling check. 169.254.169.254 can
+# be written as 2852039166, as 0xA9FEA9FE, as 0251.0376.0251.0376, as 169.254.43518 and as any mixture
+# of those, and the resolver accepts every one of them as the same address - so comparing the text
+# against '169.254.169.254' defends against nothing. Fewer than four parts means the last part supplies
+# the octets the earlier parts did not, which is where the short forms come from.
+#
+# Returns non-zero when the host is not an IPv4 literal in any form, so a caller can go on to treat it
+# as an IPv6 literal or as a name. Echoes nothing in that case.
+# $1 - the host, already lower cased and with any IPv6 brackets removed
+canonical_ipv4_host() {
+  local host="$1"
+
+  # A leading, trailing or doubled '.' is refused before splitting, because word splitting collapses
+  # empty fields and would otherwise read '1..2' as '1.2'.
+  case "$host" in
+  '' | .* | *. | *..* | *[!0-9A-Fa-fxX.]*)
+    return 1
+    ;;
+  esac
+
+  local -a parts=()
+  local IFS='.'
+  read -r -a parts <<<"$host"
+  unset IFS
+  local count="${#parts[@]}"
+  if [ "$count" -lt 1 ] || [ "$count" -gt 4 ]; then
+    return 1
+  fi
+
+  local -a values=()
+  local index value ceiling
+  for ((index = 0; index < count; index++)); do
+    value=$(numeric_ipv4_part "${parts[index]}") || return 1
+    if [ "$index" -eq "$((count - 1))" ]; then
+      ceiling=$((4294967295 >> (8 * index)))
+    else
+      ceiling=255
+    fi
+    if [ "$value" -gt "$ceiling" ]; then
+      return 1
+    fi
+    values+=("$value")
+  done
+
+  local address="${values[count - 1]}"
+  for ((index = 0; index < count - 1; index++)); do
+    address=$((address | (values[index] << (8 * (3 - index)))))
+  done
+  printf '%d.%d.%d.%d' "$(((address >> 24) & 255))" "$(((address >> 16) & 255))" \
+    "$(((address >> 8) & 255))" "$((address & 255))"
+}
+
+###############################################################################
+# Canonicalise a host written as an IPv6 literal, echoing its eight groups with leading zeros removed.
+#
+# The same argument as for IPv4: fd00:ec2::254 is also fd00:0ec2::0254 and fd00:ec2:0:0:0:0:0:254, and
+# an endpoint check that compared spellings would miss two of the three. '::' is expanded to the zero
+# groups it stands for and an embedded IPv4 tail is folded into two groups, so the result is directly
+# comparable with METADATA_IPV6_ADDRESS.
+#
+# Returns non-zero for anything that is not an IPv6 literal.
+# $1 - the host, already lower cased and with any brackets removed
+canonical_ipv6_host() {
+  local host="$1"
+
+  case "$host" in
+  *:*) : ;;
+  *) return 1 ;;
+  esac
+  case "$host" in
+  *[!0-9a-f:.]*)
+    return 1
+    ;;
+  esac
+
+  local head tail
+  case "$host" in
+  *::*::*)
+    return 1
+    ;;
+  *::*)
+    head="${host%%::*}"
+    tail="${host#*::}"
+    ;;
+  *)
+    head="$host"
+    tail=''
+    ;;
+  esac
+
+  local -a groups=()
+  local -a headGroups=()
+  local -a tailGroups=()
+  ipv6_groups_of "$head" || return 1
+  headGroups=("${IPV6_GROUPS[@]}")
+  ipv6_groups_of "$tail" || return 1
+  tailGroups=("${IPV6_GROUPS[@]}")
+
+  local missing=$((8 - ${#headGroups[@]} - ${#tailGroups[@]}))
+  case "$host" in
+  *::*)
+    if [ "$missing" -lt 1 ]; then
+      return 1
+    fi
+    ;;
+  *)
+    if [ "$missing" -ne 0 ]; then
+      return 1
+    fi
+    ;;
+  esac
+
+  groups=("${headGroups[@]}")
+  local index
+  for ((index = 0; index < missing; index++)); do
+    groups+=(0)
+  done
+  if [ "${#tailGroups[@]}" -gt 0 ]; then
+    groups+=("${tailGroups[@]}")
+  fi
+
+  local joined=''
+  for index in "${!groups[@]}"; do
+    if [ -n "$joined" ]; then
+      joined="$joined:"
+    fi
+    joined="$joined${groups[index]}"
+  done
+  printf '%s' "$joined"
+}
+
+###############################################################################
+# Split one half of an IPv6 literal into its groups, leading zeros removed, into IPV6_GROUPS.
+#
+# A global rather than stdout because the caller needs an array and a command substitution would flatten
+# it, and because a subshell could not report a malformed group to the caller as a status.
+# $1 - the half, possibly empty, possibly ending in an embedded IPv4 address
+ipv6_groups_of() {
+  local half="$1"
+  IPV6_GROUPS=()
+  if [ -z "$half" ]; then
+    return 0
+  fi
+  case "$half" in
+  :* | *:)
+    return 1
+    ;;
+  esac
+
+  local -a fields=()
+  local IFS=':'
+  read -r -a fields <<<"$half"
+  unset IFS
+
+  local index field quad
+  for index in "${!fields[@]}"; do
+    field="${fields[index]}"
+    case "$field" in
+    '')
+      return 1
+      ;;
+    *.*)
+      # An embedded IPv4 tail is only legal as the last field, and folds into two groups.
+      if [ "$index" -ne "$((${#fields[@]} - 1))" ]; then
+        return 1
+      fi
+      quad=$(canonical_ipv4_host "$field") || return 1
+      local -a octets=()
+      local IFS='.'
+      read -r -a octets <<<"$quad"
+      unset IFS
+      IPV6_GROUPS+=("$(printf '%x' "$(((octets[0] << 8) | octets[1]))")")
+      IPV6_GROUPS+=("$(printf '%x' "$(((octets[2] << 8) | octets[3]))")")
+      ;;
+    *)
+      case "$field" in
+      *[!0-9a-f]*)
+        return 1
+        ;;
+      esac
+      if [ "${#field}" -gt 4 ]; then
+        return 1
+      fi
+      IPV6_GROUPS+=("$(printf '%x' "$((16#$field))")")
+      ;;
+    esac
+  done
+}
+
+###############################################################################
+# Refuse a host that names, or resolves to, an address that answers with this instance's credentials.
+#
+# The judgement is on the ADDRESS, never on the spelling: every IPv4 address in 169.254.0.0/16 (which
+# holds both the EC2/GCE/Azure metadata service and the ECS task metadata endpoint, and nothing
+# routable), every IPv6 link-local address in fe80::/10, and the fd00:ec2::254 metadata address. The
+# metadata host NAMES are refused outright.
+#
+# A name that is not a literal is resolved with getent and every address it answers with is judged, so a
+# DNS alias for the metadata service is refused too. A name that does not resolve - or a container with
+# no getent - is REPORTED and accepted: a container is routinely started before its resolver or its
+# private zone is reachable, and refusing would turn that into a failed deployment while accepting costs
+# nothing, because S3ContentStore applies the same rules again inside the JVM and the SDK resolves the
+# name once more on every connection. Nothing at this layer can defend against rebinding, where a name
+# resolves acceptably here and to a metadata address later; that is what egress policy and IMDSv2 are
+# for. This is defence in depth against a configuration mistake or a single tampered variable.
+# $1 - the variable name, for the diagnostic
+# $2 - the host, already lower cased and with any IPv6 brackets removed
+refuse_credential_disclosing_host() {
+  local name="$1"
+  local host="$2"
+
+  local metadataName
+  for metadataName in "${INSTANCE_METADATA_NAMES[@]}"; do
+    if [ "$host" = "$metadataName" ]; then
+      metadata_host_fatal "$name"
+    fi
+  done
+
+  local canonical
+  if canonical=$(canonical_ipv4_host "$host"); then
+    refuse_metadata_address "$name" "$canonical"
+    return 0
+  fi
+  if canonical=$(canonical_ipv6_host "$host"); then
+    refuse_metadata_address "$name" "$canonical"
+    return 0
+  fi
+
+  if ! command -v getent >/dev/null 2>&1; then
+    printf '%s\n' "NOTICE: $name could not be checked against the cloud instance metadata addresses because getent is not available in this image; the JVM applies the same check again before any request is issued." >&2
+    return 0
+  fi
+  local resolved
+  if ! resolved=$(getent ahosts "$host" 2>/dev/null); then
+    printf '%s\n' "NOTICE: the $name host does not resolve yet, so it could not be checked against the cloud instance metadata addresses. The object store's own client resolves it again on every connection." >&2
+    return 0
+  fi
+  local address
+  while read -r address _; do
+    if [ -n "$address" ]; then
+      refuse_metadata_address "$name" "$(printf '%s' "$address" | tr '[:upper:]' '[:lower:]')"
+    fi
+  done <<<"$resolved"
+}
+
+###############################################################################
+# Refuse one canonical address that answers with instance credentials.
+# $1 - the variable name, for the diagnostic
+# $2 - the address, canonical or as getent reported it
+refuse_metadata_address() {
+  local name="$1"
+  local address="$2"
+
+  case "$address" in
+  169.254.*)
+    metadata_host_fatal "$name"
+    ;;
+  esac
+  # fe80::/10 is fe80: through febf:, and getent reports an IPv6 address with its zeros collapsed, so
+  # both the collapsed and the expanded spellings are matched.
+  case "$address" in
+  fe8?:* | fe9?:* | fea?:* | feb?:*)
+    metadata_host_fatal "$name"
+    ;;
+  esac
+  local normalised
+  if normalised=$(canonical_ipv6_host "$address"); then
+    if [ "$normalised" = "$METADATA_IPV6_ADDRESS" ]; then
+      metadata_host_fatal "$name"
+    fi
+    # An IPv4 address written as an IPv6 literal - ::ffff:169.254.169.254 mapped, or ::169.254.169.254
+    # compatible - denotes the IPv4 address and must be judged as one. The last two groups carry it.
+    case "$normalised" in
+    0:0:0:0:0:ffff:*:* | 0:0:0:0:0:0:*:*)
+      local high="${normalised##*:*:*:*:*:*:}"
+      local highGroup="${high%%:*}"
+      local lowGroup="${high##*:}"
+      local embedded
+      embedded=$(printf '%d.%d.%d.%d' "$(((16#$highGroup >> 8) & 255))" "$((16#$highGroup & 255))" \
+        "$(((16#$lowGroup >> 8) & 255))" "$((16#$lowGroup & 255))")
+      case "$embedded" in
+      169.254.*)
+        metadata_host_fatal "$name"
+        ;;
+      esac
+      ;;
+    esac
+  fi
+}
+
+###############################################################################
+# The one refusal, so every path refuses with the same words. The configured value is deliberately not
+# quoted back: an endpoint is the setting most likely to carry a credential.
+# $1 - the variable name
+metadata_host_fatal() {
+  config_fatal "$1 must not name, or resolve to, a cloud instance metadata address. The object-store provider sends this deployment's own credentials to that address, so this is refused in every profile and has no override."
+}
+
 require_object_store_endpoint() {
   local name="$1"
   local value="$2"
@@ -6024,14 +7630,7 @@ require_object_store_endpoint() {
     ;;
   esac
 
-  local metadataHost normalisedMetadataHost
-  for metadataHost in "${INSTANCE_METADATA_HOSTS[@]}"; do
-    normalisedMetadataHost="${metadataHost#\[}"
-    normalisedMetadataHost="${normalisedMetadataHost%\]}"
-    if [ "$host" = "$normalisedMetadataHost" ]; then
-      config_fatal "$name points at the cloud instance metadata service ($metadataHost). The object-store provider sends this deployment's own credentials to that address, so this is refused in every profile and has no override."
-    fi
-  done
+  refuse_credential_disclosing_host "$name" "$host"
 
   if [ "$scheme" = 'http' ] && [ "${OFBIZ_PROFILE:-}" = "prod" ]; then
     config_fatal "$name must use https:// when OFBIZ_PROFILE=prod. Every object write carries the store credential and every read returns content that may not be public, so a plaintext endpoint exposes both to anything on the network path. Use https, or run this deployment with OFBIZ_PROFILE=dev if it really is a local development store."
@@ -6073,12 +7672,12 @@ RESOLVED_S3_CREDENTIAL_SOURCE=""
 # deliberately, because the alternative - accepting an incomplete object-store configuration and
 # degrading to database storage - would write content to a different backend from the one the deployment
 # asked for, and content written to the wrong backend is not something a later restart can put right.
-# Selecting it is the one decision that does not fail closed: an unrecognised provider token is reported
-# and treated as the database default, matching ContentStoreFactory, because a value the Java side would
-# have warned about must not stop the container before the JVM starts. The one rule that distinguishes
-# the profiles is the refusal of a plaintext endpoint in prod, which require_object_store_endpoint
-# applies on this path as well as on the render, and it can only do that because the profile is already
-# known here.
+# SELECTING it fails closed for the same reason: an unrecognised provider token is refused here, matching
+# ContentStoreFactory, because treating it as the database default is exactly the silent relocation of
+# durable content the paragraph above refuses everywhere else. An ABSENT selector is not a token and
+# still resolves to the committed default. The one rule that distinguishes the profiles is the refusal of
+# a plaintext endpoint in prod, which require_object_store_endpoint applies on this path as well as on the
+# render, and it can only do that because the profile is already known here.
 #
 # Tracing is suspended for the whole function so a secret access key supplied through the environment is
 # never echoed.
@@ -6107,12 +7706,14 @@ resolve_content_store_configuration() {
 
   reject_unsafe_value OFBIZ_CONTENT_STORE_PROVIDER "$provider"
   # Resolved through the SAME function the render uses, which is what lets the two results be compared
-  # as plain strings after the render. Folding case and warning-with-fallback both live in that one
-  # function, so this path and the render path cannot drift into disagreeing about a value - the failure
-  # an earlier revision had, where this resolver accepted 'S3' case-insensitively and the render then
-  # refused it, making the operator's first diagnostic name OFBIZ_S3_BUCKET for a run that could never
-  # have started.
-  provider=$(resolve_content_store_provider "$provider")
+  # as plain strings after the render. Folding case and refusing an unrecognised token both live in that
+  # one function, so this path and the render path cannot drift into disagreeing about a value - the
+  # failure an earlier revision had, where this resolver accepted 'S3' case-insensitively and the render
+  # then refused it, making the operator's first diagnostic name OFBIZ_S3_BUCKET for a run that could
+  # never have started. Because the refusal is reached HERE, on the earliest path in _main, a mis-spelled
+  # provider is reported before the database is touched and before any secret is rendered.
+  require_content_store_provider "$provider"
+  provider="$RESOLVED_CONTENT_STORE_TOKEN"
   RESOLVED_CONTENT_STORE_PROVIDER="$provider"
 
   if [ "$provider" != 's3' ]; then
@@ -6275,6 +7876,12 @@ RESOLVED_JMS_USERNAME=""
 RESOLVED_JMS_PASSWORD=""
 RESOLVED_JMS_CREDENTIAL_SOURCE=""
 RESOLVED_JMS_CONNECT_TIMEOUT=""
+# The individual broker endpoints the provider URL names, filled in by split_jms_provider_url and read
+# by require_secure_jms_transport. A failover or discovery URL names several; a plain URL names one.
+# JMS_WRAPPER_QUERY carries the options written once on the wrapper and applied to every endpoint in it.
+# Declared here so both exist under 'set -u' even on the paths that never configure a transport.
+JMS_ENDPOINTS=()
+JMS_WRAPPER_QUERY=""
 
 ###############################################################################
 # Require a value that is a fully qualified Java class name.
@@ -6405,11 +8012,374 @@ require_jms_credential_pair() {
 }
 
 ###############################################################################
+# Split a JMS provider URL into the endpoints it actually connects to, in JMS_ENDPOINTS.
+#
+# A provider URL is not always one endpoint. 'failover:(tcp://a:61616,tcp://b:61616)?maxReconnectAttempts=3'
+# names two, and every policy below has to hold for BOTH of them: a list whose first member is TLS and
+# whose second is plaintext silently downgrades the connection the first time the broker restarts. One
+# wrapper is unwrapped, its trailing query is discarded, and the inner list is split on commas.
+#
+# Nesting deeper than one level is refused rather than parsed. A URL such as
+# 'failover:(failover:(tcp://a),tcp://b)' is legal for some clients, and unwrapping it correctly would
+# mean writing a parser here; refusing it means no endpoint is ever waved through because this function
+# failed to notice it. A deployment that needs one writes a single flat list of endpoints instead.
+# $1 - variable name, $2 - the provider URL
+split_jms_provider_url() {
+  local name="$1"
+  local url="$2"
+  local inner="$url"
+  local wrapper
+  local body
+
+  JMS_ENDPOINTS=()
+  JMS_WRAPPER_QUERY=""
+  for wrapper in "${JMS_URL_WRAPPERS[@]}"; do
+    case "$inner" in
+    "$wrapper":\(*\)*)
+      body="${inner#"$wrapper":(}"
+      # Kept rather than discarded: ActiveMQ's wrapper-level options - 'nested.verifyHostName=true' and
+      # the like - are applied to EVERY nested endpoint, so a policy that threw them away would refuse a
+      # correctly configured failover list for saying it once instead of twice.
+      JMS_WRAPPER_QUERY="${body#*)}"
+      inner="${body%%)*}"
+      break
+      ;;
+    esac
+  done
+  case "$inner" in
+  *'('* | *')'*)
+    config_fatal "$name nests transport lists more than one level deep, so this script cannot hold every endpoint in it to the transport policy. Write one flat list of endpoints, such as failover:(ssl://a:61617,ssl://b:61617)."
+    ;;
+  esac
+
+  local previousIFS="$IFS"
+  IFS=','
+  # shellcheck disable=SC2206 # deliberate word splitting on the separator set above
+  JMS_ENDPOINTS=($inner)
+  IFS="$previousIFS"
+
+  if [ "${#JMS_ENDPOINTS[@]}" -eq 0 ]; then
+    config_fatal "$name names no endpoint."
+  fi
+}
+
+###############################################################################
+# Report whether the string $1 contains any of the substrings $2..$n.
+# $1 - haystack, $2..$n - needles
+string_contains_any() {
+  local haystack="$1"
+  shift
+  local needle
+  for needle in "$@"; do
+    case "$haystack" in
+    *"$needle"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+###############################################################################
+# Report whether the query parameter value $1 means on / off. Anything outside the vocabulary is neither,
+# so a parameter set to a value this script does not understand is treated as saying nothing rather than
+# as saying yes.
+# $1 - the value, already lower-cased
+jms_value_is_true() {
+  local candidate
+  for candidate in "${JMS_TRUE_VALUES[@]}"; do
+    [ "$1" = "$candidate" ] && return 0
+  done
+  return 1
+}
+
+# $1 - the value, already lower-cased
+jms_value_is_false() {
+  local candidate
+  for candidate in "${JMS_FALSE_VALUES[@]}"; do
+    [ "$1" = "$candidate" ] && return 0
+  done
+  return 1
+}
+
+###############################################################################
+# Print one normalised 'key=value' line for every query parameter anywhere in the URL $1.
+#
+# Everything that separates parameters or endpoints - '?', '&', '(', ')', ',' and ';' - becomes a line
+# break, the result is lower-cased and stripped of spaces, and only the lines that carry an '=' are kept.
+# The point of scanning the WHOLE url in one pass, rather than per endpoint, is the wrapper-level option:
+# 'failover:(...)?nested.verifyHostName=false' disables verification for every endpoint in the list while
+# appearing on none of them.
+#
+# Values are normalised along with the names and must not be printed. A broker URL should carry no
+# credential - require_jms_provider_url refuses '@' outright - but a parameter is still the kind of place
+# one turns up, so every message built from this output names the KEY only.
+# $1 - the URL
+jms_url_parameters() {
+  printf '%s' "$1" \
+    | tr '?&(),;' '\n\n\n\n\n\n' \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr --delete ' \t' \
+    | { grep '=' || true; }
+}
+
+###############################################################################
+# Report whether the parameter $1=$2 switches peer verification OFF.
+# $1 - lower-cased parameter name, $2 - lower-cased parameter value
+jms_parameter_disables_verification() {
+  local key="$1"
+  local value="$2"
+
+  if string_contains_any "$key" "$JMS_JSSE_IDENTIFICATION_MARKER"; then
+    case "$value" in
+    '' | none) return 0 ;;
+    *) return 1 ;;
+    esac
+  fi
+
+  if string_contains_any "$key" "${JMS_TRUST_EVERYTHING_MARKERS[@]}"; then
+    jms_value_is_true "$value" && return 0
+    return 1
+  fi
+
+  if string_contains_any "$key" "${JMS_NEGATION_MARKERS[@]}"; then
+    if string_contains_any "$key" "${JMS_NEGATABLE_MARKERS[@]}"; then
+      jms_value_is_true "$value" && return 0
+    fi
+    return 1
+  fi
+
+  if string_contains_any "$key" "${JMS_VERIFICATION_MARKERS[@]}"; then
+    jms_value_is_false "$value" && return 0
+  fi
+  return 1
+}
+
+###############################################################################
+# Report whether the parameter $1=$2 is positive evidence that peer verification is ON.
+#
+# The mirror of the function above, and deliberately not its negation: most parameters say nothing either
+# way, and 'says nothing' must not be read as 'verifies'. 'trustAll=false' is the clearest case - it
+# withdraws a blanket trust setting and says nothing at all about the hostname check.
+# $1 - lower-cased parameter name, $2 - lower-cased parameter value
+jms_parameter_enables_verification() {
+  local key="$1"
+  local value="$2"
+
+  if string_contains_any "$key" "$JMS_JSSE_IDENTIFICATION_MARKER"; then
+    case "$value" in
+    '' | none) return 1 ;;
+    *) return 0 ;;
+    esac
+  fi
+
+  if string_contains_any "$key" "${JMS_NEGATION_MARKERS[@]}"; then
+    if string_contains_any "$key" "${JMS_VERIFICATION_MARKERS[@]}" hostname; then
+      jms_value_is_false "$value" && return 0
+    fi
+    return 1
+  fi
+
+  if string_contains_any "$key" "${JMS_VERIFICATION_MARKERS[@]}"; then
+    jms_value_is_true "$value" && return 0
+  fi
+  return 1
+}
+
+###############################################################################
+# Refuse a provider URL that anywhere switches certificate or hostname verification off.
+#
+# Applied in EVERY profile, because there is no deployment in which asking a TLS client not to check who
+# it is talking to is the intended configuration; a developer who wants a self-signed broker adds its
+# certificate to the container's trust store instead. Only the parameter NAME reaches the message.
+# $1 - where the configuration came from, $2 - the URL
+require_no_verification_disabled() {
+  local source="$1"
+  local url="$2"
+  local parameter
+  local key
+  local value
+
+  while read -r parameter; do
+    if [ -z "$parameter" ]; then
+      continue
+    fi
+    key="${parameter%%=*}"
+    value="${parameter#*=}"
+    if jms_parameter_disables_verification "$key" "$value"; then
+      config_fatal "$source sets a parameter named '$key' - shown lower-cased, because names are compared without regard to case - which turns off the check that the broker on the other end of the connection is the broker that was asked for. Remove it and add the broker's certificate authority to the container's trust store instead."
+    fi
+  done <<<"$(jms_url_parameters "$url")"
+}
+
+###############################################################################
+# Refuse a cache-invalidation transport that is not authenticated and verified, in the prod profile.
+#
+# What is enforced, and why each part of it is not optional:
+#
+#  - TLS ON EVERY ENDPOINT. Without it the invalidation stream - entity names and primary keys of
+#    everything the fleet writes - crosses the network in the clear, and anyone on the path can inject a
+#    message that the receiving instance dispatches as a service invocation. Every member of a failover
+#    list is checked, because failover is exactly when a downgrade would go unnoticed.
+#  - HOSTNAME VERIFICATION. TLS to an endpoint that is not checked to BE the broker authenticates
+#    nothing: an attacker who can influence DNS or routing presents any certificate they hold and
+#    receives the stream. Positive evidence is required - a verify parameter in the URL, or the explicit
+#    OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION=client-default statement that the client verifies by default -
+#    because "the URL says nothing about it" is not evidence either way, and the safe reading of silence
+#    in a production profile is that it is not happening.
+#  - BROKER CREDENTIALS. An anonymous connection means the broker cannot tell this fleet from anyone
+#    else who can reach it. The pair is validated for completeness elsewhere; here it must be present.
+#  - A LEAST-PRIVILEGE ACL, ACKNOWLEDGED. Whether the broker restricts this topic to this fleet's own
+#    principal is broker-side configuration that nothing in this container can read, so it cannot be
+#    verified here. It is required as an explicit acknowledgement instead - the deployment states that it
+#    has been done - which is the same shape as the schema-init singleton gate: an operator decision that
+#    the container records rather than pretends to check. See DOCKER.adoc.
+#
+# A URL that explicitly DISABLES verification is refused in every profile, prod and dev alike. There is
+# no deployment in which telling a TLS client not to check the peer is the intended configuration.
+#
+# The policy is applied to whichever transport configuration is AUTHORITATIVE on this start, which is why
+# the URL and the credential source are parameters rather than reads of the RESOLVED_JMS_* globals. A
+# policy an operator can step around by mounting their own serviceengine.xml is not a policy, so the
+# unmanaged path is held to exactly the same requirement from validate_distributed_cache_transport.
+# $1 - where the configuration came from, named in every message
+# $2 - the provider URL to hold to the policy
+# $3 - 'configured' when a broker principal is set, anything else when the connection is anonymous
+# $4 - what the operator should do to supply that principal, appended to the credential refusal
+require_secure_jms_transport() {
+  local source="$1"
+  local url="$2"
+  local credentialSource="$3"
+  local credentialRemedy="$4"
+  local endpoint
+  local scheme
+
+  split_jms_provider_url "$source" "$url"
+  require_no_verification_disabled "$source" "$url"
+
+  if [ "$OFBIZ_PROFILE" != 'prod' ]; then
+    return 0
+  fi
+
+  if [ "$credentialSource" != 'configured' ]; then
+    config_fatal "The cache-invalidation transport in $source connects to the broker anonymously, which OFBIZ_PROFILE=prod does not allow. An anonymous connection lets anything that can reach the broker publish invalidations into this fleet, and each one is dispatched as a service invocation. $credentialRemedy"
+  fi
+
+  for endpoint in "${JMS_ENDPOINTS[@]}"; do
+    if [ -z "$endpoint" ]; then
+      config_fatal "$source contains an empty endpoint. Remove the stray comma."
+    fi
+    case "$endpoint" in
+    # Lower-cased before it is compared, because a URI scheme is case-insensitive by definition. This can
+    # only ever ACCEPT a scheme that really is TLS spelled in capitals; it cannot accept one that is not,
+    # since the comparison is still against the exact list of TLS schemes.
+    *://*) scheme=$(printf '%s' "${endpoint%%://*}" | tr '[:upper:]' '[:lower:]') ;;
+    *)
+      config_fatal "The endpoint $endpoint in $source names no transport. Every endpoint must be spelled scheme://host:port."
+      ;;
+    esac
+    if ! endpoint_uses_tls "$endpoint" "$scheme"; then
+      config_fatal "The endpoint $endpoint in $source is not a TLS transport, which OFBIZ_PROFILE=prod does not allow. Use one of these schemes: ${JMS_TLS_SCHEMES[*]}, or the tcp:// spelling with sslEnabled=true that Artemis uses. The invalidation stream carries the entity name and primary key of every row this fleet writes, and a message on it is dispatched as a service invocation."
+    fi
+    if ! endpoint_verifies_hostname "$endpoint"; then
+      config_fatal "The endpoint $endpoint in $source does not state that it verifies the broker's hostname, which OFBIZ_PROFILE=prod requires. Add whatever this broker client spells it as to the endpoint's query - ${JMS_VERIFICATION_EXAMPLE_PARAMETERS[*]} are examples - or set OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION=$JMS_HOSTNAME_VERIFICATION_ACKNOWLEDGEMENT if this client library verifies by default. Encrypting a connection to an unverified peer authenticates nothing."
+    fi
+  done
+
+  if [ "${OFBIZ_JMS_TOPIC_ACL_ACKNOWLEDGED:-}" != 'true' ]; then
+    config_fatal "OFBIZ_JMS_TOPIC_ACL_ACKNOWLEDGED=true must be set when OFBIZ_PROFILE=prod and a cache-invalidation transport is configured. Nothing in this container can read the broker's authorization rules, so this states that the principal the transport authenticates as is restricted to publishing and subscribing on the cache-invalidation topic and holds no other broker privilege. See DOCKER.adoc."
+  fi
+}
+
+###############################################################################
+# Report whether one endpoint connects over TLS.
+#
+# Two spellings are accepted. Most broker clients select TLS by SCHEME - ssl://, amqps://, wss:// - and
+# Artemis selects it with a query parameter on a tcp:// endpoint. Both are genuinely TLS; nothing else is.
+# The wrapper's own query is consulted for the parameter spelling, because an option written once on a
+# failover wrapper applies to every endpoint inside it.
+# $1 - the endpoint, $2 - its scheme
+endpoint_uses_tls() {
+  local endpoint="$1"
+  local scheme="$2"
+  local accepted
+  local parameter
+  local key
+  local value
+
+  for accepted in "${JMS_TLS_SCHEMES[@]}"; do
+    if [ "$scheme" = "$accepted" ]; then
+      return 0
+    fi
+  done
+
+  while read -r parameter; do
+    if [ -z "$parameter" ]; then
+      continue
+    fi
+    key="${parameter%%=*}"
+    value="${parameter#*=}"
+    # Only spellings that unambiguously mean "negotiate TLS on this socket". A loose pattern here would
+    # accept a plaintext endpoint as encrypted, which is the one direction in which a wrong answer is
+    # dangerous, so 'secure', 'safe' and the like are deliberately absent.
+    case "$key" in
+    *sslenabled | *ssl.enabled | *usessl | *enablessl | *tlsenabled | *tls.enabled | *usetls | *enabletls)
+      if jms_value_is_true "$value"; then
+        return 0
+      fi
+      ;;
+    esac
+  done <<<"$(jms_url_parameters "$endpoint$JMS_WRAPPER_QUERY")"
+  return 1
+}
+
+###############################################################################
+# Report whether one endpoint establishes that the broker's hostname is verified.
+#
+# Either the endpoint says so itself - in whatever this broker family spells it as, classified by shape -
+# or the deployment has stated that the client library verifies by default. The wrapper's query counts as
+# the endpoint's own, for the reason given above; the OTHER endpoints' queries deliberately do not, which
+# is the whole point of asking this per endpoint.
+#
+# The acknowledgement is validated rather than accepted as any non-empty value, so a typo cannot read as
+# an acknowledgement, and a wrong value is fatal rather than merely ignored.
+# $1 - the endpoint
+endpoint_verifies_hostname() {
+  local endpoint="$1"
+  local acknowledgement="${OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION:-}"
+  local parameter
+  local key
+  local value
+
+  while read -r parameter; do
+    if [ -z "$parameter" ]; then
+      continue
+    fi
+    key="${parameter%%=*}"
+    value="${parameter#*=}"
+    if jms_parameter_enables_verification "$key" "$value"; then
+      return 0
+    fi
+  done <<<"$(jms_url_parameters "$endpoint$JMS_WRAPPER_QUERY")"
+
+  if [ -z "$acknowledgement" ]; then
+    return 1
+  fi
+  if [ "$acknowledgement" != "$JMS_HOSTNAME_VERIFICATION_ACKNOWLEDGEMENT" ]; then
+    config_fatal "OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION accepts only the value $JMS_HOSTNAME_VERIFICATION_ACKNOWLEDGEMENT, which states that the broker client verifies the peer's hostname by default. There is no value that turns verification off."
+  fi
+  return 0
+}
+
+###############################################################################
 # Report transport settings that were supplied but will have no effect.
 #
 # Supplying a provider URL, a topic and a credential and then leaving the factory class unset produces a
 # deployment that looks fully configured for a shared broker and renders nothing, so it is reported
 # rather than passed over. Only the NAMES of the variables are listed; one of them is a password.
+#
+# OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION and OFBIZ_JMS_TOPIC_ACL_ACKNOWLEDGED are deliberately NOT listed,
+# even though they look like they belong. Unlike the six below, they are not render inputs: the transport
+# policy reads them on the operator-supplied path too, so setting them without a factory class is a
+# perfectly effective configuration and reporting it as inert would be wrong.
 warn_about_inactive_transport_settings() {
   local supplied=''
   local variableName
@@ -6486,6 +8456,18 @@ resolve_cache_transport_configuration() {
   reject_unsafe_value OFBIZ_JMS_USERNAME "$RESOLVED_JMS_USERNAME"
   reject_unsafe_value OFBIZ_JMS_PASSWORD "$RESOLVED_JMS_PASSWORD"
   require_jms_credential_pair
+
+  # Last, because it reads the credential source the step above resolved. Its messages name endpoints and
+  # variable names only - never a credential - so it is safe to run with tracing still suspended.
+  #
+  # Applied here rather than only where OFBIZ_DISTRIBUTED_CACHE_CLEAR is validated, because a rendered
+  # jms-service carries listen="true" and JmsListenerFactory subscribes to it at start up whether or not
+  # the delegator flag is on. An unauthenticated plaintext subscription is a remote-invocation channel
+  # into this instance regardless of what the flag says, so the policy attaches to the transport being
+  # configured at all, not to the flag that uses it.
+  require_secure_jms_transport 'OFBIZ_JMS_PROVIDER_URL' "$RESOLVED_JMS_PROVIDER_URL" \
+    "$RESOLVED_JMS_CREDENTIAL_SOURCE" \
+    'Supply OFBIZ_JMS_USERNAME and OFBIZ_JMS_PASSWORD, and give that principal publish and subscribe rights on the cache-invalidation topic and nothing else.'
 
   RESOLVED_JMS_MANAGED="true"
   restore_trace
@@ -6613,7 +8595,7 @@ render_cache_transport_configuration() {
   local indent='        '
   local element
   element="<!-- $RENDERED_TRANSPORT_MARKER -->"
-  element="$element\\n$indent<jms-service name=\"$JMS_SERVICE_NAME\" send-mode=\"all\">"
+  element="$element\\n$indent<jms-service name=\"$JMS_SERVICE_NAME\" send-mode=\"$JMS_SEND_MODE\">"
   element="$element\\n$indent    <server jndi-server-name=\"$JNDI_SERVER_NAME\""
   element="$element\\n$indent            jndi-name=\"$(xml_escape_value "$RESOLVED_JMS_CONNECTION_FACTORY_JNDI_NAME")\""
   element="$element\\n$indent            topic-queue=\"$(xml_escape_value "$RESOLVED_JMS_TOPIC_JNDI_NAME")\""
@@ -6691,10 +8673,25 @@ require_rendered_transport_declarations() {
   fi
 
   local element
+  local serviceTag
   local serverTag
   element=$(active_service_messenger_element "$SERVICE_ENGINE_OVERRIDE")
+  serviceTag=$(printf '%s' "$element" \
+    | grep --only-matching --extended-regexp '<jms-service[^>]*>' | head --lines=1) || true
   serverTag=$(printf '%s' "$element" \
     | grep --only-matching --extended-regexp '<server[^>]*>' | head --lines=1) || true
+
+  # send-mode is checked on the jms-service element itself, separately from the server attributes below,
+  # because it is the one attribute two other components read back: JmsServiceEngine.serverList publishes
+  # nothing unless it is "all", and HealthCheckServlet reports the transport as not ready unless it is.
+  # A render that lost it would produce a fleet that never leaves the load balancer's unhealthy state, so
+  # the file is discarded rather than installed.
+  local sendMode
+  sendMode=$(xml_attribute_value "$serviceTag" 'send-mode')
+  if [ "$sendMode" != "$JMS_SEND_MODE" ]; then
+    discard_untrustworthy_render "$SERVICE_ENGINE_OVERRIDE"
+    config_fatal "The rendered $SERVICE_ENGINE_OVERRIDE declares send-mode=\"$sendMode\" on its $JMS_SERVICE_NAME element but \"$JMS_SEND_MODE\" was required: any other value publishes no invalidation at all, and the readiness probe would hold this instance out of service for it. The render has been discarded."
+  fi
 
   local attribute
   local expected
@@ -7058,6 +9055,11 @@ require_separated_database_identities() {
 # unsubstituted, the startup DDL mode and the cache invalidation mode must be the ones that were
 # requested, and the "test" delegator must still resolve to embedded H2.
 render_database_configuration() {
+  # Ownership is decided before any value is resolved and before tracing is suspended, because this render
+  # REPLACES the file at ENTITY_ENGINE_OVERRIDE and a configuration the deployment supplied there cannot be
+  # reconstructed by this container. See require_render_may_replace_override.
+  require_render_may_replace_override "$ENTITY_ENGINE_TEMPLATE"
+
   hide_secrets
 
   # The host, the port and the three database names become structural components of a JDBC URI, so they
@@ -7135,6 +9137,8 @@ render_database_configuration() {
   # server refusing new connections, which strands whichever instances lost the race and cannot be
   # recovered by restarting them, because a restarting instance re-opens pool-minsize connections
   # immediately and simply takes the slots from its neighbours.
+  require_fleet_capacity_inputs
+
   OFBIZ_DB_FLEET_SIZE=${OFBIZ_DB_FLEET_SIZE:-$DB_FLEET_SIZE_DEFAULT}
   require_integer_range OFBIZ_DB_FLEET_SIZE "$OFBIZ_DB_FLEET_SIZE" 1 "$DB_FLEET_SIZE_LIMIT"
 
@@ -7155,15 +9159,22 @@ render_database_configuration() {
     if [ "$fleetDemand" -gt "$usableConnections" ]; then
       config_fatal "The fleet can demand more database connections than the server allows: OFBIZ_DB_FLEET_SIZE=$OFBIZ_DB_FLEET_SIZE instances x OFBIZ_DB_POOL_MAX=$OFBIZ_DB_POOL_MAX x 3 entity groups = $fleetDemand, but OFBIZ_DB_MAX_CONNECTIONS=$OFBIZ_DB_MAX_CONNECTIONS leaves only $usableConnections after the $DB_CONNECTION_RESERVE connection operational reserve. Lower OFBIZ_DB_POOL_MAX to at most $((usableConnections / (OFBIZ_DB_FLEET_SIZE * 3))), reduce OFBIZ_DB_FLEET_SIZE, or raise the database's max_connections."
     fi
-  elif [ "$OFBIZ_PROFILE" = 'prod' ] && [ "$OFBIZ_DB_FLEET_SIZE" -gt 1 ]; then
-    # Refused rather than warned in the deployed profile. A multi-instance fleet is precisely the
-    # configuration in which per-instance pool bounds stop being sufficient, so starting one without
-    # stating the capacity they have to fit inside means the sizing has not been checked at all.
-    config_fatal "OFBIZ_PROFILE=prod with OFBIZ_DB_FLEET_SIZE=$OFBIZ_DB_FLEET_SIZE requires OFBIZ_DB_MAX_CONNECTIONS so the per-instance OFBIZ_DB_POOL_MAX can be checked against the capacity the fleet shares. Set it to the database's max_connections."
+
+    # The demand fits. Whether it fits COMFORTABLY is a separate question, and the one an operator is
+    # more likely to get wrong: a configuration at 95% of usable capacity passes the check above and then
+    # fails the first time a rolling deployment runs one extra instance. Multiplied out before the
+    # comparison rather than dividing, so integer arithmetic cannot round the percentage in the direction
+    # that suppresses the alert.
+    if [ "$((fleetDemand * 100))" -gt "$((usableConnections * DB_CAPACITY_ALERT_PERCENT))" ]; then
+      printf '%s\n' "WARNING: the fleet's database connection demand leaves little headroom. OFBIZ_DB_FLEET_SIZE=$OFBIZ_DB_FLEET_SIZE instances x OFBIZ_DB_POOL_MAX=$OFBIZ_DB_POOL_MAX x 3 entity groups = $fleetDemand connections, which is $((fleetDemand * 100 / usableConnections))% of the $usableConnections usable after the $DB_CONNECTION_RESERVE connection operational reserve - above the ${DB_CAPACITY_ALERT_PERCENT}% at which this is reported. It fits, so the start up continues, but a rolling deployment that briefly runs an extra instance, a concurrent schema-init execution, or an operator's own session may not. Lower OFBIZ_DB_POOL_MAX to at most $((usableConnections * DB_CAPACITY_ALERT_PERCENT / 100 / (OFBIZ_DB_FLEET_SIZE * 3))) to come back under it, or raise the database's max_connections." >&2
+    else
+      printf '%s\n' "Database connection capacity checked: OFBIZ_DB_FLEET_SIZE=$OFBIZ_DB_FLEET_SIZE instances x OFBIZ_DB_POOL_MAX=$OFBIZ_DB_POOL_MAX x 3 entity groups = $fleetDemand connections, $((fleetDemand * 100 / usableConnections))% of the $usableConnections usable after the $DB_CONNECTION_RESERVE connection operational reserve."
+    fi
   else
-    # Reported, not refused. A single instance in a development profile cannot oversubscribe anything
-    # this script can reason about, but the arithmetic is still worth stating so that the number is
-    # known before the deployment becomes a fleet.
+    # Reached in the dev profile only - require_fleet_capacity_inputs has already refused this state in
+    # prod. Reported, not refused: a developer's single container cannot oversubscribe anything this
+    # script can reason about, but the arithmetic is still worth stating so the number is known before the
+    # deployment becomes a fleet.
     printf '%s\n' "NOTICE: database connection capacity was not stated (OFBIZ_DB_MAX_CONNECTIONS is unset), so the fleet's demand of OFBIZ_DB_FLEET_SIZE=$OFBIZ_DB_FLEET_SIZE x OFBIZ_DB_POOL_MAX=$OFBIZ_DB_POOL_MAX x 3 entity groups = $((OFBIZ_DB_FLEET_SIZE * OFBIZ_DB_POOL_MAX * 3)) connections has not been checked against the server's max_connections. Set OFBIZ_DB_MAX_CONNECTIONS to have it verified." >&2
   fi
 
@@ -7231,9 +9242,14 @@ render_database_configuration() {
     write_xml_token_substitution '@CHECK_ON_START@' "$RESOLVED_SCHEMA_INIT" OFBIZ_SCHEMA_INIT
     write_xml_token_substitution '@ADD_MISSING_ON_START@' "$RESOLVED_SCHEMA_INIT" OFBIZ_SCHEMA_INIT
     write_xml_token_substitution '@DISTRIBUTED_CACHE_CLEAR@' "$RESOLVED_DISTRIBUTED_CACHE_CLEAR" OFBIZ_DISTRIBUTED_CACHE_CLEAR
+    # Stamps the artifact as this script's own, which is what lets a later start remove it when the
+    # managed database is withdrawn and re-render it when a variable changes, without ever touching an
+    # operator-authored override. See write_entity_engine_marker_substitution.
+    write_entity_engine_marker_substitution
   } >"$sedScript"
 
-  render_config_from "$ENTITY_ENGINE_OVERRIDE" "$ENTITY_ENGINE_TEMPLATE" --file="$sedScript"
+  render_config_from "$ENTITY_ENGINE_OVERRIDE" "$ENTITY_ENGINE_TEMPLATE" --file="$sedScript" \
+    "$(entity_engine_marker_expression)"
   discard_secret_temp_files
 
   # All checked on the rendered artifact rather than on the substitution, so a template that is out of
@@ -7245,6 +9261,7 @@ render_database_configuration() {
   # about, which no amount of per-setting checking can see. The specific checks that follow then confirm
   # that the values it DID substitute carry the requested modes.
   require_no_residual_placeholders "$ENTITY_ENGINE_OVERRIDE"
+  require_generated_entity_engine_marker "$ENTITY_ENGINE_OVERRIDE"
   require_rendered_transport_security "$ENTITY_ENGINE_OVERRIDE" "$OFBIZ_POSTGRES_SSLMODE"
   require_rendered_jdbc_deadlines "$ENTITY_ENGINE_OVERRIDE"
   require_rendered_schema_ddl_mode "$ENTITY_ENGINE_OVERRIDE" "$RESOLVED_SCHEMA_INIT"
@@ -7272,6 +9289,12 @@ render_embedded_cache_clear_configuration() {
   local delegatorName
   local sedArguments=()
 
+  # Same ownership decision as the managed render, and it matters just as much here: a deployment that
+  # mounted its own MySQL or Oracle configuration and then asked for cross-instance cache invalidation
+  # would otherwise have that file replaced by a render of the committed embedded configuration, which
+  # points every entity group at the H2 database on this container own volume.
+  require_render_may_replace_override "$ENTITY_ENGINE_SOURCE"
+
   for delegatorName in "${CACHE_CLEAR_DELEGATORS[@]}"; do
     if ! grep --quiet \
       "<delegator name=\"$delegatorName\"[^>]*distributed-cache-clear-enabled=\"[^\"]*\"" "$ENTITY_ENGINE_SOURCE"; then
@@ -7280,11 +9303,17 @@ render_embedded_cache_clear_configuration() {
     sedArguments+=("--expression=s|\(<delegator name=\"$delegatorName\"[^>]*\)distributed-cache-clear-enabled=\"[^\"]*\"|\1distributed-cache-clear-enabled=\"$RESOLVED_DISTRIBUTED_CACHE_CLEAR\"|")
   done
 
+  sedArguments+=("$(entity_engine_marker_expression)")
+  # Stamped for the same reason the managed render is: this file has to be removable by the next start
+  # that withdraws the flag, and an operator's own override has to survive that removal.
+  sedArguments+=("--expression=$(write_entity_engine_marker_substitution)")
+
   render_config_from "$ENTITY_ENGINE_OVERRIDE" "$ENTITY_ENGINE_SOURCE" "${sedArguments[@]}"
   # The committed configuration contains no placeholders at all, so any at-sign delimited name in the
   # result would mean this render read a template instead of the committed file. Guarded identically to
   # the managed path so that neither render can install an artifact with a literal placeholder in it.
   require_no_residual_placeholders "$ENTITY_ENGINE_OVERRIDE"
+  require_generated_entity_engine_marker "$ENTITY_ENGINE_OVERRIDE"
   require_rendered_cache_clear_mode "$ENTITY_ENGINE_OVERRIDE" "$RESOLVED_DISTRIBUTED_CACHE_CLEAR"
   require_rendered_test_delegator_isolation "$ENTITY_ENGINE_OVERRIDE"
 }
@@ -7310,6 +9339,153 @@ resolve_desired_database_mode() {
 }
 
 ###############################################################################
+# The sed expression that stamps the ownership marker into an entity engine render.
+#
+# Inserted after line 1, which is the XML declaration in both sources, so the marker is a prolog comment
+# and the document stays well formed. Both renderers use this one expression, because a render that
+# forgets it would be read as an operator's file on the NEXT start and would then never be replaced or
+# corrected again - the failure would appear one start late and look like a configuration that refuses to
+# take effect. The appended text is queued output and is never re-read by sed, so it is not subject to the
+# token substitutions the managed render performs and cannot be corrupted by them.
+entity_engine_marker_expression() {
+  printf '%s' "--expression=1a$ENTITY_ENGINE_GENERATED_COMMENT"
+}
+
+###############################################################################
+# Who owns the file currently at ENTITY_ENGINE_OVERRIDE: 'absent', 'generated', 'legacy' or 'operator'.
+#
+# This is the single decision every replacement and removal below is taken from, so all three sources of
+# evidence are read here rather than at the call sites.
+#
+#   generated - the file carries ENTITY_ENGINE_GENERATED_MARKER, so this script rendered it. It is
+#               replaced and removed freely: it is this script own output and holds nothing the
+#               environment cannot reproduce.
+#   legacy    - the file carries no marker, but a container state record from an image OLDER than the
+#               marker convention is present beside it. Images before this one rendered
+#               config/entityengine.xml unmarked and touched CONTAINER_DB_CONFIG_APPLIED in the same
+#               guarded block, and that record was an empty file rather than the versioned record written
+#               now, so an unmarked override next to a record that is empty or of an older version is
+#               this script own earlier output. It is treated as generated, which is what keeps an
+#               existing deployment upgrading into this image from refusing to start - and what stops a
+#               stale render from an earlier image surviving as if it were a deployment's own
+#               configuration. Every such file is announced, because the classification is inferred
+#               rather than read off the artifact.
+#   operator  - the file carries no marker and no older record explains it, so the deployment put it
+#               there: the documented way to run against MySQL, Oracle, or a PostgreSQL whose pgJDBC
+#               properties the template does not carry. It is NEVER replaced and NEVER removed.
+#
+# A record of the CURRENT version proves nothing about an unmarked file, and deliberately does not make
+# one legacy: this version of the script marks everything it renders, so an unmarked file sitting next to
+# a current record was put there after that render by something other than this script - which is exactly
+# the operator case, and is the sequence "start once against PostgreSQL, then mount your own
+# configuration and unset the host" that the contract in entityengine.xml invites.
+entity_engine_override_ownership() {
+  if [ ! -e "$ENTITY_ENGINE_OVERRIDE" ]; then
+    printf 'absent'
+    return 0
+  fi
+
+  # head bounds the read: the marker is inserted at line 2 of every render, and reading further would let
+  # an arbitrarily large mounted file - or a marker mentioned in a deployment own comment further down -
+  # decide ownership.
+  if head --lines=5 "$ENTITY_ENGINE_OVERRIDE" 2>/dev/null | grep --quiet --fixed-strings "$ENTITY_ENGINE_GENERATED_MARKER"; then
+    printf 'generated'
+    return 0
+  fi
+
+  if [ -e "$CONTAINER_DB_CONFIG_APPLIED" ] \
+    && [ "$(head --lines=1 "$CONTAINER_DB_CONFIG_APPLIED" 2>/dev/null)" != "$DESIRED_STATE_RECORD_VERSION" ]; then
+    printf 'legacy'
+    return 0
+  fi
+
+  printf 'operator'
+}
+
+###############################################################################
+# Refuse to render over an entity engine configuration this script does not own.
+#
+# Called by both renderers before anything is written. The alternative - rendering anyway and printing a
+# notice, which is what render_config_from does for the configuration files that have no ownership marker
+# - is not available here: this file is the one an operator is documented to supply, it is the only file
+# whose loss silently redirects every entity read and write in the deployment to a different database, and
+# the deployment cannot get it back, because the container renders from the pristine source and has no
+# copy of what was there.
+#
+# The refusal names both ways out, because both are legitimate and only the deployment knows which it
+# meant. It also names the upgrade case explicitly: an operator whose file really was rendered by an image
+# older than the marker convention, and whose state record has since been rewritten to the current
+# version, reaches this message rather than a silent replacement, and deleting the file is then the
+# correct move.
+# $1 - the source this render would have read, named in the message
+require_render_may_replace_override() {
+  local renderSource="$1"
+
+  if [ "$(entity_engine_override_ownership)" != 'operator' ]; then
+    return 0
+  fi
+
+  config_fatal "$ENTITY_ENGINE_OVERRIDE is present and carries no $ENTITY_ENGINE_GENERATED_MARKER comment, so it is a configuration this deployment supplied rather than one this container rendered, and it will not be overwritten with a render of $renderSource. Either remove that file so the container renders the configuration the OFBIZ_POSTGRES_* and OFBIZ_DISTRIBUTED_CACHE_CLEAR variables describe, or unset those variables so your own file is used - which is the documented way to run against MySQL, Oracle or a PostgreSQL this image does not parameterise, and which also requires setting distributed-cache-clear-enabled in that file yourself. If the file was in fact rendered by an image older than this one, deleting it is the right move: the render is reproduced from the environment on every start. See DOCKER.adoc."
+}
+
+###############################################################################
+# Remove a previously rendered entity engine override so the committed configuration takes effect, and
+# leave a configuration this script does not own exactly where it is.
+# Emit, on stdout, the sed s-command that stamps a rendered entity engine override as GENERATED.
+#
+# Written by both entity renders from this one definition, because the removal and the render-over refusal
+# below are only correct while EVERY file this script writes carries the marker: an unmarked render would
+# be mistaken for an operator's own file, so it would neither be removed when its variables were withdrawn
+# nor be re-rendered when they changed.
+#
+# The comment is placed immediately BEFORE the root element, which is valid in the XML prolog and is the
+# one anchor both sources share - the committed configuration and the PostgreSQL template declare
+# '<entity-config' at column 1 exactly once each. It is matched against the RAW file everywhere, because
+# strip_xml_comments would remove it from the comment-aware readers used elsewhere in this script.
+write_entity_engine_marker_substitution() {
+  printf 's|^<entity-config|<!-- %s -->\\n<entity-config|\n' "$RENDERED_ENTITY_ENGINE_MARKER"
+}
+
+###############################################################################
+# Refuse to publish an entity engine override that is not stamped as generated.
+#
+# The stamp is what makes the file removable and re-renderable, so a render that produced an UNSTAMPED
+# artifact has quietly converted this script's own output into something it will thereafter treat as
+# operator-owned: the next start that withdraws OFBIZ_POSTGRES_HOST would preserve a stale managed
+# configuration, and the next start that changes a variable would refuse to render at all. Both failures
+# would surface a long way from this render, so the stamp is verified here, on the artifact.
+# $1 - the rendered file
+require_generated_entity_engine_marker() {
+  if ! grep --quiet --fixed-strings "$RENDERED_ENTITY_ENGINE_MARKER" "$1"; then
+    discard_untrustworthy_render "$1"
+    config_fatal "Rendered $1 does not carry the generated-file marker, so a later start could not tell this script's own output from an operator-authored override: it would neither remove it when the configuration is withdrawn nor re-render it when the configuration changes. The '<entity-config' anchor the marker is inserted at has moved in the source file. The render has been discarded."
+  fi
+}
+
+###############################################################################
+# Refuse to render over an entity engine override this script did not generate.
+#
+# An operator-authored /ofbiz/config/entityengine.xml and the OFBIZ_POSTGRES_* / OFBIZ_DISTRIBUTED_CACHE_CLEAR
+# variables are two sources of truth for the same configuration, and silently preferring either one is
+# worse than refusing - exactly as require_no_unmanaged_transport_override argues for the JMS files.
+# Rendering over the file destroys deliberate configuration that this image cannot reproduce: the
+# PostgreSQL template carries the parameters this script templates and NOTHING else, so a deployment that
+# needs another JDBC parameter, a fourth datasource, or a different pool implementation states it in its
+# own override - which docker/templates/postgres-entityengine.xml documents as the supported route.
+#
+# The refusal is scoped to a file that exists and is unmarked. A marked file is this script's own previous
+# render and is replaced without comment, which is what makes every start idempotent.
+require_no_unmanaged_entity_engine_override() {
+  # Ownership is decided by entity_engine_override_ownership rather than by the generated-file marker
+  # alone, so that an unmarked render left by an image OLDER than the ownership marker is still
+  # recognised as this script's own output and re-rendered, instead of refusing the start of a
+  # deployment that is merely upgrading. Only a file this deployment supplied reaches the refusal.
+  if [ "$(entity_engine_override_ownership)" = 'operator' ]; then
+    config_fatal "$ENTITY_ENGINE_OVERRIDE already exists and was not generated by this script, but this start is configured to render it - OFBIZ_POSTGRES_HOST or OFBIZ_DISTRIBUTED_CACHE_CLEAR is set. Rendering would destroy that file, and this image cannot reproduce configuration it does not template. Either remove the file and configure the database through the OFBIZ_POSTGRES_* variables, or unset OFBIZ_POSTGRES_HOST and OFBIZ_DISTRIBUTED_CACHE_CLEAR and keep managing $ENTITY_ENGINE_OVERRIDE yourself - it stays first on the class path either way, and cross-instance invalidation is available in a file you manage by setting distributed-cache-clear-enabled=\"true\" on its default and default-no-eca delegators. See DOCKER.adoc."
+  fi
+}
+
+###############################################################################
 # Remove a previously rendered entity engine override so the committed configuration takes effect.
 #
 # /ofbiz/config precedes ofbiz.jar on the class path, and /ofbiz/config lives on a volume that outlives
@@ -7321,15 +9497,46 @@ resolve_desired_database_mode() {
 # if that file happened to be rendered by an init-mode start, check-on-start and add-missing-on-start
 # still both true, so every instance would resume issuing startup DDL.
 #
+# ONLY A FILE THIS SCRIPT OWNS IS REMOVED. Reaching this function means no managed database and no cache
+# invalidation were configured, which is ALSO precisely the documented external-configuration mode: mount
+# an entityengine.xml under /ofbiz/config and leave OFBIZ_POSTGRES_HOST unset. Removing an unmarked file
+# here withdrew the deployment own database configuration and started the fleet on the committed embedded
+# H2 file instead - a single-instance database on the container own volume, discarded with the container,
+# and reached without one error line. Such a file is therefore announced and kept, and the start
+# continues in external-configuration mode; require_serving_mode_ddl_safety and
+# require_prod_external_datasource then judge the file that is actually authoritative, so keeping it is
+# not the same as trusting it.
+#
+# An operator-authored override is also the documented way to state a JDBC parameter, a datasource or a
+# pool setting this image does not template - see docker/templates/postgres-entityengine.xml, which tells
+# the reader to leave OFBIZ_POSTGRES_HOST unset precisely so that their own file survives and stays first
+# on the class path.
+#
 # unlink is atomic, so there is no window in which a partially removed file could be read. Absence is
-# then confirmed, because silently continuing with the override still in place is the exact failure
-# this function exists to prevent.
+# then confirmed, because silently continuing with a removable override still in place is the exact
+# failure the removal exists to prevent.
 remove_entity_engine_override() {
-  if [ ! -e "$ENTITY_ENGINE_OVERRIDE" ]; then
-    return 0
-  fi
+  local ownership
+  ownership=$(entity_engine_override_ownership)
 
-  printf '%s\n' "No managed database and no cross-instance cache invalidation are configured: removing the entity engine override left by an earlier start so the committed configuration takes effect."
+  case "$ownership" in
+  absent)
+    return 0
+    ;;
+  operator)
+    printf '%s\n' "$ENTITY_ENGINE_OVERRIDE is present and carries no $ENTITY_ENGINE_GENERATED_MARKER comment, so it is this deployment's own entity engine configuration and is being kept: no managed database and no cross-instance cache invalidation are configured, which is the external-configuration mode that file is for. /ofbiz/config precedes ofbiz.jar on the class path, so that file - and not the committed configuration - is what this instance reads. Its startup DDL posture and, in the prod profile, its datasources are checked below."
+    return 0
+    ;;
+  legacy)
+    printf '%s\n' "Removing $ENTITY_ENGINE_OVERRIDE, which carries no $ENTITY_ENGINE_GENERATED_MARKER comment but sits beside a container state record written by an image older than that marker: it is the render of an earlier start of this container rather than a configuration this deployment supplied. No managed database and no cross-instance cache invalidation are configured, so the committed configuration takes effect. If that file WAS yours, mount it again after this start - an unmarked file beside the current state record is kept, not removed."
+    ;;
+  generated)
+    printf '%s\n' "No managed database and no cross-instance cache invalidation are configured: removing the entity engine override this container rendered on an earlier start so the committed configuration takes effect."
+    ;;
+  *)
+    config_fatal "Unrecognised entity engine override ownership '$ownership'."
+    ;;
+  esac
   # rm's own diagnostic is discarded, and its status is explicitly ignored, so that the failure is
   # reported by the existence check below and by nothing else: with 'set -e' in force an unguarded rm
   # that cannot unlink the file - a read-only mount, or a config directory owned by another uid - would
@@ -7614,6 +9821,218 @@ require_consistent_database_selection() {
 }
 
 ###############################################################################
+# The authoritative entity engine configuration for the JVM that is about to start: the override when one
+# exists, because /ofbiz/config precedes ofbiz.jar on the class path, and the committed copy otherwise.
+#
+# Read from the file system rather than from the resolved mode, so it is correct for a file this script
+# rendered, one an earlier start left behind and one the deployment mounted alike.
+authoritative_entity_engine_file() {
+  if [ -f "$ENTITY_ENGINE_OVERRIDE" ]; then
+    printf '%s' "$ENTITY_ENGINE_OVERRIDE"
+  else
+    printf '%s' "$ENTITY_ENGINE_SOURCE"
+  fi
+}
+
+###############################################################################
+# Print the whole named <datasource> element of the named file as one line, or nothing when the file does
+# not declare it.
+#
+# datasource_attributes stops at the start tag, which is all the DDL checks need. The datasource CONNECTION
+# is declared by a child element - <inline-jdbc> carries jdbc-uri, <jndi-jdbc> carries a JNDI name - so
+# deciding which database a datasource actually points at needs the element and not its start tag.
+# $1 - file to inspect, $2 - datasource name
+datasource_element() {
+  if [ ! -f "$1" ]; then
+    return 0
+  fi
+  #
+  # The start tag is tracked separately from the element because a datasource start tag spans many lines in
+  # these files and its children include self-closing elements of their own - <read-data reader-name="seed"/>
+  # sits between the start tag and <inline-jdbc>. Treating any "/>" as the end of the element therefore
+  # stopped at the first read-data line and reported the connection as undeclarable. Only a "/>" that closes
+  # the START TAG ends the element; after that, only </datasource> does.
+  awk -v target="name=\"$2\"" '
+    !inside && index($0, "<datasource") && index($0, target) { inside = 1; started = 0 }
+    inside {
+      block = block " " $0
+      if (!started) {
+        tagEnd = index($0, ">")
+        if (tagEnd > 0) {
+          started = 1
+          if (tagEnd > 1 && substr($0, tagEnd - 1, 1) == "/") { print stripComments(block); exit }
+        }
+      }
+      if (started && index($0, "</datasource>")) { print stripComments(block); exit }
+    }
+    # XML COMMENTS ARE REMOVED, because every alternative the caller looks for is present as a comment
+    # somewhere in these files: the committed localmysql and localoracle datasources both carry a
+    # commented-out <jndi-jdbc .../> line, and the render template mentions jdbc-uri in prose. A caller
+    # deciding "this datasource is reached over JNDI" or reading a URI out of a comment would be reading a
+    # datasource the engine never sees. gsub cannot do this - a regular expression for a comment is greedy and
+    # would swallow everything between the first <!-- and the last --> - so the spans are cut one at a time.
+    function stripComments(text) {
+      while (match(text, /<!--/)) {
+        opening = RSTART
+        remainder = substr(text, opening)
+        if (!match(remainder, /-->/)) {
+          return substr(text, 1, opening - 1)
+        }
+        text = substr(text, 1, opening - 1) substr(remainder, RSTART + 3)
+      }
+      return text
+    }
+  ' "$1"
+}
+
+###############################################################################
+# Whether a JDBC URI names a database engine that runs INSIDE this JVM, on this container filesystem.
+#
+# That is the property that decides whether an instance is replaceable: an embedded database is not shared
+# with the other instances of a fleet, is invisible to them, and is destroyed with the container that holds
+# it, so a fleet running on one is not one deployment but N unrelated ones - and a load balancer in front
+# of it answers each request from whichever isolated database it happened to reach.
+#
+# Server modes are deliberately NOT embedded. H2 over tcp/ssl, Derby over a network URI and HSQLDB over
+# hsql/http are all reached over a socket and shared between instances, so a deployment that runs one of
+# them has an external database and is not what this check exists to catch. Only the file-backed and
+# in-memory spellings are refused.
+#
+# An unrecognised subprotocol is NOT embedded: every other engine OFBiz ships a datasource definition for -
+# PostgreSQL, MySQL, Oracle, SQL Server, DB2 - is reached over the network, and guessing about a
+# subprotocol this function has never seen would refuse a working deployment over a name.
+# $1 - the jdbc-uri value
+jdbc_uri_is_embedded() {
+  case "$1" in
+  jdbc:h2:tcp:* | jdbc:h2:ssl:*) return 1 ;;
+  jdbc:h2:*) return 0 ;;
+  jdbc:derby://*) return 1 ;;
+  jdbc:derby:*) return 0 ;;
+  jdbc:hsqldb:hsql:* | jdbc:hsqldb:hsqls:* | jdbc:hsqldb:http:* | jdbc:hsqldb:https:*) return 1 ;;
+  jdbc:hsqldb:*) return 0 ;;
+  jdbc:sqlite:*) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+###############################################################################
+# Refuse to run the prod profile against an embedded database, whoever configured it.
+#
+# WHAT THIS CLOSES. require_consistent_database_selection refuses the prod profile when managed-database
+# variables were supplied WITHOUT OFBIZ_POSTGRES_HOST, which catches a deployment whose database settings
+# were all ignored. It cannot catch the case where NOTHING was supplied: OFBIZ_PROFILE=prod on its own
+# resolved to the committed configuration, whose default and default-no-eca delegators map all three entity
+# groups to the localh2* datasources, and the container then served real traffic from an H2 database file on
+# its own volume - one database per instance, invisible to every other instance, discarded when the
+# container is replaced, and reached without a single line of output saying so. The profile that fails fast
+# for a missing secret has to fail fast for a missing database.
+#
+# WHAT IS CHECKED, AND WHY IT IS THE EFFECTIVE FILE RATHER THAN THE ENVIRONMENT. The environment cannot
+# answer the question: the documented external-configuration mode supplies the datasources by mounting an
+# entityengine.xml with no OFBIZ_POSTGRES_* variable set at all, and that deployment is correct. So the
+# authoritative file is read - the override when one exists, the committed copy otherwise - and each
+# datasource the default delegator maps is resolved to the database it actually points at. A mounted MySQL
+# or Oracle configuration passes on its own terms; the committed H2 default does not.
+#
+# EVERY UNPROVABLE ANSWER IS A REFUSAL, because this is the prod profile and the cost of being wrong is a
+# fleet serving from isolated databases. A group-map naming a datasource the file does not declare, and a
+# datasource that declares neither a jdbc-uri nor a JNDI reference, are both refused rather than assumed
+# external.
+require_prod_external_datasource() {
+  if [ "$OFBIZ_PROFILE" != 'prod' ]; then
+    return 0
+  fi
+
+  local authoritative
+  authoritative=$(authoritative_entity_engine_file)
+
+  local groupMaps
+  groupMaps=$(effective_default_delegator_group_maps)
+  if [ -z "$groupMaps" ]; then
+    config_fatal "OFBIZ_PROFILE=prod but no group-map could be read from the 'default' delegator of $authoritative, so the databases this instance would serve from cannot be established. The prod profile refuses to start on a database it cannot identify. Check that file, or unset it and supply the OFBIZ_POSTGRES_* variables so the container renders the configuration itself."
+  fi
+
+  local group helper element uri
+  local embedded=''
+  local unprovable=''
+  while IFS="$(printf '\t')" read -r group helper; do
+    if [ -z "$helper" ]; then
+      continue
+    fi
+    element=$(datasource_element "$authoritative" "$helper")
+    if [ -z "$element" ]; then
+      unprovable="$unprovable $group->$helper(not declared)"
+      continue
+    fi
+    # A JNDI datasource is supplied by the container the deployment runs in, not by this file, so it is
+    # external by construction and there is no URI here to classify.
+    case "$element" in
+    *"<jndi-jdbc"*) continue ;;
+    esac
+    uri=$(printf '%s' "$element" | grep --only-matching 'jdbc-uri="[^"]*"' | head --lines=1 \
+      | sed --expression='s,^jdbc-uri=",,' --expression='s,"$,,')
+    if [ -z "$uri" ]; then
+      unprovable="$unprovable $group->$helper(no jdbc-uri)"
+      continue
+    fi
+    if jdbc_uri_is_embedded "$uri"; then
+      embedded="$embedded $group->$helper"
+    fi
+  done <<<"$groupMaps"
+
+  if [ -n "$embedded" ]; then
+    config_fatal "OFBIZ_PROFILE=prod but the 'default' delegator of $authoritative maps entity group(s) to an embedded database that lives on this container own filesystem:$embedded. Every instance would then have a database of its own - invisible to the others, destroyed with the container, and served to whichever requests the load balancer sent it. Either set OFBIZ_POSTGRES_HOST with the OFBIZ_POSTGRES_*_DB, _USER and _PASSWORD variables so the container renders the managed PostgreSQL configuration, or mount your own entityengine.xml at $ENTITY_ENGINE_OVERRIDE pointing at an external database and leave OFBIZ_POSTGRES_HOST unset. Use OFBIZ_PROFILE=dev for a local single-instance run on the embedded database. See DOCKER.adoc."
+  fi
+
+  if [ -n "$unprovable" ]; then
+    config_fatal "OFBIZ_PROFILE=prod but the database behind these mappings of the 'default' delegator in $authoritative could not be established:$unprovable. The prod profile refuses to start on a database it cannot identify rather than assume the mapping points somewhere shared. Declare each datasource the delegator maps, with an inline-jdbc jdbc-uri or a jndi-jdbc reference, or unset that file and supply the OFBIZ_POSTGRES_* variables so the container renders the configuration itself."
+  fi
+}
+
+###############################################################################
+# Require the replica count and the database's connection capacity as stated production inputs.
+#
+# WHY A DEFAULT IS NOT GOOD ENOUGH HERE, when it is elsewhere in this script. Every other setting defaults
+# to a value that is CORRECT for the container it is applied to. This one cannot: OFBIZ_DB_FLEET_SIZE
+# describes the deployment AROUND this container, and there is no value a single instance can assume about
+# how many of its siblings exist. Defaulting it to one does not make the arithmetic conservative, it makes
+# the arithmetic answer a different question - and answer it reassuringly. Six replicas each allowed the
+# default pool maximum demand 6 x 250 x 3 = 4500 connections; validated as one instance the same
+# configuration reports 750 against a stated capacity and passes, and the fleet exhausts the database as
+# the second replica starts. A check that passes for the wrong reason is worse than no check, because it
+# is quoted as evidence.
+#
+# The capacity is mandatory for the mirror-image reason: it is a fact about the managed database that
+# nothing in this container can read - there is no database client in this image - and a guessed
+# max_connections would make every conclusion drawn from it fiction.
+#
+# Both are required only in prod, and only on the managed-database path this function is called from. A
+# developer's container is the single instance by construction, and its embedded H2 database has no shared
+# connection budget to oversubscribe.
+#
+# The question asked is whether the OPERATOR supplied the value, not whether it is non-empty:
+# ofbiz_setup_env has already applied the fleet default by the time this runs, so an emptiness test would
+# report every deployment as having stated a replica count. That is what the record_supplied_variables
+# snapshot exists for.
+require_fleet_capacity_inputs() {
+  if [ "$OFBIZ_PROFILE" != 'prod' ]; then
+    return 0
+  fi
+
+  local missing=''
+  if ! variable_was_supplied OFBIZ_DB_FLEET_SIZE; then
+    missing="$missing OFBIZ_DB_FLEET_SIZE"
+  fi
+  if ! variable_was_supplied OFBIZ_DB_MAX_CONNECTIONS; then
+    missing="$missing OFBIZ_DB_MAX_CONNECTIONS"
+  fi
+
+  if [ -n "$missing" ]; then
+    config_fatal "OFBIZ_PROFILE=prod with a managed database requires these capacity inputs to be stated:$missing. OFBIZ_DB_FLEET_SIZE is the number of instances that will run against this database - not the number of containers this one knows about, which is one - and OFBIZ_DB_MAX_CONNECTIONS is that database's max_connections. Both are needed because a pool maximum is a per-instance figure while the connections it consumes are shared: without the replica count the check silently validates a fleet of one, and without the capacity there is nothing to validate against. Neither value is written into any configuration file. See DOCKER.adoc."
+  fi
+}
+
+###############################################################################
 # Render the OFBiz database configuration.
 #
 # The configuration is reconstructed on every container start rather than once behind a marker file, so
@@ -7645,11 +10064,15 @@ configure_database() {
 
   case "$desiredMode" in
   managed)
+    # Asked before anything is written, because the render is what would destroy the file. See
+    # require_no_unmanaged_entity_engine_override.
+    require_no_unmanaged_entity_engine_override
     render_database_configuration
     ;;
   embedded)
     # No managed database, but cross-instance cache invalidation was asked for, so the committed
     # configuration is rendered with just that one attribute rewritten.
+    require_no_unmanaged_entity_engine_override
     render_embedded_cache_clear_configuration
     ;;
   committed)
@@ -7663,6 +10086,14 @@ configure_database() {
   esac
 
   record_database_desired_state "$desiredMode"
+
+  # Last, because it judges the RESULT rather than the request: whichever file is now authoritative - the
+  # one just rendered, one an earlier start left behind, or one the deployment mounted and this function
+  # deliberately kept - is what the JVM will read, and the prod profile may not serve from an embedded
+  # database in any of those three cases. Placed inside configure_database so that every path reaches it,
+  # the schema-initialisation job included: an init job that applied the entity model to an H2 file on its
+  # own volume and exited 0 would tell an orchestrator the fleet database is ready.
+  require_prod_external_datasource
 
   if [ "${RESOLVED_SCHEMA_INIT:-false}" = "true" ] && [ "$desiredMode" != 'managed' ]; then
     printf '%s\n' \
@@ -7889,16 +10320,21 @@ validate_externally_provisioned_secrets() {
   hide_secrets
   # config/ takes class path precedence over the copies inside ofbiz.jar, which is where an externally
   # provisioned configuration is mounted, so that is where a supplied value has to be declared.
+  #
+  # Asked through config_declares_property rather than with a grep of its own, so that "declared" means
+  # here what it means everywhere else in this script: what java.util.Properties would deliver. A local
+  # grep for '^name=.' reported a property declared with ':' or with plain whitespace as absent, which
+  # would have refused a start over a secret the application reads perfectly well.
   if [ -z "$OFBIZ_ADMIN_KEY" ] \
-    && ! grep --quiet '^ofbiz\.admin\.key=.' "$ADMIN_KEY_OVERRIDE" 2>/dev/null; then
+    && ! config_declares_property "$ADMIN_KEY_OVERRIDE" 'ofbiz\.admin\.key'; then
     missing="$missing OFBIZ_ADMIN_KEY(or ofbiz.admin.key in $ADMIN_KEY_OVERRIDE)"
   fi
   if [ -z "$OFBIZ_LOGIN_SECRET_KEY" ] \
-    && ! grep --quiet '^login\.secret_key_string=.' "$SECURITY_PROPERTIES_OVERRIDE" 2>/dev/null; then
+    && ! config_declares_property "$SECURITY_PROPERTIES_OVERRIDE" 'login\.secret_key_string'; then
     missing="$missing OFBIZ_LOGIN_SECRET_KEY(or login.secret_key_string in $SECURITY_PROPERTIES_OVERRIDE)"
   fi
   if [ -z "$OFBIZ_JWT_TOKEN_KEY" ] \
-    && ! grep --quiet '^security\.token\.key=.' "$SECURITY_PROPERTIES_OVERRIDE" 2>/dev/null; then
+    && ! config_declares_property "$SECURITY_PROPERTIES_OVERRIDE" 'security\.token\.key'; then
     missing="$missing OFBIZ_JWT_TOKEN_KEY(or security.token.key in $SECURITY_PROPERTIES_OVERRIDE)"
   fi
   restore_trace
@@ -8013,7 +10449,13 @@ record_supplied_variables() {
   local variableName
 
   hide_secrets
-  for variableName in "${RUNTIME_APPLIED_VARIABLES[@]}"; do
+  # Both arrays, not just the rendered one. The question this snapshot answers - "did this value come
+  # from outside this script?" - has to be answerable for every OFBIZ_ name the script consumes, and the
+  # capacity inputs are the case that proves it: OFBIZ_DB_FLEET_SIZE is defaulted by ofbiz_setup_env, so
+  # without a record taken beforehand nothing downstream can tell a stated replica count from this
+  # script's assumption of one. Widening the snapshot cannot change what the two existing consumers
+  # report, because both intersect it with their own fixed lists of runtime-applied names.
+  for variableName in "${RUNTIME_APPLIED_VARIABLES[@]}" "${CONTAINER_CONTROL_VARIABLES[@]}"; do
     if [ -n "${!variableName:-}" ]; then
       SUPPLIED_VARIABLES+=("$variableName")
     # A name that is DECLARED and empty is recorded separately rather than dropped. The '+' form asks
@@ -8029,19 +10471,81 @@ record_supplied_variables() {
 }
 
 ###############################################################################
+# Read the value java.util.Properties would deliver for a property of a configuration file.
+#
+# THE ONE READER. Presence, usability and extraction are all answered from this function, and that is a
+# security requirement rather than tidiness. They used to be answered by three different expressions, and
+# the three did not agree: presence and extraction understood only the 'name=value' shape this script
+# renders, while the usability test understood every separator Properties honours and took the LAST
+# declaration. A file declaring
+#
+#     ofbiz.admin.key=NA
+#     ofbiz.admin.key:<a real secret>
+#
+# therefore PASSED the usability test - which read the real secret - and was then RENDERED from the first
+# declaration, so the instance started on the published 'NA' default with every check reporting success.
+# One reader makes that impossible: whatever is judged is what is read, and what is read is what is
+# rendered.
+#
+# WHAT IT REPRODUCES, and why each part matters:
+#
+#   * EVERY SEPARATOR Properties HONOURS - '=', ':' or plain whitespace, with optional blanks around it
+#     and before the key. Understanding fewer is what let a later declaration hide behind an earlier one.
+#   * THE LAST DECLARATION WINS. Properties.load puts each key as it reads the file, so a later duplicate
+#     overwrites an earlier one; reading the first would judge a value OFBiz will not use.
+#   * A CARRIAGE RETURN ENDS THE VALUE. Properties treats CR, LF and CRLF alike as line terminators, so a
+#     file saved with Windows line endings yields a clean value to OFBiz; keeping the CR would fail such a
+#     file on the control-character rule for an artefact OFBiz never sees.
+#   * BLANKS AFTER THE SEPARATOR ARE NOT PART OF THE VALUE. Properties skips them, so keeping them would
+#     let 'key=            abc' satisfy a minimum length the three-character value OFBiz loads does not.
+#
+# One limitation, and it fails closed: a value written across Properties continuation lines is read from
+# its first physical line, so it is likelier to be rejected than accepted. Nothing this script renders is
+# ever continued.
+#
+# The value is a secret, so tracing is suspended for the whole function and the result is written to
+# stdout for the caller to capture into a local variable rather than into a global.
+# $1 - file, $2 - property name as a regular expression
+effective_property_value() {
+  hide_secrets
+  local value=''
+
+  if [ -f "$1" ]; then
+    # '#' delimits this expression rather than the '|' used elsewhere in this script, precisely because
+    # the pattern itself contains a '|' alternation, which would otherwise end the s command. It is safe
+    # here for the reason '|' is safe there: the delimiter only has to avoid the pattern and the
+    # replacement, and this pattern is built solely from a script-internal property-name regex while the
+    # replacement is empty. No provisioned value is ever part of either.
+    #
+    # The separator group must match at least one character, so that a longer key sharing this one's
+    # prefix - 'ofbiz.admin.keyring' against 'ofbiz.admin.key' - cannot be mistaken for it.
+    value=$(sed --regexp-extended --quiet \
+      "s#^[[:blank:]]*$2([[:blank:]]*[=:]|[[:blank:]])[[:blank:]]*##p" "$1" 2>/dev/null | tail --lines=1)
+    value=${value%%$'\r'*}
+  fi
+
+  printf '%s' "$value"
+  restore_trace
+}
+
+###############################################################################
 # Report whether a configuration file already declares a property with a non-empty value.
 #
 # Used to establish what a pre-provisioned configuration contains without ever reading a secret into a
-# variable: grep runs in quiet mode and the trailing '.' of the pattern requires at least one character
-# after the '=', so a declared-but-blank property correctly counts as absent. That distinction matters
-# because java.util.Properties returns a declared empty value instead of falling back to a default, so
-# a blank key is not "unset" to OFBiz - it is an empty key, which is worse than none.
-# $1 - file, $2 - property name as a basic regular expression
+# variable of this shell: the value is read inside a command substitution, tested for emptiness and
+# discarded, and nothing is printed. A declared-but-blank property correctly counts as absent, which
+# matters because java.util.Properties returns a declared empty value instead of falling back to a
+# default, so a blank key is not "unset" to OFBiz - it is an empty key, which is worse than none.
+#
+# Answered from effective_property_value, so "declared" means what OFBiz would read and nothing else. It
+# used to mean "there is a 'name=' line with something after it", which reported a secret declared with
+# ':' as absent while the usability test read it perfectly well - and then rendered a different value.
+# $1 - file, $2 - property name as a regular expression
 config_declares_property() {
   if [ ! -f "$1" ]; then
     return 1
   fi
-  if grep --quiet "^$2=." "$1"; then
+  if [ -n "$(effective_property_value "$1" "$2")" ]; then
     return 0
   fi
   return 1
@@ -8055,10 +10559,10 @@ config_declares_property() {
 # the environment. The value is a secret, so tracing is suspended for the whole function and the result
 # is written to stdout for the caller to capture into a local variable rather than into a global.
 #
-# The extraction matches the anchored 'key=' form this script renders and strips a trailing carriage
-# return, mirroring what java.util.Properties would hand the application. The last declaration wins,
-# which is also how java.util.Properties resolves a duplicated key.
-# $1 - file, $2 - property name as a basic regular expression
+# The extraction is effective_property_value, the one reader this script judges and renders every
+# provisioned property through, so the value returned here is exactly the value that was tested for
+# usability and exactly the value java.util.Properties would hand the application.
+# $1 - file, $2 - property name as a regular expression
 declared_property_value() {
   hide_secrets
   local value
@@ -8077,8 +10581,7 @@ declared_property_value() {
   # callers are plain assignments, which take that status and abort the start through 'set -e' after the
   # ERROR has been printed. No caller may capture this value in a context that discards the status.
   require_rendered_file_present "$1"
-  value=$(sed --quiet "s|^$2=||p" "$1" 2>/dev/null | tail --lines=1)
-  value=${value%%$'\r'*}
+  value=$(effective_property_value "$1" "$2")
   if [ -z "$value" ]; then
     config_fatal "$1 no longer declares a value for the property matched by '$2', although it did when this start checked a moment ago. The most likely cause is a second container starting at the same time against the same /ofbiz/config volume. Start one container at a time against a shared configuration volume, or give each instance its own; then start again."
   fi
@@ -8103,34 +10606,13 @@ declared_property_value() {
 # that would normally have supplied it ever reach the log. The explanation is published in
 # SECRET_REJECTION_REASON, which by construction describes the value without containing it.
 #
-# WHAT IS EXTRACTED IS WHAT java.util.Properties WOULD DELIVER, in three respects, because validating
-# anything else would either reject a file OFBiz reads perfectly well or accept one it does not:
-#
-#   * The LAST declaration wins. Properties.load puts each key as it reads the file, so a later
-#     duplicate overwrites an earlier one; testing the first would test a value OFBiz will not use.
-#   * A carriage return ends the value. Properties treats CR, LF and CRLF alike as line terminators, so
-#     a file saved with Windows line endings yields a clean value to OFBiz. Keeping the CR would fail
-#     such a file on the control-character rule for a formatting artefact OFBiz never sees.
-#   * Blanks between the '=' and the value are not part of it. Properties skips them, so keeping them
-#     would let 'key=            abc' satisfy a minimum length that the three-character value OFBiz
-#     actually loads does not.
-#
-# EVERY SEPARATOR Properties HONOURS IS MATCHED, not just the '=' this script renders, and that is a
-# security requirement rather than tidiness. Properties accepts '=', ':' or plain whitespace, with
-# optional blanks around it and before the key. A file declaring 'ofbiz.admin.key=<a real secret>' and
-# then 'ofbiz.admin.key:NA' resolves to NA in OFBiz - verified against java.util.Properties - so an
-# extraction that only understood '=' would read the real secret, pronounce the file fit and let the
-# instance start on the published default. Matching every shape means a later declaration can never
-# hide behind an earlier one.
-#
-# config_declares_property above still defines PRESENCE as the 'name=value' shape this script renders.
-# The asymmetry is deliberate and fails closed in both directions: a secret declared only with ':' is
-# reported as absent - the operator is told exactly what to declare - while a bad value declared with
-# ':' is caught here.
-#
-# One limitation, and it also fails closed: a value written across Properties continuation lines is
-# judged on its first physical line, so it is likelier to be rejected than accepted. Nothing this
-# script renders is ever continued.
+# WHAT IS EXTRACTED IS WHAT java.util.Properties WOULD DELIVER, because validating anything else would
+# either reject a file OFBiz reads perfectly well or accept one it does not. That is not restated here:
+# it is effective_property_value, the one reader presence, usability and extraction all go through, and
+# the rules it reproduces are documented there. Using it is what closes the gap this function used to
+# have - it understood every Properties separator while the renderer understood only '=', so a file
+# could be pronounced fit on a value the renderer never read and a weaker one could be rendered in its
+# place.
 #
 # Returns 0 when the declared value is usable, 1 otherwise.
 # $1 - file, $2 - property name as a regular expression, $3 - minimum length,
@@ -8145,17 +10627,11 @@ preprovisioned_secret_is_usable() {
   local value
   local usable=1
 
-  # The separator group must match at least one character, so that a longer key sharing this one's
-  # prefix - 'ofbiz.admin.keyring' against 'ofbiz.admin.key' - cannot be mistaken for it.
-  #
-  # '#' delimits this expression rather than the '|' used everywhere else in this script, precisely
-  # because the pattern itself contains a '|' alternation, which would otherwise end the s command. It
-  # is safe here for the reason '|' is safe there: the delimiter only has to avoid the pattern and the
-  # replacement, and this pattern is built solely from a script-internal property-name regex while the
-  # replacement is empty. No provisioned value is ever part of either.
-  value=$(sed --regexp-extended --quiet \
-    "s#^[[:blank:]]*$property([[:blank:]]*[=:]|[[:blank:]])[[:blank:]]*##p" "$file" | tail --lines=1)
-  value=${value%%$'\r'*}
+  # Read through effective_property_value, the one reader, so that the value judged here is the value the
+  # renderer will read back and write. This function used to hold a second copy of the extraction, and
+  # the two copies disagreed: this one honoured every Properties separator while the renderer's honoured
+  # only '=', so a file could pass here on a value the renderer never saw.
+  value=$(effective_property_value "$file" "$property")
   if secret_is_usable "$value" "$minLength" "$forbidden"; then
     usable=0
   fi
@@ -8276,11 +10752,17 @@ require_preprovisioned_runtime_configuration() {
 # datasource for that reason: it is the value that tells a reader of /proc/<pid>/environ exactly which
 # managed database this fleet talks to.
 #
-# SIX AWS_ PREFIXED NAMES ARE DELIBERATELY NOT TOUCHED: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-# AWS_WEB_IDENTITY_TOKEN_FILE, AWS_REGION, AWS_MAX_ATTEMPTS and AWS_RETRY_MODE all belong to the SDK's
-# own default credential and retry chains - which is how an instance profile, an ECS task role or an EKS
-# service account supplies short lived credentials - and they are resolved inside the JVM. Removing them
-# would break the recommended production configuration.
+# THE NINE AWS_ PREFIXED CREDENTIAL AND TOKEN NAMES ARE DELIBERATELY NOT WITHDRAWN HERE - every name
+# AWS_CREDENTIAL_ENVIRONMENT_VARIABLES declares - and neither are AWS_REGION, AWS_MAX_ATTEMPTS and
+# AWS_RETRY_MODE, which carry no credential at all. All of them belong to the SDK's own default
+# credential and retry chains - which is how an instance profile, an ECS task role or an EKS service
+# account supplies short lived credentials - and they are resolved inside the JVM, from the environment,
+# after this point. Removing them would break the recommended production configuration, which is exactly
+# why they cannot be treated as the OFBIZ_* secrets are.
+#
+# They are not simply left alone throughout, though: everything before this point that could observe them
+# - an operator hook and every initialisation child - has them removed for its duration and restored
+# afterwards, so the only process that ever sees them is the serving JVM that needs them.
 #
 # No value is ever expanded here, only names, so this needs no secret-hiding region: a traced run prints
 # the name being withdrawn and never what it held.
@@ -8330,6 +10812,11 @@ _main() {
   # whether the data initialisation runs, and whether the container serves traffic at all - so they are
   # parsed and validated before any work, not discovered part way through it.
   resolve_skip_init
+
+  # Read from the COMMAND rather than the environment, which is why it is resolved here beside the other
+  # decisions rather than in ofbiz_setup_env: '$@' is in scope only in _main, and the Catalina render
+  # needs the offset to know which ports this instance will really listen on. See resolve_port_offset.
+  resolve_port_offset "$@"
 
   # Recorded before any default is applied, so the advisory on the skip path can name what the operator
   # actually supplied rather than what this script computed.

@@ -30,13 +30,13 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 
+import org.apache.ofbiz.base.test.ShellDriver;
 import org.apache.ofbiz.entity.config.model.Datasource;
 import org.apache.ofbiz.entity.config.model.DelegatorElement;
 import org.apache.ofbiz.entity.config.model.EntityConfig;
@@ -51,6 +51,7 @@ import org.w3c.dom.NodeList;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -768,6 +769,26 @@ public final class SchemaInitGatingTests {
             }
         }
 
+        // The two mismatch groups are pinned differently, and they have to be. A residual message BEGINS
+        // with its signature, so the check above can require a quotation mark in front of it; a mismatch
+        // message is a concatenation whose stable part sits in the MIDDLE - the engine builds
+        // "Column [x] of table [y] ... is of type [a] in the database, but is defined as type [b]" - so what
+        // is required here is that the fragment still appears inside a string literal of the emitting class.
+        // Without that the entry point could be grepping for text the engine no longer writes, and the whole
+        // verification would pass by finding nothing.
+        for (String group : List.of("SCHEMA_INIT_MISMATCH_SIGNATURES", "SCHEMA_INIT_UNPROVEN_SIGNATURES")) {
+            List<String> signatures = shellArray(entryPoint, group);
+            assertFalse(signatures.isEmpty(), group + " must not be empty");
+            for (String signature : signatures) {
+                assertTrue(databaseUtilSource.contains(signature),
+                        DATABASE_UTIL_SOURCE + " must still emit the fragment \"" + signature + "\": the container"
+                                + " entry point refuses to record a schema as applied when the verifying pass"
+                                + " reports it, so a rewording upstream would silently retire that refusal");
+            }
+            assertTrue(entryPoint.contains("\"${" + group + "[@]}\""),
+                    "the entry point must still consult " + group);
+        }
+
         // The constants are only worth pinning while the entry point still consults them.
         assertTrue(entryPoint.contains("grep --quiet --fixed-strings \"$SCHEMA_INIT_DDL_SIGNATURE\""),
                 "the entry point must still require the database-check message before recording success");
@@ -889,17 +910,192 @@ public final class SchemaInitGatingTests {
                     "the same message in the APPLYING pass is normal commentary and must be accepted");
         }
 
-        // The engine's foreign key and index residuals, its extra-table notice and its column-count notice
-        // are deliberately not completeness evidence: the three check-*-on-start flags that produce the
-        // first two ship disabled, DatabaseUtil's own source records that its foreign key comparison does
-        // not work on PostgreSQL, and an extra table or column is not a missing one.
+        // PRESENT IS NOT CORRECT. Every comparison the engine makes between the model and a column it
+        // FOUND is a refusal in the verifying pass, and none of them is waivable: a column of the wrong
+        // type, width, scale or key membership is wrong in every deployment, and re-running the init job
+        // cannot repair it because the DDL is additive and never alters an existing column. Each of these
+        // outcomes used to be recorded as a successfully applied schema.
+        for (String signature : shellArray(entryPoint, "SCHEMA_INIT_MISMATCH_SIGNATURES")) {
+            assertVerdict(tempDir, "verify", 0, cleanVerification + "\nColumn [PARTY_ID] of table [PARTY] of"
+                    + " entity [Party] " + signature + "numeric] in the entity definition.", 2, false,
+                    "a verifying pass reporting '" + signature + "' has proved the schema does not match the"
+                            + " entity model and must be refused");
+            assertVerdict(tempDir, "apply", 0, cleanApply + "\nColumn [PARTY_ID] of table [PARTY] of entity"
+                    + " [Party] " + signature + "numeric] in the entity definition.", 0, true,
+                    "the applying pass is judged on what it could not DO; the mismatch is the verifying"
+                            + " pass's question, and duplicating it here would refuse a run that then"
+                            + " reported the same fact conclusively");
+        }
+
+        // Present, not missing, not mismatched, and NOT DECIDABLE: a column the model has no field for is
+        // harmless when it is nullable or defaulted and breaks every insert into its table when it is NOT
+        // NULL without a default, and the engine reads that nullability without ever reporting it. Refused
+        // by default; accepted only when the operator says the difference is deliberate.
+        for (String signature : shellArray(entryPoint, "SCHEMA_INIT_UNPROVEN_SIGNATURES")) {
+            assertVerdict(tempDir, "verify", 0, cleanVerification + "\nColumn [OLD_FIELD] of table [PARTY] of"
+                    + " entity [Party" + signature + "PARTY] has 13 columns.", 2, false,
+                    "a verifying pass reporting '" + signature + "' cannot prove the schema is usable and must"
+                            + " be refused unless the operator accepts it");
+            assertVerdictWith(tempDir, "verify", 0, cleanVerification + "\nColumn [OLD_FIELD] of table [PARTY]"
+                    + " of entity [Party" + signature + "PARTY] has 13 columns.", 2,
+                    "RESOLVED_SCHEMA_INIT_ACCEPT_EXISTING=true", true,
+                    "OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true must waive '" + signature + "', which is the"
+                            + " documented way to re-initialise a schema an upgrade has changed");
+        }
+
+        // An extra TABLE stays acceptable, and so do the foreign key and index residuals. The engine names
+        // every table it uses, so a table no entity describes cannot affect a statement it issues; and the
+        // two residuals are produced by check-*-on-start flags that ship disabled and by a comparison that
+        // reads nothing at all on PostgreSQL - a live initialisation of this image against PostgreSQL 13.23
+        // created 1970 foreign key constraints and 4600 indexes while the same run reported every one of
+        // them missing, so treating either as evidence would fail every correct initialisation.
         assertVerdict(tempDir, "verify", 0, String.join("\n", cleanVerification,
                 "Table named [OLD_THING] exists in the database but has no corresponding entity",
-                "Entity [Party] has 12 fields but table [PARTY] has 13 columns.",
                 "No Foreign Key Constraint [PARTY_CB] found for entity [Party]",
                 "No Index [PARTY_TXCRTD] found for entity [Party]"), 2, true,
-                "extra objects, a column-count difference and the disabled-by-default foreign key and index"
-                        + " residuals must not be mistaken for an incomplete schema");
+                "an extra table and the disabled-by-default foreign key and index residuals must not be"
+                        + " mistaken for an incomplete or incompatible schema");
+    }
+
+    /**
+     * AAP Objective 4: pins the three engine comparisons that are deliberately NOT treated as evidence, and
+     * the measurement that is the reason.
+     *
+     * <p>Two of them - the foreign key and index residuals - have always been excluded. The third is the
+     * primary key comparison, and excluding it is counter-intuitive enough that it has to be a checked
+     * decision rather than an omission somebody might helpfully "fix": {@code check-pks-on-start} defaults
+     * to {@code true} in {@code entity-config.xsd}, so {@code DatabaseUtil} emits those messages with no
+     * configuration at all, and a reader who found them missing from the entry point's enumeration would
+     * reasonably add them.</p>
+     *
+     * <p>They are excluded because on PostgreSQL the comparison reads nothing. A full initialisation of this
+     * image against PostgreSQL 13.23 with pgJDBC 42.7.13 logged
+     * {@code "Reviewed 0 primary key fields from database."} for each of its three databases - after asking
+     * {@code getPrimaryKeys} with a {@code "%"} table name and then falling back to asking for each of the 852
+     * tables individually - and then reported {@code "IS NOT a primary key in the database, but IS a primary
+     * key in the entity definition"} 1691 times, once for very nearly every primary key column in the model,
+     * while the catalogue held 852 primary key constraints over 1674 columns that the very same run had
+     * created. The foreign key and index comparisons behave identically: the same run reported
+     * {@code "There are 0 indices in the database"} and 1970 missing foreign keys against a database holding
+     * 1970 foreign key constraints and 4600 indexes. Treating any of the three as evidence would refuse every
+     * correct initialisation of this image, which is a far worse outcome than the gap it would close - and the
+     * gap is closed instead by
+     * {@link #theFreshnessVerdictRefusesASchemaItCannotProveItCreated}, which proves the schema was created
+     * from the entity model by the run that is releasing it.</p>
+     *
+     * @param tempDir a per-test temporary directory for the sourced library, the driver and the logs
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    @Test
+    @DisplayName("the comparisons that read nothing on PostgreSQL are excluded, and stay excluded")
+    public void theEngineComparisonsThatReadNothingOnPostgresAreNotTreatedAsEvidence(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point's verdicts");
+        String entryPoint = repositoryText(ENTRY_POINT);
+        String verifyLine = shellConstant(entryPoint, "SCHEMA_INIT_VERIFY_SIGNATURE");
+        String cleanVerification = String.join("\n", verifyLine, verifyLine,
+                "Finished the data load with 0 rows changed");
+
+        // Both directions of the primary key comparison, as the engine writes them, on a verifying pass that
+        // is otherwise clean. This is the shape of EVERY correct PostgreSQL initialisation of this image.
+        String pkDrift = String.join("\n", cleanVerification,
+                "Reviewed 0 primary key fields from database.",
+                "Column [PARTY_ID] of table [public.PARTY] of entity [Party] IS NOT a primary key in the"
+                        + " database, but IS a primary key in the entity definition. The primary key for this"
+                        + " table needs to be re-created or modified to add this column to the primary key.",
+                "Column [OLD_ID] of table [public.PARTY] of entity [Party] IS a primary key in the database,"
+                        + " but IS NOT a primary key in the entity definition. The primary key for this table"
+                        + " needs to be re-created or modified so that this column is NOT part of the primary"
+                        + " key.");
+        assertVerdict(tempDir, "verify", 0, pkDrift, 2, true,
+                "the primary key comparison reads nothing on PostgreSQL - the same run that created 852"
+                        + " primary keys reported 1691 of them missing - so treating it as evidence would"
+                        + " refuse every correct initialisation");
+
+        // And the exclusion is stated where it can be found, next to the enumeration it is an exception to,
+        // with the measurement rather than an assertion of belief.
+        for (String required : List.of("Reviewed 0 primary key fields from database.",
+                "IS NOT a primary key in the database, but IS a primary key in the entity definition",
+                "There are 0 indices in the database")) {
+            assertTrue(entryPoint.contains(required),
+                    "the entry point must record the measurement that justifies excluding an engine"
+                            + " comparison, including \"" + required + "\"");
+        }
+        assertFalse(shellArray(entryPoint, "SCHEMA_INIT_MISMATCH_SIGNATURES").stream()
+                        .anyMatch(signature -> signature.contains("primary key")),
+                "no primary key comparison may be enumerated as evidence while it reads nothing on"
+                        + " PostgreSQL: every correct initialisation of this image would be refused");
+    }
+
+    /**
+     * AAP Objective 4: executes the entry point's freshness verdict and asserts that a schema this run did
+     * not create in full cannot be released without the operator saying so.
+     *
+     * <p>This is the dimension no comparison can reach. {@code DatabaseUtil} reads the nullability of every
+     * column and neither compares nor logs it, and its foreign key and index comparison reads nothing on
+     * PostgreSQL - measured, and recorded beside the residual signatures in the entry point - so for a table
+     * this run did not create, three properties are simply unavailable: the nullability and defaults of its
+     * columns, and the presence of its declared foreign keys and indexes. For a table this run DID create
+     * they need no checking at all, because the engine emitted their DDL from the entity model in this very
+     * execution. Proving authorship is therefore strictly stronger than any comparison available here, and
+     * it is proved from the engine's own numbers: ModelReader's {@code #Entities=N}, one
+     * {@code has no table in the database} per entity, and one {@code Created table [} per creation.</p>
+     *
+     * <p>The numbers below are the shape of a real run: a live PostgreSQL 13.23 initialisation of this image
+     * logged {@code #Entities=865} with 865 of each line.</p>
+     *
+     * @param tempDir a per-test temporary directory for the sourced library, the driver and the logs
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    @Test
+    @DisplayName("a schema this run did not create in full is not released without an explicit acceptance")
+    public void theFreshnessVerdictRefusesASchemaItCannotProveItCreated(@TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point's verdicts");
+        String entryPoint = repositoryText(ENTRY_POINT);
+        String applyLine = shellConstant(entryPoint, "SCHEMA_INIT_DDL_SIGNATURE");
+        String model = "Finished loading entities; #Entities=3 #ViewEntities=1 #Fields=9 #Relationships=4";
+
+        String fresh = String.join("\n", applyLine, model,
+                "Entity [Party] has no table in the database", "Entity [Person] has no table in the database",
+                "Entity [PartyRole] has no table in the database",
+                "Created table [public.PARTY]", "Created table [public.PERSON]",
+                "Created table [public.PARTY_ROLE]", "Finished the data load with 0 rows changed");
+        assertFreshness(tempDir, fresh, "", true,
+                "a run that found every entity without a table and created every one of them has created the"
+                        + " whole schema from the model and needs no further proof");
+
+        assertFreshness(tempDir, String.join("\n", applyLine, model,
+                "Entity [Party] has no table in the database", "Created table [public.PARTY]",
+                "Finished the data load with 0 rows changed"), "", false,
+                "a run that created one of three tables is adding to a schema something else created, whose"
+                        + " nullability, defaults, foreign keys and indexes it cannot see");
+
+        assertFreshness(tempDir, String.join("\n", applyLine, model,
+                "Finished the data load with 0 rows changed"), "", false,
+                "a re-run against a complete schema creates nothing and proves nothing about it");
+
+        assertFreshness(tempDir, String.join("\n", applyLine,
+                "Entity [Party] has no table in the database", "Created table [public.PARTY]"), "", false,
+                "a log with no #Entities line gives nothing to compare the counts against, and a verdict that"
+                        + " cannot read its evidence must refuse rather than pass");
+
+        assertFreshness(tempDir, String.join("\n", applyLine, model,
+                "Entity [Party] has no table in the database", "Entity [Person] has no table in the database",
+                "Entity [PartyRole] has no table in the database", "Created table [public.PARTY]",
+                "Created table [public.PERSON]"), "", false,
+                "a run that found three tables missing and created two has left one missing and must not be"
+                        + " read as having created the schema");
+
+        // The refusal names the numbers rather than only the conclusion, because the operator's next action
+        // depends entirely on which of the two situations it is: a deliberate re-initialisation, or a
+        // database that should have been empty and is not.
+        String refusal = freshnessVerdict(tempDir, String.join("\n", applyLine, model,
+                "Entity [Party] has no table in the database", "Created table [public.PARTY]"), "");
+        assertTrue(refusal.contains("declares 3 entities") && refusal.contains("found 1 of them")
+                        && refusal.contains("created 1 tables"),
+                "the refusal must state the three counts it compared, was: " + refusal);
+        assertTrue(refusal.contains("OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true"),
+                "the refusal must name the way to accept a deliberate re-initialisation, was: " + refusal);
     }
 
     /**
@@ -957,6 +1153,84 @@ public final class SchemaInitGatingTests {
      */
     private static void assertVerdict(Path workDir, String pass, int status, String log, int appliedChecks,
             boolean expectedAccepted, String because) throws Exception {
+        assertVerdictWith(workDir, pass, status, log, appliedChecks, "", expectedAccepted, because);
+    }
+
+    /**
+     * {@link #assertVerdict} with shell run before the verdict, so a case can present the verdict with the
+     * configuration an operator would have supplied.
+     *
+     * <p>The preamble assigns the RESOLVED variable rather than the {@code OFBIZ_} one, because that is what
+     * the verdict reads: {@code resolve_entity_engine_flags} normalises the environment variable into it long
+     * before either pass runs, and a case that set the environment variable alone would be asserting that the
+     * verdict duplicates that normalisation, which it deliberately does not.</p>
+     *
+     * @param workDir a per-test temporary directory
+     * @param pass {@code "apply"} for the applying verdict, {@code "verify"} for the verifying one
+     * @param status the exit status to present as the data-load child's
+     * @param log the synthetic engine log the verdict must judge
+     * @param appliedChecks how many database-check lines the applying pass produced
+     * @param preamble shell to run after the entry point is sourced and before the verdict is called
+     * @param expectedAccepted whether the verdict must accept this outcome
+     * @param because what the assertion is proving
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    private static void assertVerdictWith(Path workDir, String pass, int status, String log, int appliedChecks,
+            String preamble, boolean expectedAccepted, String because) throws Exception {
+        String invocation = "apply".equals(pass)
+                ? "schema_init_apply_verdict " + status + " @LOG@"
+                : "schema_init_verification_verdict " + status + " @LOG@ " + appliedChecks;
+        String verdict = runVerdictFunction(workDir, preamble, log, invocation, pass);
+        assertEquals(expectedAccepted, verdict.isEmpty(), because + " -- verdict was: " + verdict);
+    }
+
+    /**
+     * Asserts the outcome of the entry point's freshness verdict over a synthetic applying-pass log.
+     *
+     * @param workDir a per-test temporary directory
+     * @param log the synthetic applying-pass log
+     * @param preamble shell to run after the entry point is sourced and before the verdict is called
+     * @param expectedAccepted whether the verdict must accept this outcome
+     * @param because what the assertion is proving
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    private static void assertFreshness(Path workDir, String log, String preamble, boolean expectedAccepted,
+            String because) throws Exception {
+        String verdict = freshnessVerdict(workDir, log, preamble);
+        assertEquals(expectedAccepted, verdict.isEmpty(), because + " -- verdict was: " + verdict);
+    }
+
+    /**
+     * The freshness verdict's own words, for a case that has to assert on what the refusal says.
+     *
+     * @param workDir a per-test temporary directory
+     * @param log the synthetic applying-pass log
+     * @param preamble shell to run after the entry point is sourced and before the verdict is called
+     * @return the refusal, or the empty string when the schema was proved fresh
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    private static String freshnessVerdict(Path workDir, String log, String preamble) throws Exception {
+        return runVerdictFunction(workDir, preamble, log, "schema_init_freshness_verdict @LOG@", "freshness");
+    }
+
+    /**
+     * Sources the real entry point and calls one of its pure verdict functions over a synthetic log.
+     *
+     * <p>The entry point is sourced with its trailing {@code _main "$@"} line removed, exactly as
+     * {@code AdminKeyConfigTests} does, so one function can be invoked as a black box without starting
+     * OFBiz. Every verdict prints an explanation when it refuses and prints nothing when it accepts, so
+     * "accepted" is simply empty output - which is also why no verdict may print anything else.</p>
+     *
+     * @param workDir a per-test temporary directory
+     * @param preamble shell to run after the entry point is sourced and before the verdict is called
+     * @param log the synthetic engine log to judge
+     * @param invocation the call to make, with {@code @LOG@} where the log path belongs
+     * @param described what is being run, for the failure messages
+     * @return the combined output of the call
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    private static String runVerdictFunction(Path workDir, String preamble, String log, String invocation,
+            String described) throws Exception {
         Path library = workDir.resolve("entrypoint-library.sh");
         if (!Files.exists(library)) {
             List<String> sourced = new ArrayList<>();
@@ -969,41 +1243,42 @@ public final class SchemaInitGatingTests {
         }
         Path logFile = Files.createTempFile(workDir, "engine-", ".log");
         Files.writeString(logFile, log + "\n", StandardCharsets.UTF_8);
-        String invocation = "apply".equals(pass)
-                ? "schema_init_apply_verdict " + status + " " + shellQuote(logFile)
-                : "schema_init_verification_verdict " + status + " " + shellQuote(logFile) + " " + appliedChecks;
         Path driver = Files.createTempFile(workDir, "verdict-", ".sh");
-        Files.writeString(driver, "#!/usr/bin/env bash\n. " + shellQuote(library) + "\n" + invocation + "\n",
-                StandardCharsets.UTF_8);
+        Files.writeString(driver, "#!/usr/bin/env bash\n. " + shellQuote(library) + "\n"
+                + (preamble.isEmpty() ? "" : preamble + "\n")
+                + invocation.replace("@LOG@", shellQuote(logFile)) + "\n", StandardCharsets.UTF_8);
 
-        ProcessBuilder builder = new ProcessBuilder("bash", driver.toString());
-        builder.redirectErrorStream(true);
-        Process process = builder.start();
-        String verdict = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertTrue(process.waitFor(VERDICT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
-                "the " + pass + " verdict did not terminate");
-        assertEquals(0, process.exitValue(), "the " + pass + " verdict must not fail as a shell function");
-        assertEquals(expectedAccepted, verdict.isEmpty(), because + " -- verdict was: " + verdict);
+        // Run through the shared driver, which waits on the process BEFORE collecting its output. Reading
+        // the output first, as this used to, makes the deadline unreachable: the read blocks until the child
+        // closes its stream, so a child that never exits is waited on for ever and never destroyed.
+        ShellDriver.Run run = ShellDriver.run(driver, workDir, Map.of(), VERDICT_TIMEOUT_SECONDS);
+        assertFalse(run.timedOut(), "the " + described + " verdict did not terminate, output was:\n"
+                + run.output());
+        assertEquals(0, run.exitCode(), "the " + described + " verdict must not fail as a shell function");
+        return run.output();
     }
 
     /** A shell-quoted path, so a temporary directory containing a space or a quote cannot break a driver. */
     private static String shellQuote(Path path) {
-        return "'" + path.toString().replace("'", "'\\''") + "'";
+        return shellQuote(path.toString());
+    }
+
+    /** Single-quotes arbitrary text for safe interpolation into a generated driver script. */
+    private static String shellQuote(String text) {
+        return "'" + text.replace("'", "'\\''") + "'";
     }
 
     /** Whether a POSIX shell can be executed, so the shell-driven assertions can be skipped if not. */
+    /**
+     * Whether a POSIX shell can be executed, so the shell-driven assertions can be skipped if not.
+     *
+     * <p>Delegated to the shared driver rather than repeated: this probe has to start a process, wait
+     * for it and close its output, and every copy of it was one more place to get that wrong.
+     *
+     * @return true when {@code bash} can be run
+     */
     private static boolean isBashAvailable() {
-        try {
-            Process process = new ProcessBuilder("bash", "-c", "exit 0").start();
-            return process.waitFor(VERDICT_TIMEOUT_SECONDS, TimeUnit.SECONDS) && process.exitValue() == 0;
-        } catch (IOException e) {
-            return false;
-        } catch (InterruptedException e) {
-            // Restored rather than swallowed: this runs on a JUnit worker thread that outlives the
-            // method, and a thread whose interrupt flag was cleared silently ignores a cancellation.
-            Thread.currentThread().interrupt();
-            return false;
-        }
+        return ShellDriver.isBashAvailable();
     }
 
     /**
@@ -1269,15 +1544,23 @@ public final class SchemaInitGatingTests {
      * data is simply wrong on one instance; the broker client must be loadable, or the listener cannot be constructed;
      * and at least one broker endpoint must answer within a bounded deadline.</p>
      *
-     * <p><b>These are necessary conditions, not sufficient ones, and this test does not claim otherwise.</b> None
-     * of the three creates a JNDI context, looks a connection factory or topic up in one, authenticates
-     * credentials, constructs a subscriber or publisher, or publishes anything, so none of them shows that an
-     * invalidation reaches a peer. A start up cannot show it here: {@code dependencies.gradle} bundles only the JMS
-     * API - the Agent Action Plan authorises exactly two dependency additions, neither a broker client nor an
-     * embedded broker - and the provider's client library is deployment specific and mounted by the operator, so
-     * there is nothing available to perform a lookup with. Propagation is verified instead by running two
-     * instances, for which {@code DOCKER.adoc} carries the procedure, and the companion test below holds the start
-     * up log to that boundary.</p>
+     * <p><b>These are conditions on the start up, and this test asserts only those.</b> None of the three creates
+     * a JNDI context, looks a connection factory or topic up in one, authenticates credentials, constructs a
+     * subscriber or publisher, or publishes anything. A start up cannot: {@code dependencies.gradle} bundles only
+     * the JMS API - the Agent Action Plan authorises exactly two dependency additions, neither a broker client nor
+     * an embedded broker - and the provider's client library is deployment specific and mounted by the operator, so
+     * there is nothing available to perform a lookup with. What the three do establish is that this instance is
+     * configured to subscribe, that a client library is on the class path, and that something answers on the
+     * broker's port; the companion test below holds the start up log to exactly that boundary.</p>
+     *
+     * <p><b>That an invalidation reaches a peer is proved elsewhere, and automatically.</b>
+     * {@code framework/entityext/src/test/java/org/apache/ofbiz/entityext/cache/DistributedCacheInvalidationPropagationTests}
+     * drives the production publisher and the production consumer against two instances' caches and asserts the
+     * whole hop for every kind of invalidation the engine raises, including that a consumer applies the clear
+     * locally so it cannot re-publish it. It runs in the same required build gate as this test, so neither the
+     * start up conditions here nor the propagation there depends on an operator remembering to check it. Running
+     * two containers, for which {@code DOCKER.adoc} carries the procedure, remains worthwhile for the one thing
+     * neither test can cover: a specific broker, client library, credentials and topic.</p>
      */
     @Test
     public void containerEntryPointRequiresASubscriberAndStartupConnectivityEvidenceForTheTransport() {
@@ -1328,7 +1611,241 @@ public final class SchemaInitGatingTests {
         assertTrue(accepted.contains("propagation must be confirmed against a second instance"), ENTRY_POINT
                 + " must tell the operator what would establish coherence, because a disclaimer that leaves no next"
                 + " step is ignored. The message was: " + accepted);
+
+        // The reachability clause has to be READ OUT of the probe's own finding rather than written into this
+        // line, because a line that states the finding in its own words can state one that did not happen.
+        assertTrue(accepted.contains("$RESOLVED_TRANSPORT_PROBE_RESULT"), ENTRY_POINT + " must compose the"
+                + " reachability clause of its acceptance message from RESOLVED_TRANSPORT_PROBE_RESULT, which the"
+                + " probe publishes, so the line cannot claim a probe that did not happen. The message was: "
+                + accepted);
+        assertFalse(accepted.contains("accepted a TCP connection"), ENTRY_POINT + " states in its acceptance"
+                + " message that an endpoint accepted a TCP connection. Written here it is unconditional, and a"
+                + " provider URL naming no host and port reaches this line having probed nothing at all - so the"
+                + " one line an operator reads would contradict the warning printed moments earlier. Report the"
+                + " probe's own finding instead. The message was: " + accepted);
     }
+
+    /**
+     * AAP Objective 5 / B2-JMS-RES-02: asserts the reachability probe reports what it established and refuses a
+     * provider URL through which no client could connect at all.
+     *
+     * <p>Three outcomes are possible and they must be three, not two. An endpoint that <em>answers</em> is the
+     * finding the acceptance message may quote. A URL that names no TCP endpoint - {@code vm://localhost} is an
+     * in-JVM broker, {@code discovery:(multicast://default)} finds its own - is well formed and legitimately
+     * unprobeable, so the start proceeds, but nothing has confirmed that a broker answers and the log must say
+     * exactly that. A URL such as {@code tcp://:61616} is neither: no client could connect through it, so the
+     * instance would roll back the entity write behind every invalidation, and it used to be indistinguishable
+     * from the unprobeable case - the start warned that it could not probe and then reported that an endpoint had
+     * accepted a connection.</p>
+     *
+     * <p>The reachable leg binds a real listening socket rather than assuming any address answers, so the
+     * acceptance clause is asserted against a probe that genuinely succeeded.</p>
+     *
+     * @param tempDir a JUnit-managed sandbox; nothing is written outside it
+     * @throws Exception if the entry point could not be executed, which fails the test rather than being handled
+     */
+    @Test
+    public void theReachabilityProbeReportsWhatItProbedAndRefusesAUrlNoClientCouldConnectThrough(
+            @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the container entry point");
+        Path home = prepareEntryPointHome(tempDir);
+
+        for (String unusable : List.of("tcp://:61616", "tcp://", "tcp://fd00::1:61616",
+                "failover:(tcp://,tcp://b.example:61616)")) {
+            ProbeRun refused = probeReachability(tempDir, home, unusable);
+
+            assertNotEquals(0, refused.exitCode(), "the provider URL [" + unusable + "] names nothing a client"
+                    + " could connect to, so it must be refused rather than reported as unprobeable. Output was:\n"
+                    + refused.output());
+            assertTrue(refused.output().contains("OFBIZ_JMS_PROVIDER_URL"), "the refusal must name the variable"
+                    + " the operator has to correct. Output was:\n" + refused.output());
+            assertFalse(refused.output().contains("accepted a TCP connection"), "a refused URL must not be"
+                    + " reported as an endpoint that answered. Output was:\n" + refused.output());
+        }
+
+        for (String unprobeable : List.of("vm://localhost", "discovery:(multicast://default)")) {
+            ProbeRun accepted = probeReachability(tempDir, home, unprobeable);
+
+            assertEquals(0, accepted.exitCode(), "the provider URL [" + unprobeable + "] is well formed and names"
+                    + " no TCP endpoint, which is a legitimate transport and must not stop the start. Output"
+                    + " was:\n" + accepted.output());
+            assertTrue(accepted.output().contains("NOTHING here has confirmed that a broker answers"),
+                    "an unprobed transport must publish a finding that says so, or the acceptance message would"
+                    + " read as a successful probe. Output was:\n" + accepted.output());
+            assertFalse(accepted.output().contains("accepted a TCP connection"), "nothing was probed, so nothing"
+                    + " may be reported as having accepted a connection. Output was:\n" + accepted.output());
+        }
+
+        // A socket that really is listening, so the accepting leg is asserted against a real probe.
+        try (java.net.ServerSocket listener = new java.net.ServerSocket(0, 1,
+                java.net.InetAddress.getLoopbackAddress())) {
+            ProbeRun reachable = probeReachability(tempDir, home,
+                    "tcp://127.0.0.1:" + listener.getLocalPort());
+
+            assertEquals(0, reachable.exitCode(), "a listening endpoint must be accepted. Output was:\n"
+                    + reachable.output());
+            assertTrue(reachable.output().contains("accepted a TCP connection"),
+                    "an endpoint that answered must be reported as having answered. Output was:\n"
+                            + reachable.output());
+            assertTrue(reachable.output().contains("PROBE_RESULT=[names the broker endpoint [127.0.0.1:"
+                    + listener.getLocalPort() + "], which accepted a TCP connection"),
+                    "the published finding must name the endpoint that answered, because that is the clause the"
+                            + " acceptance message quotes. Output was:\n" + reachable.output());
+        }
+    }
+
+    /**
+     * AAP portability contract: asserts an operator-authored {@code /ofbiz/config/entityengine.xml} is neither
+     * deleted nor rendered over, while the entry point's own render still is.
+     *
+     * <p>{@code docker/templates/postgres-entityengine.xml} documents that route in as many words: a deployment
+     * needing a JDBC parameter, a datasource or a pool implementation this image does not template states it in
+     * its own override and leaves {@code OFBIZ_POSTGRES_HOST} unset, so the mounted file stays first on the
+     * class path. The entry point contradicted that - it removed {@code config/entityengine.xml}
+     * unconditionally whenever nothing was configured, so withdrawing the managed database destroyed the
+     * operator's configuration and the instance silently fell back to the committed embedded H2 datasource,
+     * which is the one outcome a portability guarantee exists to prevent.</p>
+     *
+     * <p>Both directions are required, and the second is what makes the first safe. Preserving an unmarked file
+     * is worthless if a later start renders over it, and rendering over it would be exactly as destructive as
+     * deleting it - so a start that WOULD render is refused instead, naming the file. The generated leg is
+     * asserted too, because a marker that stopped this script from removing its OWN output would leave a stale
+     * managed configuration - the old host, the old credentials, possibly DDL still enabled - in force forever.</p>
+     *
+     * @param tempDir a JUnit-managed sandbox; nothing is written outside it
+     * @throws Exception if the entry point could not be executed, which fails the test rather than being handled
+     */
+    @Test
+    public void anOperatorAuthoredEntityEngineOverrideIsNeitherRemovedNorRenderedOver(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the container entry point");
+        Path home = prepareEntryPointHome(tempDir);
+        Path stateDir = tempDir.resolve("container_state");
+        Path override = home.resolve(RENDERED_CONFIGURATION);
+        String authored = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n"
+                + "<entity-config>\n"
+                + "    <!-- an operator's own datasource, carrying a JDBC parameter this image does not"
+                + " template -->\n"
+                + "</entity-config>\n";
+        Files.writeString(override, authored, StandardCharsets.UTF_8);
+
+        ProbeRun preserved = runEntryPointAllowingRefusal(tempDir, home,
+                containerStatePreamble(stateDir) + RESOLVE_AND_CONFIGURE, Map.of());
+        assertEquals(0, preserved.exitCode(), "a start that configures no database must succeed with an"
+                + " operator-authored override present. Output was:\n" + preserved.output());
+        assertEquals(authored, Files.readString(override, StandardCharsets.UTF_8),
+                "an override this script did not generate must be left exactly as it is: it is the documented"
+                        + " way to state configuration the template does not carry, and deleting it drops the"
+                        + " deployment onto the committed embedded database");
+        assertTrue(preserved.output().contains("OFBIZ-CONTAINER-GENERATED-ENTITY-ENGINE-CONFIGURATION")
+                        && preserved.output().contains("is being kept"), "the start must report that it left the"
+                + " file alone, and name the marker whose absence made it the operator's file, so an operator can"
+                + " see which configuration is in force. Output was:\n" + preserved.output());
+
+        ProbeRun refusedManaged = runEntryPointAllowingRefusal(tempDir, home,
+                containerStatePreamble(stateDir) + RESOLVE_AND_CONFIGURE, MANAGED_DATABASE_ENVIRONMENT);
+        assertNotEquals(0, refusedManaged.exitCode(), "a start that would RENDER over an operator-authored"
+                + " override must be refused: rendering destroys it exactly as deleting it would. Output was:\n"
+                + refusedManaged.output());
+        assertEquals(authored, Files.readString(override, StandardCharsets.UTF_8),
+                "the refusal must leave the file byte for byte as it was");
+        assertTrue(refusedManaged.output().contains(RENDERED_CONFIGURATION),
+                "the refusal must name the file. Output was:\n" + refusedManaged.output());
+
+        // The embedded render is refused on the same grounds, driven directly because resolving the flag would
+        // also invoke the transport validation - a different refusal, which would prove nothing here.
+        ProbeRun refusedEmbedded = runEntryPointAllowingRefusal(tempDir, home,
+                containerStatePreamble(stateDir) + "RESOLVED_DISTRIBUTED_CACHE_CLEAR=true\nconfigure_database\n",
+                Map.of());
+        assertNotEquals(0, refusedEmbedded.exitCode(), "the embedded render must be refused over an"
+                + " operator-authored override too. Output was:\n" + refusedEmbedded.output());
+        assertEquals(authored, Files.readString(override, StandardCharsets.UTF_8),
+                "the embedded refusal must leave the file byte for byte as it was");
+
+        // The other direction: this script's OWN render is still withdrawn when nothing is configured.
+        Path generatedHome = prepareEntryPointHome(tempDir);
+        Path generatedState = tempDir.resolve("generated_state");
+        String generated = configureDatabase(tempDir, generatedHome, generatedState, null);
+        Path generatedOverride = generatedHome.resolve(RENDERED_CONFIGURATION);
+        assertTrue(Files.exists(generatedOverride), "the managed render must have produced an override. Output"
+                + " was:\n" + generated);
+        assertTrue(Files.readString(generatedOverride, StandardCharsets.UTF_8)
+                        .contains("GENERATED BY docker-entrypoint.sh"),
+                "every override this script renders must be stamped, or it cannot be told from an"
+                        + " operator-authored one");
+
+        ProbeRun withdrawn = runEntryPointAllowingRefusal(tempDir, generatedHome,
+                containerStatePreamble(generatedState) + RESOLVE_AND_CONFIGURE, Map.of());
+        assertEquals(0, withdrawn.exitCode(), "withdrawing the managed database must succeed. Output was:\n"
+                + withdrawn.output());
+        assertFalse(Files.exists(generatedOverride), "a stamped override is this script's own previous render"
+                + " and must be removed when its configuration is withdrawn, or the instance keeps using the old"
+                + " host and credentials - and, after an init-mode start, the startup DDL as well. Output was:\n"
+                + withdrawn.output());
+    }
+
+    /**
+     * Drives {@code require_transport_reachable} against one provider URL, tolerating a refusal.
+     *
+     * <p>{@link #runEntryPoint} asserts a zero exit, because every start it drives is one the entry point must
+     * accept; this case is about the ones it must not, so the status is returned instead. The published finding
+     * is printed after the call so that a run which proceeded can be asserted on as well as one that stopped.</p>
+     *
+     * @param workDir a per-test temporary directory for the generated library and driver
+     * @param home the directory the entry point runs in
+     * @param providerUrl the provider URL the resolved transport names
+     * @return the exit status and combined output of the run
+     * @throws Exception if the driver could not be written or executed
+     */
+    private static ProbeRun probeReachability(Path workDir, Path home, String providerUrl) throws Exception {
+        return runEntryPointAllowingRefusal(workDir, home,
+                "RESOLVED_TRANSPORT_CONFIGURATION_FILE='config/serviceengine.xml'\n"
+                        + "RESOLVED_TRANSPORT_PROVIDER_URL=" + shellQuote(providerUrl) + "\n"
+                        + "RESOLVED_JMS_CONNECT_TIMEOUT=2\n"
+                        + "require_transport_reachable\n"
+                        + "printf 'PROBE_RESULT=[%s]\\n' \"$RESOLVED_TRANSPORT_PROBE_RESULT\"\n",
+                Map.of());
+    }
+
+    /**
+     * Runs a fragment of shell against the real entry point and returns its status as well as its output.
+     *
+     * <p>{@link #runEntryPoint} asserts a zero exit, because every start it drives is one the entry point must
+     * accept. The cases that assert a REFUSAL need the status instead, and they need the run not to fail the
+     * test merely by being refused - which is what this returns.</p>
+     *
+     * @param workDir a per-test temporary directory for the generated library and driver
+     * @param home the directory the entry point runs in, which it treats as the OFBiz home
+     * @param body the shell to run once the entry point has been sourced
+     * @param environment the variables to supply; every inherited {@code OFBIZ_} variable is removed first
+     * @return the exit status and combined output of the run
+     * @throws Exception if the driver could not be written or executed
+     */
+    private static ProbeRun runEntryPointAllowingRefusal(Path workDir, Path home, String body,
+            Map<String, String> environment) throws Exception {
+        Path library = workDir.resolve("entrypoint-library.sh");
+        if (!Files.exists(library)) {
+            List<String> sourced = new ArrayList<>();
+            for (String line : Files.readAllLines(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8)) {
+                if (!"_main \"$@\"".equals(line)) {
+                    sourced.add(line);
+                }
+            }
+            Files.write(library, sourced, StandardCharsets.UTF_8);
+        }
+        Path driver = Files.createTempFile(workDir, "refusable", ".sh");
+        Files.writeString(driver, "#!/usr/bin/env bash\n"
+                + ". " + shellQuote(library) + "\n"
+                + "cd " + shellQuote(home) + " || exit 1\n"
+                + body, StandardCharsets.UTF_8);
+
+        ShellDriver.Run run = ShellDriver.run(driver, home, environment, VERDICT_TIMEOUT_SECONDS);
+        assertFalse(run.timedOut(), "the entry point did not terminate, output was:\n" + run.output());
+        return new ProbeRun(run.exitCode(), run.output());
+    }
+
+    /** What one black-box execution of the reachability probe produced. */
+    private record ProbeRun(int exitCode, String output) { }
 
     /**
      * AAP Objective 5 ordering contract: asserts the transport is rendered before it is judged, and on every start.
@@ -2105,22 +2622,10 @@ public final class SchemaInitGatingTests {
                 + "cd " + shellQuote(home) + " || exit 1\n"
                 + body, StandardCharsets.UTF_8);
 
-        ProcessBuilder builder = new ProcessBuilder("bash", driver.toString());
-        builder.directory(home.toFile());
-        builder.redirectErrorStream(true);
-        Map<String, String> processEnvironment = builder.environment();
-        for (String name : new ArrayList<>(processEnvironment.keySet())) {
-            if (name.startsWith("OFBIZ_")) {
-                processEnvironment.remove(name);
-            }
-        }
-        processEnvironment.putAll(environment);
-
-        Process process = builder.start();
-        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertTrue(process.waitFor(VERDICT_TIMEOUT_SECONDS, TimeUnit.SECONDS), "the entry point did not terminate");
-        assertEquals(0, process.exitValue(), "the entry point refused this start, output was:\n" + output);
-        return output;
+        ShellDriver.Run run = ShellDriver.run(driver, home, environment, VERDICT_TIMEOUT_SECONDS);
+        assertFalse(run.timedOut(), "the entry point did not terminate, output was:\n" + run.output());
+        assertEquals(0, run.exitCode(), "the entry point refused this start, output was:\n" + run.output());
+        return run.output();
     }
 
     /**

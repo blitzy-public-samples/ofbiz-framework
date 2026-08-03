@@ -142,7 +142,7 @@ echo "Using start.properties: $START_PROPERTIES"
 START_PROPERTIES_CONTENT=$(cat "$START_PROPERTIES")
 
 OFBIZ_ADMIN_PORT=$(getPropertyValue "$START_PROPERTIES_CONTENT" "ofbiz.admin.port")
-echo Admin port: $OFBIZ_ADMIN_PORT;
+echo "Admin port: $OFBIZ_ADMIN_PORT"
 
 if [ -n "${OFBIZ_ADMIN_KEY:-}" ]; then
     ADMIN_KEY="$OFBIZ_ADMIN_KEY"

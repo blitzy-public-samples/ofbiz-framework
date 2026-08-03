@@ -34,8 +34,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.concurrent.TimeUnit;
 
+import org.apache.ofbiz.base.test.ShellDriver;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -293,17 +293,12 @@ public final class ContentUrlPrefixRenderingTests {
                 + "cd " + shellQuote(sandbox) + " || exit 1\n"
                 + "render_content_url_configuration\n", StandardCharsets.UTF_8);
 
-        ProcessBuilder builder = new ProcessBuilder("bash", driver.toString());
-        builder.directory(sandbox.toFile());
-        builder.redirectErrorStream(true);
-        Map<String, String> processEnvironment = builder.environment();
-        RENDERER_VARIABLES.forEach(processEnvironment::remove);
-        processEnvironment.putAll(environment);
-
-        Process process = builder.start();
-        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertTrue(process.waitFor(120, TimeUnit.SECONDS), "the entry point renderer did not terminate");
-        return new RendererRun(process.exitValue(), output);
+        // The shared driver waits on the process before collecting its output, and destroys a child that
+        // outruns its deadline. It also strips every inherited OFBIZ_ variable, which is what keeps a run
+        // from being steered by the environment of whoever started the build.
+        ShellDriver.Run run = ShellDriver.run(driver, sandbox, environment);
+        assertFalse(run.timedOut(), "the entry point renderer did not terminate, output was:\n" + run.output());
+        return new RendererRun(run.exitCode(), run.output());
     }
 
     /** Single-quotes a path for safe interpolation into the generated driver. */
@@ -319,16 +314,16 @@ public final class ContentUrlPrefixRenderingTests {
         return properties;
     }
 
+    /**
+     * Whether a POSIX shell can be executed, so the shell-driven assertions can be skipped if not.
+     *
+     * <p>Delegated to the shared driver rather than repeated: this probe has to start a process, wait
+     * for it and close its output, and every copy of it was one more place to get that wrong.
+     *
+     * @return true when {@code bash} can be run
+     */
     private static boolean isBashAvailable() {
-        try {
-            Process process = new ProcessBuilder("bash", "-c", "exit 0").start();
-            return process.waitFor(60, TimeUnit.SECONDS) && process.exitValue() == 0;
-        } catch (IOException e) {
-            return false;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
+        return ShellDriver.isBashAvailable();
     }
 
     private static Path repositoryRoot() {

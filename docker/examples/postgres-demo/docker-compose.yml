@@ -17,24 +17,6 @@
 # under the License.
 #####################################################################
 
-# No password is declared in any tracked file of this example. The "${...:?}" references below are
-# Compose REQUIRED variables: Compose aborts with the quoted message when one of them is unset or empty,
-# so the example can never start with a credential that is public knowledge. Supply them either by
-# exporting them in the shell that runs "docker compose up", or by writing them into a local ".env" file
-# next to this compose file - ".gitignore" excludes that path so it cannot be committed by accident.
-# Each password must satisfy the entry point's rules: at least 16 characters, at least 8 distinct
-# characters, and not one of the retired demo values. See DOCKER.adoc, "Database passwords".
-#
-# The example runs OFBiz TWICE, which is the shape a deployment behind a load balancer has:
-#
-#   ofbiz-schema-init  one shot. Creates the schema and loads the demo data, authenticating as the three
-#                      accounts that may issue DDL, then exits. Serves no traffic and publishes no port.
-#   ofbiz              serves traffic, authenticating as three accounts that may read and write rows but
-#                      may NOT create, alter or drop anything. Started only once the init run has
-#                      succeeded, and told to skip the initialization the init run already did.
-#
-# Splitting them is what keeps DDL privileges out of the process that answers requests. See "Database
-# roles and least privilege" and "Schema initialization" in DOCKER.adoc.
 services:
   db:
     image: postgres:13
@@ -47,66 +29,6 @@ services:
     env_file:
       - postgres.env
       - ofbiz-postgres.env
-      # The names of the three DDL-capable accounts, because this service is what creates them.
-      - ofbiz-postgres-init.env
-    # Both OFBiz runs below wait for this, and the one-shot init run in particular cannot be retried by
-    # Compose: it must not start before the server accepts connections. 127.0.0.1 is deliberate - it
-    # forces a TCP check, and the postgres image's own initialization phase listens on the unix socket
-    # only, so a socket check would report ready while 10-init-user-db.sh was still running.
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 10s
-    environment:
-      # Superuser password of the PostgreSQL service itself.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD - the compose example ships no password}
-      # postgres-initdb.d/10-init-user-db.sh creates two accounts per database with these passwords: a
-      # serving account that may only read and write rows, and an initialization account that owns the
-      # database and may change its schema. Every service below must be given the very same values.
-      OFBIZ_POSTGRES_OFBIZ_PASSWORD: ${OFBIZ_POSTGRES_OFBIZ_PASSWORD:?set OFBIZ_POSTGRES_OFBIZ_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_OLAP_PASSWORD: ${OFBIZ_POSTGRES_OLAP_PASSWORD:?set OFBIZ_POSTGRES_OLAP_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_TENANT_PASSWORD: ${OFBIZ_POSTGRES_TENANT_PASSWORD:?set OFBIZ_POSTGRES_TENANT_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD: ${OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD:?set OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_OLAP_INIT_PASSWORD: ${OFBIZ_POSTGRES_OLAP_INIT_PASSWORD:?set OFBIZ_POSTGRES_OLAP_INIT_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_TENANT_INIT_PASSWORD: ${OFBIZ_POSTGRES_TENANT_INIT_PASSWORD:?set OFBIZ_POSTGRES_TENANT_INIT_PASSWORD - the compose example ships no password}
-
-  # The one-shot schema initialization. This is the only execution in the whole example that holds DDL
-  # privileges, and it exits as soon as the schema and the demo data are in place.
-  ofbiz-schema-init:
-    image: ofbiz-docker
-    mem_limit: 1600M
-    memswap_limit: 1600M
-    cpu_shares: 200
-    restart: "no"
-    depends_on:
-      db:
-        condition: service_healthy
-    env_file:
-      - ofbiz-postgres.env
-      - ofbiz-postgres-init.env
-    environment:
-      # Renders the three managed datasources with check-on-start="true" and add-missing-on-start="true",
-      # applies the entity-model schema, and exits 0 without serving traffic. The run refuses to report
-      # success unless a schema-applying data load actually ran, so a failure here is a real failure.
-      OFBIZ_SCHEMA_INIT: "true"
-      OFBIZ_PROFILE: dev
-      OFBIZ_DATA_LOAD: demo
-      # The same configuration the serving instance is given: the init run renders the same files, so
-      # giving it different values would render a configuration nothing else uses.
-      OFBIZ_HOST: example.internal
-      OFBIZ_CONTENT_URL_PREFIX: https://example.internal:8443
-      OFBIZ_POSTGRES_SSLMODE: disable
-      # The privileged credentials, given to this run and to nothing else.
-      OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD: ${OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD:?set OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_OLAP_INIT_PASSWORD: ${OFBIZ_POSTGRES_OLAP_INIT_PASSWORD:?set OFBIZ_POSTGRES_OLAP_INIT_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_TENANT_INIT_PASSWORD: ${OFBIZ_POSTGRES_TENANT_INIT_PASSWORD:?set OFBIZ_POSTGRES_TENANT_INIT_PASSWORD - the compose example ships no password}
-      # Still required even though the serving accounts are not what this run authenticates as: the
-      # entry point validates every database credential it was given, whichever one it renders.
-      OFBIZ_POSTGRES_OFBIZ_PASSWORD: ${OFBIZ_POSTGRES_OFBIZ_PASSWORD:?set OFBIZ_POSTGRES_OFBIZ_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_OLAP_PASSWORD: ${OFBIZ_POSTGRES_OLAP_PASSWORD:?set OFBIZ_POSTGRES_OLAP_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_TENANT_PASSWORD: ${OFBIZ_POSTGRES_TENANT_PASSWORD:?set OFBIZ_POSTGRES_TENANT_PASSWORD - the compose example ships no password}
 
   ofbiz:
     image: ofbiz-docker
@@ -115,13 +37,6 @@ services:
     cpu_shares: 200
     ports:
       - 8443:8443
-    depends_on:
-      db:
-        condition: service_healthy
-      # Nothing is served until the schema exists. Compose keeps this service down until the one-shot
-      # run above has exited 0, and does not start it at all if that run failed.
-      ofbiz-schema-init:
-        condition: service_completed_successfully
     volumes:
       - ./after-config-applied.d:/docker-entrypoint-hooks/after-config-applied.d
       # Note, on Unix systems, ensure the ofbiz user (uid 1000) or group (gid 1000) running inside the container has
@@ -129,40 +44,8 @@ services:
       # be mapped to host uid 165536 or gid 166536 depending on the configuration in /etc/subuid and /etc/subgid.
       - ./logs:/ofbiz/runtime/logs
     env_file:
-      # ofbiz-postgres-init.env is deliberately absent: this is the process that answers requests, and
-      # it must not be able to authenticate as an account that can change the schema.
       - ofbiz-postgres.env
     environment:
-      # Same required variables as the db service: the serving datasources must authenticate with the
-      # passwords postgres-initdb.d/10-init-user-db.sh gave the three serving roles.
-      OFBIZ_POSTGRES_OFBIZ_PASSWORD: ${OFBIZ_POSTGRES_OFBIZ_PASSWORD:?set OFBIZ_POSTGRES_OFBIZ_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_OLAP_PASSWORD: ${OFBIZ_POSTGRES_OLAP_PASSWORD:?set OFBIZ_POSTGRES_OLAP_PASSWORD - the compose example ships no password}
-      OFBIZ_POSTGRES_TENANT_PASSWORD: ${OFBIZ_POSTGRES_TENANT_PASSWORD:?set OFBIZ_POSTGRES_TENANT_PASSWORD - the compose example ships no password}
-      # Required, and deliberately not defaulted by the entry point: the profile decides whether an
-      # absent secret is fatal or is replaced by a generated per-container value, so a manifest that
-      # forgot to set it is refused rather than given the permissive setting. "dev" is correct for this
-      # single-host demo - it generates the signing keys and keeps the published demo admin password.
-      # A deployment serving real traffic sets "prod", which additionally requires every secret to be
-      # supplied and every password to clear the length and entropy floor.
-      OFBIZ_PROFILE: dev
-      # The schema, the demo data and the administrator user were all applied by the one-shot run above,
-      # against this same database. Loading them again would be slow and pointless. Configuration is
-      # still rendered in full - only the data initialization is skipped - so a rotated password or a
-      # changed host still takes effect when this container restarts.
-      OFBIZ_SKIP_INIT: "true"
+      OFBIZ_DATA_LOAD: demo
       OFBIZ_HOST: example.internal
       OFBIZ_CONTENT_URL_PREFIX: https://example.internal:8443
-      # The managed datasources verify the database server's certificate by default
-      # (OFBIZ_POSTGRES_SSLMODE=verify-full). The stock postgres image used by the db service above
-      # has no TLS listener and no certificate, so this example - a single-host demo on a private
-      # compose network - turns verification off explicitly. Only the dev profile accepts anything
-      # weaker than verify-full; OFBIZ_PROFILE=prod accepts verify-full alone, because verify-ca does
-      # NOT check that the certificate belongs to the host that was asked for and a managed database
-      # service issues certificates from a CA shared with every other tenant. A prod deployment should
-      # also point OFBIZ_POSTGRES_SSLROOTCERT at its provider's CA bundle. Never copy this line into a
-      # deployment that reaches a database over a network.
-      # Pin the client side as this example does, but do not stop there: enforce encryption on the
-      # server too, with a hostssl rule in pg_hba.conf, so an unencrypted client is rejected rather
-      # than quietly accepted. A server-side rule cannot be forgotten the way a client-side setting
-      # can.
-      OFBIZ_POSTGRES_SSLMODE: disable

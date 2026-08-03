@@ -99,7 +99,24 @@ dependencies {
       exclude group: 'pull-parser', module: 'pull-parser'
       exclude group: 'xpp3', module: 'xpp3'
     }
-    implementation 'software.amazon.awssdk:s3:2.49.1' // S3 client for the content-store provider
+    // S3 client for the content-store provider (applications/content/.../data/store/S3ContentStore.java).
+    //
+    // The async transport graph is excluded deliberately. S3ContentStore builds only the SYNCHRONOUS
+    // S3Client, which resolves software.amazon.awssdk:apache5-client; the s3 module additionally declares
+    // netty-nio-client for the async client this deployment never constructs, and that module is the sole
+    // source of io.netty on the runtime class path. Left in, its io.netty 4.1.136 requirement wins the
+    // conflict resolution against the 4.1.75/4.1.80 requests made by unrelated components (LDAP/CAS), so
+    // adding an object-store provider would silently change the Netty version those components run on -
+    // which the plan forbids: the two new dependencies must be "isolated to the components that use them"
+    // and no existing dependency version may change (technical specification sections 0.2.1 and 0.5.1).
+    // Excluding the module removes the async client, its HTTP/2 codec and the entire Netty tree with it.
+    //
+    // If an async S3 client is ever needed, add netty-nio-client back as an explicit, version-pinned
+    // dependency and re-check the Netty resolution of every other consumer first - do not simply drop
+    // this exclusion.
+    implementation('software.amazon.awssdk:s3:2.49.1') {
+      exclude group: 'software.amazon.awssdk', module: 'netty-nio-client'
+    }
 
     testImplementation 'org.junit.jupiter:junit-jupiter-api:6.1.0'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:6.1.0'

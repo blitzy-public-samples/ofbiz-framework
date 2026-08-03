@@ -18,9 +18,9 @@
  *******************************************************************************/
 package org.apache.ofbiz.content.data.store;
 
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 
 import org.apache.ofbiz.base.util.GeneralException;
 
@@ -30,30 +30,38 @@ import org.apache.ofbiz.base.util.GeneralException;
  * horizontally scaled deployment can reach.
  *
  * <p>Five operations, and deliberately no more: store, read whole, read as a stream, test and
- * remove. Listing, copying, metadata, presigned URLs, batching and multipart controls are
+ * remove. Storing has two overloads - from an array and from a stream of a known length - because the
+ * source differs and the operation does not. Listing, copying, metadata, presigned URLs, batching and
+ * multipart controls are
  * deliberately absent; a deployment that needs object expiry uses the object store's own lifecycle
  * rules, which needs no code here at all.
  *
  * <p><strong>Keys.</strong> A key is an opaque, provider-relative location expressed with {@code /}
  * separators. It carries no leading separator, no {@code .} or {@code ..} component and no control
- * character, and it is at most {@link #MAX_KEY_LENGTH_BYTES} bytes when encoded as UTF-8 - the
- * limit an object store imposes, applied to every provider so that a key one provider accepts is a
- * key all of them accept. A key is never invented by a caller: it comes from
+ * character, and it is bounded both as a whole and per component by the limits an object store and a
+ * filesystem impose, applied to every provider so that a key one provider accepts is a key all of
+ * them accept. A key is never invented by a caller: it comes from
  * {@link ContentStoreFactory#storeKey}, which derives it from what the active provider needs - the
  * {@code ofbiz.home}-relative path for a path-keyed provider, and namespace, tenant scope and
  * {@code dataResourceId} for the object store - so the same resource maps to the same key on every
  * instance and no two tenants map to one key. Every provider applies that grammar again at its own
- * boundary through the one implementation of it, {@link #requireUsableKey(String)}, which lives here
- * beside the documentation it enforces so that a key one provider accepts is never a key another
- * refuses; a provider then adds whatever its own storage requires and refuses a key it cannot
- * confine to the one tree or bucket it owns rather than resolve it somewhere else.
+ * boundary, and it does so through the single validator the factory owns, so that a key one provider
+ * accepts is never a key another refuses; a provider then adds whatever its own storage requires and
+ * refuses a key it cannot confine to the one tree or bucket it owns rather than resolve it somewhere
+ * else. This interface declares the five operations and nothing else - no constant and no helper -
+ * because the grammar is one implementation shared by the factory and every provider rather than a
+ * second thing an implementer could satisfy differently.
  *
  * <p><strong>Bounded reads.</strong> {@link #get(String)} materialises whole content and is
  * therefore bounded by {@link ContentStoreFactory#maxObjectSize}: content larger than the
  * configured ceiling is refused rather than allocated, so one oversized object cannot exhaust the
  * heap of the instance that reads it. {@link #openStream(String)} is the unbounded operation, and it
  * is unbounded in the sense that matters - it never holds the content in the heap in full - which is
- * why it, and not {@code get}, is what content of a size an uploader chose is served through.
+ * why it, and not {@code get}, is what content of a size an uploader chose is served through. It
+ * returns a {@link ContentStream}, which carries the exact number of bytes the stream will yield
+ * alongside the stream itself, so a caller that has to declare a length - an HTTP response, or the
+ * {@code length} a stream consumer is handed - gets one without a second request and without reading
+ * the content to measure it.
  *
  * <p><strong>Absence.</strong> {@link #get(String)} and {@link #openStream(String)} throw
  * {@link java.io.FileNotFoundException} for a key that holds nothing; they never return
@@ -63,25 +71,34 @@ import org.apache.ofbiz.base.util.GeneralException;
  * not there and a credential that is refused are failures, and reporting any of them as "nothing
  * stored here" would turn an outage into silently missing content.
  *
- * <p><strong>What the integration seam uses, and what it does not.</strong> The seam in
- * {@link org.apache.ofbiz.content.data.DataResourceWorker} reads content through this contract and
- * writes through it. Its two read seams serve a render and a stream, and its write seam,
- * {@code publishToContentStore}, is called by the services that create or update file-backed content
- * once their write has succeeded, so an upload reaches the store inside the same transaction that
- * records the {@code DataResource} row describing it: a failure to store the content fails the write
- * rather than committing a row for content the fleet cannot read. Those services keep resolving their
- * own target and writing their own bytes - {@code createFileMethod} writes to the path it builds, and
- * {@code createBinaryFileMethod} and {@code updateBinaryFileMethod} write to the file the seam
- * resolves for them - and none of them knows which provider is active; every such decision stays in
- * the seam and in this package (plan sections 0.2.1 and 0.6.3). {@link #put(String, byte[])} is
- * therefore what publication calls.
+ * <p><strong>What the integration seam uses.</strong> The seam in
+ * {@link org.apache.ofbiz.content.data.DataResourceWorker} both reads and writes through this
+ * contract, which is what makes an instance replaceable: an upload becomes readable by every other
+ * instance before the request that carried it completes.
  *
- * <p>{@link #delete(String)} has no such caller, and that is a property of the deployment rather than
- * an omission: nothing in OFBiz deletes the file a file-backed resource names, so removing a
- * {@code DataResource} row leaves its content exactly as it leaves a local file. It is part of the
- * contract because the plan freezes the five operations (plan section 0.4.1), and because an ingest,
- * a migration or a reconciliation job that reclaims orphaned objects needs it; the provider tests
- * exercise it.
+ * <ul>
+ * <li><em>Reads.</em> Rendering text content and serving binary content go through
+ * {@link #openStream(String)}; a caller that needs the whole content in the heap, and knows it is
+ * modest, uses {@link #get(String)}.</li>
+ * <li><em>Writes.</em> The services that create or update file-backed content resolve a local
+ * {@code File} and write their bytes to it - {@code createFileMethod} writes to the path it builds,
+ * and {@code createBinaryFileMethod} and {@code updateBinaryFileMethod} write to the file the seam
+ * resolved for them. Once those bytes are on disk and have passed the upload validation those
+ * services perform, the seam publishes them with {@link #put(String, InputStream, long)}, streaming
+ * from that file so an upload is not held in the heap a second time. Their signatures, their service
+ * definitions and the {@code DataResource} entity are untouched: publishing is an additional step
+ * taken inside the same service call, and it does nothing at all when no provider is
+ * configured.</li>
+ * <li><em>Rollback.</em> A publish happens inside the transaction that records the
+ * {@code DataResource} row, and {@link #delete(String)} is what undoes it when that transaction rolls
+ * back, so a failed create leaves no object behind. That is why removal is part of this contract
+ * rather than an out-of-band chore.</li>
+ * </ul>
+
+ *
+ * <p>When no provider is configured the seam answers "nothing to do" and the content services perform
+ * exactly the local write they always performed: no service signature, no service definition and no
+ * field of the {@code DataResource} row changes for any of this.
  *
  * <p><strong>Provider selection.</strong> Instances are obtained from
  * {@link ContentStoreFactory}, never constructed by callers. A {@code null} store is the
@@ -94,80 +111,84 @@ import org.apache.ofbiz.base.util.GeneralException;
 public interface ContentStore {
 
     /**
+     * An open stream over stored content, together with the exact number of bytes it will yield.
+     *
+     * <p>It is an {@link InputStream}, so every consumer that only wants the bytes treats it as one and
+     * closing it closes whatever the provider opened underneath. What it adds is the one thing a stream
+     * cannot answer for itself: how long the content is. A caller that has to declare a length up front -
+     * an HTTP {@code Content-Length}, or the {@code length} the {@code getDataResourceStream} contract
+     * returns beside its stream - therefore gets one without a second request to the store and without
+     * reading the content into the heap to measure it, which is the whole reason content of a size an
+     * uploader chose can be served through this operation rather than through {@link #get(String)}.
+     *
+     * <p>The length is what the store reports, and it is reported rather than trusted: a consumer that
+     * copies the stream should still copy until the stream ends rather than assume exactly this many
+     * bytes arrive. It is declared {@code final} because it holds no policy - it is a stream and a
+     * number - and a provider that needed to add behaviour would add it to the stream it wraps.
+     */
+    final class ContentStream extends FilterInputStream {
+
+        private final long length;
+
+        /**
+         * Wraps an open stream with the length of the content behind it.
+         *
+         * @param content the open stream, positioned at the first byte; must not be null
+         * @param length the exact number of bytes the stream will yield; must not be negative
+         */
+        public ContentStream(InputStream content, long length) {
+            super(content);
+            if (content == null) {
+                throw new IllegalArgumentException("A content stream must wrap an open stream");
+            }
+            if (length < 0L) {
+                throw new IllegalArgumentException("A content stream cannot be " + length + " bytes long");
+            }
+            this.length = length;
+        }
+
+        /**
+         * Returns the exact number of bytes this stream will yield.
+         *
+         * @return the content length in bytes, never negative
+         */
+        public long length() {
+            return length;
+        }
+    }
+
+    /**
      * The greatest length of a storage key, in bytes of its UTF-8 encoding.
      *
-     * <p>1024 is the object-store limit on an object key. Applying it to every provider is what
-     * keeps a key portable between them: content stored while one provider was configured is
-     * addressable by the same key after a deployment changes provider.
+     * <p>The value is {@link ContentStoreFactory#MAX_KEY_LENGTH_BYTES}, which is where the one key
+     * grammar lives; this is the name that grammar is published under to a caller holding only this
+     * contract. Two declarations of one number, not two numbers.
      */
-    int MAX_KEY_LENGTH_BYTES = 1024;
+    int MAX_KEY_LENGTH_BYTES = ContentStoreFactory.MAX_KEY_LENGTH_BYTES;
 
     /**
      * The greatest length of one key component, in bytes of its UTF-8 encoding.
      *
-     * <p>255 is the file-name limit common filesystems impose. Applying it to every provider is the
-     * other half of key portability: a key an object store accepts as one long string has to remain
-     * writable as a path once a deployment changes to a path-keyed provider.
+     * <p>As above: the value is {@link ContentStoreFactory#MAX_KEY_COMPONENT_LENGTH_BYTES}.
      */
-    int MAX_KEY_COMPONENT_LENGTH_BYTES = 255;
+    int MAX_KEY_COMPONENT_LENGTH_BYTES = ContentStoreFactory.MAX_KEY_COMPONENT_LENGTH_BYTES;
 
     /**
      * Requires that a key satisfies the grammar documented above, so that every provider refuses
      * exactly the same keys, in the same way, before it issues any request or touches any storage.
      *
-     * <p>One implementation for every provider, because a key is only opaque if it means the same
-     * thing everywhere: a deployment that migrates content from one provider to another must not
-     * discover that a key one accepted is a key the next refuses. It is also why this raises a
-     * {@link GeneralException} rather than an {@link IOException} - an unusable key is the caller's
-     * mistake, not the store's failure, and every caller of this contract distinguishes the two.
-     *
-     * <p>Refused, in this order: a null, empty or whitespace-only key; a control character anywhere,
-     * because a key travels to an object store inside the request line and its headers; a leading
-     * {@code /} or {@code \} or a Windows drive prefix, any of which would make the key absolute and
-     * so make a provider ignore its own root; a key longer than
-     * {@link #MAX_KEY_LENGTH_BYTES} bytes; an empty component, which is a doubled or trailing
-     * separator naming no content at all; a {@code .} or {@code ..} component, which names something
-     * other than what it appears to; and a component longer than
-     * {@link #MAX_KEY_COMPONENT_LENGTH_BYTES} bytes. A colon that is not a drive prefix is legal in a
-     * POSIX file name and is deliberately allowed.
+     * <p><strong>One implementation, reached by two names.</strong> The grammar is
+     * {@link ContentStoreFactory#requireUsableKey(String)}: the factory mints keys and both providers
+     * validate them there, so this method delegates rather than restates. A second copy of the rules was
+     * the defect - the two lists disagreed, so the factory could mint a key the provider it was minted
+     * for then refused - and this is the name a caller holding only this contract uses to reach the one
+     * that remains.
      *
      * @param key the key to check
      * @throws GeneralException if the key does not satisfy the grammar, naming the rule it broke
      */
     static void requireUsableKey(String key) throws GeneralException {
-        if (key == null || key.trim().isEmpty()) {
-            throw new GeneralException("A content store key must not be empty");
-        }
-        for (int index = 0; index < key.length(); index++) {
-            if (Character.isISOControl(key.charAt(index))) {
-                throw new GeneralException("A content store key must not contain a control character");
-            }
-        }
-        // A leading separator or a Windows drive prefix would make a provider ignore its own root entirely.
-        if (key.startsWith("/") || key.startsWith("\\")
-                || (key.length() > 1 && key.charAt(1) == ':' && Character.isLetter(key.charAt(0)))) {
-            throw new GeneralException("A content store key must be relative and must not carry a drive prefix:"
-                    + " [" + key + "]");
-        }
-        if (key.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_LENGTH_BYTES) {
-            throw new GeneralException("A content store key must be at most " + MAX_KEY_LENGTH_BYTES
-                    + " bytes long");
-        }
-        // Split keeping trailing empties, so that "a/b/" and "a//b" are both seen as an empty component.
-        for (String component : key.split("/", -1)) {
-            if (component.isEmpty()) {
-                throw new GeneralException("A content store key must not contain an empty component: ["
-                        + key + "]");
-            }
-            if (".".equals(component) || "..".equals(component)) {
-                throw new GeneralException("A content store key must not contain a '" + component
-                        + "' component: [" + key + "]");
-            }
-            if (component.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_COMPONENT_LENGTH_BYTES) {
-                throw new GeneralException("A content store key component must be at most "
-                        + MAX_KEY_COMPONENT_LENGTH_BYTES + " bytes long: [" + key + "]");
-            }
-        }
+        ContentStoreFactory.requireUsableKey(key);
     }
 
     /**
@@ -199,6 +220,37 @@ public interface ContentStore {
     void put(String key, byte[] data) throws GeneralException, IOException;
 
     /**
+     * Stores content read from a stream under the supplied key, creating the entry when it is absent
+     * and replacing it in full when it already exists.
+     *
+     * <p>The same operation as {@link #put(String, byte[])} with the same visibility, permission and
+     * atomicity guarantees; what differs is where the bytes come from. This is the overload a caller
+     * uses when the content is already somewhere it can be streamed from - a validated upload on
+     * local disk, for instance - because it never holds that content in the heap in full, and it is
+     * therefore the overload that makes publishing an upload of a size the uploader chose safe.
+     *
+     * <p>The length has to be exact and has to be known in advance: an object store needs it to frame
+     * the request. Supplying a length that does not match the stream is a caller error, and a provider
+     * reports it rather than storing content that is silently truncated or padded.
+     *
+     * <p>Ownership of the stream stays with the caller, which must close it; a provider reads from it
+     * and does not close it, so a caller can go on using the source it came from.
+     *
+     * @param key the opaque, provider-relative storage key; neither null nor empty, and must resolve
+     *     inside the provider's own storage root
+     * @param content the stream to read the content from, positioned at its first byte; must not be
+     *     null
+     * @param length the exact number of bytes to read from {@code content}; must not be negative, and
+     *     may be zero in order to store empty content
+     * @throws GeneralException if the key or the content is unusable - a null or empty key, a key
+     *     carrying a control character or a traversal component, a key that would escape the
+     *     provider's storage root, a null stream, a negative length, a stream that does not yield
+     *     exactly {@code length} bytes, or an incomplete provider configuration
+     * @throws IOException if the content cannot be read or the underlying store cannot be written to
+     */
+    void put(String key, InputStream content, long length) throws GeneralException, IOException;
+
+    /**
      * Reads the whole content stored under the supplied key.
      *
      * <p>For content whose size is known to be modest. Use {@link #openStream(String)} for
@@ -225,17 +277,18 @@ public interface ContentStore {
      *
      * <p>Ownership of the returned stream passes to the caller, which must close it. This is
      * the unbounded read: content is transferred as it is consumed and is never materialised in
-     * the heap in full.
+     * the heap in full. The returned {@link ContentStream} also reports the exact length of the
+     * content, so a caller that has to declare one does not have to read the content to find it.
      *
      * @param key the opaque, provider-relative storage key; neither null nor empty
-     * @return a fresh stream over the stored content, never null
+     * @return a fresh stream over the stored content, carrying its exact length; never null
      * @throws GeneralException if the key is null, empty, refused by the provider, or the
      *     provider configuration is incomplete
      * @throws IOException if the content cannot be opened; in particular
      *     {@link java.io.FileNotFoundException} when the key holds nothing, so that this
      *     method never returns null
      */
-    InputStream openStream(String key) throws GeneralException, IOException;
+    ContentStream openStream(String key) throws GeneralException, IOException;
 
     /**
      * Reports whether the supplied key holds stored content.

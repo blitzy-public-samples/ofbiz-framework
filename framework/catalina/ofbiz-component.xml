@@ -49,16 +49,25 @@ under the License.
              failover - there is nothing for the balancer to fail over TO. Sticky routing keeps a session
              usable while its instance is alive; it cannot restore one after that instance is gone.
 
+             WHAT THIS FLEET IS, STATED WITHOUT OVERCLAIMING. It is a STICKY fleet whose instances are
+             replaceable AT THE COST OF LOGGING OUT the users whose sessions they held. It is not a fleet of
+             interchangeable instances that a request can be moved between mid-session, and nothing in this
+             configuration makes it one. Every claim of statelessness in this work is about DURABLE state and
+             only about durable state: the database holds the data, the object store holds file-backed content
+             and uploads, the entity caches are kept coherent by distributed cache clear, and health probes
+             create nothing at all - ControlFilter and ContextFilter pass the two probe paths through before
+             either of them creates a session, so being polled by a load balancer leaves no state behind.
+             Session state is the one category that is neither durable nor externalised, and its loss is
+             recoverable by signing in again, which is why it is accepted rather than solved here.
+
              This is a deliberate, documented limitation of the stateless-deployment work rather than an
-             oversight. Instances are freely replaceable because they hold no DURABLE state - the database
-             holds the data, the object store holds the content, and the entity caches are kept coherent by
-             distributed cache clear - and a lost session is recoverable by signing in again, which durable
-             state is not. Adding session replication or an external session store would be a separate change
+             oversight. Adding session replication or an external session store would be a separate change
              with its own transport, serialization and operational cost; see the "Running more than one
-             instance" section of DOCKER.adoc, which states the same limitation for operators. Two practical
-             consequences worth planning around: drain connections before terminating an instance so sessions
-             end at a moment of your choosing, and expect a deployment that rolls every instance to log every
-             signed-in user out. -->
+             instance" section of DOCKER.adoc, which states the same limitation for operators in the same
+             terms. Three practical consequences worth planning around: configure the balancer for sticky
+             sessions or signed-in users will be logged out on their next request rather than on replacement;
+             drain connections before terminating an instance so sessions end at a moment of your choosing;
+             and expect a deployment that rolls every instance to log every signed-in user out. -->
         <!-- configuration of the Tomcat service that hosts OFBiz applications: the service has one engine and one or more connectors -->
         <property name="default-server" value="engine">
             <property name="default-host" value="0.0.0.0"/>
@@ -134,15 +143,21 @@ under the License.
                  Enable it only when instances are served under several sub-domains of one parent domain and a
                  shared session cookie is genuinely required - the valve calls request.getSession(true), so it
                  forces a session for every request it handles.
-                 The valve exempts the two health probe paths and passes them straight down the pipeline. Read
-                 that exemption precisely: it does NOT make a probe session-free, because the webtools chain
-                 that answers a probe reaches ControlFilter, which calls getSession() unconditionally. What the
-                 exemption avoids is narrower - this valve runs at ENGINE scope, above every context, so a probe
-                 path addressed to a context that neither allow-lists nor maps it would otherwise have a session
-                 minted here for a request that context is going to refuse anyway, and no domain-widened session
-                 cookie is rewritten onto a response that a probe client never reads. The paths it exempts are
-                 the servlet's own published HealthCheckServlet.isProbePath contract, not a copy of the literals,
-                 so the exemption cannot drift from what the endpoint serves. -->
+                 The valve exempts the two health probe paths and passes them straight down the pipeline. This
+                 valve runs at ENGINE scope, above every context, so without the exemption it would mint a
+                 session for a probe before any context saw it - including for a probe path addressed to a
+                 context that neither maps nor allow-lists it - and would rewrite a domain-widened session
+                 cookie onto a response no probe client reads.
+                 The exemption is one of two layers, and together they are what makes a probe session-free end
+                 to end: inside the webapp, HealthProbeFilter is mapped first on the two exact probe paths and
+                 forwards to HealthCheckServlet by name, and a named dispatch is not filtered by a url-pattern
+                 mapping, so ControlFilter and ContextFilter - both of which call getSession() unconditionally
+                 - do not run for a probe either. The servlet additionally discards any session it still finds
+                 was created for the probe, so the guarantee survives a webapp that registers the servlet
+                 without the filter.
+                 The paths this valve exempts are the servlet's own published HealthCheckServlet.isProbePath
+                 contract, not a copy of the literals, so the exemption cannot drift from what the endpoint
+                 serves. -->
             <property name="enable-cross-subdomain-sessions" value="false"/>
         </property>
         <property name="ajp-connector" value="connector">

@@ -41,7 +41,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -51,8 +50,11 @@ import javax.xml.transform.stream.StreamSource;
 import javax.xml.validation.SchemaFactory;
 import javax.xml.validation.Validator;
 
+import org.apache.ofbiz.base.test.ShellDriver;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
@@ -134,6 +136,21 @@ public final class SchemaInitEntryPointTests {
     /** The generated override. {@code /ofbiz/config} precedes {@code ofbiz.jar}, so this is what OFBiz reads. */
     private static final String RENDERED_OVERRIDE = "config/entityengine.xml";
 
+    /**
+     * The ownership marker every render of {@link #RENDERED_OVERRIDE} carries, which is what entitles the entry
+     * point to replace or delete that file. Checked against the script's own declaration by
+     * {@link #theOwnershipMarkerAndStateRecordVersionTheFixturesUseAreTheOnesTheScriptDeclares}, so a rename in
+     * the script cannot leave these cases asserting on a marker nothing writes any more.
+     */
+    private static final String OWNERSHIP_MARKER = "OFBIZ-CONTAINER-GENERATED-ENTITY-ENGINE-CONFIGURATION";
+
+    /**
+     * The current version line of the container database state record. An unmarked override beside a record of
+     * THIS version belongs to the deployment; beside an older or empty one it is a render from an image that
+     * predates the marker.
+     */
+    private static final String DESIRED_STATE_RECORD_VERSION = "version=2";
+
     /** The local grammar the rendered configuration is validated against, so validation stays offline. */
     private static final String ENTITY_CONFIG_SCHEMA = "framework/entity/dtd/entity-config.xsd";
 
@@ -142,6 +159,20 @@ public final class SchemaInitEntryPointTests {
 
     /** Any at-sign delimited render placeholder. */
     private static final Pattern PLACEHOLDER = Pattern.compile("@[A-Z_0-9]+@");
+
+    /** How many distinct placeholders the committed render template carries. */
+    private static final int SUBSTITUTED_TOKEN_COUNT = 20;
+
+    /**
+     * How many placeholder occurrences the committed render template carries in total.
+     *
+     * <p>Stated separately from the distinct count because the two are different contracts. Ten of the twenty
+     * are written once per managed datasource and one - the cache-clear flag - once per rewritten delegator, so
+     * 10x3 + 1x2 + 9x1 = 41. A repetition dropped from one datasource leaves the distinct inventory untouched
+     * and would leave that datasource silently on a different setting from the other two, which is why the
+     * total is asserted as well as the set.
+     */
+    private static final int SUBSTITUTED_TOKEN_OCCURRENCES = 41;
 
     /**
      * Every placeholder {@code render_database_configuration} writes a substitution for, in the order the
@@ -268,6 +299,16 @@ public final class SchemaInitEntryPointTests {
     private static final String POOL_MIN = "7";
     private static final String POOL_MAX = "77";
 
+    /**
+     * The fleet capacity inputs the deployed profile requires an operator to state.
+     *
+     * <p>Chosen so the baseline demand - {@code FLEET_SIZE * POOL_MAX * 3} entity groups = 693 connections -
+     * is a small share of the budget once the entry point's operational reserve is withheld, which keeps the
+     * baseline quiet and leaves room for the cases that perturb the pool maximum.</p>
+     */
+    private static final String FLEET_SIZE = "3";
+    private static final String MAX_CONNECTIONS = "5000";
+
     /** The desired-state record the render writes, relative to the sandbox. */
     private static final String DB_CONFIG_APPLIED_MARKER = "state/db_config_applied";
 
@@ -357,11 +398,19 @@ public final class SchemaInitEntryPointTests {
     private static final String LOCAL_VARIABLE_COUNT =
             "Two variables rather than one because they are consulted at different points";
 
-    /** The claim about the SDK's own variables, whose count is of names the same sentence lists. */
-    private static final String SDK_VARIABLES_CLAIM = "SIX AWS_ PREFIXED NAMES ARE DELIBERATELY NOT TOUCHED";
+    /**
+     * The claim about the SDK's own credential variables, counted against the array that declares them.
+     *
+     * <p>Registered apart from {@link #STATED_LIST_SIZES} because that map counts {@code OFBIZ_} prefixed
+     * names and this is the one inventory in the entry point made of {@code AWS_} prefixed ones - the names
+     * the AWS SDK resolves for itself, which are therefore the names this script must NOT withdraw from the
+     * environment of the JVM it exec's.</p>
+     */
+    private static final String SDK_VARIABLES_CLAIM =
+            "THE NINE AWS_ PREFIXED CREDENTIAL AND TOKEN NAMES ARE DELIBERATELY NOT WITHDRAWN HERE";
 
-    /** How far past that claim its enumeration reaches. The prose holds no other {@code AWS_} name. */
-    private static final int SDK_CLAIM_ENUMERATION_LENGTH = 200;
+    /** The array those names are declared in, which is what the claim above is checked against. */
+    private static final String SDK_CREDENTIAL_ARRAY = "AWS_CREDENTIAL_ENVIRONMENT_VARIABLES";
 
     /** The number words the entry point's prose uses, which is as far as any count in it goes. */
     private static final Map<String, Integer> NUMBER_WORDS = Map.ofEntries(
@@ -947,8 +996,13 @@ public final class SchemaInitEntryPointTests {
      * Every placeholder the render template carries is substituted by the real shell, and the set of
      * placeholders it carries is exactly the set the shell writes a substitution for.
      *
-     * <p>The two halves are asserted together on purpose. A template that gained a seventeenth placeholder
-     * would render it unsubstituted into the deployed configuration - {@code pool-maxsize="@DB_POOL_CAP@"} is a
+     * <p>The contract is the one {@link #SUBSTITUTED_TOKENS} states: {@value #SUBSTITUTED_TOKEN_COUNT} distinct
+     * placeholders, appearing {@value #SUBSTITUTED_TOKEN_OCCURRENCES} times between them, because most of them
+     * are written once per managed datasource. Both numbers are asserted below rather than merely described
+     * here, so neither can drift away from the template.</p>
+     *
+     * <p>The two halves are asserted together on purpose. A template that gained a further placeholder would
+     * render it unsubstituted into the deployed configuration - {@code pool-maxsize="@DB_POOL_CAP@"} is a
      * number the pool cannot parse - and a substitution the shell writes for a placeholder the template no
      * longer has is dead code that hides a lost setting. Both are caught by comparing the two inventories and
      * then proving the render leaves nothing behind.</p>
@@ -963,10 +1017,18 @@ public final class SchemaInitEntryPointTests {
         assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
         Path sandbox = prepareSandbox(tempDir);
 
-        Set<String> declared = placeholdersIn(Files.readString(sandbox.resolve(ENTITY_ENGINE_TEMPLATE),
-                StandardCharsets.UTF_8));
+        String template = Files.readString(sandbox.resolve(ENTITY_ENGINE_TEMPLATE), StandardCharsets.UTF_8);
+        Set<String> declared = placeholdersIn(template);
         assertEquals(new LinkedHashSet<>(SUBSTITUTED_TOKENS), declared,
                 "the render template's placeholder inventory and the entry point's substitutions must agree");
+        assertEquals(SUBSTITUTED_TOKEN_COUNT, SUBSTITUTED_TOKENS.size(), "the substitution list must hold the"
+                + " number of tokens this suite documents, or the documented contract is not the asserted one");
+        // The occurrence total, not just the distinct set. A datasource that lost one repetition of a shared
+        // placeholder - a pool bound dropped from the OLAP datasource, say - keeps the set identical and would
+        // otherwise pass, leaving that datasource silently on a different setting from the other two.
+        assertEquals(SUBSTITUTED_TOKEN_OCCURRENCES, placeholderOccurrencesIn(template), "every occurrence of"
+                + " every placeholder must be present, because they are what carries one setting to all three"
+                + " managed datasources");
 
         Map<String, String> environment = managedDatabaseEnvironment();
         // Asked for explicitly so that the cache-clear placeholder is substituted with the value that is NOT
@@ -1799,6 +1861,179 @@ public final class SchemaInitEntryPointTests {
                 "the failure must name the variable, output was:\n" + refused.getOutput());
     }
 
+    /**
+     * A component path that escapes the OFBiz installation is refused rather than rewritten.
+     *
+     * <p>{@code OFBIZ_DISABLE_COMPONENTS} is a list of paths this script hands to an XSLT transform that
+     * REWRITES each file in place, and the path was used as supplied: {@code /ofbiz/} with the operator's text
+     * appended. {@code ../../etc/something.xml} therefore left {@code /ofbiz} altogether, and any XML file the
+     * container user can write - including one on a volume shared with another workload - had an
+     * {@code enabled="false"} attribute written onto its root element. That is a traversal with a write
+     * primitive on the end of it, reachable from a variable whose documented purpose is to switch off a
+     * plugin.</p>
+     *
+     * <p>Containment is decided after canonicalisation, so a symlink inside the installation that points
+     * outward is refused too - which a textual check on the supplied string could never see - and the file
+     * name is required to be {@code ofbiz-component.xml}, because the transform is meaningful for no other
+     * file and could only damage one. The accepting legs are asserted as well: a relative path, an absolute
+     * one naming the same file, and a path with a redundant segment all still work, so the rule admits exactly
+     * what the feature exists for.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void aComponentPathThatEscapesTheInstallationIsRefusedRatherThanRewritten(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Path installation = Files.createDirectories(sandbox.resolve("installation"));
+        Path component = Files.createDirectories(installation.resolve("plugins/birt"));
+        Files.writeString(component.resolve("ofbiz-component.xml"),
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ofbiz-component name=\"birt\"/>\n",
+                StandardCharsets.UTF_8);
+        Files.writeString(component.resolve("other.xml"), "<other/>\n", StandardCharsets.UTF_8);
+        Path outside = Files.createDirectories(sandbox.resolve("outside"));
+        Files.writeString(outside.resolve("ofbiz-component.xml"), "<victim/>\n", StandardCharsets.UTF_8);
+        Files.writeString(outside.resolve("victim.xml"), "<victim/>\n", StandardCharsets.UTF_8);
+        Files.createSymbolicLink(installation.resolve("escape"), outside);
+
+        for (String refused : List.of("../outside/ofbiz-component.xml", "../../../etc/ofbiz-component.xml",
+                outside.resolve("ofbiz-component.xml").toString(), "plugins/birt/other.xml",
+                "../outside/victim.xml", "escape/ofbiz-component.xml")) {
+            EntryPointRun run = resolveComponentPath(tempDir, sandbox, installation, refused);
+
+            assertNotEquals(0, run.getExitCode(), "the component path [" + refused + "] must be refused: this"
+                    + " setting rewrites the file it names, so anything outside the installation - or any file"
+                    + " that is not a component descriptor - could only be damaged by it. Output was:\n"
+                    + run.getOutput());
+            assertTrue(run.getOutput().contains("OFBIZ_DISABLE_COMPONENTS"), "the refusal must name the variable"
+                    + " the operator has to correct. Output was:\n" + run.getOutput());
+        }
+
+        String descriptor = component.resolve("ofbiz-component.xml").toString();
+        for (String accepted : List.of("plugins/birt/ofbiz-component.xml", descriptor,
+                "plugins/birt/./ofbiz-component.xml", "plugins/../plugins/birt/ofbiz-component.xml")) {
+            EntryPointRun run = resolveComponentPath(tempDir, sandbox, installation, accepted);
+
+            assertEquals(0, run.getExitCode(), "the component path [" + accepted + "] names a descriptor inside"
+                    + " the installation and must be accepted. Output was:\n" + run.getOutput());
+            assertTrue(run.getOutput().contains("RESOLVED=[" + descriptor + "]"), "an accepted path must resolve"
+                    + " to the canonical descriptor, so the transform is applied to exactly one known file."
+                    + " Output was:\n" + run.getOutput());
+        }
+
+        // Nothing outside the installation was touched by any leg, refused or accepted.
+        assertEquals("<victim/>\n", Files.readString(outside.resolve("victim.xml"), StandardCharsets.UTF_8),
+                "a refused path must not have been rewritten");
+        assertEquals("<victim/>\n", Files.readString(outside.resolve("ofbiz-component.xml"),
+                StandardCharsets.UTF_8), "a refused path must not have been rewritten");
+    }
+
+    /**
+     * Drives the entry point's component-path validator against one supplied path.
+     *
+     * @param workDir a per-test temporary directory for the generated driver scripts
+     * @param sandbox the directory the functions treat as the OFBiz home
+     * @param installation the directory that stands in for the container's {@code /ofbiz}
+     * @param suppliedPath the path as an operator would write it in {@code OFBIZ_DISABLE_COMPONENTS}
+     * @return the exit code and the combined output of the run
+     * @throws Exception if the entry point cannot be read or the shell cannot be run
+     */
+    private static EntryPointRun resolveComponentPath(Path workDir, Path sandbox, Path installation,
+            String suppliedPath) throws Exception {
+        return runInSandbox(workDir, sandbox,
+                "COMPONENT_ROOT_DIR=" + shellQuote(installation) + "\n"
+                        + "require_component_descriptor_path " + shellQuote(suppliedPath) + "\n"
+                        + "printf 'RESOLVED=[%s]\\n' \"$RESOLVED_COMPONENT_DESCRIPTOR\"\n",
+                Map.of());
+    }
+
+    /**
+     * The AWS SDK's own credential inputs are hidden from a hook and from every initialisation child, and
+     * restored - exported - for the serving JVM that has to resolve them.
+     *
+     * <p>These variables are not injected by this script and cannot be withdrawn like the {@code OFBIZ_*}
+     * secrets are: {@code AWS_ACCESS_KEY_ID} and the eight token and container-credential names beside it are
+     * how an instance profile, an ECS task role or an EKS service account hands short-lived credentials to the
+     * SDK, and the SDK resolves them inside the JVM, from the environment, after this script has exec'd it.
+     * Removing them permanently would break the recommended production configuration; leaving them exported
+     * throughout means arbitrary operator-supplied hook code and every data-load JVM carry a live cloud
+     * credential in an environment readable through {@code /proc/<pid>/environ} for their whole lifetime,
+     * while the documented contract says a hook sees no credential at all.</p>
+     *
+     * <p>The resolution is therefore scoped rather than absolute, and all three scopes are asserted here
+     * together because the guarantee is the relationship between them: hidden where nothing needs them,
+     * present where something does. A value that is restored WITHOUT its export attribute would satisfy the
+     * first two and silently break the third - the JVM is a child, so an unexported value reaches it as
+     * nothing - which is why the last leg reads the environment of the process the entry point actually
+     * exec's rather than this shell's own variables.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void theSdkOwnCredentialsAreHiddenFromHooksAndChildrenAndRestoredForTheServingJvm(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Path hook = sandbox.resolve("hook.sh");
+        List<String> sdkCredentials = List.of("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+                "AWS_SECURITY_TOKEN", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+        assertEquals(new LinkedHashSet<>(sdkCredentials), declaredNamesMatching(SDK_CREDENTIAL_ARRAY, "AWS_[A-Z0-9_]+"),
+                "this case asserts on the names " + SDK_CREDENTIAL_ARRAY + " declares, so the two must agree");
+
+        StringBuilder hookBody = new StringBuilder("#!/usr/bin/env bash\n");
+        for (String name : sdkCredentials) {
+            hookBody.append("printf 'HOOK_SAW ").append(name).append("=[%s]\\n' \"${").append(name).append("-}\"\n");
+        }
+        Files.writeString(hook, hookBody.toString(), StandardCharsets.UTF_8);
+
+        // Distinctive per name, so a value that survived under a DIFFERENT name is caught as well.
+        String unique = "SDKCRED4f1b8e07";
+        Map<String, String> environment = new LinkedHashMap<>();
+        environment.put("OFBIZ_PROFILE", "dev");
+        for (String name : sdkCredentials) {
+            environment.put(name, unique + name);
+        }
+
+        for (boolean executable : List.of(true, false)) {
+            assertTrue(hook.toFile().setExecutable(executable), "could not set the hook's execute bit");
+            String form = executable ? "an executable" : "a sourced";
+
+            EntryPointRun run = runInSandbox(tempDir, sandbox, HOOK_BODY + SDK_CREDENTIAL_REPORT, environment);
+
+            assertEquals(0, run.getExitCode(), form + " hook must run, output was:\n" + run.getOutput());
+            for (String name : sdkCredentials) {
+                assertTrue(run.getOutput().contains("HOOK_SAW " + name + "=[]"),
+                        form + " hook must see no value for " + name + ": a hook is arbitrary operator code and "
+                                + "the documented contract is that it receives no credential. Output was:\n"
+                                + run.getOutput());
+                // Restored WITH the export attribute, because the SDK reads them in the JVM this shell exec's.
+                assertTrue(run.getOutput().contains("AFTER_HOOK_EXPORTED " + name + "=[" + unique + name + "]"),
+                        name + " must be exported again once " + form + " hook has returned, or the serving JVM "
+                                + "would resolve no credentials at all. Output was:\n" + run.getOutput());
+            }
+        }
+
+        // The serving process: the one place these values legitimately belong.
+        Map<String, String> serving = new LinkedHashMap<>(environment);
+        serving.put("OFBIZ_S3_ACCESS_KEY_ID", "");
+        serving.put("OFBIZ_S3_SECRET_ACCESS_KEY", "");
+        EntryPointRun exec = runInSandbox(tempDir, sandbox, MAIN_BODY, serving, List.of("/usr/bin/env"));
+
+        assertEquals(0, exec.getExitCode(),
+                "the start must succeed so that what it exec'd can be inspected, output was:\n" + exec.getOutput());
+        for (String name : sdkCredentials) {
+            assertTrue(exec.getOutput().contains(name + "=" + unique + name),
+                    name + " must reach the environment of the process the entry point exec's, because the AWS "
+                            + "SDK's default credential chain resolves it there. Environment was:\n"
+                            + exec.getOutput());
+        }
+    }
+
     /*
      * configure_database: which source is rendered, and how often
      */
@@ -2156,6 +2391,342 @@ public final class SchemaInitEntryPointTests {
     }
 
     /**
+     * The two values these fixtures stand in for are the ones the script actually declares.
+     *
+     * <p>Both are strings a test cannot derive: the ownership marker decides whether a file is replaceable, and
+     * the state record version decides whether an unmarked file predates the marker convention. A rename of
+     * either in the script would leave every case around this one asserting on something nothing writes - green,
+     * and testing nothing - so the two declarations are compared with the script text itself.</p>
+     *
+     * @throws Exception if the entry point could not be read, which fails the test rather than being handled
+     */
+    @Test
+    public void theOwnershipMarkerAndStateRecordVersionTheFixturesUseAreTheOnesTheScriptDeclares()
+            throws Exception {
+        String script = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
+
+        assertTrue(script.contains("ENTITY_ENGINE_GENERATED_MARKER=\"" + OWNERSHIP_MARKER + "\""),
+                "the entry point must declare ENTITY_ENGINE_GENERATED_MARKER as " + OWNERSHIP_MARKER);
+        assertTrue(script.contains("DESIRED_STATE_RECORD_VERSION='" + DESIRED_STATE_RECORD_VERSION + "'"),
+                "the entry point must declare DESIRED_STATE_RECORD_VERSION as " + DESIRED_STATE_RECORD_VERSION);
+        assertTrue(script.contains("ENTITY_ENGINE_GENERATED_COMMENT=\"<!-- $ENTITY_ENGINE_GENERATED_MARKER:"),
+                "the marker must be stamped as an XML comment built from that one declaration");
+    }
+
+    /**
+     * The prod profile refuses to serve from the embedded database, including when nothing at all was
+     * configured.
+     *
+     * <p>{@code require_consistent_database_selection} catches a managed configuration that lost its host,
+     * which is the case where settings were supplied and ignored. It cannot catch the case where NOTHING was
+     * supplied: {@code OFBIZ_PROFILE=prod} on its own resolved to the committed configuration, whose
+     * {@code default} and {@code default-no-eca} delegators map all three entity groups to the
+     * {@code localh2*} datasources, and the container then served real traffic from an H2 file on its own
+     * volume - one database per instance, invisible to the others, discarded when the instance is replaced,
+     * and reached without one line of output saying so. A profile that fails fast for a missing secret has to
+     * fail fast for a missing database.</p>
+     *
+     * <p>The refusal is asserted on the EFFECTIVE configuration rather than on the environment, both
+     * profiles are driven because they differ by design, and the initialisation job is driven too: an init
+     * run that applied the entity model to an H2 file on its own volume and exited 0 would tell an
+     * orchestrator that the fleet's database is ready.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void theProdProfileRefusesToServeFromTheEmbeddedDatabaseWhenNothingWasConfigured(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Path refused = prepareSandbox(Files.createTempDirectory(tempDir, "prod-unconfigured"));
+        EntryPointRun prodRun = runInSandbox(tempDir, refused, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_PROFILE", "prod"));
+
+        assertNotEquals(0, prodRun.getExitCode(),
+                "the prod profile must not serve from the embedded database, output was:\n" + prodRun.getOutput());
+        assertTrue(prodRun.getOutput().contains("ERROR: OFBIZ_PROFILE=prod"),
+                "the refusal must name the profile that requires an external database, output was:\n"
+                        + prodRun.getOutput());
+        for (String mapping : List.of("org.apache.ofbiz->localh2", "org.apache.ofbiz.olap->localh2olap",
+                "org.apache.ofbiz.tenant->localh2tenant")) {
+            assertTrue(prodRun.getOutput().contains(mapping),
+                    "the refusal must name the mapping that resolves to an embedded database: " + mapping
+                            + ", output was:\n" + prodRun.getOutput());
+        }
+        assertTrue(prodRun.getOutput().contains("OFBIZ_POSTGRES_HOST")
+                        && prodRun.getOutput().contains(RENDERED_OVERRIDE)
+                        && prodRun.getOutput().contains("OFBIZ_PROFILE=dev"),
+                "the refusal must name all three ways out - render, mount, or say it is a development run -"
+                        + " output was:\n" + prodRun.getOutput());
+
+        Path allowed = prepareSandbox(Files.createTempDirectory(tempDir, "dev-unconfigured"));
+        EntryPointRun devRun = runInSandbox(tempDir, allowed, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_PROFILE", "dev"));
+        assertEquals(0, devRun.getExitCode(),
+                "the zero-configuration development start must be untouched, output was:\n" + devRun.getOutput());
+        assertTrue(devRun.getOutput().contains(COMPLETED),
+                "configure_database must return in the development profile, output was:\n" + devRun.getOutput());
+        assertFalse(devRun.getOutput().contains("ERROR"),
+                "a development start on the embedded database must say nothing about it, output was:\n"
+                        + devRun.getOutput());
+
+        // The singleton acknowledgement is supplied because a prod init execution requires it BEFORE anything
+        // about the datasource is examined; without it this run is refused for the wrong reason and proves
+        // nothing about where the schema would have been created.
+        Path initRefused = prepareSandbox(Files.createTempDirectory(tempDir, "prod-init-unconfigured"));
+        EntryPointRun initRun = runInSandbox(tempDir, initRefused, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_PROFILE", "prod", "OFBIZ_SCHEMA_INIT", "true",
+                        "OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED", "true"));
+        assertNotEquals(0, initRun.getExitCode(),
+                "a prod initialisation job must not report success for an embedded schema, output was:\n"
+                        + initRun.getOutput());
+        assertTrue(initRun.getOutput().contains("ERROR: OFBIZ_PROFILE=prod"),
+                "the initialisation refusal must be the same one, output was:\n" + initRun.getOutput());
+    }
+
+    /**
+     * The documented external-configuration mode works end to end: a mounted entity engine configuration is
+     * kept, is what the instance reads, and satisfies the prod profile on its own terms.
+     *
+     * <p>This is the contract {@code framework/entity/config/entityengine.xml} states next to the
+     * {@code localpostgres*} definitions - mount an {@code entityengine.xml} under {@code /ofbiz/config} and
+     * leave {@code OFBIZ_POSTGRES_HOST} unset - and it is the ONLY way to run this image against MySQL,
+     * Oracle, or a PostgreSQL whose pgJDBC properties the template does not carry. Leaving the host unset is
+     * also what selects the committed mode, whose job is to remove a stale render, so the mounted file was
+     * deleted on the first start and every instance silently fell back to the committed embedded H2
+     * configuration. Ownership is what tells the two apart, so both halves are asserted here: the file
+     * survives byte for byte, and the prod profile accepts it because the datasources it maps are external.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void anOperatorSuppliedConfigurationIsKeptAndSatisfiesTheProdProfileOnItsOwnTerms(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "external-config"));
+        String mounted = writeOperatorConfiguration(sandbox, "localmysql", "localmysqlolap", "localmysqltenant");
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_PROFILE", "prod"));
+
+        assertEquals(0, run.getExitCode(),
+                "an external database declared by the deployment must satisfy the prod profile, output was:\n"
+                        + run.getOutput());
+        assertTrue(run.getOutput().contains(COMPLETED),
+                "configure_database must return, output was:\n" + run.getOutput());
+        assertEquals(mounted, Files.readString(sandbox.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8),
+                "the mounted configuration must survive byte for byte");
+        assertTrue(run.getOutput().contains("external-configuration mode"),
+                "the start must announce that the deployment's own configuration is what applies, output was:\n"
+                        + run.getOutput());
+
+        // The same mode in the development profile is equally untouched, and says the same thing.
+        Path development = prepareSandbox(Files.createTempDirectory(tempDir, "external-config-dev"));
+        String devMounted = writeOperatorConfiguration(development, "localmysql", "localmysqlolap",
+                "localmysqltenant");
+        EntryPointRun devRun = runInSandbox(tempDir, development, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_PROFILE", "dev"));
+        assertEquals(0, devRun.getExitCode(), "output was:\n" + devRun.getOutput());
+        assertEquals(devMounted, Files.readString(development.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8),
+                "the mounted configuration must survive in the development profile too");
+    }
+
+    /**
+     * A configuration this container did not render is never overwritten by a render either.
+     *
+     * <p>Removal is not the only way to lose it. Both renders write to the same path the deployment mounts,
+     * and the container renders from the pristine source on every start, so a replaced file cannot be
+     * reconstructed - and the managed render would point every entity group at PostgreSQL while the embedded
+     * render would point them all at the H2 file on this container's volume. Neither is a change an operator
+     * who mounted their own MySQL configuration asked for, so both are refused, before anything is written,
+     * naming both ways out. The embedded case matters as much as the managed one: wanting cross-instance
+     * cache invalidation with your own datasources is a perfectly ordinary combination.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void aConfigurationThisContainerDidNotRenderIsNeverOverwritten(@TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Path managed = prepareSandbox(Files.createTempDirectory(tempDir, "operator-vs-managed"));
+        String mounted = writeOperatorConfiguration(managed, "localmysql", "localmysqlolap", "localmysqltenant");
+        EntryPointRun managedRun = runInSandbox(tempDir, managed, CONFIGURE_DATABASE_BODY,
+                managedDatabaseEnvironment());
+
+        assertNotEquals(0, managedRun.getExitCode(),
+                "the managed render must not overwrite a mounted configuration, output was:\n"
+                        + managedRun.getOutput());
+        assertTrue(managedRun.getOutput().contains("ERROR:")
+                        && managedRun.getOutput().contains("already exists and was not generated by this script"),
+                "the refusal must say why the file is not the container's to replace, output was:\n"
+                        + managedRun.getOutput());
+        assertEquals(mounted, Files.readString(managed.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8),
+                "the mounted configuration must be intact after the refusal");
+
+        Path embedded = prepareSandbox(Files.createTempDirectory(tempDir, "operator-vs-embedded"));
+        String embeddedMounted = writeOperatorConfiguration(embedded, "localmysql", "localmysqlolap",
+                "localmysqltenant");
+        EntryPointRun embeddedRun = runInSandbox(tempDir, embedded, CONFIGURE_DATABASE_WITHOUT_TRANSPORT_BODY,
+                Map.of("OFBIZ_DISTRIBUTED_CACHE_CLEAR", "true", "OFBIZ_PROFILE", "prod"));
+
+        assertNotEquals(0, embeddedRun.getExitCode(),
+                "the embedded cache-clear render must not overwrite a mounted configuration, output was:\n"
+                        + embeddedRun.getOutput());
+        assertTrue(embeddedRun.getOutput().contains("distributed-cache-clear-enabled"),
+                "the refusal must say how to keep the mounted file and still get invalidation, output was:\n"
+                        + embeddedRun.getOutput());
+        assertEquals(embeddedMounted, Files.readString(embedded.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8),
+                "the mounted configuration must be intact after the refusal");
+    }
+
+    /**
+     * Every render stamps the ownership marker, and only a stamped file is withdrawn.
+     *
+     * <p>The marker is what makes the two previous cases decidable, so it is asserted on both renders and on
+     * the withdrawal that depends on it: a render that forgot it would be read as an operator's file on the
+     * NEXT start and would never be corrected again, and the symptom - a configuration that refuses to take
+     * effect - would appear one start late. The withdrawal is driven on the very sandbox the managed render
+     * wrote, which is the real sequence: configure a database, then take the variables away again.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void everyRenderIsStampedAndOnlyAStampedConfigurationIsWithdrawn(@TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "stamped-managed"));
+        assertEquals(0, runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, managedDatabaseEnvironment())
+                .getExitCode(), "the managed render must succeed");
+        String rendered = Files.readString(sandbox.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8);
+        // Asserted on the PROLOG, not merely on the text, because that is where the entry point reads it: the
+        // committed configuration mentions the marker in prose, so a render that only inherited that mention
+        // would satisfy a whole-text assertion and would then be classified as an operator's file.
+        assertTrue(String.join("\n", Files.readAllLines(sandbox.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8)
+                        .subList(0, 5)).contains(OWNERSHIP_MARKER),
+                "the managed render must stamp the ownership marker into the document prolog");
+        // Parsed rather than merely searched: the marker is inserted into the document prolog, so a malformed
+        // insertion would leave a file the Entity Engine reads without complaining and this suite would not see.
+        assertEquals("localpostgres", delegatorMapping(parseXml(rendered), "default").get("org.apache.ofbiz"),
+                "the stamped render must still be the managed configuration, and still parse");
+
+        EntryPointRun withdrawn = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_PROFILE", "dev"));
+        assertEquals(0, withdrawn.getExitCode(), "the withdrawal must succeed, output was:\n"
+                + withdrawn.getOutput());
+        assertFalse(Files.exists(sandbox.resolve(RENDERED_OVERRIDE)),
+                "withdrawing the variables must remove the container's own render");
+        assertTrue(withdrawn.getOutput().contains("this container rendered"),
+                "the removal must say whose file it was, output was:\n" + withdrawn.getOutput());
+
+        Path cacheClear = prepareSandbox(Files.createTempDirectory(tempDir, "stamped-embedded"));
+        assertEquals(0, runInSandbox(tempDir, cacheClear, CONFIGURE_DATABASE_WITHOUT_TRANSPORT_BODY,
+                Map.of("OFBIZ_DISTRIBUTED_CACHE_CLEAR", "true", "OFBIZ_PROFILE", "dev")).getExitCode(),
+                "the embedded render must succeed");
+        assertTrue(String.join("\n", Files.readAllLines(cacheClear.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8)
+                        .subList(0, 5)).contains(OWNERSHIP_MARKER),
+                "the embedded render must stamp the ownership marker into the prolog too");
+    }
+
+    /**
+     * An unmarked override beside a state record from an image older than the marker is this container's own
+     * earlier render, and is withdrawn rather than kept.
+     *
+     * <p>Images before this one rendered {@code config/entityengine.xml} with no marker and touched
+     * {@code CONTAINER_DB_CONFIG_APPLIED} - an empty file - in the same guarded block. Treating those renders
+     * as operator files would do two wrong things at once: an existing deployment upgrading into this image
+     * would refuse to start, and a stale render naming a decommissioned host, rotated credentials and, if it
+     * came from an init run, both DDL flags true, would survive as if the deployment had chosen it. The pair
+     * of facts is what distinguishes them, and the removal says so rather than claiming certainty it does not
+     * have.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void anUnmarkedRenderFromAnOlderImageIsRecognisedAsThisContainersOwn(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Path legacy = prepareSandbox(Files.createTempDirectory(tempDir, "legacy-render"));
+        writeOperatorConfiguration(legacy, "localpostgres", "localpostgresolap", "localpostgrestenant");
+        // Exactly what the older entry point left behind: the render, and an EMPTY marker file beside it.
+        Files.createFile(legacy.resolve("state/db_config_applied"));
+
+        EntryPointRun run = runInSandbox(tempDir, legacy, CONFIGURE_DATABASE_BODY, Map.of("OFBIZ_PROFILE", "dev"));
+
+        assertEquals(0, run.getExitCode(), "the upgrade must not refuse to start, output was:\n" + run.getOutput());
+        assertFalse(Files.exists(legacy.resolve(RENDERED_OVERRIDE)),
+                "a render from an older image must be withdrawn like any other render of this container");
+        assertTrue(run.getOutput().contains("older than that marker"),
+                "the removal must say what made it decidable, output was:\n" + run.getOutput());
+
+        // The mirror image, and the reason the record's VERSION is what is read rather than its presence: a
+        // deployment that started once against PostgreSQL and then mounted its own configuration leaves a
+        // CURRENT record beside an unmarked file, and that file is the deployment's.
+        Path afterUpgrade = prepareSandbox(Files.createTempDirectory(tempDir, "current-record"));
+        String mounted = writeOperatorConfiguration(afterUpgrade, "localmysql", "localmysqlolap",
+                "localmysqltenant");
+        Files.writeString(afterUpgrade.resolve("state/db_config_applied"),
+                DESIRED_STATE_RECORD_VERSION + "\nprofile=prod\ndatabase-mode=managed\n", StandardCharsets.UTF_8);
+
+        EntryPointRun kept = runInSandbox(tempDir, afterUpgrade, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_PROFILE", "prod"));
+        assertEquals(0, kept.getExitCode(), "output was:\n" + kept.getOutput());
+        assertEquals(mounted, Files.readString(afterUpgrade.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8),
+                "an unmarked file beside a CURRENT record is the deployment's and must be kept");
+    }
+
+    /**
+     * The prod profile refuses a mounted configuration whose database it cannot identify, rather than
+     * assuming it is shared.
+     *
+     * <p>Keeping an operator's file is not the same as trusting it. Two shapes cannot be proved external and
+     * both are refused: a {@code group-map} naming a datasource the file does not declare, and a datasource
+     * that declares neither an {@code inline-jdbc} URI nor a {@code jndi-jdbc} reference. The alternative -
+     * assuming external - would let exactly the fleet-wide isolation this check exists to prevent through on
+     * a typo.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void theProdProfileRefusesAMountedConfigurationWhoseDatabaseCannotBeIdentified(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Path undeclared = prepareSandbox(Files.createTempDirectory(tempDir, "undeclared-datasource"));
+        writeOperatorConfiguration(undeclared, "somewhere", "somewhereolap", "somewheretenant");
+        EntryPointRun run = runInSandbox(tempDir, undeclared, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_PROFILE", "prod"));
+
+        assertNotEquals(0, run.getExitCode(),
+                "a mapping to an undeclared datasource must be refused in prod, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains("could not be established")
+                        && run.getOutput().contains("org.apache.ofbiz->somewhere(not declared)"),
+                "the refusal must name the mapping it could not resolve, output was:\n" + run.getOutput());
+
+        // A declared datasource with no connection at all: helper-class only, which DBCP could not use either.
+        Path connectionless = prepareSandbox(Files.createTempDirectory(tempDir, "connectionless-datasource"));
+        String withoutConnection = writeOperatorConfiguration(connectionless, "localmysql", "localmysqlolap",
+                "localmysqltenant")
+                .replaceAll("(?s)<inline-jdbc\\s+jdbc-driver=\"com.mysql.cj.jdbc.Driver\".*?/>", "");
+        Files.writeString(connectionless.resolve(RENDERED_OVERRIDE), withoutConnection, StandardCharsets.UTF_8);
+        EntryPointRun connectionlessRun = runInSandbox(tempDir, connectionless, CONFIGURE_DATABASE_BODY,
+                Map.of("OFBIZ_PROFILE", "prod"));
+
+        assertNotEquals(0, connectionlessRun.getExitCode(),
+                "a datasource with no jdbc-uri and no JNDI reference must be refused in prod, output was:\n"
+                        + connectionlessRun.getOutput());
+        assertTrue(connectionlessRun.getOutput().contains("no jdbc-uri"),
+                "the refusal must say what was missing, output was:\n" + connectionlessRun.getOutput());
+    }
+
+    /**
      * Sizing the connection pool without configuring a database is not a contradiction and stays silent.
      *
      * <p>The consistency check is deliberately confined to the {@code OFBIZ_POSTGRES_} names, which describe a
@@ -2477,18 +3048,14 @@ public final class SchemaInitEntryPointTests {
                 "each of these counts variables somewhere no test can check it; register it in STATED_LIST_SIZES "
                         + "against the array it describes");
 
-        // The one count of names the prose itself enumerates, so the sentence is checked against itself.
-        int claimAt = prose.indexOf(SDK_VARIABLES_CLAIM);
-        assertTrue(claimAt >= 0, "the claim about the SDK's own variables is no longer present");
-        String enumeration = prose.substring(claimAt,
-                Math.min(prose.length(), claimAt + SDK_VARIABLES_CLAIM.length() + SDK_CLAIM_ENUMERATION_LENGTH));
-        Set<String> listed = new LinkedHashSet<>();
-        Matcher sdkName = Pattern.compile("AWS_[A-Z_]+").matcher(enumeration);
-        while (sdkName.find()) {
-            listed.add(sdkName.group());
-        }
-        assertEquals(statedNumber(SDK_VARIABLES_CLAIM), listed.size(),
-                "the claim states a number of SDK variables that its own list does not hold: " + listed);
+        // The one inventory of AWS_ prefixed names, counted against the array rather than against a sentence.
+        assertTrue(prose.contains(SDK_VARIABLES_CLAIM),
+                "the claim about the SDK's own credential variables is no longer present, so the count it "
+                        + "states is checked against nothing");
+        Set<String> sdkNames = declaredNamesMatching(SDK_CREDENTIAL_ARRAY, "AWS_[A-Z0-9_]+");
+        assertEquals(statedNumber(SDK_VARIABLES_CLAIM), sdkNames.size(),
+                "the claim states a number of SDK credential variables that " + SDK_CREDENTIAL_ARRAY
+                        + " does not declare: " + sdkNames);
     }
 
     /**
@@ -3059,6 +3626,142 @@ public final class SchemaInitEntryPointTests {
     }
 
     /**
+     * The deployed profile requires the replica count, the database's connection budget and the schema-init
+     * singleton acknowledgement to be stated, and refuses to assume any of them.
+     *
+     * <p>All three describe the deployment AROUND the container, and none of them can be observed from inside
+     * it, so each is a value an operator has to supply rather than one this image may guess. Defaulting the
+     * replica count to one is the case worth being explicit about: it does not make the capacity arithmetic
+     * conservative, it makes it answer a different question and answer it reassuringly. Six replicas each
+     * allowed the shipped pool maximum demand 6 * 250 * 3 = 4500 connections, and validating them as a single
+     * instance passes the same configuration at 750 - so the check would report success for a fleet that
+     * exhausts the database as its second replica starts.</p>
+     *
+     * <p>Each requirement is withdrawn from the shared baseline in turn, which is also what keeps that
+     * baseline honest: {@link #managedDatabaseEnvironment()} supplies all three so that the many cases which
+     * merely flip to prod are not refused, and this case is what proves the requirements are still enforced.
+     * The aggregate-demand arithmetic is exercised in both directions as well - a demand that exceeds the
+     * budget is refused, and one that merely leaves little headroom is reported and allowed - because the
+     * second is the state an operator is far more likely to reach and would otherwise never hear about.</p>
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
+     */
+    @Test
+    public void theDeployedProfileRequiresTheFleetCapacityInputsAndTheSingletonAcknowledgement(
+            @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        for (String withdrawn : List.of("OFBIZ_DB_FLEET_SIZE", "OFBIZ_DB_MAX_CONNECTIONS")) {
+            Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "prod-capacity"));
+            Map<String, String> environment = managedDatabaseEnvironment();
+            environment.put("OFBIZ_PROFILE", "prod");
+            environment.remove(withdrawn);
+
+            EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, environment);
+
+            assertNotEquals(0, run.getExitCode(),
+                    "prod without " + withdrawn + " must be refused, output was:\n" + run.getOutput());
+            assertTrue(run.getOutput().contains(withdrawn),
+                    "the refusal must name the variable to supply, output was:\n" + run.getOutput());
+            assertFalse(Files.exists(sandbox.resolve(RENDERED_OVERRIDE)),
+                    "nothing may be rendered for a fleet whose connection demand has not been checked");
+        }
+
+        // The same withdrawal in the dev profile is a NOTICE, not a refusal: a developer's container is the
+        // single instance by construction and its budget is nobody else's.
+        Path development = prepareSandbox(Files.createTempDirectory(tempDir, "dev-capacity"));
+        Map<String, String> developmentEnvironment = managedDatabaseEnvironment();
+        developmentEnvironment.remove("OFBIZ_DB_FLEET_SIZE");
+        developmentEnvironment.remove("OFBIZ_DB_MAX_CONNECTIONS");
+        EntryPointRun developmentRun =
+                runInSandbox(tempDir, development, CONFIGURE_DATABASE_BODY, developmentEnvironment);
+        assertEquals(0, developmentRun.getExitCode(),
+                "dev must not require the capacity inputs, output was:\n" + developmentRun.getOutput());
+        assertTrue(developmentRun.getOutput().contains("capacity was not stated"),
+                "but it must still say the demand was not checked, output was:\n" + developmentRun.getOutput());
+
+        // A demand that exceeds the stated budget is refused outright. 3 instances * 250 * 3 groups = 2250,
+        // against a budget of 500 less the entry point's operational reserve.
+        Path oversubscribed = prepareSandbox(Files.createTempDirectory(tempDir, "prod-oversubscribed"));
+        Map<String, String> tooMany = managedDatabaseEnvironment();
+        tooMany.put("OFBIZ_PROFILE", "prod");
+        tooMany.put("OFBIZ_DB_MAX_CONNECTIONS", "500");
+        tooMany.put("OFBIZ_DB_POOL_MAX", "250");
+        EntryPointRun oversubscribedRun =
+                runInSandbox(tempDir, oversubscribed, CONFIGURE_DATABASE_BODY, tooMany);
+        assertNotEquals(0, oversubscribedRun.getExitCode(),
+                "a fleet that can exhaust the database must be refused, output was:\n"
+                        + oversubscribedRun.getOutput());
+        assertTrue(oversubscribedRun.getOutput().contains("more database connections than the server allows"),
+                "the refusal must say what is oversubscribed, output was:\n" + oversubscribedRun.getOutput());
+
+        // A demand that fits but leaves little headroom is reported and allowed. 3 * 60 * 3 = 540 of the 590
+        // usable after the reserve is 91%, above the share at which the entry point speaks up.
+        Path thin = prepareSandbox(Files.createTempDirectory(tempDir, "prod-thin-headroom"));
+        Map<String, String> nearlyFull = managedDatabaseEnvironment();
+        nearlyFull.put("OFBIZ_PROFILE", "prod");
+        nearlyFull.put("OFBIZ_DB_MAX_CONNECTIONS", "600");
+        nearlyFull.put("OFBIZ_DB_POOL_MAX", "60");
+        EntryPointRun thinRun = runInSandbox(tempDir, thin, CONFIGURE_DATABASE_BODY, nearlyFull);
+        assertEquals(0, thinRun.getExitCode(),
+                "a demand that fits must not be refused, output was:\n" + thinRun.getOutput());
+        assertTrue(thinRun.getOutput().contains("leaves little headroom"),
+                "but it must be reported, output was:\n" + thinRun.getOutput());
+
+        // And a comfortable one is reported as checked rather than passed over in silence.
+        Path comfortable = prepareSandbox(Files.createTempDirectory(tempDir, "prod-comfortable"));
+        Map<String, String> sized = managedDatabaseEnvironment();
+        sized.put("OFBIZ_PROFILE", "prod");
+        EntryPointRun comfortableRun = runInSandbox(tempDir, comfortable, CONFIGURE_DATABASE_BODY, sized);
+        assertEquals(0, comfortableRun.getExitCode(),
+                "the baseline must be accepted in prod, output was:\n" + comfortableRun.getOutput());
+        assertTrue(comfortableRun.getOutput().contains("Database connection capacity checked"),
+                "and the arithmetic must be stated, output was:\n" + comfortableRun.getOutput());
+        assertFalse(comfortableRun.getOutput().contains("leaves little headroom"),
+                "without a headroom warning, output was:\n" + comfortableRun.getOutput());
+
+        // The singleton acknowledgement, which applies to a prod INIT run only.
+        for (String value : List.of("", "yes", "false", "TRUE")) {
+            Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "prod-singleton"));
+            Map<String, String> environment = managedDatabaseEnvironment();
+            environment.putAll(initIdentityEnvironment());
+            environment.put("OFBIZ_PROFILE", "prod");
+            environment.put("OFBIZ_SCHEMA_INIT", "true");
+            environment.put("OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED", value);
+
+            EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, environment);
+
+            assertNotEquals(0, run.getExitCode(),
+                    "OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED=[" + value
+                            + "] must not satisfy the gate, output was:\n" + run.getOutput());
+            assertTrue(run.getOutput().contains("OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED=true must be set"),
+                    "the refusal must name the acknowledgement, output was:\n" + run.getOutput());
+        }
+
+        // It applies to an init run only: a serving instance is never asked for it.
+        Path serving = prepareSandbox(Files.createTempDirectory(tempDir, "prod-serving-singleton"));
+        Map<String, String> servingEnvironment = managedDatabaseEnvironment();
+        servingEnvironment.put("OFBIZ_PROFILE", "prod");
+        servingEnvironment.remove("OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED");
+        EntryPointRun servingRun = runInSandbox(tempDir, serving, CONFIGURE_DATABASE_BODY, servingEnvironment);
+        assertEquals(0, servingRun.getExitCode(),
+                "a serving instance must not be asked for the init acknowledgement, output was:\n"
+                        + servingRun.getOutput());
+
+        // And a dev init run is not asked for it either.
+        Path developmentInit = prepareSandbox(Files.createTempDirectory(tempDir, "dev-singleton"));
+        Map<String, String> developmentInitEnvironment = managedDatabaseEnvironment();
+        developmentInitEnvironment.put("OFBIZ_SCHEMA_INIT", "true");
+        developmentInitEnvironment.remove("OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED");
+        EntryPointRun developmentInitRun =
+                runInSandbox(tempDir, developmentInit, CONFIGURE_DATABASE_BODY, developmentInitEnvironment);
+        assertEquals(0, developmentInitRun.getExitCode(),
+                "a dev init run must not require the acknowledgement, output was:\n"
+                        + developmentInitRun.getOutput());
+    }
+
+    /**
      * A successful initialisation hands the configuration volume back in serving mode instead of failing on
      * the credential it was given to do the work with.
      *
@@ -3211,6 +3914,522 @@ public final class SchemaInitEntryPointTests {
     }
 
     /*
+     * Fail-fast matrix: the datasource settings whose refusal branches nothing executed
+     *
+     * Every case below runs the real validator, asserts the exact diagnostic and asserts that nothing was
+     * left in config/. The reason each of these has to be refused rather than defaulted is the same: every
+     * one of them reaches Java as a string in a configuration file the fleet then runs on, so a value that
+     * is merely WRONG produces no error at all - a pool that cannot serve its instances, a connection
+     * deadline that never applies, or a database connection that is not authenticated.
+     */
+
+    /**
+     * Every TLS mode the driver understands is accepted in the development profile, and only the one that
+     * authenticates the server it is talking to is accepted in the deployed profile.
+     *
+     * <p>Table driven because the interesting property is the BOUNDARY between the two sets, and the boundary
+     * is not where it first appears to be: {@code require} encrypts without checking who answered, and
+     * {@code verify-ca} checks that the certificate chains to a trusted root but NOT that it belongs to the
+     * host that presented it - so any host holding a certificate from the same authority is trusted. Both are
+     * therefore refused in prod, and a case that only asserted "disable is refused" would not see it.
+     *
+     * @param mode the TLS mode to supply
+     * @param acceptedInProd whether the deployed profile must accept it
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @ParameterizedTest(name = "sslmode {0} accepted in prod: {1}")
+    @CsvSource({
+        "disable,false",
+        "allow,false",
+        "prefer,false",
+        "require,false",
+        "verify-ca,false",
+        "verify-full,true",
+    })
+    public void everyTlsModeIsAcceptedInDevelopmentAndOnlyTheVerifyingOneInProduction(String mode,
+            boolean acceptedInProd, @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        for (String profile : List.of("dev", "prod")) {
+            Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "sslmode"));
+            Map<String, String> environment = managedDatabaseEnvironment();
+            environment.put("OFBIZ_POSTGRES_SSLMODE", mode);
+            environment.put("OFBIZ_PROFILE", profile);
+            // Removed because the deployed profile refuses a missing or guessable one before it ever reaches
+            // the TLS check, and this case is about the TLS mode rather than about the credentials.
+            environment.put("OFBIZ_ADMIN_PASSWORD", "Z3rl9Qm2Xv7Kd4Tb8Fw6");
+
+            EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, environment);
+
+            boolean shouldSucceed = "dev".equals(profile) || acceptedInProd;
+            assertEquals(shouldSucceed, run.getExitCode() == 0, "sslmode=[" + mode + "] in the " + profile
+                    + " profile, output was:\n" + run.getOutput());
+            if (shouldSucceed) {
+                assertTrue(Files.readString(sandbox.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8)
+                        .contains("sslmode=" + mode), "the accepted mode must reach every managed URI");
+            } else {
+                assertTrue(run.getOutput().contains("does not authenticate the identity of the database server"),
+                        "the refusal must say what the mode fails to establish, output was:\n" + run.getOutput());
+                assertTrue(run.getOutput().contains("verify-full"), "the refusal must name what to use instead,"
+                        + " output was:\n" + run.getOutput());
+                assertFalse(Files.exists(sandbox.resolve(RENDERED_OVERRIDE)),
+                        "a refused TLS mode must leave no rendered configuration behind");
+            }
+        }
+    }
+
+    /**
+     * A TLS mode outside the driver's vocabulary is refused by the enum, listing what is allowed. Without
+     * this, a typo such as {@code verify_full} would fall through to whatever the driver makes of an unknown
+     * {@code sslmode} - which, for pgJDBC, is its own default of {@code prefer}: encryption that silently
+     * falls back to none.
+     *
+     * @param mode a value that is not a TLS mode
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @ParameterizedTest(name = "sslmode {0} is not in the vocabulary")
+    @CsvSource({"verify_full", "VERIFY-FULL", "verifyfull", "full", "true", "'verify-full '"})
+    public void aTlsModeOutsideTheDriversVocabularyIsRefusedWithTheAllowedValuesNamed(String mode,
+            @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Map<String, String> environment = managedDatabaseEnvironment();
+        environment.put("OFBIZ_POSTGRES_SSLMODE", mode);
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, environment);
+
+        assertNotEquals(0, run.getExitCode(), "[" + mode + "] is not a TLS mode and must be refused, output"
+                + " was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains("OFBIZ_POSTGRES_SSLMODE has an unsupported value"),
+                "the refusal must name the variable and say the value is unsupported, output was:\n"
+                        + run.getOutput());
+        assertTrue(run.getOutput().contains("disable allow prefer require verify-ca verify-full"),
+                "the refusal must list the whole accepted vocabulary, output was:\n" + run.getOutput());
+        assertFalse(Files.exists(sandbox.resolve(RENDERED_OVERRIDE)),
+                "a refused TLS mode must leave no rendered configuration behind");
+    }
+
+    /**
+     * The boolean settings of the datasource are parsed as booleans, in every spelling the entry point
+     * accepts, and refused otherwise.
+     *
+     * <p>The reason none of them may be tested for mere non-emptiness is that each has a meaningful FALSE:
+     * {@code tcpKeepAlive=false} lets a dead connection sit in the pool, and {@code test-on-borrow=false} hands
+     * one out. An operator who writes {@code false} to say "off" must not get "on" because the value happens to
+     * be non-empty, and one who mistypes it must be told rather than silently given the default.
+     *
+     * @param variable the boolean setting
+     * @param supplied the value to supply
+     * @param accepted whether it must be accepted
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @ParameterizedTest(name = "{0}={1} accepted: {2}")
+    @CsvSource({
+        "OFBIZ_POSTGRES_TCP_KEEPALIVE,true,true",
+        "OFBIZ_POSTGRES_TCP_KEEPALIVE,false,true",
+        "OFBIZ_POSTGRES_TCP_KEEPALIVE,YES,true",
+        "OFBIZ_POSTGRES_TCP_KEEPALIVE,no,true",
+        "OFBIZ_POSTGRES_TCP_KEEPALIVE,1,true",
+        "OFBIZ_POSTGRES_TCP_KEEPALIVE,0,true",
+        "OFBIZ_POSTGRES_TCP_KEEPALIVE,on,false",
+        "OFBIZ_POSTGRES_TCP_KEEPALIVE,enabled,false",
+        "OFBIZ_POSTGRES_TCP_KEEPALIVE,2,false",
+        "OFBIZ_DB_POOL_TEST_ON_BORROW,true,true",
+        "OFBIZ_DB_POOL_TEST_ON_BORROW,false,true",
+        "OFBIZ_DB_POOL_TEST_ON_BORROW,No,true",
+        "OFBIZ_DB_POOL_TEST_ON_BORROW,sometimes,false",
+        "OFBIZ_DB_POOL_TEST_ON_BORROW,-1,false",
+    })
+    public void everyDatasourceBooleanIsParsedAsABooleanRatherThanForNonEmptiness(String variable,
+            String supplied, boolean accepted, @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Map<String, String> environment = managedDatabaseEnvironment();
+        environment.put(variable, supplied);
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, environment);
+
+        assertEquals(accepted, run.getExitCode() == 0, variable + "=[" + supplied + "], output was:\n"
+                + run.getOutput());
+        if (!accepted) {
+            assertTrue(run.getOutput().contains(variable + " must be a boolean"),
+                    "the refusal must name the variable and say a boolean is required, output was:\n"
+                            + run.getOutput());
+            assertFalse(Files.exists(sandbox.resolve(RENDERED_OVERRIDE)),
+                    "an unparseable boolean must leave no rendered configuration behind");
+        }
+    }
+
+    /**
+     * The pool and deadline settings are bounded integers, and every way of being outside the bound is
+     * refused with the bound stated.
+     *
+     * <p>A pool maximum in the tens of thousands is not a deployment decision, and a socket deadline of zero -
+     * which is pgJDBC's own default, meaning NO limit - is what made an unreachable database look like a hung
+     * instance rather than a failing one. The leading-zero case is here because {@code 010} is a plausible way
+     * to write a port or a size and the shell's arithmetic reads it as octal, so it is refused rather than
+     * quietly interpreted as 8.
+     *
+     * @param variable the setting to break
+     * @param value the value to supply
+     * @param diagnostic the words the refusal must carry
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @ParameterizedTest(name = "{0}={1} is refused")
+    @CsvSource({
+        "OFBIZ_DB_POOL_MIN,0,must be between",
+        "OFBIZ_DB_POOL_MIN,10001,must be between",
+        "OFBIZ_DB_POOL_MIN,abc,plain decimal integer",
+        "OFBIZ_DB_POOL_MIN,07,without a leading zero",
+        "OFBIZ_DB_POOL_MIN,-2,plain decimal integer",
+        "OFBIZ_DB_POOL_MAX,0,must be between",
+        "OFBIZ_DB_POOL_MAX,10001,must be between",
+        "OFBIZ_DB_POOL_MAX,2.5,plain decimal integer",
+        "OFBIZ_DB_POOL_WAIT,999,must be between",
+        "OFBIZ_DB_POOL_WAIT,300001,must be between",
+        "OFBIZ_DB_POOL_WAIT,0,must be between",
+        "OFBIZ_DB_FLEET_SIZE,0,must be between",
+        "OFBIZ_DB_FLEET_SIZE,1001,must be between",
+        "OFBIZ_DB_MAX_CONNECTIONS,0,must be between",
+        "OFBIZ_DB_MAX_CONNECTIONS,100001,must be between",
+        "OFBIZ_POSTGRES_CONNECT_TIMEOUT,0,must be between",
+        "OFBIZ_POSTGRES_CONNECT_TIMEOUT,301,must be between",
+        "OFBIZ_POSTGRES_SOCKET_TIMEOUT,4,must be between",
+        "OFBIZ_POSTGRES_SOCKET_TIMEOUT,86401,must be between",
+        // An empty value never reaches the range check: the earlier empty-variable census owns it, because
+        // an empty value is what an unresolved secret reference leaves behind rather than a typo.
+        "OFBIZ_POSTGRES_SOCKET_TIMEOUT,'',supplied with an empty value",
+    })
+    public void aBoundedIntegerOutsideItsBoundIsRefusedWithTheBoundStated(String variable, String value,
+            String diagnostic, @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Map<String, String> environment = managedDatabaseEnvironment();
+        environment.put(variable, value);
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, environment);
+
+        assertNotEquals(0, run.getExitCode(), variable + "=[" + value + "] must be refused, output was:\n"
+                + run.getOutput());
+        assertTrue(run.getOutput().contains(variable), "the refusal must name the variable, output was:\n"
+                + run.getOutput());
+        assertTrue(run.getOutput().contains(diagnostic), "the refusal must contain [" + diagnostic
+                + "], output was:\n" + run.getOutput());
+        assertFalse(Files.exists(sandbox.resolve(RENDERED_OVERRIDE)),
+                "a refused value must leave no rendered configuration behind");
+    }
+
+    /**
+     * The cross-field checks: four contradictions that each value passes on its own.
+     *
+     * <p>These are the ones no per-variable validator can see, and each is a configuration that would run
+     * without ever reporting anything. A minimum above the maximum is rejected by DBCP at pool construction,
+     * deep inside entity-engine start up. A connect deadline longer than the socket deadline never applies,
+     * because the socket read ends the attempt first - so the setting an operator added to bound connection
+     * time does nothing. A fleet whose instances can collectively demand more connections than the server
+     * allows works until the last instance starts, and then fails at whichever request happens to arrive next.
+     * And a deployed multi-instance fleet that states no capacity at all has not had its sizing checked.
+     *
+     * @param first the first variable of the pair
+     * @param firstValue its value
+     * @param second the second variable of the pair
+     * @param secondValue its value
+     * @param diagnostic the words the refusal must carry
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @ParameterizedTest(name = "{0}={1} with {2}={3} is refused")
+    @CsvSource({
+        // Individually valid, jointly impossible: the pool cannot hold fewer than its own minimum.
+        "OFBIZ_DB_POOL_MIN,9,OFBIZ_DB_POOL_MAX,8,must not exceed",
+        // The connect deadline can never apply, because the socket deadline ends the attempt first.
+        "OFBIZ_POSTGRES_CONNECT_TIMEOUT,60,OFBIZ_POSTGRES_SOCKET_TIMEOUT,30,would end the connection attempt"
+            + " first",
+        // 10 instances x 250 pooled connections x 3 entity groups against a 100 connection server.
+        "OFBIZ_DB_FLEET_SIZE,10,OFBIZ_DB_MAX_CONNECTIONS,100,can demand more database connections than the"
+            + " server allows",
+    })
+    public void aPairOfSettingsThatContradictEachOtherIsRefusedEvenThoughEachIsValidAlone(String first,
+            String firstValue, String second, String secondValue, String diagnostic, @TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Map<String, String> environment = managedDatabaseEnvironment();
+        environment.put(first, firstValue);
+        environment.put(second, secondValue);
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, environment);
+
+        assertNotEquals(0, run.getExitCode(), first + "=[" + firstValue + "] with " + second + "=["
+                + secondValue + "] must be refused, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains(diagnostic), "the refusal must contain [" + diagnostic
+                + "], output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains(first) && run.getOutput().contains(second),
+                "the refusal must name both halves of the contradiction, output was:\n" + run.getOutput());
+        assertFalse(Files.exists(sandbox.resolve(RENDERED_OVERRIDE)),
+                "a refused pair must leave no rendered configuration behind");
+    }
+
+    /**
+     * A stated capacity entirely consumed by the operational reserve is refused before any arithmetic about the
+     * fleet is attempted.
+     *
+     * <p>The reserve is withheld from the fleet's share for three separate consumers - the slots PostgreSQL
+     * keeps for superusers, the one-shot schema-initialisation execution, and an operator who has to be able to
+     * connect at all to diagnose a saturated database. A stated capacity at or below the reserve therefore
+     * leaves the fleet nothing, and the useful diagnostic is that the stated number cannot be the database's
+     * real {@code max_connections} rather than any statement about pool sizes.
+     *
+     * @param stated the capacity supplied
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @ParameterizedTest(name = "a stated capacity of {0} is entirely reserve")
+    @CsvSource({"1", "9", "10"})
+    public void aStatedCapacityConsumedEntirelyByTheOperationalReserveIsRefused(String stated,
+            @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Map<String, String> environment = managedDatabaseEnvironment();
+        environment.put("OFBIZ_DB_MAX_CONNECTIONS", stated);
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, environment);
+
+        assertNotEquals(0, run.getExitCode(), "a capacity of " + stated + " leaves the fleet nothing and must be"
+                + " refused, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains("leaves nothing once the"), "the refusal must say that the reserve"
+                + " consumes the whole capacity, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains("OFBIZ_DB_MAX_CONNECTIONS"), "the refusal must name the variable to"
+                + " correct, output was:\n" + run.getOutput());
+        assertFalse(Files.exists(sandbox.resolve(RENDERED_OVERRIDE)),
+                "a refused capacity must leave no rendered configuration behind");
+    }
+
+    /**
+     * The fleet-capacity check is a refusal in the deployed profile and a notice in the development one.
+     *
+     * <p>Both halves matter. A multi-instance fleet is precisely the configuration in which a per-instance pool
+     * bound stops being sufficient, so starting one in prod without stating the shared capacity means the
+     * sizing has not been checked at all - that is refused. A single developer container cannot oversubscribe
+     * anything this script can reason about, so refusing there would break the zero-configuration run this
+     * refactor has to preserve; the arithmetic is stated instead, so the number is known before the deployment
+     * becomes a fleet.
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @Test
+    public void anUnstatedFleetCapacityIsRefusedInProductionAndOnlyReportedInDevelopment(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+
+        Path deployed = prepareSandbox(Files.createTempDirectory(tempDir, "prod-fleet"));
+        Map<String, String> production = managedDatabaseEnvironment();
+        production.put("OFBIZ_PROFILE", "prod");
+        production.put("OFBIZ_ADMIN_PASSWORD", "Z3rl9Qm2Xv7Kd4Tb8Fw6");
+        production.put("OFBIZ_DB_FLEET_SIZE", "4");
+        production.remove("OFBIZ_DB_MAX_CONNECTIONS");
+
+        EntryPointRun refused = runInSandbox(tempDir, deployed, CONFIGURE_DATABASE_BODY, production);
+
+        assertNotEquals(0, refused.getExitCode(), "a deployed fleet of 4 that states no capacity must be"
+                + " refused, output was:\n" + refused.getOutput());
+        assertTrue(refused.getOutput().contains("capacity inputs to be stated: OFBIZ_DB_MAX_CONNECTIONS"),
+                "the refusal must name the variable that has to be supplied, output was:\n"
+                        + refused.getOutput());
+        assertFalse(Files.exists(deployed.resolve(RENDERED_OVERRIDE)),
+                "a refused sizing must leave no rendered configuration behind");
+
+        Path development = prepareSandbox(Files.createTempDirectory(tempDir, "dev-fleet"));
+        Map<String, String> single = managedDatabaseEnvironment();
+        single.remove("OFBIZ_DB_MAX_CONNECTIONS");
+
+        EntryPointRun reported = runInSandbox(tempDir, development, CONFIGURE_DATABASE_BODY, single);
+
+        assertEquals(0, reported.getExitCode(), "a single development container must still start, output"
+                + " was:\n" + reported.getOutput());
+        assertTrue(reported.getOutput().contains("has not been checked against the server's max_connections"),
+                "the unchecked arithmetic must be reported so the number is known, output was:\n"
+                        + reported.getOutput());
+    }
+
+    /**
+     * A fleet demand that exactly fits the stated capacity is accepted, which is the boundary the refusal is
+     * anchored on. Without it the capacity check could be off by one - or arbitrarily conservative - and every
+     * case above would still pass while correctly sized deployments were refused.
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @Test
+    public void aFleetDemandThatExactlyFitsTheStatedCapacityIsAccepted(@TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Map<String, String> environment = managedDatabaseEnvironment();
+        // 2 instances x 15 pooled connections x 3 entity groups = 90, and 100 stated less the 10 connection
+        // operational reserve leaves exactly 90.
+        environment.put("OFBIZ_DB_FLEET_SIZE", "2");
+        environment.put("OFBIZ_DB_POOL_MAX", "15");
+        environment.put("OFBIZ_DB_POOL_MIN", "1");
+        environment.put("OFBIZ_DB_MAX_CONNECTIONS", "100");
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, CONFIGURE_DATABASE_BODY, environment);
+
+        assertEquals(0, run.getExitCode(), "a demand of exactly the usable capacity must be accepted, output"
+                + " was:\n" + run.getOutput());
+        assertTrue(Files.readString(sandbox.resolve(RENDERED_OVERRIDE), StandardCharsets.UTF_8)
+                .contains("pool-maxsize=\"15\""), "the accepted pool bound must reach the rendered pools");
+    }
+
+    /*
+     * The retired runtime driver download
+     */
+
+    /**
+     * A PostgreSQL driver jar left in the {@code lib-extra} volume by an older image stops the start.
+     *
+     * <p>The generated start script puts {@code lib-extra} BEFORE {@code lib} on the class path, so a jar there
+     * takes precedence over the driver bundled with the distribution. Earlier versions of this entry point
+     * downloaded {@code postgresql-42.5.4.jar} into that volume on every start; the download is gone and the
+     * driver is bundled at a current, patched version, but the volume persists - so the one thing that must not
+     * happen is silently loading the old jar in preference to the new one. That is a downgrade to a driver with
+     * known CVEs, with no symptom at all.
+     *
+     * @param jar the file name left behind in the volume
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @ParameterizedTest(name = "a stale {0} in lib-extra stops the start")
+    @CsvSource({"postgresql-42.5.4.jar", "postgresql-42.2.5.jre7.jar", "postgresql-9.4.1212.jar",
+        "postgresql-.jar"})
+    public void aStaleJdbcDriverLeftInTheVolumeIsRefusedRatherThanLoadedInsteadOfTheBundledOne(String jar,
+            @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Files.writeString(sandbox.resolve("lib-extra").resolve(jar), "not really a jar",
+                StandardCharsets.UTF_8);
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, "guard_against_stale_jdbc_drivers\n"
+                + "printf '%s\\n' GUARD_PASSED\n", managedDatabaseEnvironment());
+
+        assertNotEquals(0, run.getExitCode(), "[" + jar + "] in lib-extra must stop the start, output was:\n"
+                + run.getOutput());
+        assertFalse(run.getOutput().contains("GUARD_PASSED"), "the guard must not fall through, output was:\n"
+                + run.getOutput());
+        assertTrue(run.getOutput().contains(jar), "the refusal must name the jar it found so the operator can"
+                + " delete it, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains("takes class path precedence"), "the refusal must say why the jar"
+                + " matters, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains("no runtime download is needed"), "the refusal must say that"
+                + " nothing will replace the jar, output was:\n" + run.getOutput());
+    }
+
+    /**
+     * Everything else in the volume is left alone. The volume exists so an operator can add a JMS client jar -
+     * which the cache-invalidation transport requires and this distribution does not bundle - so a guard that
+     * refused any jar at all would make cross-instance cache invalidation unconfigurable.
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @Test
+    public void anyOtherJarInTheVolumeIsLeftAloneBecauseThatIsWhatTheVolumeIsFor(@TempDir Path tempDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Path libExtra = sandbox.resolve("lib-extra");
+        for (String kept : List.of("activemq-client-6.1.4.jar", "artemis-jms-client-all.jar",
+                "mysql-connector-j-9.1.0.jar", "postgresql-notes.txt", "postgresql-42.7.13.jar.disabled")) {
+            Files.writeString(libExtra.resolve(kept), "not really a jar", StandardCharsets.UTF_8);
+        }
+        // A directory whose name matches the pattern: the guard looks for FILES, and refusing a directory
+        // would be a refusal an operator could not act on by deleting a jar.
+        Files.createDirectories(libExtra.resolve("postgresql-42.7.13.jar"));
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, "guard_against_stale_jdbc_drivers\n"
+                + "printf '%s\\n' GUARD_PASSED\n", managedDatabaseEnvironment());
+
+        assertEquals(0, run.getExitCode(), "only a PostgreSQL driver jar may stop the start, output was:\n"
+                + run.getOutput());
+        assertTrue(run.getOutput().contains("GUARD_PASSED"), "the guard must fall through, output was:\n"
+                + run.getOutput());
+    }
+
+    /**
+     * The variable that used to suppress the download is still accepted, and says once that it now does
+     * nothing. Refusing it would break an existing deployment manifest for no benefit; staying silent would
+     * leave an operator to conclude from silence that it still applies.
+     *
+     * @param tempDir a per-test sandbox; nothing outside it is written
+     * @throws Exception if the shell could not be run at all
+     */
+    @Test
+    public void theVariableThatSuppressedTheDownloadIsStillAcceptedAndReportsThatItDoesNothing(
+            @TempDir Path tempDir) throws Exception {
+        assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
+        Path sandbox = prepareSandbox(tempDir);
+        Map<String, String> environment = managedDatabaseEnvironment();
+        environment.put("OFBIZ_SKIP_DB_DRIVER_DOWNLOAD", "true");
+
+        EntryPointRun run = runInSandbox(tempDir, sandbox, "guard_against_stale_jdbc_drivers\n"
+                + "printf '%s\\n' GUARD_PASSED\n", environment);
+
+        assertEquals(0, run.getExitCode(), "the obsolete variable must not stop the start, output was:\n"
+                + run.getOutput());
+        assertTrue(run.getOutput().contains("OFBIZ_SKIP_DB_DRIVER_DOWNLOAD is obsolete and has no effect"),
+                "the obsolete variable must be reported once, output was:\n" + run.getOutput());
+        assertTrue(run.getOutput().contains("GUARD_PASSED"), "the guard must fall through, output was:\n"
+                + run.getOutput());
+    }
+
+    /**
+     * The download itself is gone, asserted from the shipped files rather than from a run.
+     *
+     * <p>A behavioural test cannot establish an ABSENCE: no environment makes the entry point download a
+     * driver, so no run can prove that none would. What can be established is that the script contains no
+     * fetch of one and no variable naming its URL, and that the driver the datasources need is instead a
+     * declared build dependency - which is what makes the bundled jar the only one on the class path.
+     *
+     * @throws IOException if the script or the dependency manifest cannot be read
+     */
+    @Test
+    public void noRuntimeDriverDownloadRemainsAnywhereInTheEntryPoint() throws IOException {
+        String script = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
+
+        // Comments are excluded, and deliberately: the script explains at the guard WHY the download was
+        // retired, and it names the jar it used to fetch in order to do so. What must be absent is an
+        // executable statement that fetches one, not the prose that records that none does.
+        List<String> executable = new ArrayList<>();
+        for (String line : script.split("\n")) {
+            if (!line.stripLeading().startsWith("#")) {
+                executable.add(line);
+            }
+        }
+        for (String line : executable) {
+            for (String retired : List.of("POSTGRES_DRIVER_URL", "jdbc.postgresql.org", "postgresql-42.5.4.jar")) {
+                assertFalse(line.contains(retired), ENTRY_POINT + " must no longer name [" + retired + "] in an"
+                        + " executable line, and this one does: " + line.trim() + ". The driver is bundled by"
+                        + " dependencies.gradle, and a runtime download would put an unpinned jar ahead of it"
+                        + " on the class path");
+            }
+            for (String fetch : List.of("wget", "curl")) {
+                assertFalse(line.contains(fetch) && line.contains("postgresql"), ENTRY_POINT + " must not"
+                        + " fetch a PostgreSQL driver at runtime, and this line does: " + line.trim());
+            }
+        }
+
+        String dependencies = Files.readString(repositoryRoot().resolve("dependencies.gradle"),
+                StandardCharsets.UTF_8);
+        assertTrue(dependencies.contains("org.postgresql:postgresql:"), "dependencies.gradle must declare the"
+                + " PostgreSQL JDBC driver, because the datasources the container renders name"
+                + " org.postgresql.Driver and nothing downloads it any more");
+    }
+
+    /*
      * Harness
      */
 
@@ -3287,6 +4506,24 @@ public final class SchemaInitEntryPointTests {
             + "*x*) printf 'AFTER_HOOK_TRACING=on\\n' ;;\n"
             + "*) printf 'AFTER_HOOK_TRACING=off\\n' ;;\n"
             + "esac\n";
+
+    /**
+     * Reports each SDK credential variable AND whether it is still exported, once a hook has returned.
+     *
+     * <p>The export attribute is the half a value comparison cannot see: {@code declare -p} prints the flags,
+     * and only a name carrying {@code x} reaches the JVM this script exec's. A restore that put the value back
+     * without it would leave every assertion about the value passing and the serving instance resolving no
+     * credentials at all.</p>
+     */
+    private static final String SDK_CREDENTIAL_REPORT =
+            "for sdkName in \"${AWS_CREDENTIAL_ENVIRONMENT_VARIABLES[@]}\"; do\n"
+            + "  sdkFlags=$(declare -p \"$sdkName\" 2>/dev/null || true)\n"
+            + "  sdkFlags=${sdkFlags#declare }\n"
+            + "  case \"${sdkFlags%% *}\" in\n"
+            + "  *x*) printf 'AFTER_HOOK_EXPORTED %s=[%s]\\n' \"$sdkName\" \"${!sdkName-}\" ;;\n"
+            + "  *) printf 'AFTER_HOOK_UNEXPORTED %s\\n' \"$sdkName\" ;;\n"
+            + "  esac\n"
+            + "done\n";
 
     /**
      * Replaces every initialisation stage with a recorder so that {@code _main}'s own control flow - the
@@ -3659,12 +4896,28 @@ public final class SchemaInitEntryPointTests {
     }
 
     private static Set<String> declaredVariableNames(String arrayName) throws IOException {
+        return declaredNamesMatching(arrayName, "OFBIZ_[A-Z0-9_]+");
+    }
+
+    /**
+     * The names matching {@code namePattern} that a multi-line array in the entry point declares.
+     *
+     * <p>Extracted from {@link #declaredVariableNames} for the one inventory made of {@code AWS_} prefixed
+     * names rather than {@code OFBIZ_} ones, so that both counts are taken from the arrays themselves by the
+     * same reader and neither can be checked against a hand-written list that has drifted.</p>
+     *
+     * @param arrayName the shell array to read
+     * @param namePattern the variable-name shape to collect from it
+     * @return the declared names, in declaration order
+     * @throws IOException if the entry point could not be read, which fails the test
+     */
+    private static Set<String> declaredNamesMatching(String arrayName, String namePattern) throws IOException {
         String script = Files.readString(repositoryRoot().resolve(ENTRY_POINT), StandardCharsets.UTF_8);
         Matcher declaration = Pattern.compile("^" + Pattern.quote(arrayName) + "=\\((.*?)^\\)$",
                 Pattern.MULTILINE | Pattern.DOTALL).matcher(script);
         assertTrue(declaration.find(), arrayName + " must be declared as a multi-line array in the entry point");
         Set<String> names = new LinkedHashSet<>();
-        Matcher name = Pattern.compile("OFBIZ_[A-Z0-9_]+").matcher(declaration.group(1));
+        Matcher name = Pattern.compile(namePattern).matcher(declaration.group(1));
         while (name.find()) {
             names.add(name.group());
         }
@@ -3711,6 +4964,14 @@ public final class SchemaInitEntryPointTests {
      * A complete, valid managed-database environment, as a fresh mutable map so a case can change one entry.
      * Every value is synthetic and the host is unroutable, so a case that somehow reached a driver could still
      * not contact anything.
+     *
+     * <p>"Complete" includes the three inputs the deployed profile requires an operator to state rather than
+     * assume - the replica count, the database's connection budget and the schema-init singleton
+     * acknowledgement - because dozens of cases below flip this baseline to {@code OFBIZ_PROFILE=prod} to
+     * examine something else entirely, and every one of them would otherwise be refused for a reason that has
+     * nothing to do with what it is testing. That the three really are required is asserted by
+     * {@link #theDeployedProfileRequiresTheFleetCapacityInputsAndTheSingletonAcknowledgement}, which withdraws
+     * each of them from this same baseline in turn.</p>
      */
     private static Map<String, String> managedDatabaseEnvironment() {
         Map<String, String> environment = new LinkedHashMap<>();
@@ -3729,6 +4990,13 @@ public final class SchemaInitEntryPointTests {
         environment.put("OFBIZ_POSTGRES_SSLROOTCERT", SSL_ROOT_CERTIFICATE);
         environment.put("OFBIZ_DB_POOL_MIN", POOL_MIN);
         environment.put("OFBIZ_DB_POOL_MAX", POOL_MAX);
+        // The capacity inputs the prod profile requires. Sized so the baseline demand - FLEET_SIZE pools of
+        // POOL_MAX for each of the three managed entity groups - sits well inside the budget, because a case
+        // that perturbs the pool maximum must not trip a capacity refusal it was not written to examine.
+        environment.put("OFBIZ_DB_FLEET_SIZE", FLEET_SIZE);
+        environment.put("OFBIZ_DB_MAX_CONNECTIONS", MAX_CONNECTIONS);
+        // Required only by a prod init run, and supplied unconditionally for the same reason as the two above.
+        environment.put("OFBIZ_SCHEMA_INIT_SINGLETON_ACKNOWLEDGED", "true");
         // OFBIZ_DISTRIBUTED_CACHE_CLEAR is deliberately absent, so the baseline render is the default
         // single-node one and a case that wants the other state has to ask for it explicitly.
         environment.put("OFBIZ_PROFILE", "dev");
@@ -3822,6 +5090,21 @@ public final class SchemaInitEntryPointTests {
     }
 
     /** Every distinct render placeholder in a document, in the order they first appear. */
+    /**
+     * Counts every placeholder occurrence in a text, repetitions included.
+     *
+     * @param text the template or rendered configuration to scan
+     * @return how many placeholder occurrences it holds
+     */
+    private static int placeholderOccurrencesIn(String text) {
+        int found = 0;
+        Matcher matcher = PLACEHOLDER.matcher(text);
+        while (matcher.find()) {
+            found++;
+        }
+        return found;
+    }
+
     private static Set<String> placeholdersIn(String text) {
         Set<String> found = new LinkedHashSet<>();
         Matcher matcher = PLACEHOLDER.matcher(text);
@@ -4015,19 +5298,63 @@ public final class SchemaInitEntryPointTests {
                 + "cd " + shellQuote(sandbox) + " || exit 1\n"
                 + body, StandardCharsets.UTF_8);
 
-        List<String> command = new ArrayList<>(List.of("bash", driver.toString()));
-        command.addAll(arguments);
-        ProcessBuilder builder = new ProcessBuilder(command);
-        builder.directory(sandbox.toFile());
-        builder.redirectErrorStream(true);
-        Map<String, String> processEnvironment = builder.environment();
-        processEnvironment.keySet().removeIf(name -> name.startsWith("OFBIZ_"));
-        processEnvironment.putAll(environment);
+        // The shared driver waits on the process before collecting its output and destroys a child that
+        // outruns its deadline; draining first, as this used to, made the deadline unreachable because the
+        // read blocks until the child closes its stream.
+        ShellDriver.Run run = ShellDriver.run(driver, sandbox, environment,
+                ShellDriver.DEFAULT_TIMEOUT_SECONDS, arguments);
+        assertFalse(run.timedOut(), "the entry point driver did not terminate, output was:\n" + run.output());
+        return new EntryPointRun(run.exitCode(), run.output());
+    }
 
-        Process process = builder.start();
-        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertTrue(process.waitFor(120, TimeUnit.SECONDS), "the entry point driver did not terminate");
-        return new EntryPointRun(process.exitValue(), output);
+    /**
+     * Writes a configuration of the deployment's OWN, at the path the container renders into, with the three
+     * entity groups of both default delegators repointed at the named datasources.
+     *
+     * <p>Derived from the committed configuration rather than hand written, so the fixture is a complete, valid
+     * entity configuration - the datasource definitions, the field types and the delegator structure are the
+     * real ones - and the only thing that distinguishes it from a render is the one thing under test: it
+     * carries no ownership marker. The {@code test} delegator is deliberately left on the embedded datasources,
+     * which is what a deployment running its own database would do.</p>
+     *
+     * @param sandbox the directory the script treats as the OFBiz home
+     * @param ofbizHelper the datasource {@code org.apache.ofbiz} is to be mapped to
+     * @param olapHelper the datasource {@code org.apache.ofbiz.olap} is to be mapped to
+     * @param tenantHelper the datasource {@code org.apache.ofbiz.tenant} is to be mapped to
+     * @return the exact bytes written, so a case can assert the file survived unchanged
+     * @throws IOException if the sandbox could not be written, which fails the test rather than being handled
+     */
+    private static String writeOperatorConfiguration(Path sandbox, String ofbizHelper, String olapHelper,
+            String tenantHelper) throws IOException {
+        String committed = Files.readString(sandbox.resolve(ENTITY_ENGINE_SOURCE), StandardCharsets.UTF_8);
+        String mounted = committed;
+        for (String delegatorName : CACHE_CLEAR_DELEGATORS) {
+            int start = mounted.indexOf("<delegator name=\"" + delegatorName + "\"");
+            assertTrue(start >= 0, "the committed configuration must declare the " + delegatorName + " delegator");
+            int end = mounted.indexOf("</delegator>", start);
+            assertTrue(end > start, delegatorName + " must be a closed element");
+            String block = mounted.substring(start, end)
+                    .replace("datasource-name=\"localh2\"", "datasource-name=\"" + ofbizHelper + "\"")
+                    .replace("datasource-name=\"localh2olap\"", "datasource-name=\"" + olapHelper + "\"")
+                    .replace("datasource-name=\"localh2tenant\"", "datasource-name=\"" + tenantHelper + "\"");
+            mounted = mounted.substring(0, start) + block + mounted.substring(end);
+        }
+        assertNotEquals(committed, mounted, "the fixture must actually repoint the default delegators");
+        Path destination = sandbox.resolve(RENDERED_OVERRIDE);
+        Files.createDirectories(destination.getParent());
+        Files.writeString(destination, mounted, StandardCharsets.UTF_8);
+        // The marker must be absent from the PROLOG, which is the only place the entry point looks: it reads the
+        // first five lines, so a file that merely MENTIONS the marker further down is still the deployment's -
+        // and the committed configuration this fixture is derived from does mention it, in the comment that
+        // documents the ownership rule. Asserting on the whole text would therefore both fail here and assert a
+        // rule the script does not have.
+        assertFalse(String.join("\n", Files.readAllLines(destination, StandardCharsets.UTF_8).subList(0, 5))
+                        .contains(OWNERSHIP_MARKER),
+                "a fixture standing in for a deployment's own file must carry no ownership marker in its prolog");
+        assertTrue(mounted.contains(OWNERSHIP_MARKER),
+                "the committed configuration documents the ownership rule, so this fixture also proves that a"
+                        + " file merely mentioning the marker is not mistaken for a render");
+        return mounted;
     }
 
     /** Single-quotes a path for safe interpolation into the generated driver. */
@@ -4040,16 +5367,16 @@ public final class SchemaInitEntryPointTests {
         return "'" + value.replace("'", "'\\''") + "'";
     }
 
+    /**
+     * Whether a POSIX shell can be executed, so the shell-driven assertions can be skipped if not.
+     *
+     * <p>Delegated to the shared driver rather than repeated: this probe has to start a process, wait
+     * for it and close its output, and every copy of it was one more place to get that wrong.
+     *
+     * @return true when {@code bash} can be run
+     */
     private static boolean isBashAvailable() {
-        try {
-            Process process = new ProcessBuilder("bash", "-c", "exit 0").start();
-            return process.waitFor(60, TimeUnit.SECONDS) && process.exitValue() == 0;
-        } catch (IOException unavailable) {
-            return false;
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
+        return ShellDriver.isBashAvailable();
     }
 
     private static Path repositoryRoot() {

@@ -160,6 +160,30 @@ public class ControlFilter extends HttpFilter {
         return null != System.getProperty("ControlFilterTests");
     }
 
+    /**
+     * Returns the requested path with the webapp's mount point removed.
+     *
+     * <p>Used only to recognise a health probe. The container has already normalised and decoded the URI
+     * and stripped any path parameters by the time a filter sees it, so no {@code ../} traversal,
+     * {@code %2e} escape or {@code ;jsessionid} suffix can reach the exact comparison the probe test
+     * performs. Nothing here touches the session or the request body, which is the whole point of doing
+     * it before either of those happens.
+     *
+     * @param req the request being filtered
+     * @param context the webapp's context path
+     * @return the path within the webapp, or the whole URI when it does not start with the context path
+     */
+    private static String pathWithinWebapp(HttpServletRequest req, String context) {
+        String uri = req.getRequestURI();
+        if (uri == null) {
+            return "";
+        }
+        if (context != null && !context.isEmpty() && uri.startsWith(context)) {
+            return uri.substring(context.length());
+        }
+        return uri;
+    }
+
 
     /**
      * Makes allowed paths pass through while redirecting the others to a fix location.
@@ -168,6 +192,22 @@ public class ControlFilter extends HttpFilter {
     @Override
     public void doFilter(HttpServletRequest req, HttpServletResponse resp, FilterChain chain) throws IOException, ServletException {
         String context = req.getContextPath();
+        // A load-balancer health probe passes straight through, before anything below runs. Two of the
+        // statements that follow would otherwise happen on every probe: req.getSession() CREATES a
+        // session, and UtilHttp.getParameterMap READS THE REQUEST BODY. A probe that mints a session is
+        // per-instance state created by an unauthenticated caller at the polling interval - the opposite
+        // of what a probe on a freely replaceable instance may do - and a probe that has its body parsed
+        // is no longer a cheap, side-effect-free question. Neither the allowed-path test nor the
+        // redirect below has anything to decide for these two paths either: the servlet-mapping answers
+        // them and nothing else, and a probe cannot follow a redirect to a login screen.
+        //
+        // The paths come from HealthCheckServlet, which owns them, so this exemption cannot drift from
+        // what the servlet actually answers, and it is an EXACT match on the two of them - no /health
+        // prefix is exempted, so no other URL reaches the chain with these checks skipped.
+        if (HealthCheckServlet.isProbePath(pathWithinWebapp(req, context))) {
+            chain.doFilter(req, resp);
+            return;
+        }
         HttpSession session = req.getSession();
         boolean isEntityImport = req.getRequestURI().equals("/webtools/control/entityImport");
         boolean isProgramExport = req.getRequestURI().equals("/webtools/control/ProgramExport");

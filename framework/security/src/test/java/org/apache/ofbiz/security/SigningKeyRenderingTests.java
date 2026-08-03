@@ -39,9 +39,9 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
+import org.apache.ofbiz.base.test.ShellDriver;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -355,56 +355,76 @@ public final class SigningKeyRenderingTests {
      */
 
     /**
-     * A key that begins with whitespace is refused rather than silently shortened.
+     * A key with whitespace at either end is refused rather than silently shortened.
      *
-     * <p>Every validation in this script runs on the shell's copy of the value, but the application reads
-     * whatever {@code java.util.Properties} makes of the rendered line - and {@code Properties} discards blanks
-     * between the {@code =} and the first non-blank character. A 64 character key with three leading spaces
-     * therefore passes the HMAC512 length floor in the shell and arrives at {@code JWTManager} as 61
-     * characters, where it is rejected outright at the first token; a leading tab does the same. The failure is
-     * invisible until the first JWT or the first forgot-password request, and nothing in the container reports
-     * why. A leading space is exactly what a YAML block scalar or a copied secret-manager value produces, so
-     * this is a configuration mistake rather than an attack, and it has to be reported at start up.</p>
+     * <p>Every validation in this script runs on the shell's copy of the value, but the application reads what
+     * the rendered line yields <em>through {@code UtilProperties}</em>, and two separate layers shorten a key
+     * before it gets there.</p>
+     *
+     * <p>{@code java.util.Properties} discards blanks between the {@code =} and the first non-blank character, so
+     * a 64 character key with three LEADING spaces passes the HMAC512 length floor in the shell and arrives at
+     * {@code JWTManager} as 61 characters, where it is rejected outright at the first token; a leading tab does
+     * the same.</p>
+     *
+     * <p>A TRAILING blank survives {@code Properties.load} - the value runs to the end of the line - but it does
+     * not survive the accessor: {@code LoginWorker} reads {@code login.secret_key_string} and {@code JWTManager}
+     * reads {@code security.token.key} through {@code UtilProperties.getPropertyValue}, which returns
+     * {@code value.trim()}. A key whose last character is a space is therefore validated at one length and used
+     * at another, exactly as a leading blank is, and a 64 character key with one trailing space is used as 63 -
+     * below the floor the shell just enforced. The value is also one no operator can reproduce: it cannot be
+     * typed back, and rotating to "the same" key without the invisible character produces a different key and
+     * invalidates every issued token.</p>
+     *
+     * <p>Both ends are consequently refused before anything is written, while whitespace INSIDE a key is
+     * accepted - neither layer touches it - which is what stops the rule from becoming an arbitrary
+     * restriction. A blank at an end is exactly what a YAML block scalar or a copied secret-manager value
+     * produces, so this is a configuration mistake rather than an attack, and it has to be reported at start
+     * up.</p>
      *
      * @param tempDir a per-test sandbox; nothing outside it is written
      * @throws Exception if the shell could not be run at all, which fails the test rather than being handled
      */
     @Test
-    public void aSigningKeyThatBeginsWithWhitespaceIsRefusedRatherThanSilentlyShortened(@TempDir Path tempDir)
+    public void aSigningKeyWithWhitespaceAtEitherEndIsRefusedRatherThanSilentlyShortened(@TempDir Path tempDir)
             throws Exception {
         assumeTrue(isBashAvailable(), "a POSIX shell is required to execute the entry point");
 
         for (String variable : List.of(LOGIN_KEY_VARIABLE, JWT_KEY_VARIABLE)) {
             for (String blank : List.of(" ", "   ", "\t", " \t ")) {
-                Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "blank"));
-                Map<String, String> environment = new LinkedHashMap<>();
-                environment.put("OFBIZ_PROFILE", "prod");
-                environment.put(LOGIN_KEY_VARIABLE, LOGIN_KEY);
-                environment.put(JWT_KEY_VARIABLE, JWT_KEY);
-                String padded = blank + (LOGIN_KEY_VARIABLE.equals(variable) ? LOGIN_KEY : JWT_KEY);
-                environment.put(variable, padded);
+                for (boolean leading : List.of(true, false)) {
+                    Path sandbox = prepareSandbox(Files.createTempDirectory(tempDir, "blank"));
+                    Map<String, String> environment = new LinkedHashMap<>();
+                    environment.put("OFBIZ_PROFILE", "prod");
+                    environment.put(LOGIN_KEY_VARIABLE, LOGIN_KEY);
+                    environment.put(JWT_KEY_VARIABLE, JWT_KEY);
+                    String key = LOGIN_KEY_VARIABLE.equals(variable) ? LOGIN_KEY : JWT_KEY;
+                    String padded = leading ? blank + key : key + blank;
+                    environment.put(variable, padded);
 
-                RendererRun run = renderSecurityConfiguration(tempDir, sandbox, environment);
+                    RendererRun run = renderSecurityConfiguration(tempDir, sandbox, environment);
 
-                assertNotEquals(0, run.exitCode(), variable
-                        + " with leading whitespace must be refused, output was:\n" + run.output());
-                assertTrue(run.output().contains(variable),
-                        "the failure must name the offending variable, output was:\n" + run.output());
-                assertFalse(Files.exists(sandbox.resolve(SECURITY_OVERRIDE)),
-                        "a refused key must leave no configuration behind");
-                assertFalse(run.output().contains(padded.strip()),
-                        "the refused key leaked into the output:\n" + run.output());
+                    assertNotEquals(0, run.exitCode(), variable + " with "
+                            + (leading ? "leading" : "trailing")
+                            + " whitespace must be refused, output was:\n" + run.output());
+                    assertTrue(run.output().contains(variable),
+                            "the failure must name the offending variable, output was:\n" + run.output());
+                    assertFalse(Files.exists(sandbox.resolve(SECURITY_OVERRIDE)),
+                            "a refused key must leave no configuration behind");
+                    assertFalse(run.output().contains(padded.strip()),
+                            "the refused key leaked into the output:\n" + run.output());
+                }
             }
         }
 
-        // Whitespace INSIDE or at the END of a key is not a canonicalization hazard - Properties preserves it -
-        // so it must still be accepted, which is what stops this check from becoming an arbitrary restriction.
+        // Whitespace INSIDE a key is not a canonicalization hazard - neither Properties.load nor
+        // UtilProperties.getPropertyValue touches it - so it must still be accepted and must still round trip
+        // verbatim, which is what stops the refusal above from becoming a blanket "no whitespace" rule.
         Path accepted = prepareSandbox(Files.createTempDirectory(tempDir, "inner-blank"));
-        String innerBlanks = "Login Signing Key With Inner Blanks And A Trailing One-0123456789 ";
+        String innerBlanks = "Login Signing Key With Inner Blanks And No Edge One-0123456789012";
         assertTrue(innerBlanks.length() >= SIGNING_KEY_MIN_LENGTH, "the fixture must clear the length floor");
         RendererRun run = renderSecurityConfiguration(tempDir, accepted, Map.of(
                 "OFBIZ_PROFILE", "prod", LOGIN_KEY_VARIABLE, innerBlanks, JWT_KEY_VARIABLE, JWT_KEY));
-        assertEquals(0, run.exitCode(), "inner and trailing blanks must be accepted, output was:\n" + run.output());
+        assertEquals(0, run.exitCode(), "inner blanks must be accepted, output was:\n" + run.output());
         assertEquals(innerBlanks, loadProperties(accepted.resolve(SECURITY_OVERRIDE))
                 .getProperty(LOGIN_KEY_PROPERTY), "a key with inner blanks must round trip exactly");
     }
@@ -895,17 +915,12 @@ public final class SigningKeyRenderingTests {
                 + "cd " + shellQuote(sandbox) + " || exit 1\n"
                 + body, StandardCharsets.UTF_8);
 
-        ProcessBuilder builder = new ProcessBuilder("bash", driver.toString());
-        builder.directory(sandbox.toFile());
-        builder.redirectErrorStream(true);
-        Map<String, String> processEnvironment = builder.environment();
-        RENDERER_VARIABLES.forEach(processEnvironment::remove);
-        processEnvironment.putAll(environment);
-
-        Process process = builder.start();
-        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertTrue(process.waitFor(120, TimeUnit.SECONDS), "the entry point renderer did not terminate");
-        return new RendererRun(process.exitValue(), output);
+        // The shared driver waits on the process before collecting its output and destroys a child that
+        // outruns its deadline; draining first, as this used to, made the deadline unreachable because the
+        // read blocks until the child closes its stream.
+        ShellDriver.Run run = ShellDriver.run(driver, sandbox, environment);
+        assertFalse(run.timedOut(), "the entry point renderer did not terminate, output was:\n" + run.output());
+        return new RendererRun(run.exitCode(), run.output());
     }
 
     /** Single-quotes a path for safe interpolation into the generated driver. */
@@ -921,16 +936,16 @@ public final class SigningKeyRenderingTests {
         return properties;
     }
 
+    /**
+     * Whether a POSIX shell can be executed, so the shell-driven assertions can be skipped if not.
+     *
+     * <p>Delegated to the shared driver rather than repeated: this probe has to start a process, wait
+     * for it and close its output, and every copy of it was one more place to get that wrong.
+     *
+     * @return true when {@code bash} can be run
+     */
     private static boolean isBashAvailable() {
-        try {
-            Process process = new ProcessBuilder("bash", "-c", "exit 0").start();
-            return process.waitFor(60, TimeUnit.SECONDS) && process.exitValue() == 0;
-        } catch (IOException e) {
-            return false;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
+        return ShellDriver.isBashAvailable();
     }
 
     private static Path repositoryRoot() {

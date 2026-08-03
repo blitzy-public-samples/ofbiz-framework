@@ -19,7 +19,6 @@
 package org.apache.ofbiz.entity;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,17 +34,16 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Asserts the database least-privilege posture of Objective 4 against a real PostgreSQL server: the
@@ -62,24 +60,28 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * instance or reads its environment inherits the privilege. The only way to establish that the
  * privilege is actually absent is to ask a real server to refuse it.</p>
  *
- * <p>What is exercised is the artefact the project ships, not a copy of it. The two accounts are
- * provisioned by running {@code docker/examples/postgres-demo/postgres-initdb.d/10-init-user-db.sh}
- * - the script an operator's PostgreSQL service actually runs - so a change that weakens the grants
- * in that script fails this test. The grants it applies are written out for a single database, with
- * the reasoning behind each one, under <i>Database roles and least privilege</i> in
- * {@code DOCKER.adoc}.</p>
+ * <p>What is exercised is the grant sequence the project documents, not an invention of this test. The
+ * statements applied by {@link Provisioning} are the ones written out under <i>Database roles and least
+ * privilege</i> in {@code DOCKER.adoc}, and
+ * {@link #theDocumentedGrantSequenceIsTheOneThisTestApplies()} asserts that correspondence directly, so
+ * a change that weakens the documented grants fails this test rather than quietly diverging from it.
+ * The grants are applied over JDBC, through the driver this refactor bundles, so the test needs neither
+ * a shell nor a {@code psql} client and cannot be skipped for want of one.</p>
  *
- * <p><b>This test is opt-in and is skipped by default</b>, because it needs a PostgreSQL server that
- * it may create and drop databases and roles on, which a unit tier cannot assume. Supply the
- * connection details to run it, either as Gradle command-line system properties:</p>
+ * <p><b>The two live checks below carry the {@code external-services} JUnit tag</b>, so they are excluded
+ * from the offline {@code test} task and are run by {@code testExternalServices}, where a missing setting
+ * FAILS instead of skipping. That separation replaces what this class used to do: sit in the ordinary unit
+ * task and skip itself whenever no server was configured, which meant the whole suite reported success while
+ * the one contract only a server can establish had been verified by nothing at all. The documentation check
+ * carries no tag and stays in the unit tier, because it needs no server.</p>
  *
  * <pre>
- * ./gradlew test --tests '*DatabaseLeastPrivilegeTests*' \
+ * ./gradlew testExternalServices --tests '*DatabaseLeastPrivilegeTests*' \
  *     -Dofbiz.test.postgres.host=127.0.0.1 \
  *     -Dofbiz.test.postgres.password="the superuser password"
  * </pre>
  *
- * <p>or as environment variables ({@code OFBIZ_TEST_POSTGRES_HOST},
+ * <p>Every setting may also arrive as an environment variable ({@code OFBIZ_TEST_POSTGRES_HOST},
  * {@code OFBIZ_TEST_POSTGRES_PORT}, {@code OFBIZ_TEST_POSTGRES_SUPERUSER},
  * {@code OFBIZ_TEST_POSTGRES_PASSWORD}, {@code OFBIZ_TEST_POSTGRES_SSLMODE}). The account supplied
  * must be able to create roles and databases. Every object this test creates carries a per-run random
@@ -88,14 +90,21 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 public class DatabaseLeastPrivilegeTests {
 
+    /**
+     * The JUnit tag that moves a check out of the offline unit task and into {@code testExternalServices}.
+     *
+     * <p>Named here as a constant rather than written as a literal at each use so that a rename cannot leave
+     * one of the two live checks behind in the unit tier, where it would once again skip itself.
+     */
+    private static final String EXTERNAL_SERVICES = "external-services";
+
     /** Located by walking up from the working directory, so the suite runs from any module. */
     private static final String DEPENDENCY_MANIFEST = "dependencies.gradle";
 
-    /** The provisioning script this test exercises rather than re-implements. */
-    private static final String PROVISIONING_SCRIPT =
-            "docker/examples/postgres-demo/postgres-initdb.d/10-init-user-db.sh";
+    /** The document whose <i>Database roles and least privilege</i> section this test holds itself to. */
+    private static final String OPERATOR_DOCUMENTATION = "DOCKER.adoc";
 
-    /** Opt-in configuration. Absent host or password means the whole class is skipped. */
+    /** Injected configuration. Absent host or password fails the live checks; it never skips them. */
     private static final String HOST_KEY = "ofbiz.test.postgres.host";
     private static final String PORT_KEY = "ofbiz.test.postgres.port";
     private static final String SUPERUSER_KEY = "ofbiz.test.postgres.superuser";
@@ -122,8 +131,55 @@ public class DatabaseLeastPrivilegeTests {
     /** The driver is on the test runtime classpath through {@code runtimeOnly} and is loaded by name. */
     private static final String DRIVER_CLASS = "org.postgresql.Driver";
 
-    /** Long enough that a slow provisioning run does not fail, short enough that a hang is a failure. */
-    private static final long SCRIPT_TIMEOUT_SECONDS = 180;
+    /**
+     * The example identifiers the documented grant sequence is written with, and the placeholder the
+     * documented passwords carry. {@link Provisioning} substitutes its own throwaway names for these,
+     * which is also what lets {@link #theDocumentedGrantSequenceIsTheOneThisTestApplies()} compare the
+     * two texts.
+     */
+    private static final String DOCUMENTED_INIT_ROLE = "ofbiz_init";
+    private static final String DOCUMENTED_SERVING_ROLE = "ofbiz_app";
+    private static final String DOCUMENTED_DATABASE = "ofbizmaindb";
+
+    /**
+     * The grant sequence exactly as <i>Database roles and least privilege</i> in {@code DOCKER.adoc}
+     * writes it out, split into the statements a JDBC connection issues one at a time.
+     *
+     * <p>Held here as data rather than embedded in the provisioning code so that one list is both what
+     * gets applied to the server and what gets compared with the documentation. The two
+     * {@code CREATE ROLE} statements are omitted because the documented text carries a literal password
+     * placeholder rather than a value; the roles are still created with exactly the documented
+     * {@code LOGIN PASSWORD} shape, which {@link Provisioning#createRoles} does.
+     *
+     * <p>The first group runs against the maintenance database, because the target database does not
+     * exist yet; the second runs inside the database it configures, which is what the documented
+     * {@code \connect} metacommand does for a {@code psql} reader.
+     */
+    private static final List<String> CLUSTER_GRANTS = List.of(
+            "CREATE DATABASE " + DOCUMENTED_DATABASE + " OWNER " + DOCUMENTED_INIT_ROLE,
+            "REVOKE ALL ON DATABASE " + DOCUMENTED_DATABASE + " FROM PUBLIC",
+            "GRANT CONNECT, TEMPORARY ON DATABASE " + DOCUMENTED_DATABASE + " TO " + DOCUMENTED_INIT_ROLE,
+            "GRANT CONNECT, TEMPORARY ON DATABASE " + DOCUMENTED_DATABASE + " TO " + DOCUMENTED_SERVING_ROLE);
+
+    private static final List<String> SCHEMA_GRANTS = List.of(
+            "ALTER SCHEMA public OWNER TO " + DOCUMENTED_INIT_ROLE,
+            "REVOKE ALL ON SCHEMA public FROM PUBLIC",
+            "GRANT USAGE ON SCHEMA public TO " + DOCUMENTED_SERVING_ROLE,
+            "ALTER DEFAULT PRIVILEGES FOR ROLE " + DOCUMENTED_INIT_ROLE + " IN SCHEMA public"
+                    + " GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO " + DOCUMENTED_SERVING_ROLE,
+            "ALTER DEFAULT PRIVILEGES FOR ROLE " + DOCUMENTED_INIT_ROLE + " IN SCHEMA public"
+                    + " GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO " + DOCUMENTED_SERVING_ROLE,
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO " + DOCUMENTED_SERVING_ROLE,
+            "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO " + DOCUMENTED_SERVING_ROLE);
+
+    /** Both halves of the sequence, in the order they are applied and documented. */
+    private static final List<String> DOCUMENTED_GRANT_SEQUENCE = documentedGrantSequence();
+
+    private static List<String> documentedGrantSequence() {
+        List<String> sequence = new ArrayList<>(CLUSTER_GRANTS);
+        sequence.addAll(SCHEMA_GRANTS);
+        return List.copyOf(sequence);
+    }
 
     /**
      * Two entity-model-shaped tables, created by the initialization role exactly as the init execution
@@ -184,19 +240,20 @@ public class DatabaseLeastPrivilegeTests {
      * the schema in the first place.
      *
      * <p>The order matters and is the point of the test. The tables are created by the initialization
-     * role <em>after</em> the provisioning script has run, which is the real sequence - the grants are
+     * role <em>after</em> the documented grants have been applied, which is the real sequence - the grants
      * applied to an empty database and the schema arrives later, from the init execution. The serving
      * role's row privileges on those tables therefore cannot have come from a grant naming them; they
      * come from {@code ALTER DEFAULT PRIVILEGES}, which is what makes the arrangement survive the next
      * schema-affecting release without a follow-up grant. If that statement were dropped from the
-     * provisioning script, the permitted half of this test would fail rather than the refused half.</p>
+     * documented sequence, the permitted half of this test would fail rather than the refused half.</p>
      *
-     * @throws Exception if the server could not be reached or the provisioning script could not be
-     *         run, either of which fails the test rather than being reported as a pass
+     * @throws Exception if the server could not be reached or a documented grant was refused, either of
+     *         which fails the test rather than being reported as a pass
      */
     @Test
+    @Tag(EXTERNAL_SERVICES)
     public void theServingRoleMovesRowsAndIsRefusedEverySchemaChange() throws Exception {
-        assumeConfigured();
+        requireConfigured();
         Provisioning provisioning = new Provisioning();
         try {
             provisioning.run();
@@ -251,11 +308,12 @@ public class DatabaseLeastPrivilegeTests {
      * membership, so the three routes are asserted directly: reading the password hash, being a member
      * of the privileged role, and holding the attributes that would make the restriction moot.</p>
      *
-     * @throws Exception if the server could not be reached or the provisioning script could not be run
+     * @throws Exception if the server could not be reached or a documented grant was refused
      */
     @Test
+    @Tag(EXTERNAL_SERVICES)
     public void theServingRoleCannotBecomeTheInitializationRole() throws Exception {
-        assumeConfigured();
+        requireConfigured();
         Provisioning provisioning = new Provisioning();
         try {
             provisioning.run();
@@ -287,39 +345,30 @@ public class DatabaseLeastPrivilegeTests {
     }
 
     /**
-     * The provisioning script refuses to create a pair of accounts that is not really a pair, and
-     * refuses an incomplete one, rather than provisioning databases in a shape the container would
-     * later reject.
+     * The grant sequence this test applies is the sequence {@code DOCKER.adoc} tells an operator to
+     * apply, statement for statement.
      *
-     * <p>Both refusals are asserted against the first group the script handles, so the assertion that
-     * nothing was created is meaningful: a script that failed on the third group would already have
-     * provisioned the first two.</p>
+     * <p>This is what keeps the privilege assertions above honest. They prove that <em>some</em> pair of
+     * roles behaves correctly; only this test proves that the pair they prove it for is the pair the
+     * documentation asks an operator to create. Without it, the documented grants could be weakened -
+     * a {@code GRANT CREATE ON SCHEMA public}, a forgotten {@code REVOKE} - while the assertions above
+     * went on passing against a stricter set that no deployment actually applies.</p>
      *
-     * @throws Exception if the server could not be reached or the provisioning script could not be run
+     * <p>It needs no server and no configuration, so it is not opt-in: the correspondence between the
+     * test and the documentation is checked on every unit run.</p>
+     *
+     * @throws IOException if the operator documentation cannot be read
      */
     @Test
-    public void theProvisioningScriptRefusesAnIdentityThatIsNotSeparate() throws Exception {
-        assumeConfigured();
-        Provisioning provisioning = new Provisioning();
-        try {
-            Map<String, String> notSeparate = provisioning.environment();
-            notSeparate.put("OFBIZ_POSTGRES_OFBIZ_INIT_USER", provisioning.servingUser(Group.OFBIZ));
-            ScriptRun reused = provisioning.runExpectingFailure(notSeparate);
-            assertTrue(reused.output().contains("OFBIZ_POSTGRES_OFBIZ_INIT_USER")
-                            && reused.output().contains("name the same role"),
-                    "the refusal must say which two variables collided, output was:\n" + reused.output());
-            assertFalse(provisioning.databaseExists(Group.OFBIZ),
-                    "nothing may be provisioned when the identities are not separate");
-
-            Map<String, String> incomplete = provisioning.environment();
-            incomplete.remove("OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD");
-            ScriptRun missing = provisioning.runExpectingFailure(incomplete);
-            assertTrue(missing.output().contains("OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD"),
-                    "the refusal must name the missing variable, output was:\n" + missing.output());
-            assertFalse(provisioning.databaseExists(Group.OFBIZ),
-                    "a role must never be created without the password it was supposed to be given");
-        } finally {
-            provisioning.drop();
+    public void theDocumentedGrantSequenceIsTheOneThisTestApplies() throws IOException {
+        String documented = normaliseSql(Files.readString(repositoryRoot().resolve(OPERATOR_DOCUMENTATION),
+                StandardCharsets.UTF_8));
+        for (String statement : DOCUMENTED_GRANT_SEQUENCE) {
+            assertTrue(documented.contains(normaliseSql(statement)),
+                    OPERATOR_DOCUMENTATION + " must document the statement this test applies, and no longer"
+                            + " declares [" + statement + "]. Either the documented grants were weakened, in"
+                            + " which case restore them, or they were deliberately changed, in which case change"
+                            + " this test and its privilege assertions with them.");
         }
     }
 
@@ -327,22 +376,30 @@ public class DatabaseLeastPrivilegeTests {
      * Opt-in gating
      */
 
-    private static void assumeConfigured() {
-        assumeTrue(setting(HOST_KEY, null) != null,
-                "set -D" + HOST_KEY + " (or OFBIZ_TEST_POSTGRES_HOST) to run the least-privilege test against"
-                        + " a PostgreSQL server");
-        assumeTrue(setting(PASSWORD_KEY, null) != null,
-                "set -D" + PASSWORD_KEY + " (or OFBIZ_TEST_POSTGRES_PASSWORD) to the password of a PostgreSQL"
-                        + " account that may create roles and databases");
-        assumeTrue(isCommandAvailable("bash", "-c", "exit 0"),
-                "a POSIX shell is required to run the provisioning script this test exercises");
-        assumeTrue(isCommandAvailable("psql", "--version"),
-                "the psql client is required: the provisioning script this test exercises uses it");
-        assumeTrue(isDriverAvailable(), DRIVER_CLASS + " must be on the test runtime classpath");
+    private static void requireConfigured() {
+        List<String> missing = new ArrayList<>();
+        if (setting(HOST_KEY, null) == null) {
+            missing.add(HOST_KEY + " (or OFBIZ_TEST_POSTGRES_HOST), the host of a PostgreSQL server this test"
+                    + " may create and drop databases and roles on");
+        }
+        if (setting(PASSWORD_KEY, null) == null) {
+            missing.add(PASSWORD_KEY + " (or OFBIZ_TEST_POSTGRES_PASSWORD), the password of an account that may"
+                    + " create roles and databases");
+        }
+        if (!missing.isEmpty()) {
+            fail("the least-privilege checks need a real PostgreSQL server and these settings were not"
+                    + " supplied: " + missing + ". Supply each as -D<name>=<value>, as -P<name>=<value>, or as"
+                    + " the matching OFBIZ_TEST_POSTGRES_* environment variable, and run ./gradlew"
+                    + " testExternalServices. This is a failure rather than a skip on purpose: only a server can"
+                    + " establish that a serving role is REFUSED a schema change, so a skip here would report"
+                    + " success for the one privilege claim nothing else in this repository can verify.");
+        }
+        assertTrue(isDriverAvailable(), DRIVER_CLASS + " must be on the test runtime classpath: it is bundled by "
+                + DEPENDENCY_MANIFEST + ", so its absence is a build problem rather than a configuration one");
     }
 
     /**
-     * Reads one opt-in setting, preferring a system property so that a value can be supplied on the
+     * Reads one injected setting, preferring a system property so that a value can be supplied on the
      * Gradle command line without restarting the daemon, and falling back to the equivalent
      * environment variable.
      *
@@ -369,24 +426,6 @@ public class DatabaseLeastPrivilegeTests {
             Class.forName(DRIVER_CLASS);
             return true;
         } catch (ClassNotFoundException absent) {
-            return false;
-        }
-    }
-
-    private static boolean isCommandAvailable(String... command) {
-        try {
-            Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-            // Drained before waiting, and closed, so neither a probe that prints more than the pipe
-            // buffer holds nor a repeated availability check can leave the JVM holding a pipe open.
-            try (InputStream output = process.getInputStream()) {
-                output.readAllBytes();
-            }
-            boolean finished = process.waitFor(60, TimeUnit.SECONDS);
-            return finished && process.exitValue() == 0;
-        } catch (IOException unavailable) {
-            return false;
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
             return false;
         }
     }
@@ -428,40 +467,20 @@ public class DatabaseLeastPrivilegeTests {
     }
 
     /*
-     * Provisioning through the shipped script
+     * Provisioning through the documented grant sequence
      */
 
-    /** The three entity groups the provisioning script and the entry point both iterate over. */
+    /** The three entity groups the documented procedure and the entry point both iterate over. */
     private enum Group {
         OFBIZ, OLAP, TENANT
     }
 
-    /** The outcome of one run of the provisioning script. */
-    private static final class ScriptRun {
-        private final int exitCode;
-        private final String output;
-
-        private ScriptRun(int exitCode, String output) {
-            this.exitCode = exitCode;
-            this.output = output;
-        }
-
-        private int exitCode() {
-            return exitCode;
-        }
-
-        private String output() {
-            return output;
-        }
-    }
-
     /**
-     * Creates, connects to and drops the throwaway databases and roles of one test, driving the shipped
-     * provisioning script for the creation half so that what is proven is the shipped grants.
+     * Creates, connects to and drops the throwaway databases and roles of one test by applying
+     * {@link #DOCUMENTED_GRANT_SEQUENCE} over JDBC, so that what is proven is the documented grants.
      */
     private static final class Provisioning {
         private final String suffix = "lp" + Long.toHexString(new SecureRandom().nextLong() & 0xFFFFFFFFL);
-        private final Path script = repositoryRoot().resolve(PROVISIONING_SCRIPT);
 
         private String database(Group group) {
             return suffix + "_" + group.name().toLowerCase(Locale.ROOT) + "_db";
@@ -484,66 +503,73 @@ public class DatabaseLeastPrivilegeTests {
         }
 
         /**
-         * The environment the compose example gives the PostgreSQL service, with this run's throwaway
-         * names. Returned mutable so a test can break exactly one value and assert the refusal.
+         * Applies the documented grant sequence to all three databases, exactly as an operator would.
          *
-         * @return the fifteen provisioning variables plus the psql connection settings
+         * <p>The two roles are created first, then the cluster-level statements against the maintenance
+         * database, then the schema-level statements from inside each database - which is the order the
+         * documentation prescribes and the order the grants require, since a schema cannot be configured
+         * before the database that holds it exists.
+         *
+         * @throws SQLException if the server refused a statement the documented procedure relies on,
+         *     which fails the test rather than being reported as a pass
          */
-        private Map<String, String> environment() {
-            Map<String, String> environment = new LinkedHashMap<>();
+        private void run() throws SQLException {
+            try (Connection superuser = connectAsSuperuser()) {
+                createRoles(superuser);
+                for (Group group : Group.values()) {
+                    for (String statement : CLUSTER_GRANTS) {
+                        execute(superuser, substituted(statement, group));
+                    }
+                }
+            }
             for (Group group : Group.values()) {
-                environment.put("OFBIZ_POSTGRES_" + group + "_DB", database(group));
-                environment.put("OFBIZ_POSTGRES_" + group + "_USER", servingUser(group));
-                environment.put("OFBIZ_POSTGRES_" + group + "_PASSWORD", servingPassword(group));
-                environment.put("OFBIZ_POSTGRES_" + group + "_INIT_USER", initializationUser(group));
-                environment.put("OFBIZ_POSTGRES_" + group + "_INIT_PASSWORD", initializationPassword(group));
+                try (Connection inDatabase = connect(database(group), setting(SUPERUSER_KEY, DEFAULT_SUPERUSER),
+                        setting(PASSWORD_KEY, null))) {
+                    for (String statement : SCHEMA_GRANTS) {
+                        execute(inDatabase, substituted(statement, group));
+                    }
+                }
             }
-            // psql reads these, so the script needs no modification to reach a server that is not local.
-            environment.put("PGHOST", setting(HOST_KEY, null));
-            environment.put("PGPORT", setting(PORT_KEY, DEFAULT_PORT));
-            environment.put("PGPASSWORD", setting(PASSWORD_KEY, null));
-            environment.put("PGSSLMODE", setting(SSLMODE_KEY, DEFAULT_SSLMODE));
-            return environment;
         }
 
-        private void run() throws Exception {
-            ScriptRun run = execute(environment());
-            assertEquals(0, run.exitCode(), "the shipped provisioning script must succeed, output was:\n"
-                    + run.output());
+        /**
+         * Creates the two roles of every group with the {@code LOGIN PASSWORD} shape the documentation
+         * writes out, quoting the generated password as a literal.
+         *
+         * @param superuser the maintenance-database connection to create them through
+         * @throws SQLException if a role cannot be created
+         */
+        private void createRoles(Connection superuser) throws SQLException {
             for (Group group : Group.values()) {
-                assertTrue(run.output().contains(database(group)),
-                        "the script must report what it provisioned for " + group + ", output was:\n"
-                                + run.output());
+                execute(superuser, "CREATE ROLE " + quoteIdentifier(initializationUser(group))
+                        + " LOGIN PASSWORD " + literal(initializationPassword(group)));
+                execute(superuser, "CREATE ROLE " + quoteIdentifier(servingUser(group))
+                        + " LOGIN PASSWORD " + literal(servingPassword(group)));
             }
         }
 
-        private ScriptRun runExpectingFailure(Map<String, String> environment) throws Exception {
-            ScriptRun run = execute(environment);
-            assertNotEquals(0, run.exitCode(),
-                    "the provisioning script must refuse this configuration, output was:\n" + run.output());
-            return run;
+        /**
+         * Rewrites one documented statement with this run's throwaway identifiers.
+         *
+         * <p>Substitution rather than a parameterised statement, because these are identifiers and no
+         * JDBC placeholder may stand for one. The generated names are hexadecimal and underscore only,
+         * and they are still quoted, so the statement cannot be steered by them.
+         *
+         * @param statement the documented statement
+         * @param group the entity group it is being applied for
+         * @return the statement to issue
+         */
+        private String substituted(String statement, Group group) {
+            return statement
+                    .replace(DOCUMENTED_DATABASE, quoteIdentifier(database(group)))
+                    .replace(DOCUMENTED_INIT_ROLE, quoteIdentifier(initializationUser(group)))
+                    .replace(DOCUMENTED_SERVING_ROLE, quoteIdentifier(servingUser(group)));
         }
 
-        private ScriptRun execute(Map<String, String> environment) throws Exception {
-            assertTrue(Files.isRegularFile(script), "the provisioning script must exist at " + script);
-            ProcessBuilder builder = new ProcessBuilder("bash", script.toString());
-            builder.directory(repositoryRoot().toFile());
-            builder.redirectErrorStream(true);
-            // Replaced rather than added to: the ambient environment of a build agent may already carry
-            // OFBIZ_POSTGRES_* values, and inheriting one would make this test's outcome depend on them.
-            builder.environment().keySet().removeIf(name -> name.startsWith("OFBIZ_POSTGRES_")
-                    || name.startsWith("PG"));
-            builder.environment().putAll(environment);
-
-            Process process = builder.start();
-            String output;
-            try (InputStream stream = process.getInputStream()) {
-                output = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+        private void execute(Connection connection, String sql) throws SQLException {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(sql);
             }
-            assertTrue(process.waitFor(SCRIPT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
-                    "the provisioning script did not finish within " + SCRIPT_TIMEOUT_SECONDS
-                            + " seconds, output so far was:\n" + output);
-            return new ScriptRun(process.exitValue(), output);
         }
 
         private Connection connectAsServing(Group group) throws SQLException {
@@ -626,6 +652,21 @@ public class DatabaseLeastPrivilegeTests {
 
     private static String literal(String value) {
         return '\'' + value.replace("'", "''") + '\'';
+    }
+
+    /**
+     * Collapses every run of whitespace to one space, so that the documentation's line wrapping cannot
+     * make a statement it does declare look absent.
+     *
+     * <p>Only whitespace is normalised. Role names, privilege lists, object classes and the direction of
+     * each grant are compared verbatim, which is the whole point: a {@code GRANT} that gained
+     * {@code CREATE}, or a {@code REVOKE} that was dropped, changes the compared text.
+     *
+     * @param sql the text to normalise
+     * @return the text with each whitespace run replaced by one space
+     */
+    private static String normaliseSql(String sql) {
+        return sql.replaceAll("\\s+", " ");
     }
 
     private static Path repositoryRoot() {

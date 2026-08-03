@@ -41,18 +41,35 @@ under the License.
         <param-value>component://webtools/widget/CommonScreens.xml</param-value>
     </context-param>
 
+    <!-- Answers the two load-balancer probe paths before any other filter runs, by forwarding to
+         HealthCheckServlet (declared below) through a named dispatch. Mapped FIRST, and only on the two
+         exact paths, which is what keeps probes off the rest of this chain: ControlFilter and
+         ContextFilter both call getSession() unconditionally, so a probe answered behind them would
+         create a session and make the container emit a session cookie on every probe, several times a
+         minute per instance, for a caller that follows no cookie and returns no session.
+
+         Because probes never reach ControlFilter, its allowedPaths below needs NO /health entry.
+         allowedPaths is matched with startsWith, so the only concise way to express such an entry would
+         be /health, which would grant anonymous chain access to every /health* spelling - /healthz/live,
+         /health-internal, /health/live/anything - none of which is a probe. Removing the entry removes
+         that grant outright: a near miss is now treated exactly like any other unauthenticated request
+         to this webapp and is redirected to /control/main. -->
+    <filter>
+        <display-name>HealthProbeFilter</display-name>
+        <filter-name>HealthProbeFilter</filter-name>
+        <filter-class>org.apache.ofbiz.webapp.control.HealthProbeFilter</filter-class>
+    </filter>
     <filter>
         <display-name>ControlFilter</display-name>
         <filter-name>ControlFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.ControlFilter</filter-class>
-        <!-- /health is what lets a load balancer reach HealthCheckServlet (declared below) without a
-             login: an unlisted path is redirected to /control/main, which no anonymous probe can
-             follow. allowedPaths is matched with startsWith, so this one entry admits every /health*
-             spelling to the chain; only the two exact paths the servlet-mapping below declares reach
-             the servlet, and the container answers anything else. -->
+        <!-- No /health entry here, deliberately. allowedPaths is matched with startsWith, so one would
+             admit every /health* spelling to this chain, and probe traffic no longer needs to reach it
+             at all: the HealthProbeFilter above answers the two exact probe paths before this filter
+             runs. -->
         <init-param>
             <param-name>allowedPaths</param-name>
-            <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp:/health</param-value>
+            <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp</param-value>
         </init-param>
         <init-param>
             <param-name>redirectPath</param-name>
@@ -74,6 +91,16 @@ under the License.
         <filter-name>SameSiteFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.SameSiteFilter</filter-class>
     </filter>
+    <!-- First, and exact. The container applies filter-mappings in the order they are declared, so this
+         one decides a probe before ControlFilter can create a session for it. The patterns are exact,
+         not /health/*, so /health/live/anything and /healthz/live do not match and take the ordinary
+         chain like any other unlisted path. Only REQUEST is covered, which is the default: a named
+         dispatch is not filtered by a url-pattern mapping, so this cannot re-enter itself. -->
+    <filter-mapping>
+        <filter-name>HealthProbeFilter</filter-name>
+        <url-pattern>/health/live</url-pattern>
+        <url-pattern>/health/ready</url-pattern>
+    </filter-mapping>
     <filter-mapping>
         <filter-name>ControlFilter</filter-name>
         <url-pattern>/*</url-pattern>
@@ -113,8 +140,9 @@ under the License.
     </servlet-mapping>
 
     <!-- Load-balancer health probes, mapped outside /control/* so they carry neither the OFBTOOLS nor
-         the WEBTOOLS base permission, and reached anonymously through the /health entry in
-         ControlFilter's allowedPaths above. The servlet takes no init-param and is loaded on demand:
+         the WEBTOOLS base permission, and reached anonymously because HealthProbeFilter above forwards
+         to this servlet by name before any authenticating filter runs. The servlet-name below is the
+         name that filter dispatches to. The servlet takes no init-param and is loaded on demand:
          nothing it holds is created until the first probe arrives. -->
     <servlet>
         <description>Health and readiness check servlet for load balancer probes</description>

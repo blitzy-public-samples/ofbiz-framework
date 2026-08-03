@@ -50,7 +50,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
     <connection-factory class="org.apache.ofbiz.entity.connection.DBCPConnectionFactory"/>
 
     <debug-xa-resources value="false" />  <!-- see https://issues.apache.org/jira/browse/OFBIZ-4282 for more -->
-    
+
     <!-- Deployment profiles (see DOCKER.adoc):
          * Development profile (this committed file, zero configuration): the default, default-no-eca and test
            delegators all resolve to the embedded H2 datasources, so a bare checkout boots with no environment
@@ -100,24 +100,35 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          rather than only publishing; the initial-context-factory class named by the jndi-server resolves on the
          class path, which is where an absent /ofbiz/lib-extra client library is caught by name; and at least one
          host and port in the provider URL accepts a TCP connection within a bounded deadline.
-         WHAT THAT DOES NOT ESTABLISH, and why none of it may be read as proof of cache coherence: no JNDI context
-         is created, the connection factory and topic names are checked only for being DECLARED and are never
-         looked up, no credentials are authenticated, no subscriber or publisher is constructed, and nothing is
-         published - so delivery between instances is not verified at start up. The three checks are necessary
-         conditions, not sufficient ones. A live lookup is not available to this path at all: dependencies.gradle
-         bundles only the JMS API, the provider's client library is deployment specific and supplied by the
-         operator, so there is nothing to perform the lookup with when the configuration is rendered. Coherence is
-         established by running two instances and observing an invalidation arrive, for which DOCKER.adoc carries
-         the procedure; while an instance runs, its subscriber's own connection state is the second readiness
-         dimension of /webtools/health/ready, which is where a broker that goes away is reported. Any failure of
-         the three aborts the start up under both OFBIZ_PROFILE=dev and OFBIZ_PROFILE=prod. DOCKER.adoc carries the
+         WHAT THE START UP CHECKS COVER, precisely: no JNDI context is created, the connection factory and topic
+         names are checked only for being DECLARED and are never looked up, no credentials are authenticated, no
+         subscriber or publisher is constructed, and nothing is published. They establish that this instance is
+         configured to subscribe, that a client library is on the class path, and that something answers on the
+         broker's port. A live lookup is not available to this path at all: dependencies.gradle bundles only the
+         JMS API, and the provider's client library is deployment specific and supplied by the operator, so there
+         is nothing to perform the lookup with when the configuration is rendered. Any failure of the three aborts
+         the start up under both OFBIZ_PROFILE=dev and OFBIZ_PROFILE=prod.
+         DELIVERY IS PROVED SEPARATELY, AND AUTOMATICALLY, by
+         framework/entityext/src/test/java/org/apache/ofbiz/entityext/cache/DistributedCacheInvalidationPropagationTests.java,
+         which is part of the ordinary build gate rather than a procedure someone has to remember. It drives the
+         production publisher and the production consumer against two instances' caches and asserts the whole hop:
+         that each of the five invalidations the engine raises is published to the service its consumer implements,
+         that the payload carries the value and the login the auth=true consumer needs, that the shipped
+         framework/entityext/servicedef/services.xml routes the published service to EntityCacheServices, that
+         delivering that payload to a peer removes the row from the peer's real entity cache, and that the peer
+         applies the clear locally with distribute=false so consuming an invalidation cannot re-publish it into a
+         broker storm. Only the broker hop itself is substituted, for the dependency reason above.
+         What running two instances adds beyond that is the deployment half - a specific broker, client library,
+         credentials and topic - so DOCKER.adoc keeps that procedure as supplemental operator guidance. While an
+         instance runs, its subscriber's own connection state is the second readiness dimension of
+         /webtools/health/ready, which is where a broker that goes away is reported. DOCKER.adoc carries the
          operator procedure for supplying the provider client library and the JNDI settings. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
         <group-map group-name="org.apache.ofbiz.tenant" datasource-name="localh2tenant"/>
     </delegator>
-    <!-- May be used when you create a service that manages many data for massive imports, this for performance reason or to escape functional cases --> 
+    <!-- May be used when you create a service that manages many data for massive imports, this for performance reason or to escape functional cases -->
     <delegator name="default-no-eca" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" entity-eca-enabled="false" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
@@ -130,7 +141,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
         <group-map group-name="org.apache.ofbiz.tenant" datasource-name="localh2tenant"/>
     </delegator>
-   
+
     <!-- need to at least define a name for each component to use -->
     <entity-model-reader name="main"/>
 
@@ -321,7 +332,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
     collation-server = utf8_unicode_ci
     init-connect='SET NAMES utf8'
     character-set-server = utf8
-    
+
     Mysql Version: > 5.6.4 (supports datetime milliseconds)
      -->
     <datasource name="localmysql"
@@ -580,7 +591,19 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          PGSSLROOTCERT environment variables, so neither the mode nor the trusted root can be supplied that
          way. A deployment that needs pgJDBC TLS properties this file does not parameterise supplies its own
          override instead: mount an entityengine.xml under /ofbiz/config and leave OFBIZ_POSTGRES_HOST unset,
-         which suppresses the template while keeping the mounted file first on the classpath. -->
+         which suppresses the template while keeping the mounted file first on the classpath.
+         THE MOUNTED FILE IS YOURS AND THE CONTAINER LEAVES IT ALONE. Every entityengine.xml the entry point
+         renders carries an OFBIZ-CONTAINER-GENERATED-ENTITY-ENGINE-CONFIGURATION comment, and that marker is
+         the only thing that entitles the entry point to replace or delete the file at that path: a file
+         without it is never overwritten and never removed, so leaving OFBIZ_POSTGRES_HOST unset really does
+         hand the configuration to the mounted file rather than deleting it as a stale render. Setting
+         OFBIZ_POSTGRES_HOST or OFBIZ_DISTRIBUTED_CACHE_CLEAR while such a file is mounted is refused outright
+         rather than resolved by overwriting it - state the cache-invalidation attribute in the mounted file
+         yourself, exactly as the delegators above declare it. What the entry point still checks on a mounted
+         file, because keeping it is not the same as trusting it: its managed datasources may not leave startup
+         DDL enabled, and in OFBIZ_PROFILE=prod every datasource its default delegator maps must be an external
+         database - an embedded H2, Derby, HSQLDB or SQLite URI, or a mapping whose datasource the file does not
+         declare, fails the start rather than serving a fleet from per-instance databases. See DOCKER.adoc. -->
     <!-- Objective 4 (gated schema initialization): this managed-RDBMS run mode issues NO startup DDL, so a
          serving instance needs no DDL privileges and a whole fleet can scale out without racing on schema
          changes. Schema changes are applied exclusively by a separate one-shot init execution driven by
@@ -604,6 +627,19 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          actually disables the startup schema check, while add-missing-on-start is read as
          "true".equals(attribute), so its false is explicit rather than required.
          Schema truth remains the entity model - no Flyway, Liquibase, schema-version table or hand-written DDL.
+         What the second, non-amending pass establishes, and what it cannot: it refuses a table or column the
+         model declares and the catalogue does not have, a column whose type, width or scale differs from the
+         model, and a column the model has no field for - the last waivable only by
+         OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true, because a column the model does not describe is harmless when
+         nullable and fatal to every insert when NOT NULL without a default, and the engine reads that
+         nullability without ever reporting it. It cannot establish nullability, defaults, primary keys,
+         foreign keys or indexes on a table it did not create: measured against PostgreSQL 13.23, the engine
+         reported 1691 primary keys and 1970 foreign keys as missing, and "There are 0 indices in the
+         database", against a catalogue holding all of them, because it creates objects with unquoted
+         upper-case names that PostgreSQL folds to lower case and then looks them up in upper case. The init
+         job therefore proves instead that it created the whole schema itself, by comparing the engine's own
+         entity count with the tables it found missing and the tables it created; a schema it did not create in
+         full is refused unless that same variable accepts it. See DOCKER.adoc.
          The embedded localh2* datasources deliberately keep both flags enabled for zero-configuration local
          development, where the file-based database belongs to the single JVM that opens it. -->
     <datasource name="localpostgres"
@@ -620,7 +656,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
             offset-style="limit"
             result-fetch-size="50"> <!-- Comment out the result-fetch-size attribute for jdbc driver versions older than 8.0.
             Not recommended to use those though. They are archived unsupported versions: http://jdbc.postgresql.org/download.html -->
-        
+
         <read-data reader-name="tenant"/>
         <read-data reader-name="seed"/>
         <read-data reader-name="seed-initial"/>
@@ -683,7 +719,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 test-while-idle="true"
                 test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
                     is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
-        
+
         <!-- <jndi-jdbc jndi-server-name="default" jndi-name="java:comp/env/jdbc/localpostgres" isolation-level="ReadCommitted"/>-->
         <!-- <jndi-jdbc jndi-server-name="default" jndi-name="comp/env/jdbc/xa/localpostgres" isolation-level="ReadCommitted"/> --> <!-- Orion Style JNDI name -->
         <!-- <jndi-jdbc jndi-server-name="localweblogic" jndi-name="PostgresDataSource"/> --> <!-- Weblogic Style JNDI name -->
@@ -724,7 +760,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 test-while-idle="true"
                 test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
                     is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
-        
+
         <!-- <jndi-jdbc jndi-server-name="default" jndi-name="java:comp/env/jdbc/localpostgres" isolation-level="ReadCommitted"/>-->
         <!-- <jndi-jdbc jndi-server-name="default" jndi-name="comp/env/jdbc/xa/localpostgres" isolation-level="ReadCommitted"/> --> <!-- Orion Style JNDI name -->
         <!-- <jndi-jdbc jndi-server-name="localweblogic" jndi-name="PostgresDataSource"/> --> <!-- Weblogic Style JNDI name -->
