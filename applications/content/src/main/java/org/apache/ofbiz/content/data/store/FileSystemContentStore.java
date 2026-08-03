@@ -36,6 +36,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Set;
+import java.util.UUID;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.GeneralException;
@@ -389,15 +390,35 @@ public final class FileSystemContentStore implements ContentStore {
     /**
      * Reports content that does not fit inside the configured ceiling.
      *
-     * @param target the resolved path, named relative to the root
-     * @param size the size as far as it is known
+     * <p>The thrown message names the ceiling and an opaque reference, and deliberately not the content's
+     * location: an {@link IOException} raised while serving content reaches the rendered page, and the
+     * path a deployment keeps its content at is not an end user's to know (CWE-200). The location, the
+     * size and the ceiling are logged beside the same reference, so an operator joins the report a user
+     * quotes to the file that produced it. This is the posture the object-store provider already takes
+     * for the same refusal, and the two are deliberately identical: whether a path or a bucket backs the
+     * content must not change what a reader is told.
+     *
+     * @param target the resolved path, named relative to the root, for the log
+     * @param size the size as far as it is known, for the log
      * @param limit the ceiling that was exceeded
      * @return the exception to throw
      */
     private IOException oversized(Path target, String size, long limit) {
-        return new IOException("The filesystem content store refuses to read [" + relative(target) + "] whole"
-                + " because it is " + size + " bytes, over the " + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY
-                + " ceiling of " + limit + "; content this large has to be streamed rather than read whole");
+        String reference = reference();
+        Debug.logError("Content store refusal [" + reference + "]: content at [" + relative(target) + "] is " + size
+                + " bytes, over the " + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of " + limit
+                + "; content this large has to be streamed rather than read whole", MODULE);
+        return new IOException("The requested content is larger than this instance may read in one piece."
+                + " Reference [" + reference + "].");
+    }
+
+    /**
+     * Mints the opaque reference that joins a report an end user can see to the log line that explains it.
+     *
+     * @return a reference that identifies one refusal and describes nothing about the deployment
+     */
+    private static String reference() {
+        return UUID.randomUUID().toString();
     }
 
     /**

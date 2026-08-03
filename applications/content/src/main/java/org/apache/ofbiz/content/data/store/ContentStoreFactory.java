@@ -106,7 +106,9 @@ import org.apache.ofbiz.entity.util.EntityUtilProperties;
  * deployment already uses, while the object store is keyed by immutable identity - namespace,
  * tenant scope and {@code dataResourceId} - so that one bucket shared by several tenants cannot
  * serve one tenant's content to another. {@link #maxObjectSize} bounds what any single read may
- * materialise, and {@link #localFallbackEnabled} is the explicit, opt-in migration mode.
+ * materialise, {@link #publicationRequired} says whether a local write still has to be handed to the
+ * provider, and {@link #localFallbackEnabled} decides what a store miss means for a resource this
+ * instance holds a file for.
  */
 public final class ContentStoreFactory {
 
@@ -135,16 +137,28 @@ public final class ContentStoreFactory {
     private static final String STORE_PROPERTY_PREFIX = "content.store.";
 
     /**
-     * The ceiling on what a single read may materialise, in bytes.
+     * The ceiling on what a single read may materialise, and on what one publication may hand over,
+     * in bytes.
      *
-     * <p>Package-private because a provider that refuses an oversized read names this property in the
-     * refusal it logs: an operator reading that line needs to know which setting to change, and the
-     * name should come from the one place it is defined rather than be spelled out again.
+     * <p>Public because everything that refuses content for exceeding it names this property in the
+     * refusal it reports - the two providers when a read is too large, and the write seam when
+     * content is too large to publish. An operator reading that line needs to know which setting to
+     * change, and the name should come from the one place it is defined rather than be spelled out
+     * again.
      */
-    static final String MAX_OBJECT_SIZE_PROPERTY = "content.store.max.object.size";
+    public static final String MAX_OBJECT_SIZE_PROPERTY = "content.store.max.object.size";
 
-    /** The property that opens the migration mode in which a store miss falls back to local content. */
+    /** The property that decides whether a store miss falls back to the local copy of a resource. */
     private static final String LOCAL_FALLBACK_PROPERTY = "content.store.local.fallback";
+
+    /**
+     * The committed answer to a store miss for a resource this instance holds a file for.
+     *
+     * <p>True, so that selecting a provider never refuses content that predates the selection. See
+     * {@link #localFallbackEnabled} for why that is the parity-preserving default and what setting
+     * it false buys.
+     */
+    private static final boolean DEFAULT_LOCAL_FALLBACK = true;
 
     /** The committed ceiling on a single read, used whenever the configured value is unusable. */
     private static final long DEFAULT_MAX_OBJECT_SIZE = 10485760L;
@@ -252,32 +266,46 @@ public final class ContentStoreFactory {
     /**
      * Reports whether a store miss may fall back to the content the instance holds locally.
      *
-     * <p>Read from {@code content.store.local.fallback}, which is {@code false} in the committed
-     * configuration: a provider that has been selected and does not hold the content fails closed,
-     * so a fleet member cannot quietly serve a file that only it has. Setting it {@code true} is the
-     * documented migration mode for the window in which content is being copied into the store -
-     * every read is answered from the store when the store has it and from the local file when it
-     * does not - and it is a mode to leave, because it is exactly the local state the object-store
-     * objective exists to remove.
+     * <p>Read from {@code content.store.local.fallback}, which is {@value #DEFAULT_LOCAL_FALLBACK}
+     * in the committed configuration. The store remains the authority wherever it holds content -
+     * an object in the store always wins over a local copy of the same resource - and this setting
+     * decides only what a store <em>miss</em> means for a resource this instance happens to hold a
+     * file for. Answering it from that file is what keeps selecting a provider from refusing content
+     * that predates the selection: the shipped demo content, every file-backed resource uploaded
+     * before the provider was configured, and anything an operator has yet to copy into the bucket
+     * would otherwise stop serving the moment the provider is switched on, which is the functional
+     * parity the plan requires of every new capability (plan sections 0.1.2 and 0.7.1). New content
+     * needs no such bridge, because an upload is published to the store as it is written.
+     *
+     * <p>Setting it {@code false} is the strict, fail-closed mode: once a provider is configured,
+     * content it does not hold is an error rather than a file only one fleet member can see. That is
+     * the mode to run once existing content has been migrated, and selecting an object store while
+     * it is set reports a warning naming what will be refused, because the choice is not one to make
+     * by accident.
+     *
+     * <p>An unusable value is reported once and the committed default applies, exactly as every
+     * other setting of this package treats one: a typo must not decide whether a fleet serves its
+     * own shipped content.
      *
      * @param delegator the delegator a {@code SystemProperty} override is read through; may be null,
      *     in which case only {@code content.properties} is consulted
-     * @return true only when the value reads as {@code true}; anything else, including an
-     *     unrecognised value, keeps the fail-closed default
+     * @return true when a local copy may answer a store miss, which is the committed default; false
+     *     only when the value reads as {@code false}
      */
     public static boolean localFallbackEnabled(Delegator delegator) {
         String configured = propertyValue(LOCAL_FALLBACK_PROPERTY, delegator);
         if (UtilValidate.isEmpty(configured)) {
-            return false;
+            return DEFAULT_LOCAL_FALLBACK;
         }
         String normalised = configured.trim().toLowerCase(Locale.ROOT);
         if ("true".equals(normalised)) {
             return true;
         }
-        if (!"false".equals(normalised)) {
-            reportUnusableValue(LOCAL_FALLBACK_PROPERTY, configured, "is not true or false");
+        if ("false".equals(normalised)) {
+            return false;
         }
-        return false;
+        reportUnusableValue(LOCAL_FALLBACK_PROPERTY, configured, "is not true or false");
+        return DEFAULT_LOCAL_FALLBACK;
     }
 
     /**
@@ -317,6 +345,29 @@ public final class ContentStoreFactory {
      *     missing or carries something a key may not, or if the derived key exceeds
      *     {@link ContentStore#MAX_KEY_LENGTH_BYTES}
      */
+    /**
+     * Reports whether content written to the deployment's own tree still has to be handed to the
+     * provider, or whether writing it locally has already placed it there.
+     *
+     * <p>The answer follows from how a provider is keyed, which is why it is decided here beside
+     * {@link #storeKey} rather than at the write seam. A path-keyed provider is the deployment's own
+     * tree at the deployment's own paths, so a service that has just written a file under
+     * {@code ofbiz.home} has by construction written it into the provider and handing the same bytes
+     * over again would only rewrite the file it already wrote. An identity-keyed provider - the
+     * object store - is a namespace outside every instance, so content that is only on this
+     * instance's disk is content the rest of the fleet cannot read: it has to be published.
+     *
+     * <p>Database mode, which is {@code null}, requires no publication either: the bytes are held in
+     * the {@code DataResource} columns and are shared by every instance the moment the row commits.
+     *
+     * @param store the provider content was written under, or {@code null} for database mode
+     * @return true only when the provider holds content apart from the deployment's own tree and a
+     *     local write therefore has to be published to it
+     */
+    public static boolean publicationRequired(ContentStore store) {
+        return store instanceof S3ContentStore;
+    }
+
     public static String storeKey(ContentStore store, Delegator delegator, String dataResourceId,
             String relativePath) throws GeneralException {
         if (store == null) {
@@ -401,6 +452,17 @@ public final class ContentStoreFactory {
             return new FileSystemContentStore(delegator);
         case S3:
             Debug.logInfo("Content storage provider [" + S3 + "] selected by " + PROVIDER_PROPERTY, MODULE);
+            if (!localFallbackEnabled(delegator)) {
+                // Reported at selection rather than at the first refused read, because the refusal an
+                // operator would otherwise meet first is a shipped image or a document uploaded before
+                // the store existed, and by then it looks like a fault rather than the configured
+                // posture. One line per resolution, not per read.
+                Debug.logWarning(LOCAL_FALLBACK_PROPERTY + " is false, so this instance refuses to read any"
+                        + " file-backed content the object store does not hold, including content written before"
+                        + " the store was configured. Uploads made from now on are published to the store as they"
+                        + " are written; copy existing content into the store, or set " + LOCAL_FALLBACK_PROPERTY
+                        + "=true until it has been copied.", MODULE);
+            }
             return new S3ContentStore(delegator);
         default:
             // Warned about and treated as database mode, never thrown: see the class documentation.

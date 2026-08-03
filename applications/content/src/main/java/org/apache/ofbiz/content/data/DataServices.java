@@ -323,6 +323,12 @@ public class DataServices {
                     UtilMisc.toMap("fileName", file.getAbsolutePath()), locale));
         }
 
+        // Content-storage publication. Inert unless an object store is configured; see publishToContentStore.
+        Map<String, Object> unpublished = publishToContentStore(dctx, context, file);
+        if (unpublished != null) {
+            return unpublished;
+        }
+
         Map<String, Object> result = ServiceUtil.returnSuccess();
         return result;
     }
@@ -541,6 +547,12 @@ public class DataServices {
             throw new GenericServiceException(e.getMessage());
         }
 
+        // Content-storage publication. Inert unless an object store is configured; see publishToContentStore.
+        Map<String, Object> unpublished = publishToContentStore(dctx, context, file);
+        if (unpublished != null) {
+            return unpublished;
+        }
+
         return result;
     }
 
@@ -698,6 +710,11 @@ public class DataServices {
                 Debug.logWarning(e, MODULE);
                 throw new GenericServiceException(e.getMessage());
             }
+            // Content-storage publication. Inert unless an object store is configured; see publishToContentStore.
+            Map<String, Object> unpublished = publishToContentStore(dctx, context, file);
+            if (unpublished != null) {
+                return unpublished;
+            }
         }
         return result;
     }
@@ -759,7 +776,68 @@ public class DataServices {
                 Debug.logWarning(e, MODULE);
                 throw new GenericServiceException(e.getMessage());
             }
+            // Content-storage publication. Inert unless an object store is configured; see publishToContentStore.
+            Map<String, Object> unpublished = publishToContentStore(dctx, context, file);
+            if (unpublished != null) {
+                return unpublished;
+            }
         }
         return result;
+    }
+
+    /**
+     * Hands content a write has just placed at a location to the configured content store, and reports a
+     * failure to do so as the failure of that write.
+     *
+     * <p>Every write of file-backed {@code DataResource} content in this class calls this once its own write has
+     * succeeded, which is what makes an upload readable by an instance other than the one that received it.
+     * The work itself belongs to {@link DataResourceWorker#publishToContentStore}: which provider is active,
+     * whether it holds content apart from the deployment's own tree at all, which key the content belongs under
+     * and what bound applies are decisions this class deliberately does not make (plan sections 0.2.1 and
+     * 0.6.3). It is <strong>inert</strong> in the committed configuration and in filesystem mode, where the
+     * write above has already landed in the provider's own tree, so an unconfigured deployment reaches nothing
+     * new here.
+     *
+     * <p>A failure is returned as a service error rather than logged and swallowed, so the transaction that was
+     * about to record the {@code DataResource} row rolls back with it: a row that names content the rest of the
+     * fleet cannot read would be worse than a failed upload, because nothing afterwards would report it.
+     *
+     * @param dctx the dispatch context the service runs in, carrying the delegator the content was written
+     *     through
+     * @param context the service context, which carries the resource identity as {@code dataResourceId} or as
+     *     the {@code dataResource} value
+     * @param file the location the write completed at
+     * @return {@code null} when there is nothing to report, otherwise the error the calling service must return
+     */
+    private static Map<String, Object> publishToContentStore(DispatchContext dctx, Map<String, ? extends Object> context,
+            File file) {
+        try {
+            DataResourceWorker.publishToContentStore(dctx.getDelegator(), dataResourceIdOf(context), file);
+            return null;
+        } catch (GeneralException | IOException e) {
+            Debug.logError(e, "Content written to [" + file.getAbsolutePath() + "] could not be published to the"
+                    + " configured content store", MODULE);
+            return ServiceUtil.returnError(e.getMessage());
+        }
+    }
+
+    /**
+     * Resolves the identity of the resource a write belongs to from a service context.
+     *
+     * <p>Both spellings are read because both are in use: the services that create content carry
+     * {@code dataResourceId} directly, while those that update it are handed the {@code dataResource} value the
+     * caller already loaded. Neither service definition changes for this, which is what keeps the published
+     * service contracts frozen.
+     *
+     * @param context the service context
+     * @return the {@code dataResourceId}, or null when the context carries neither spelling
+     */
+    private static String dataResourceIdOf(Map<String, ? extends Object> context) {
+        String dataResourceId = (String) context.get("dataResourceId");
+        if (UtilValidate.isNotEmpty(dataResourceId)) {
+            return dataResourceId;
+        }
+        GenericValue dataResource = (GenericValue) context.get("dataResource");
+        return dataResource == null ? null : dataResource.getString("dataResourceId");
     }
 }

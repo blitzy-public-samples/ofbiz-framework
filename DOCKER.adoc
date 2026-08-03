@@ -385,6 +385,31 @@ dimension is *inert* on a delegator that does not enable distributed cache
 clear, which is the default, so a single-instance deployment is unaffected
 by it. See _Running more than one instance_ below.
 
+*Readiness deliberately checks nothing else.* It does not contact the
+object store, whatever `+OFBIZ_CONTENT_STORE_PROVIDER+` selects, and it
+reads no content. That is a decision about what a `+503+` ought to mean
+rather than an omission. The store is shared by every instance of a
+fleet, so a dimension that checked it would fail on all of them at the
+same moment and empty the target group - withdrawing every page that
+never touches content along with the few that do, and turning a degraded
+deployment into an unreachable one. An instance whose datasource is
+healthy serves almost all of the application with the bucket unreachable,
+so it stays routable and the store is monitored where it lives instead.
+The same reasoning keeps the other dependencies a deployment may acquire
+out of the dimension list: an SMTP relay and an external OIDC provider
+are not readiness dimensions either.
+
+*So a probe cannot tell you whether content is being served - and neither
+can a status code.* Monitor content separately, and assert on what comes
+back rather than on the status when you do: a content read that fails is
+answered with the application's own error page, which is a normal HTTP
+`+200+` response, because the request did reach a working instance and
+was handled, which is all a status code claims. A synthetic check that
+fetches a known image and asserts on its length, its bytes or its
+`+Content-Type+` reports a store that has stopped answering; one that
+asserts `+200+` alone reports nothing. See _How content reaches and
+leaves the object store_ below for which operations reach the store.
+
 Both endpoints answer with a small fixed JSON document
 (`+{"status":"UP"}+`, `+{"status":"UP","database":"UP"}+`,
 `+{"status":"DOWN"}+`) marked `+no-store+`, and both are unauthenticated,
@@ -892,8 +917,11 @@ had.
 
 A fleet also needs somewhere to put content that every instance can
 reach. Leave `+OFBIZ_CONTENT_STORE_PROVIDER+` at its default of
-`+database+`, or set it to `+s3+` with a bucket every instance shares and
-an out-of-band way to place uploaded content into it. Do *not* select
+`+database+`, or set it to `+s3+` with a bucket every instance shares:
+uploads are published to that bucket as they are written, so no instance
+depends on a file only it holds. Content that predates the switch is
+yours to copy into the bucket - see _How content reaches and leaves the
+object store_ below. Do *not* select
 `+filesystem+` for a fleet unless every instance mounts the same shared
 volume: that backend reads and writes the instance's own
 `+runtime/uploads+` tree, so a file uploaded through one instance is
@@ -944,8 +972,10 @@ draining discipline below is what it needs.
 
 What this does *not* compromise is the statelessness the rest of this
 document describes. An instance holds no *durable* state: the database
-holds the data, the object store holds the file-backed content that has
-been placed in it when `+OFBIZ_CONTENT_STORE_PROVIDER=s3+`, the schema is
+holds the data, the object store holds the file-backed content when
+`+OFBIZ_CONTENT_STORE_PROVIDER=s3+` - every upload is published to it as
+it is written, and content that predates the switch is migrated into it -
+the schema is
 applied by the separate initialization run, and the entity caches are kept
 coherent by distributed cache clear. That is what makes an instance freely
 replaceable, and reads through the store leave nothing on local disk to
@@ -974,11 +1004,13 @@ an external session store - and it is deliberately not part of this image.
 An instance that keeps content on its own disk is not replaceable: a
 document uploaded through one instance is invisible to every other one
 and is lost when that container is replaced. Selecting an S3-compatible
-object store instead makes every instance *read* file-backed content from
-one bucket, so no instance depends on a file only it holds. Content is
-placed into that bucket out of band rather than by the upload itself -
-_How content reaches and leaves the object store_ below states exactly
-which operations the provider serves, and what that leaves you to arrange.
+object store instead makes every instance *write* file-backed content to
+one bucket as the upload that produced it is recorded, and *read* it back
+from there, so no instance depends on a file only it holds. Content
+written before the switch is the one thing an upload cannot publish for
+you - _How content reaches and leaves the object store_ below states
+exactly which operations the provider serves, and what migrating that
+content involves.
 
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
@@ -2241,12 +2273,14 @@ link, resolves it.
 
 `+s3+`::
 An S3-compatible object store - Amazon S3, MinIO, Ceph or anything else
-that speaks the same API. Every instance *reads* file-backed content from
-the same bucket, so no instance depends on a file only it happens to hold,
-which is what makes it the backend to use behind a load balancer. Content
-is *placed* into the bucket out of band rather than by the upload itself -
-see _How content reaches and leaves the object store_ below for exactly
-which operations the provider serves and which it does not.
+that speaks the same API. Every instance *writes* file-backed content to
+the same bucket as it records the upload, and *reads* it back from there,
+so no instance depends on a file only it happens to hold, which is what
+makes it the backend to use behind a load balancer. Content written before
+the backend was selected is the one thing an upload cannot publish for you
+and is migrated once - see _How content reaches and leaves the object
+store_ below for exactly which operations the provider serves and what
+that migration involves.
 
 The `+s3+` provider needs a bucket and a region, and takes an endpoint, a
 credential pair and an addressing style. On Amazon S3 with an instance
@@ -2304,9 +2338,11 @@ in sight.
 Object storage has a few more settings than these seven, and they
 deliberately have no environment variable of their own:
 `+content.store.max.object.size+` bounds what one read may hold in
-memory, `+content.store.local.fallback+` opens the migration mode in
-which a store miss is answered from the content an instance still holds
-locally, `+content.store.s3.key.prefix+` places every object key under a
+memory and what one upload may publish, `+content.store.local.fallback+`
+decides whether a store miss is answered from the content an instance
+still holds locally - _true_ in the committed configuration, so content
+that predates the store keeps serving while it is migrated into it -
+`+content.store.s3.key.prefix+` places every object key under a
 prefix so one bucket can hold several deployments, and
 `+content.store.s3.api.timeout.millis+`,
 `+content.store.s3.attempt.timeout.millis+` and
@@ -2320,6 +2356,19 @@ the two layers to disagree. They are documented beside their values in
 rendered into `+/ofbiz/config/content.properties+` when any of the seven
 variables above is set, so the defaults reach a configured container
 unchanged.
+
+Write such a row *through the framework* - the `+SystemProperty+` screens
+in `+webtools+`, an entity-engine call, or an import through
+`+webtools/control/EntityImport+` - and never with SQL against the
+database. Each of these settings is read through
+`+EntityUtilProperties+`, which resolves the row from the entity cache and
+caches a *missing* row exactly as readily as a present one. Storing the
+row through the framework clears that cache as part of the write; a direct
+`+INSERT+` does not, so every instance goes on answering from the value it
+resolved before the row existed - an override that appears to have been
+applied and has not. Changing or removing a row has the same requirement.
+A restart clears the cache too, which is the only reason a direct write
+ever looks as though it worked.
 
 Values are validated before anything is written, so a mistake is reported
 at start up rather than at the first upload an end user attempts:
@@ -2398,21 +2447,53 @@ for what that means for content written before one.
 
 ===== How content reaches and leaves the object store
 
-The provider serves *reads* of file-backed content. It is not wired into
-the write path, and that is deliberate rather than unfinished: the
-services that write `+DataResource+` content are business logic, which
-this change set does not modify (see section 0.2.2 of the technical
-specification, which excludes all service implementations), and every one
-of them writes to a `+java.io.File+` it obtained beforehand rather than
-handing its bytes to anything that could route them elsewhere. Seven
-things follow that are worth knowing when you operate a fleet.
+The provider serves *reads* of file-backed content and *receives* the
+content an upload writes. Seven things follow that are worth knowing when
+you operate a fleet.
 
-*Exactly two operations reach the store.* Rendering text content into a
-screen or a template, and streaming binary content to a browser, read the
-object from the bucket every time - so an instance never serves a version
-another instance has replaced, and it never depends on a file only it
-holds. Nothing else in the running system contacts the store: no upload,
-no content write and no deletion.
+*Three operations reach the store.* Rendering text content into a screen
+or a template, and streaming binary content to a browser, read the object
+from the bucket every time - so an instance never serves a version another
+instance has replaced, and it never depends on a file only it holds. The
+third is publication: a service that writes file-backed content hands the
+bytes it just wrote to the store before its transaction commits, so the
+`+DataResource+` row and the object it describes appear together. Nothing
+else in the running system contacts the store: no deletion, and no
+metadata write - editing a document's name, status or mime type never
+touches the bytes.
+
+*An upload is published by the write that created it.* Uploading through
+any surface that stores a file-backed `+DataResource+` - the content
+manager, an order attachment, a party's logo - writes the file to this
+instance's own numbered `+runtime/uploads+` subdirectory as it always has,
+and then publishes it to the bucket under the key described below. If the
+store cannot be written to, the *upload fails* and its transaction rolls
+back: a `+DataResource+` row is never committed for content the rest of
+the fleet cannot read, because nothing afterwards would report that it
+had happened. The local file stays where the service wrote it - it is the
+staging copy the deployment's own validation ran against, and it is not
+what a read is served from; the object in the bucket is. An instance may
+therefore be replaced without losing content, and the upload directory of
+a running instance may be pruned once its content is in the bucket.
+
+*Publication is bounded by `+content.store.max.object.size+`.* The same
+ceiling that bounds a whole read bounds what one upload may publish -
+10 MiB by default. Content over the ceiling is refused with a message
+naming the ceiling rather than being half stored, because content the
+bucket would hold but no consumer could then be served in one piece would
+only look published. Raise the setting in a deployment that stores
+content this large.
+
+The ceiling bounds what the *provider* hands over, which is what keeps one
+read from exhausting the heap on a store that misreports a size. A read
+the local fallback answers - below - is the same local stream the
+deployment performed before the store was configured and is not bounded by
+it, so raising or lowering the setting changes nothing about content that
+has yet to be migrated. Every refusal it produces, from either backend,
+names the ceiling and a correlation reference and nothing else: the path,
+the size and the key go to the log under that same reference, so a refusal
+can be diagnosed from the log without the page disclosing where the
+deployment keeps its content.
 
 *The path that hands out a `+java.io.File+` stays local, because it is a
 write target.* `+DataResourceWorker.getContentFile()+` is called by
@@ -2422,17 +2503,43 @@ something to read. Fetching the object into that location first would
 hand a writer a stale copy and then lose the write it made, so this path
 resolves the local location and nothing more, exactly as it always has.
 
-*Content is placed into the bucket out of band.* Because writes are not
-intercepted, an upload lands in this instance's own numbered
-`+runtime/uploads+` subdirectory - the path that becomes the
-`+DataResource.objectInfo+` of the row naming it - and it is yours to copy
-into the bucket, keyed as described below. Do that with a sidecar that
-watches the upload tree, with a scheduled reconciliation job, or by
-placing content into the bucket directly; a shared volume for
-`+/ofbiz/runtime+` is the other way to make an upload readable
-immediately. Until content is in the bucket, only the instance that
-received it can read it - which is the state the `+filesystem+` provider
-leaves a fleet in permanently.
+*Content that predates the switch is migrated once, by you.* Publication
+applies to writes made while the store is configured; it cannot reach back
+to the shipped demo content, to a `+DataResource+` whose file was uploaded
+before the store existed, or to anything an earlier `+filesystem+`
+deployment left in `+runtime/uploads+`. Copy those objects into the bucket
+once, at the key described below, and the fleet reads them from there
+afterwards:
+
+[source,shell]
+----
+# The key is derived from the DataResource id, not from the path in objectInfo,
+# so read both out of the database and pair them up:
+PGPASSWORD="$OFBIZ_POSTGRES_OFBIZ_PASSWORD" psql -h "$OFBIZ_POSTGRES_HOST" \
+    -U "$OFBIZ_POSTGRES_OFBIZ_USER" -d "$OFBIZ_POSTGRES_OFBIZ_DB" -At -F' ' -c \
+  "select data_resource_id, object_info from data_resource
+     where data_resource_type_id in
+       ('OFBIZ_FILE', 'OFBIZ_FILE_BIN', 'LOCAL_FILE', 'LOCAL_FILE_BIN')" \
+| while read -r id path; do
+    # OFBIZ_FILE paths are relative to /ofbiz; LOCAL_FILE paths are absolute.
+    case "$path" in /ofbiz/*) file="$path" ;; *) file="/ofbiz/${path#/}" ;; esac
+    [ -f "$file" ] || continue
+    aws s3 cp "$file" \
+      "s3://$OFBIZ_S3_BUCKET/${OFBIZ_S3_KEY_PREFIX:+$OFBIZ_S3_KEY_PREFIX/}dataresource/default/$id"
+  done
+----
+
+Replace `+default+` with `+<base>~<tenant>+` for a tenanted delegator, and
+run it from a host that can read the upload tree - a job container with
+the same `+/ofbiz/runtime+` volume, for instance. Leave
+`+content.store.local.fallback+` at its committed _true_ while the copy is
+in progress: content the bucket does not hold yet keeps serving from the
+local file, and each such resource is named once in the log so you can see
+what is left. Set it to _false_ once the copy is complete, which is the
+strict posture in which the bucket is the only authority. Until content is
+in the bucket, only the instance that holds a copy of it can read it -
+which is the state the `+filesystem+` provider leaves a fleet in
+permanently.
 
 *An object is addressed by identity, not by the path in `+objectInfo+`.*
 The key is `+dataresource/<scope>/<dataResourceId>+`, where `+<scope>+` is
@@ -2448,24 +2555,33 @@ identical on every instance and would otherwise have to be uploaded
 before an instance could serve its own static files; and any location
 outside the deployment's own tree, which no key can be derived for.
 
-*Content the store does not hold is refused, not silently answered from
-local disk.* If the bucket holds no object for a resource and this
-instance happens to hold a file at the recorded path, the read fails with
-an error naming `+content.store.local.fallback+`. Serving the local copy
-instead is how one instance quietly returns content another has already
-replaced. Set `+content.store.local.fallback+` to _true_ while you are
-migrating existing content into the bucket: it lets a store miss be
-answered from the local copy, so a fleet can be switched to `+s3+` before
-every object has been copied, and it should be turned off once the copy
-is complete. Content that exists neither in the store nor on disk is
-reported as absent exactly as it always was.
+*The bucket always wins where it holds content; a local copy only fills
+gaps.* Where the bucket holds an object for a resource, that object is what
+every instance serves, whatever any instance happens to have on disk - so
+one instance can never quietly return content another has replaced. Where
+the bucket holds nothing and this instance does hold a file at the recorded
+path, `+content.store.local.fallback+` decides:
+
+* _true_, the committed default, serves the local copy and names the
+resource in the log once - not once per read - so switching a running
+deployment to `+s3+` never stops it serving content it served the day
+before, and the log tells you what has yet to be migrated.
+* _false_ refuses the read with an error naming the setting. That is the
+strict posture to run once the migration above is complete: the bucket is
+the only authority, and a file only one fleet member can see is an error
+rather than an answer. Selecting `+s3+` while it is _false_ logs a warning
+at start up naming exactly what will be refused, so the posture is never
+adopted by accident.
+
+Content that exists neither in the bucket nor on disk is reported as absent
+exactly as it always was.
 
 *A read writes nothing and leaves nothing behind.* No staging file, no
 spool file and no local cache of a fetched object: a read holds the object
 in memory, bounded by `+content.store.max.object.size+`, and hands it
 straight to its consumer. So there is nothing for a rolled-back
 transaction to leave stranded and nothing for an operator to clean up, and
-an instance keeps no durable local state on account of the store.
+an instance keeps no durable local state on account of a read.
 
 *Deleting content does not delete the object.* Removing a
 `+DataResource+` row removes the row and nothing else, exactly as it

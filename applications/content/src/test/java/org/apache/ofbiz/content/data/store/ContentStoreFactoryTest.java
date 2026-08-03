@@ -865,8 +865,15 @@ public final class ContentStoreFactoryTest {
 
         assertFalse(refused instanceof FileNotFoundException, "an oversized file is present, not absent: "
                 + refused);
-        assertTrue(refused.getMessage().contains(PROPERTY_MAX_OBJECT_SIZE), "the refusal must name the setting"
-                + " to change: " + refused.getMessage());
+        // Identical posture to the object-store provider's refusal of the same thing: an IOException raised
+        // while serving content reaches the rendered page, so the reader is given the breach and a reference
+        // and the location is left to the log. Which provider backs the content must not change that.
+        assertTrue(refused.getMessage().contains("Reference ["), "the refusal must carry a reference: "
+                + refused.getMessage());
+        assertFalse(refused.getMessage().contains(key), "the refusal must not disclose the content location: "
+                + refused.getMessage());
+        assertFalse(refused.getMessage().contains("large.bin"), "the refusal must not disclose the file name: "
+                + refused.getMessage());
         // Streaming is how content of a size an uploader chose is served, so it stays unbounded.
         try (InputStream opened = store.openStream(key)) {
             assertEquals(4096, opened.readAllBytes().length, "a streamed read must stay unbounded");
@@ -1165,19 +1172,33 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
-    public void theLocalFallbackIsOffUnlessItIsAskedForExactly() {
-        assertFalse(ContentStoreFactory.localFallbackEnabled(null), "the committed default must fail closed");
+    public void theLocalFallbackServesExistingContentUnlessTheStrictPostureIsAskedForExactly() {
+        // The committed default lets the local copy answer a store miss, so selecting a provider never stops a
+        // deployment serving content that predates the selection - the shipped content, and every file uploaded
+        // before the provider was switched on. Content written afterwards is published as it is written.
+        assertTrue(ContentStoreFactory.localFallbackEnabled(null), "the committed default must keep serving"
+                + " content the store does not hold yet");
+
+        // The strict posture is the one an operator asks for by name, once existing content has been migrated.
+        for (String off : new String[] {"false", "FALSE", "  False  "}) {
+            UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_LOCAL_FALLBACK, off);
+            assertFalse(ContentStoreFactory.localFallbackEnabled(null), "[" + off + "] must select the strict,"
+                    + " store-is-the-only-authority posture");
+        }
 
         for (String on : new String[] {"true", "TRUE", "  True  "}) {
             UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_LOCAL_FALLBACK, on);
-            assertTrue(ContentStoreFactory.localFallbackEnabled(null), "[" + on + "] must open the migration mode");
+            assertTrue(ContentStoreFactory.localFallbackEnabled(null), "[" + on + "] must let the local copy"
+                    + " answer");
         }
-        // Anything that is not "true" fails closed, including a value that looks affirmative: a
-        // deployment either asked for the migration mode in the documented spelling or it did not.
-        for (String off : new String[] {"false", "", "yes", "1", "Y", "on"}) {
-            UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_LOCAL_FALLBACK, off);
-            assertFalse(ContentStoreFactory.localFallbackEnabled(null), "[" + off + "] must keep the fail-closed"
-                    + " default");
+
+        // Anything that is neither spelling is reported once and the committed default applies, exactly as
+        // every other setting of this package treats an unusable value: a typo must not decide whether a fleet
+        // serves its own shipped content.
+        for (String unusable : new String[] {"", "yes", "no", "1", "Y", "on"}) {
+            UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_LOCAL_FALLBACK, unusable);
+            assertTrue(ContentStoreFactory.localFallbackEnabled(null), "[" + unusable + "] must leave the"
+                    + " committed default in force");
         }
     }
 
@@ -1363,7 +1384,7 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
-    public void contentTheProviderDoesNotHoldIsRefusedWhileALocalCopyExists() throws Exception {
+    public void contentTheProviderDoesNotHoldIsRefusedWhileALocalCopyExistsInTheStrictPosture() throws Exception {
         // The three cases the seam has to tell apart, asserted directly because only one of them is a
         // refusal and getting that wrong in either direction is a data-integrity bug.
         configureProvider(PROVIDER_S3);
@@ -1374,18 +1395,20 @@ public final class ContentStoreFactoryTest {
         assertDoesNotThrow(() -> refuseUnlessLocalCopyMayAnswer(KEY, true, delegator),
                 "content that exists nowhere is plain absence, not a refusal");
 
-        // Nothing in the store but a local copy exists: refused, and the refusal has to name the way out.
+        // Nothing in the store but a local copy exists, with the committed default in force: the local copy
+        // answers, because refusing it would stop a deployment serving content that predates the provider.
+        assertDoesNotThrow(() -> refuseUnlessLocalCopyMayAnswer(KEY, false, delegator),
+                "the committed default must let a local copy answer for content the store does not hold yet");
+
+        // The strict posture an operator asks for once content has been migrated: refused, and the refusal has
+        // to name the way out.
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_LOCAL_FALLBACK, "false");
+        ContentStoreFactory.clearCache();
         GeneralException refused = assertThrows(GeneralException.class, () ->
                 refuseUnlessLocalCopyMayAnswer(KEY, false, delegator));
         assertTrue(refused.getMessage().contains(PROPERTY_LOCAL_FALLBACK), "the refusal must name ["
                 + PROPERTY_LOCAL_FALLBACK + "], because an operator cannot act on a refusal that does not say"
                 + " what to do: [" + refused.getMessage() + "]");
-
-        // The same, with the migration setting on: the local copy may answer.
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_LOCAL_FALLBACK, "true");
-        ContentStoreFactory.clearCache();
-        assertDoesNotThrow(() -> refuseUnlessLocalCopyMayAnswer(KEY, false, delegator),
-                "the documented migration setting must allow the local copy to answer");
     }
 
     @Test
@@ -1458,19 +1481,22 @@ public final class ContentStoreFactoryTest {
         Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
         Files.writeString(uploads.resolve("orphan.txt"), "a local copy the store never received");
         configureLiveObjectStore();
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_LOCAL_FALLBACK, "false");
+        ContentStoreFactory.clearCache();
 
         GeneralException refused = assertThrows(GeneralException.class, () -> renderedThroughSeam("OFBIZ_FILE",
                 "/runtime/uploads/orphan.txt", null, seamDelegator("default", null), LIVE_ABSENT_RESOURCE_ID),
-                "a real store holding nothing must refuse rather than serve the local copy");
-        assertTrue(refused.getMessage().contains(PROPERTY_LOCAL_FALLBACK), "the refusal must name the migration"
-                + " setting: [" + refused.getMessage() + "]");
+                "a real store holding nothing must refuse rather than serve the local copy in the strict posture");
+        assertTrue(refused.getMessage().contains(PROPERTY_LOCAL_FALLBACK), "the refusal must name the setting"
+                + " that governs it: [" + refused.getMessage() + "]");
 
-        // With the migration setting on, the same read is allowed to answer from disk.
+        // With the committed default restored, the same read is allowed to answer from disk, which is what keeps
+        // content that predates the store serving while it is being migrated into it.
         UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_LOCAL_FALLBACK, "true");
         ContentStoreFactory.clearCache();
         assertEquals("a local copy the store never received", renderedThroughSeam("OFBIZ_FILE",
                 "/runtime/uploads/orphan.txt", null, seamDelegator("default", null), LIVE_ABSENT_RESOURCE_ID),
-                "the documented migration setting must let existing local content keep being served");
+                "the committed default must let existing local content keep being served");
     }
 
     @Test
@@ -1557,6 +1583,153 @@ public final class ContentStoreFactoryTest {
         assertThrows(FileNotFoundException.class, () -> DataResourceWorker.getContentFile("OFBIZ_FILE",
                 "/runtime/uploads/never-created.txt", null), "an absent location must stay absent rather than"
                 + " being reported as present because a store might hold something");
+    }
+
+    @Test
+    public void publicationIsRequiredOnlyWhereAProviderHoldsContentApartFromTheDeployment() throws Exception {
+        // Database mode shares content the moment the row commits, and the filesystem provider's tree IS the
+        // deployment's tree, so in both a local write has already put the content where a reader will look.
+        // Only a store outside every instance has to be handed the bytes.
+        assertFalse(ContentStoreFactory.publicationRequired(null), "database storage needs no publication");
+        assertFalse(ContentStoreFactory.publicationRequired(storeConfiguredAs(PROVIDER_FILESYSTEM)),
+                "a write into the deployment's own tree is already in the filesystem provider");
+        assertTrue(ContentStoreFactory.publicationRequired(storeConfiguredAs(PROVIDER_S3)),
+                "content written locally is invisible to the fleet until it is published to the object store");
+    }
+
+    @Test
+    public void publishingIsInertUnlessAnObjectStoreIsConfigured(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
+        Path written = uploads.resolve("just-written.txt");
+        Files.writeString(written, "the bytes a service just wrote");
+        Delegator delegator = seamDelegator("default", null);
+
+        // Database mode: nothing is asked of any provider, and the write is left exactly as it was.
+        configureProvider(PROVIDER_DATABASE);
+        Map<String, String> before = snapshotOf(home);
+        assertDoesNotThrow(() -> DataResourceWorker.publishToContentStore(delegator, "10000", written.toFile()),
+                "publication must be a no-op when content is held in the database");
+        assertEquals(before, snapshotOf(home), "publication in database mode must touch nothing at all");
+
+        // Filesystem mode: the provider's tree is this tree, so publication must not rewrite, move or duplicate
+        // the file the caller just wrote.
+        configureProvider(PROVIDER_FILESYSTEM);
+        assertDoesNotThrow(() -> DataResourceWorker.publishToContentStore(delegator, "10000", written.toFile()),
+                "publication must be a no-op when the provider's tree is the deployment's own tree");
+        assertEquals(before, snapshotOf(home), "publication in filesystem mode must leave the local write alone");
+        assertEquals("the bytes a service just wrote", Files.readString(written), "the content must be untouched");
+
+        // And a caller that wrote nothing publishes nothing, whatever is configured. The offline object-store
+        // fixture is in force here, so any request at all would fail this assertion rather than pass it quietly.
+        configureProvider(PROVIDER_S3);
+        assertDoesNotThrow(() -> DataResourceWorker.publishToContentStore(delegator, "10000", null),
+                "there is nothing to publish when no file was written");
+    }
+
+    @Test
+    public void publicationIsAttemptedRatherThanSkippedOnceAnObjectStoreIsConfigured(@TempDir Path home)
+            throws Exception {
+        // The defect this guards against is silence: an upload that reports success while the store stays empty.
+        // The configured endpoint refuses every connection, so a publication that is actually attempted fails
+        // loudly and a publication that is quietly skipped passes - which is why the assertion is that it throws.
+        System.setProperty("ofbiz.home", home.toString());
+        configureProvider(PROVIDER_S3);
+        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
+        Path written = Files.writeString(uploads.resolve("unreachable-store.txt"), "bytes bound for the store");
+
+        assertThrows(IOException.class, () -> DataResourceWorker.publishToContentStore(seamDelegator("default",
+                null), "10000", written.toFile()), "an object store that cannot be reached must fail the write"
+                + " rather than let it report success with nothing stored");
+    }
+
+    @Test
+    public void publicationRefusesToGuessWhatItCannotDerive(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        configureProvider(PROVIDER_S3);
+        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
+        Path written = Files.writeString(uploads.resolve("identity.txt"), "content with nothing to key it by");
+
+        // Identity is what an object-store key is derived from. Publishing without it would have to invent a key,
+        // and an invented key is content nothing can find again.
+        assertThrows(GeneralException.class, () -> DataResourceWorker.publishToContentStore(seamDelegator("default",
+                null), null, written.toFile()), "publication must refuse rather than invent an identity");
+        assertThrows(GeneralException.class, () -> DataResourceWorker.publishToContentStore(null, "10000",
+                written.toFile()), "publication must refuse rather than invent a tenant scope");
+
+        // A location outside the deployment's own tree is host-local state an operator placed deliberately - the
+        // read seams read it where it is, and publication leaves it there rather than failing a write over it.
+        Path elsewhere = Files.createTempDirectory("blitzy-adhoc-outside-home");
+        try {
+            Path outside = Files.writeString(elsewhere.resolve("host-local.txt"), "not part of the deployment");
+            assertDoesNotThrow(() -> DataResourceWorker.publishToContentStore(seamDelegator("default", null),
+                    "10000", outside.toFile()), "content outside the deployment tree is not provider-backed and"
+                    + " must not fail the write that produced it");
+        } finally {
+            try (Stream<Path> entries = Files.walk(elsewhere)) {
+                entries.sorted(java.util.Comparator.reverseOrder()).forEach(path -> path.toFile().delete());
+            }
+        }
+    }
+
+    @Test
+    public void publicationRefusesContentLargerThanOneReadMayHold(@TempDir Path home) throws Exception {
+        // Publishing content no consumer could then be served in one piece would only look published, so the
+        // whole-read ceiling bounds publication too. Refused before a request is made, which is why the
+        // unreachable endpoint of the offline fixture never comes into it.
+        System.setProperty("ofbiz.home", home.toString());
+        configureProvider(PROVIDER_S3);
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_MAX_OBJECT_SIZE, "1024");
+        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
+        Path written = Files.write(uploads.resolve("too-large.bin"), new byte[4096]);
+
+        GeneralException refused = assertThrows(GeneralException.class, () ->
+                DataResourceWorker.publishToContentStore(seamDelegator("default", null), "10000",
+                        written.toFile()), "content over the ceiling must be refused rather than published");
+        assertTrue(refused.getMessage().contains(PROPERTY_MAX_OBJECT_SIZE), "the refusal must name the setting"
+                + " that governs it: [" + refused.getMessage() + "]");
+        // The refusal reaches the caller of a service and, through it, an end user, so it names the resource and
+        // the ceiling and not where this deployment keeps its content (CWE-200).
+        assertFalse(refused.getMessage().contains("too-large.bin"), "the refusal must not disclose the content"
+                + " path: [" + refused.getMessage() + "]");
+        assertFalse(refused.getMessage().contains(home.toString()), "the refusal must not disclose the"
+                + " deployment root: [" + refused.getMessage() + "]");
+    }
+
+    @Test
+    public void contentPublishedAsItIsWrittenIsServedFromALiveObjectStore(@TempDir Path home) throws Exception {
+        assumeTrue(liveObjectStoreIsReachable(), "no S3-compatible endpoint is reachable at " + LIVE_ENDPOINT);
+        // The plan's object-storage round trip, end to end and in the order a deployment performs it: a service
+        // writes content locally, publication hands it to the store, and an instance that has no copy of its own
+        // serves it from there. The local copy is removed before the read precisely to prove the second half.
+        System.setProperty("ofbiz.home", home.toString());
+        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
+        Path written = uploads.resolve("published.txt");
+        byte[] content = "content published by the write that created it".getBytes(StandardCharsets.UTF_8);
+        Files.write(written, content);
+        configureLiveObjectStore();
+        Delegator delegator = seamDelegator("default", null);
+        ContentStore store = ContentStoreFactory.getContentStore();
+        assertNotNull(store, "the object store must be selected for this test to mean anything");
+        String key = ContentStoreFactory.storeKey(store, delegator, LIVE_RESOURCE_ID, null);
+        try {
+            DataResourceWorker.publishToContentStore(delegator, LIVE_RESOURCE_ID, written.toFile());
+
+            assertTrue(store.exists(key), "the write must have placed the content in the store under ["
+                    + key + "]");
+            assertArrayEquals(content, store.get(key), "the store must hold exactly the bytes that were written");
+            assertArrayEquals(content, Files.readAllBytes(written), "publication must not alter the local write");
+
+            // No local copy left: what answers now can only be the store, which is what makes the content
+            // readable by an instance that never received the upload.
+            Files.delete(written);
+            assertEquals(new String(content, StandardCharsets.UTF_8), renderedThroughSeam("OFBIZ_FILE",
+                    "/runtime/uploads/published.txt", null, delegator, LIVE_RESOURCE_ID),
+                    "content published as it was written must be served from the store afterwards");
+        } finally {
+            store.delete(key);
+            ContentStoreFactory.clearCache();
+        }
     }
 
     @Test
@@ -1716,8 +1889,8 @@ public final class ContentStoreFactoryTest {
 
         assertFalse(refused instanceof FileNotFoundException, "an oversized file is present, not absent: "
                 + refused);
-        assertTrue(refused.getMessage().contains(PROPERTY_MAX_OBJECT_SIZE), "the refusal must name the setting"
-                + " to change: " + refused.getMessage());
+        assertTrue(refused.getMessage().contains("Reference ["), "the refusal must carry a reference: "
+                + refused.getMessage());
     }
 
     @Test

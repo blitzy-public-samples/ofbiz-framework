@@ -46,7 +46,9 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -120,6 +122,20 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     private static final String MODULE = DataResourceWorker.class.getName();
     private static final String ERR_RESOURCE = "ContentErrorUiLabels";
     private static final String PROPERTY_RESOURCE = "content";
+
+    /**
+     * The storage keys whose local-copy answer has already been reported, so that a resource waiting to be
+     * copied into the configured content store is named once rather than on every read of it. Keyed by the
+     * storage key, because that is what an operator migrating content acts on.
+     */
+    private static final Set<String> REPORTED_FALLBACK_KEYS = ConcurrentHashMap.newKeySet();
+
+    /**
+     * The greatest number of keys {@link #REPORTED_FALLBACK_KEYS} holds. Past it, a local-copy answer is only
+     * recorded verbosely: the report exists to tell an operator that content has yet to be migrated, and a
+     * thousand distinct resources have already told them that, so the set must not grow with the catalogue.
+     */
+    private static final int REPORTED_FALLBACK_KEY_LIMIT = 1024;
 
     /**
      * Traverses the DataCategory parent/child structure and put it in categoryNode. Returns non-null error string if there is an error.
@@ -1571,27 +1587,143 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     // ---------------------------------------------------------------------------------------------------------
     // Content store seam support
     //
-    // The helpers the two read seams above delegate through. There are only two seams and they only read:
-    // renderFile copies content to an output, and getDataResourceStream hands a consumer a stream. Nothing here
-    // writes to a provider, and that is a deliberate limit rather than an omission - see the note on the write
-    // path below. Each helper reports "nothing to do" when no provider is configured, so the committed default,
-    // DataResource database storage with file-backed resources on the local filesystem, reaches none of it.
-    // All object-storage behaviour itself lives in the store package; nothing here knows which provider is
-    // active and nothing here touches a provider SDK.
+    // The helpers the seams above and the publication seam below delegate through. Two seams read - renderFile
+    // copies content to an output, and getDataResourceStream hands a consumer a stream - and one writes:
+    // publishToContentStore places content a service has just written where every instance can read it. Each
+    // helper reports "nothing to do" when no provider is configured, so the committed default, DataResource
+    // database storage with file-backed resources on the local filesystem, reaches none of it. All
+    // object-storage behaviour itself lives in the store package; nothing here knows which provider is active
+    // and nothing here touches a provider SDK.
     //
-    // Why the write path is not a seam. The services that create file-backed content write the bytes
-    // themselves: createFile builds a File from the objectInfo it computed and writes to it, and
-    // createBinaryFile and updateBinaryFile take the File that getContentFile returns and open their own
-    // FileOutputStream on it. None of them hands its bytes to this class, so there is no point inside this class
-    // at which an upload's content can be published to a provider in the same transaction that records the
-    // metadata describing it. Those services are business logic the plan freezes - "all business logic services
-    // and their Java, Groovy and MiniLang implementations" are excluded from this work (plan section 0.2.2) - so
-    // the seam cannot be moved to where the bytes are either. In filesystem mode this costs nothing, because the
-    // provider's tree is the deployment's own tree and a write therefore lands in the provider by construction;
-    // that is where the plan's upload story is honoured (plan section 0.6.3). For an object store it means
-    // content has to be placed in the bucket out of band, which is why ContentStore documents put and delete as
-    // out-of-band operations and why content.store.local.fallback exists as a documented migration bridge.
+    // Where the write path is seamed, and why here. The services that create file-backed content resolve their
+    // own target and write the bytes themselves: createFile builds a File from the objectInfo it computed and
+    // writes to it, and createBinaryFile and updateBinaryFile take the File that getContentFile returns and
+    // open their own FileOutputStream on it. None of them can hand its bytes to a provider on its own without
+    // learning which provider is active, which is exactly the knowledge the plan confines to this seam and the
+    // store package (plan sections 0.2.1 and 0.6.3). So each of them calls publishToContentStore once its write
+    // has succeeded, and every decision - whether a provider is configured, whether it holds content apart from
+    // the deployment's own tree, which key the content belongs under, and what bound applies - is taken here.
+    // That is what makes the plan's upload story true of an object store as well: an upload is published as it
+    // is written, so the round trip the plan requires of a configured store holds in both directions (plan
+    // sections 0.1.1 goal 3 and 0.7.3). In filesystem mode publication is a no-op, because the provider's tree
+    // is the deployment's own tree and the write has already landed in it by construction; in database mode
+    // nothing is asked of a provider at all.
     // ---------------------------------------------------------------------------------------------------------
+
+    /**
+     * Publishes content a caller has just written at a file-backed location to the configured content storage
+     * provider, so that every instance of a deployment can read it and not only the one that received it.
+     *
+     * <p>This is the write half of the storage seam (plan sections 0.1.1 goal 3, 0.4.1 and 0.7.3). It is called
+     * by the services that write file-backed {@code DataResource} content, once their write has succeeded, and it
+     * takes every provider decision on their behalf so that no service has to know which provider is active.
+     *
+     * <p><strong>Inert unless an object store is configured.</strong> In database mode there is no provider and
+     * nothing is asked of one. In filesystem mode the provider's tree is the deployment's own tree, so the write
+     * the caller has just performed already landed in the provider and handing the same bytes over again would
+     * only rewrite the file it wrote; {@link ContentStoreFactory#publicationRequired} is what says so. Only an
+     * identity-keyed provider - a store that holds content apart from every instance - is published to.
+     *
+     * <p><strong>The bytes published are the bytes on disk.</strong> They are read back from the location the
+     * caller wrote, so what the store holds is what the deployment's own validation accepted and what a local
+     * read would return, rather than a second copy of a buffer that may have been transformed on its way to the
+     * file. The read is bounded by {@code content.store.max.object.size}, the same ceiling a whole read is
+     * bounded by, because content the store could hold but no consumer could then be served in one piece would
+     * only look published (CWE-400).
+     *
+     * <p><strong>A failure is a failure of the write.</strong> Nothing is caught here: a caller that cannot
+     * publish its content reports an error and lets its transaction roll back, so a {@code DataResource} row is
+     * never committed for content the rest of the fleet cannot read. That is the whole point of publishing
+     * inside the write rather than out of band afterwards.
+     *
+     * <p><strong>Content outside the deployment's own tree is not published.</strong> An absolute
+     * {@code LOCAL_FILE} elsewhere on the host is state an operator placed deliberately, no storage key can be
+     * derived for it, and the read seams read it from where it is; publication reports it and leaves it there,
+     * exactly as a read would.
+     *
+     * @param delegator the delegator the content was written through, carrying the tenant scope; required when a
+     *     provider that has to be published to is configured
+     * @param dataResourceId the immutable identifier of the resource the content belongs to; required for the
+     *     same reason, because it is what the storage key is derived from
+     * @param file the location the caller has finished writing, or {@code null} when it wrote nothing
+     * @throws GeneralException if a provider that has to be published to is configured but the resource identity
+     *     it keys content by is missing, if the provider refuses the key, or if the content is larger than one
+     *     read may hold
+     * @throws IOException if the content cannot be read back from the location, or the provider cannot store it
+     */
+    public static void publishToContentStore(Delegator delegator, String dataResourceId, File file)
+            throws GeneralException, IOException {
+        if (file == null) {
+            return;
+        }
+        ContentStore store = ContentStoreFactory.getContentStore(delegator);
+        if (!ContentStoreFactory.publicationRequired(store)) {
+            return;
+        }
+        if (delegator == null || UtilValidate.isEmpty(dataResourceId)) {
+            throw new GeneralException("Content written for a file-backed resource cannot be published to the"
+                    + " configured content store, because the resource identity the store keys content by was not"
+                    + " supplied with it");
+        }
+        String relative = deploymentRelativePath(file);
+        if (relative == null) {
+            Debug.logWarning("The content of DataResource [" + dataResourceId + "] was written outside this"
+                    + " deployment's own tree, so it is not published to the content store and only this instance"
+                    + " can read it", MODULE);
+            return;
+        }
+        String key = ContentStoreFactory.storeKey(store, delegator, dataResourceId, relative);
+        store.put(key, contentToPublish(delegator, dataResourceId, file));
+        Debug.logInfo("Published the content of DataResource [" + dataResourceId + "] to the content store under ["
+                + key + "]", MODULE);
+    }
+
+    /**
+     * Reads back the content that is about to be published, refusing content larger than the configured ceiling.
+     *
+     * <p>Bounded twice, as every whole read in this refactor is: once from the size the filesystem reports, and
+     * again as the content is read, because the location is one the deployment writes to and the size that was
+     * measured can be stale by the time it is read.
+     *
+     * @param delegator the delegator the bound is resolved through
+     * @param dataResourceId the immutable identifier of the resource, for the refusal
+     * @param file the location the caller has finished writing
+     * @return the content to hand to the provider
+     * @throws GeneralException if the content is larger than one read may hold
+     * @throws IOException if it cannot be read
+     */
+    private static byte[] contentToPublish(Delegator delegator, String dataResourceId, File file)
+            throws GeneralException, IOException {
+        long limit = ContentStoreFactory.maxObjectSize(delegator);
+        if (file.length() > limit) {
+            throw tooLargeToPublish(dataResourceId, limit);
+        }
+        try (InputStream content = Files.newInputStream(file.toPath(), StandardOpenOption.READ)) {
+            byte[] read = content.readNBytes((int) limit);
+            if (content.read() != -1) {
+                throw tooLargeToPublish(dataResourceId, limit);
+            }
+            return read;
+        }
+    }
+
+    /**
+     * Reports content that cannot be published because it exceeds the configured whole-read ceiling.
+     *
+     * <p>Names the resource, the ceiling and the setting that governs it, and deliberately not the location the
+     * content was written to: this message reaches the caller of a service and, through it, an end user
+     * (CWE-200). The location is already in the caller's own log.
+     *
+     * @param dataResourceId the immutable identifier of the resource
+     * @param limit the ceiling that was exceeded
+     * @return the exception to throw
+     */
+    private static GeneralException tooLargeToPublish(String dataResourceId, long limit) {
+        return new GeneralException("The content of DataResource [" + dataResourceId + "] is larger than the "
+                + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of " + limit + " bytes, which is the"
+                + " most one read may hold, so it cannot be published to the content store. Raise that ceiling"
+                + " to store content this large.");
+    }
 
     /**
      * Resolves the one content-storage provider that serves a single read operation.
@@ -1764,15 +1896,18 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * <ul>
      * <li><strong>Nothing in the provider and nothing on disk.</strong> The content does not exist. No fallback
      * decision arises, and the caller reports absence exactly as it always has.</li>
-     * <li><strong>Nothing in the provider but a local copy exists.</strong> This is the dangerous case. The
-     * provider is the authority for this deployment's content, so whatever is on this instance's disk is either
-     * left over from before the provider was adopted or particular to this instance - and serving it would let a
-     * stale or wrong document reach a user with nothing to show it had happened, differently on each instance.
-     * It is refused.</li>
-     * <li><strong>The same, with {@code content.store.local.fallback} enabled.</strong> The operator has stated
-     * that local copies may answer, which is what makes migrating existing local content into a provider
-     * possible without downtime. The read proceeds and is recorded as a warning, because it is a temporary
-     * state that ought to end.</li>
+     * <li><strong>Nothing in the provider but a local copy exists, with {@code
+     * content.store.local.fallback} at its committed default.</strong> The local copy answers. Content written
+     * since the provider was configured is published to it as it is written, so this case is content that
+     * predates the provider - shipped content, or an upload made before it was switched on - and refusing it
+     * would make selecting a provider stop a deployment serving content it served the day before. It is
+     * reported once per resource rather than once per read, because the report is about a resource that has yet
+     * to be migrated and repeating it on every render says nothing new.</li>
+     * <li><strong>The same, with {@code content.store.local.fallback} set false.</strong> The operator has asked
+     * for the strict posture: the provider is the sole authority, so whatever is on this instance's disk is
+     * either left over from before the provider was adopted or particular to this instance, and serving it would
+     * let a stale or wrong document reach a user with nothing to show it had happened, differently on each
+     * instance. It is refused.</li>
      * </ul>
      *
      * @param key the provider key that holds nothing
@@ -1795,8 +1930,14 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                     + " content.store.local.fallback=true to allow local copies to answer while content is"
                     + " migrated into it.", absent);
         }
-        Debug.logWarning(absent, "The configured content store holds nothing under [" + key + "], so the local"
-                + " copy answers for it because content.store.local.fallback is enabled. This is a migration"
-                + " setting: the content belongs in the store.", MODULE);
+        if (REPORTED_FALLBACK_KEYS.size() < REPORTED_FALLBACK_KEY_LIMIT && REPORTED_FALLBACK_KEYS.add(key)) {
+            Debug.logWarning(absent, "The configured content store holds nothing under [" + key + "], so the"
+                    + " local copy answers for it because content.store.local.fallback allows it. Content"
+                    + " written since the store was configured is published to it as it is written, so this"
+                    + " content predates the store and belongs copied into it.", MODULE);
+            return;
+        }
+        Debug.logVerbose(absent, "The configured content store holds nothing under [" + key + "], so the local"
+                + " copy answers for it because content.store.local.fallback allows it", MODULE);
     }
 }

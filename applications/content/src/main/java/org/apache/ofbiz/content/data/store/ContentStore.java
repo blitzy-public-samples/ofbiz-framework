@@ -63,22 +63,25 @@ import org.apache.ofbiz.base.util.GeneralException;
  * not there and a credential that is refused are failures, and reporting any of them as "nothing
  * stored here" would turn an outage into silently missing content.
  *
- * <p><strong>What the integration seam uses, and what it cannot.</strong> The seam in
- * {@link org.apache.ofbiz.content.data.DataResourceWorker} reads content through this contract. It
- * does not write through it, and the reason is in the write path this refactor may not change: the
- * services that create or update file-backed content resolve the target themselves and write the
- * bytes themselves - {@code createFileMethod} writes to the path it builds, and
+ * <p><strong>What the integration seam uses, and what it does not.</strong> The seam in
+ * {@link org.apache.ofbiz.content.data.DataResourceWorker} reads content through this contract and
+ * writes through it. Its two read seams serve a render and a stream, and its write seam,
+ * {@code publishToContentStore}, is called by the services that create or update file-backed content
+ * once their write has succeeded, so an upload reaches the store inside the same transaction that
+ * records the {@code DataResource} row describing it: a failure to store the content fails the write
+ * rather than committing a row for content the fleet cannot read. Those services keep resolving their
+ * own target and writing their own bytes - {@code createFileMethod} writes to the path it builds, and
  * {@code createBinaryFileMethod} and {@code updateBinaryFileMethod} write to the file the seam
- * resolves for them - so there is no moment inside the seam at which content bytes are handed over.
- * There is no removal flow either: nothing in those services deletes a backing file. Publishing an
- * upload from inside the seam would therefore have to happen outside the transaction that records
- * the {@code DataResource} row, which is a conflict this contract cannot resolve on its own, so it
- * is reported here rather than worked around: those services are business logic the plan places
- * out of scope (plan section 0.2.2), and the seam is confined to the file-resolution methods the
- * plan names (plan sections 0.2.1 and 0.6.3). {@link #put(String, byte[])} and
- * {@link #delete(String)} are consequently part of the contract - the plan freezes the five
- * operations (plan section 0.4.1) - and are what an out-of-band ingest or migration performs, and
- * what the provider tests exercise, rather than operations a request reaches.
+ * resolves for them - and none of them knows which provider is active; every such decision stays in
+ * the seam and in this package (plan sections 0.2.1 and 0.6.3). {@link #put(String, byte[])} is
+ * therefore what publication calls.
+ *
+ * <p>{@link #delete(String)} has no such caller, and that is a property of the deployment rather than
+ * an omission: nothing in OFBiz deletes the file a file-backed resource names, so removing a
+ * {@code DataResource} row leaves its content exactly as it leaves a local file. It is part of the
+ * contract because the plan freezes the five operations (plan section 0.4.1), and because an ingest,
+ * a migration or a reconciliation job that reclaims orphaned objects needs it; the provider tests
+ * exercise it.
  *
  * <p><strong>Provider selection.</strong> Instances are obtained from
  * {@link ContentStoreFactory}, never constructed by callers. A {@code null} store is the
