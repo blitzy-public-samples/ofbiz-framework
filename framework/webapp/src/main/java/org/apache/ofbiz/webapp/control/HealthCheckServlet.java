@@ -19,14 +19,30 @@
 package org.apache.ofbiz.webapp.control;
 
 import java.io.IOException;
+import java.util.Objects;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
+import jakarta.servlet.Filter;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.FilterConfig;
+import jakarta.servlet.ServletContext;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletRequest;
+import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.entity.Delegator;
-import org.apache.ofbiz.entity.GenericEntityException;
 import org.apache.ofbiz.entity.util.EntityQuery;
 import org.apache.ofbiz.webapp.WebAppUtil;
 
@@ -47,25 +63,54 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  * </ul>
  *
  * <p>What a probe result is used for is the caller's policy, not this class's: a load balancer decides
- * target health and routing from it, and an orchestrator may decide replacement from it.</p>
+ * target health and routing from it, and an orchestrator may decide replacement from it.
  *
- * <p>The readiness query mirrors the {@code ping} service in
- * {@code org.apache.ofbiz.common.CommonServices}: it counts rows in {@code SequenceValueItem}, a seed
- * entity every deployment has, so the check exercises the connection pool, the JDBC driver, the
- * datasource credentials and the schema without touching business data or writing anything.
+ * <p><strong>A probe is cheap, and bounded.</strong> The readiness query mirrors the {@code ping} service
+ * in {@code org.apache.ofbiz.common.CommonServices} - it counts rows in {@code SequenceValueItem}, a seed
+ * entity every deployment has, so the check exercises the connection pool, the JDBC driver, the datasource
+ * credentials and the schema without touching business data or writing anything - but two limits are
+ * applied on top of it, because a probe runs every few seconds on every instance forever:
  *
- * <p>The servlet holds no state: the delegator is resolved from the servlet context on every request, so
- * a probe reports what the instance can do NOW rather than what it could do when the servlet was first
- * loaded. It never calls {@code getSession()} and never authenticates: it is mapped outside
- * {@code /control/*}, so it carries no base permission, and its two paths are listed in
- * {@code ControlFilter}'s {@code allowedPaths} so a probe reaches it anonymously.
+ * <ul>
+ *   <li>The result is CACHED for {@value #READINESS_CACHE_MILLIS} ms, so a probe interval shorter than
+ *       that cannot multiply into database load. The cache is deliberately far shorter than any
+ *       target-group interval, so the verdict is still current.</li>
+ *   <li>The query is run with a DEADLINE of {@value #READINESS_TIMEOUT_MILLIS} ms. Neither the driver nor
+ *       the pool bounds a probe usefully - the datasource's socket timeout is 60 s and its pool wait 20 s,
+ *       both far above a typical 5 s target-group timeout - so a degraded database would otherwise make
+ *       probes HANG rather than fail, and a hung probe is indistinguishable from a lost one. Passing the
+ *       deadline is reported as not ready.</li>
+ * </ul>
  *
- * <p>Registered from a webapp's {@code web.xml} with one {@code servlet} element and the two exact
- * {@code url-pattern} values. Any other path that reaches this class - only possible through an internal
- * dispatch, since the mappings are exact - is answered 404 rather than a false 200, so a misconfigured
- * probe cannot keep a broken instance in service.
+ * <p><strong>It is registered as a FILTER as well as a servlet</strong>, mapped to the same two exact
+ * paths and declared ahead of the other filters. That is what keeps a probe from minting an
+ * {@code HttpSession}: {@code ControlFilter} calls {@code getSession()} unconditionally, before it
+ * examines the path, so a probe that reached it would allocate a session - and, when that session later
+ * expired, a transaction and a query to finalise a visit that never happened. Answering in the filter
+ * means the rest of the chain never runs for a probe. The servlet registration is kept as the declared
+ * endpoint, so the two paths still resolve if the filter mapping is ever removed. Neither role ever calls
+ * {@code getSession()} itself.
+ *
+ * <p>One consequence of answering ahead of the chain is worth recording, because it looks like an omission
+ * in a scan: a probe response carries only {@code Cache-Control}, {@code Content-Type} and
+ * {@code Content-Length}, and NOT the security headers the filter chain adds to an ordinary response
+ * ({@code Strict-Transport-Security}, {@code X-Frame-Options}, {@code Content-Security-Policy} and the
+ * rest). Those headers instruct a BROWSER about a document; the two responses here are constant JSON with
+ * no markup, no script, no link and no user data, read by a load balancer rather than rendered, so there
+ * is nothing for them to protect. Running the chain to obtain them is precisely what would mint the
+ * session this class exists to avoid.
+ *
+ * <p>The class holds no per-request state: the delegator is resolved from the servlet context on every
+ * readiness evaluation, so a probe reports what the instance can do NOW rather than what it could do when
+ * the class was first loaded. It never authenticates: it is mapped outside {@code /control/*}, so it
+ * carries no base permission, and its two paths are listed in {@code ControlFilter}'s
+ * {@code allowedPaths} so a probe still reaches it anonymously if the chain does run.
+ *
+ * <p>Any other path that reaches this class - only possible through an internal dispatch, since the
+ * mappings are exact - is answered 404 rather than a false 200, so a misconfigured probe cannot keep a
+ * broken instance in service. Any method other than GET and HEAD is answered 405.
  */
-public final class HealthCheckServlet extends HttpServlet {
+public final class HealthCheckServlet extends HttpServlet implements Filter {
 
     private static final long serialVersionUID = 1L;
 
@@ -83,26 +128,133 @@ public final class HealthCheckServlet extends HttpServlet {
     private static final String CHARACTER_ENCODING = "UTF-8";
     private static final String CACHE_CONTROL_HEADER = "Cache-Control";
     private static final String CACHE_CONTROL_VALUE = "no-store";
+    private static final String ALLOW_HEADER = "Allow";
+    private static final String ALLOWED_METHODS = "GET, HEAD";
+    private static final String METHOD_GET = "GET";
+    private static final String METHOD_HEAD = "HEAD";
 
+    /** How long a readiness verdict is reused before the database is asked again. */
+    private static final long READINESS_CACHE_MILLIS = 2000L;
+    /** How long a probe waits for the readiness query before reporting not ready. */
+    private static final long READINESS_TIMEOUT_MILLIS = 2000L;
+    /** The shortest interval between two logged readiness failures. */
+    private static final long FAILURE_LOG_INTERVAL_MILLIS = 60000L;
+
+    /**
+     * Runs the readiness query away from the request thread, so that a database which has stopped
+     * answering cannot hold a probe open.
+     *
+     * <p>One daemon thread is enough: the result cache means at most one query per
+     * {@value #READINESS_CACHE_MILLIS} ms is ever submitted, and a submission that outlives its deadline
+     * is abandoned rather than waited for. A daemon thread so that it never keeps the JVM alive.
+     */
+    private static final ExecutorService PROBE_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> {
+        Thread worker = new Thread(runnable, "ofbiz-readiness-probe");
+        worker.setDaemon(true);
+        return worker;
+    });
+
+    /**
+     * The last verdict for each delegator, and when it was reached.
+     *
+     * <p>Static, so that the two instances of this class one webapp has - the servlet registration and the
+     * filter registration - share one verdict instead of each keeping its own and doubling the queries.
+     *
+     * <p>Keyed by DELEGATOR NAME, because that is what a readiness verdict is actually about. The class is
+     * meant to be registerable from any webapp's web.xml, and two webapps in one JVM can be configured
+     * with different delegators through the entityDelegatorName context parameter; a single shared verdict
+     * would then let one webapp's database answer for another's, reporting an instance ready on the
+     * strength of a database it does not use. The map holds one entry per delegator a probe has asked
+     * about, which is one or two in any realistic deployment.
+     */
+    private static final ConcurrentMap<String, Verdict> VERDICTS = new ConcurrentHashMap<>();
+
+    /** When a readiness failure was last logged, so an outage cannot flood the log. */
+    private static final AtomicLong FAILURE_LAST_LOGGED = new AtomicLong();
+
+    /** The servlet context, when this instance is running as a filter rather than as a servlet. */
+    private transient ServletContext filterContext;
+
+    /**
+     * Records the servlet context of the webapp this filter belongs to.
+     *
+     * @param filterConfig the filter configuration the container supplies
+     */
     @Override
-    protected void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
-        handleProbe(request, response);
+    public void init(FilterConfig filterConfig) {
+        this.filterContext = filterConfig.getServletContext();
     }
 
     /**
-     * Answers a probe sent with HEAD, with exactly the status and headers GET would answer.
+     * Answers a probe without running the rest of the filter chain, and passes everything else through.
      *
-     * <p>Written here rather than left to the default implementation, which wraps the response in a
-     * body-swallowing decorator and calls {@code doGet} only to compute a Content-Length - work a health
-     * probe has no use for. The container suppresses the body of a HEAD response itself.
+     * <p>The chain is deliberately NOT continued for a probe path: continuing it is what would mint a
+     * session. Every request that is not a probe is passed on untouched, so this mapping cannot affect
+     * anything else even if it is widened by mistake.
      *
-     * @param request the probe request
+     * @param request the request
+     * @param response the response
+     * @param chain the rest of the chain
+     * @throws IOException if the response cannot be written
+     * @throws ServletException if the rest of the chain fails
+     */
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+        if (request instanceof HttpServletRequest probe && response instanceof HttpServletResponse answer
+                && isProbePath(pathWithinWebapp(probe))) {
+            // service() rather than handleProbe(), so that method handling - GET and HEAD answered, every
+            // other method refused with 405 and an Allow header - is decided in exactly one place for
+            // both roles. See the service() override below.
+            service(probe, answer);
+            return;
+        }
+        chain.doFilter(request, response);
+    }
+
+    /**
+     * Dispatches a probe request: GET and HEAD are answered, every other method is refused with 405.
+     *
+     * <p>Method handling is decided HERE, in one place, rather than in the {@code doXxx} hooks, because
+     * {@code HttpServlet}'s own dispatch does not implement this contract: its {@code doPost},
+     * {@code doPut} and {@code doDelete} answer 405 with no {@code Allow} header, its {@code doOptions}
+     * answers 200 and advertises TRACE, its {@code doTrace} echoes the request back, and a method it does
+     * not recognise at all - PATCH, say - gets 501. A probe endpoint should give one answer to everything
+     * it does not serve, with the header that says what it does serve, so the dispatch is replaced rather
+     * than patched hook by hook. It also means the filter role and the servlet role cannot diverge: both
+     * arrive here.
+     *
+     * <p>HEAD is answered by exactly the code that answers GET, so the status and the headers - including
+     * Content-Length - are identical; the container discards the body of a HEAD response itself.
+     *
+     * <p>TRACE normally never reaches this method: Tomcat's {@code allowTrace} defaults to false and the
+     * Catalina descriptor does not set it, so the connector refuses TRACE with its own 405 and its own
+     * {@code Allow} header before any webapp is consulted. The branch below covers a deployment that turns
+     * {@code allowTrace} on, which would otherwise let {@code HttpServlet.doTrace} echo a probe request
+     * back to its sender.
+     *
+     * @param request the request
      * @param response the response to write
      * @throws IOException if the response cannot be written
      */
     @Override
-    protected void doHead(HttpServletRequest request, HttpServletResponse response) throws IOException {
-        handleProbe(request, response);
+    protected void service(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        String method = request.getMethod();
+        if (METHOD_GET.equals(method) || METHOD_HEAD.equals(method)) {
+            handleProbe(request, response);
+        } else {
+            refuseMethod(response);
+        }
+    }
+
+    private static void refuseMethod(HttpServletResponse response) {
+        response.setStatus(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
+        response.setHeader(ALLOW_HEADER, ALLOWED_METHODS);
+        response.setHeader(CACHE_CONTROL_HEADER, CACHE_CONTROL_VALUE);
+    }
+
+    private static boolean isProbePath(String path) {
+        return PROBE_LIVE.equals(path) || PROBE_READY.equals(path);
     }
 
     private void handleProbe(HttpServletRequest request, HttpServletResponse response) throws IOException {
@@ -124,32 +276,113 @@ public final class HealthCheckServlet extends HttpServlet {
     }
 
     /**
-     * Reports whether this instance can reach its database.
+     * Reports whether this instance can reach its database, reusing a recent verdict.
      *
-     * <p>The delegator is resolved per request from the servlet context, and a null one - the Entity
-     * Engine could not build it - is itself a not-ready verdict. Both a checked
-     * {@link GenericEntityException} and an unchecked failure from the pool or the driver are reported
-     * as not ready: a readiness probe answers a question, so it never propagates.
+     * <p>The delegator is resolved on every probe, before the cache is consulted, so that the verdict
+     * reused is one about THIS webapp's database and a webapp whose delegator changes is not answered from
+     * the previous one's verdict. Resolving it is a servlet-context attribute lookup, not a connection.
      *
      * @return true when the readiness query succeeded and found the seed entity populated
      */
     private boolean isDatabaseReachable() {
-        Delegator delegator = WebAppUtil.getDelegator(getServletContext());
+        ServletContext context = servletContext();
+        Delegator delegator = context == null ? null : WebAppUtil.getDelegator(context);
         if (delegator == null) {
-            Debug.logError("Readiness probe found no delegator for this webapp", MODULE);
+            reportFailure("Readiness probe found no delegator for this webapp", null);
             return false;
         }
+        // A delegator with no name would be unusual; keyed under the empty string rather than risking a
+        // null key, so that an odd configuration cannot turn a probe into an exception.
+        String scope = Objects.requireNonNullElse(delegator.getDelegatorName(), "");
+        long now = System.currentTimeMillis();
+        Verdict held = VERDICTS.get(scope);
+        if (held != null && now - held.at() < READINESS_CACHE_MILLIS) {
+            return held.up();
+        }
+        boolean up = evaluateReadiness(delegator);
+        VERDICTS.put(scope, new Verdict(System.currentTimeMillis(), up));
+        return up;
+    }
+
+    /**
+     * Runs the readiness query under a deadline.
+     *
+     * <p>Both a checked {@code GenericEntityException} and an unchecked failure from the pool or the
+     * driver are reported as not ready, as is passing the deadline: a readiness probe answers a question,
+     * so it never propagates. An abandoned query is cancelled with an interrupt, so a driver that honours
+     * one gives up its connection rather than holding it for the socket timeout.
+     *
+     * @param delegator the delegator to query, never null
+     * @return true when the query succeeded within the deadline and found the seed entity populated
+     */
+    private boolean evaluateReadiness(Delegator delegator) {
+        Callable<Boolean> statement = () -> EntityQuery.use(delegator).from(READINESS_ENTITY).queryCount() > 0;
+        Future<Boolean> query = PROBE_EXECUTOR.submit(statement);
         try {
-            // Only the message is logged: a stack trace on every failed probe of every instance would
-            // flood the log while a database is unreachable, which is exactly when it must stay readable.
-            return EntityQuery.use(delegator).from(READINESS_ENTITY).queryCount() > 0;
-        } catch (GenericEntityException e) {
-            Debug.logError(e.getMessage(), MODULE);
+            if (Boolean.TRUE.equals(query.get(READINESS_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS))) {
+                return true;
+            }
+            // The query SUCCEEDED and found nothing. Reported, because otherwise this is the one way to
+            // answer 503 with nothing in the log to say why, and an operator watching a rollout could not
+            // tell an empty schema from an unreachable database. It is the expected state of a database
+            // whose schema has just been created: no identifier has been allocated from the sequencer yet.
+            reportFailure("Readiness probe reached the database but found no allocated identifier in "
+                    + READINESS_ENTITY + ", so this instance cannot serve yet. Load the seed data, or wait"
+                    + " for the first sequenced record to be written", null);
             return false;
-        } catch (RuntimeException e) {
-            Debug.logError(e.getMessage(), MODULE);
+        } catch (TimeoutException slow) {
+            query.cancel(true);
+            reportFailure("Readiness probe gave up after " + READINESS_TIMEOUT_MILLIS
+                    + " ms waiting for the database", null);
+            return false;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            query.cancel(true);
+            return false;
+        } catch (RuntimeException | java.util.concurrent.ExecutionException failed) {
+            reportFailure("Readiness probe could not reach the database", failed.getCause() == null
+                    ? failed : failed.getCause());
             return false;
         }
+    }
+
+    /**
+     * Logs a readiness failure at most once per {@value #FAILURE_LOG_INTERVAL_MILLIS} ms.
+     *
+     * <p>A probe runs every few seconds on every instance, so an unrated log line would turn a database
+     * outage - exactly when the log has to stay readable - into unbounded log volume. The interval is
+     * enough to keep the outage visible while a single instance contributes at most one line a minute.
+     *
+     * @param message what happened
+     * @param cause the failure, or null when there is no exception to report
+     */
+    private static void reportFailure(String message, Throwable cause) {
+        long now = System.currentTimeMillis();
+        long last = FAILURE_LAST_LOGGED.get();
+        if (now - last < FAILURE_LOG_INTERVAL_MILLIS || !FAILURE_LAST_LOGGED.compareAndSet(last, now)) {
+            return;
+        }
+        if (cause == null) {
+            Debug.logError(message + ". Further readiness failures are logged at most once every "
+                    + FAILURE_LOG_INTERVAL_MILLIS + " ms.", MODULE);
+        } else {
+            // The exception object, not just its message: getMessage() can be null, which logged the
+            // literal "null" and told an operator nothing at all.
+            Debug.logError(cause, message + ". Further readiness failures are logged at most once every "
+                    + FAILURE_LOG_INTERVAL_MILLIS + " ms.", MODULE);
+        }
+    }
+
+    /**
+     * Returns the servlet context of the webapp this instance belongs to, in either role.
+     *
+     * @return the context, or null when neither role has been initialised
+     */
+    private ServletContext servletContext() {
+        if (filterContext != null) {
+            return filterContext;
+        }
+        return getServletConfig() == null ? null : getServletContext();
     }
 
     /**
@@ -182,11 +415,20 @@ public final class HealthCheckServlet extends HttpServlet {
      * @param body the JSON body to write
      * @throws IOException if the response cannot be written
      */
-    private static void writeResponse(HttpServletResponse response, int status, String body) throws IOException {
+    private static void writeResponse(HttpServletResponse response, int status, String body)
+            throws IOException {
         response.setStatus(status);
         response.setContentType(CONTENT_TYPE_JSON);
         response.setCharacterEncoding(CHARACTER_ENCODING);
         response.setHeader(CACHE_CONTROL_HEADER, CACHE_CONTROL_VALUE);
         response.getWriter().write(body);
     }
+
+    /**
+     * One readiness verdict and the instant it was reached.
+     *
+     * @param at the epoch millisecond the verdict was reached
+     * @param up whether the database answered
+     */
+    private record Verdict(long at, boolean up) { }
 }

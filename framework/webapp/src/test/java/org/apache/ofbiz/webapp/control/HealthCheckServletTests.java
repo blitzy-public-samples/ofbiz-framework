@@ -1,0 +1,305 @@
+/*******************************************************************************
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *******************************************************************************/
+package org.apache.ofbiz.webapp.control;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.io.PrintWriter;
+import java.io.StringWriter;
+
+import org.apache.ofbiz.entity.Delegator;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.FilterConfig;
+import jakarta.servlet.ServletContext;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+
+/**
+ * The liveness and readiness endpoints a load balancer probes.
+ *
+ * <p><strong>Hermetic.</strong> No container is started, no socket is opened and no database is reached:
+ * the servlet is exercised in its FILTER role against mocked servlet objects, and the delegator is a mock
+ * whose count method is stubbed, so the readiness query runs entirely in memory.
+ *
+ * <p>What is asserted here is the contract a target group depends on. A probe endpoint that answers 200
+ * when the instance cannot serve keeps a broken instance in rotation; one that answers 503 when the
+ * instance is healthy takes a working instance out. Both are asserted, along with the three properties
+ * that are easy to regress and invisible in production until they matter: that a probe never allocates an
+ * {@code HttpSession}, that readiness is not re-queried on every probe, and that a method other than GET
+ * or HEAD is refused with the header saying what is allowed.
+ */
+public final class HealthCheckServletTests {
+
+    private static final String LIVE = "/health/live";
+    private static final String READY = "/health/ready";
+
+    private HealthCheckServlet probe;
+    private ServletContext context;
+    private Delegator delegator;
+    private HttpServletRequest request;
+    private HttpServletResponse response;
+    private FilterChain chain;
+    private StringWriter body;
+
+    @BeforeEach
+    public void setUp(TestInfo about) throws Exception {
+        delegator = mock(Delegator.class);
+        // The readiness verdict is cached PER DELEGATOR and the cache is static, so each test names its own
+        // delegator: that is what keeps these tests independent of each other and of their order, without
+        // reaching into the class to clear anything.
+        when(delegator.getDelegatorName()).thenReturn(about.getDisplayName());
+        // EntityQuery.use() asks the delegator for itself, so a bare mock would hand back null and every
+        // readiness evaluation would fail for the wrong reason.
+        when(delegator.getDelegator()).thenReturn(delegator);
+        context = mock(ServletContext.class);
+        when(context.getAttribute("delegator")).thenReturn(delegator);
+        FilterConfig config = mock(FilterConfig.class);
+        when(config.getServletContext()).thenReturn(context);
+        probe = new HealthCheckServlet();
+        probe.init(config);
+
+        request = mock(HttpServletRequest.class);
+        when(request.getMethod()).thenReturn("GET");
+        response = mock(HttpServletResponse.class);
+        body = new StringWriter();
+        when(response.getWriter()).thenReturn(new PrintWriter(body));
+        chain = mock(FilterChain.class);
+    }
+
+    @Test
+    public void livenessAnswersUpWithoutConsultingTheDatabase() throws Exception {
+        at(LIVE);
+
+        probe.doFilter(request, response, chain);
+
+        verify(response).setStatus(HttpServletResponse.SC_OK);
+        assertEquals("{\"status\":\"UP\"}", body.toString(), "liveness must answer a constant body");
+        // Liveness says "this JVM is running", so it must not depend on anything outside the JVM. A
+        // liveness probe that consulted the database would have the whole fleet restarted by the
+        // orchestrator during a database outage, turning a recoverable fault into an outage of everything.
+        verify(context, never()).getAttribute(anyString());
+    }
+
+    @Test
+    public void readinessAnswersUpWhenTheDatabaseAnswers() throws Exception {
+        databaseAnswers(1L);
+        at(READY);
+
+        probe.doFilter(request, response, chain);
+
+        verify(response).setStatus(HttpServletResponse.SC_OK);
+        assertEquals("{\"status\":\"UP\",\"database\":\"UP\"}", body.toString(),
+                "readiness must report the database it checked");
+    }
+
+    @Test
+    public void readinessAnswersUnavailableWhenTheDatabaseCannotBeReached() throws Exception {
+        databaseFails();
+        at(READY);
+
+        probe.doFilter(request, response, chain);
+
+        // 503, and not an exception and not a 200: the load balancer has to be able to take this instance
+        // out of rotation, and a probe that propagated the failure would answer 500 through the container's
+        // error machinery instead.
+        verify(response).setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+        assertEquals("{\"status\":\"DOWN\",\"database\":\"DOWN\"}", body.toString(),
+                "readiness must report which dependency was down");
+    }
+
+    @Test
+    public void anEmptySequencerIsNotReadyEither() throws Exception {
+        databaseAnswers(0L);
+        at(READY);
+
+        probe.doFilter(request, response, chain);
+
+        // A schema that has just been created answers this query successfully and finds nothing, because no
+        // identifier has been allocated from the sequencer yet. The instance genuinely cannot serve, so the
+        // probe must say 503 - and it must say so in the log too, or an operator watching a rollout could
+        // not tell an empty schema from an unreachable database.
+        verify(response).setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+        assertEquals("{\"status\":\"DOWN\",\"database\":\"DOWN\"}", body.toString(),
+                "an empty sequencer must report not ready");
+    }
+
+    @Test
+    public void aProbeNeverAllocatesASession() throws Exception {
+        databaseAnswers(1L);
+
+        at(LIVE);
+        probe.doFilter(request, response, chain);
+        at(READY);
+        probe.doFilter(request, response, chain);
+
+        // The reason this class is registered as a filter ahead of ControlFilter, which calls getSession()
+        // unconditionally. One session per probe, at the rate a target group probes, is a slow leak whose
+        // expiry work costs a transaction and a query each.
+        verify(request, never()).getSession();
+        verify(request, never()).getSession(true);
+        // And the chain is not continued for a probe, which is what keeps the rest of it from doing so.
+        verify(chain, never()).doFilter(any(), any());
+    }
+
+    @Test
+    public void aReadinessVerdictIsReusedRatherThanRequeriedOnEveryProbe() throws Exception {
+        databaseAnswers(1L);
+
+        for (int attempt = 0; attempt < 5; attempt++) {
+            at(READY);
+            body.getBuffer().setLength(0);
+            probe.doFilter(request, response, chain);
+        }
+
+        // Five probes, one query. A target group probes every few seconds from every instance it fronts,
+        // so an unbounded probe would add a database round trip per probe per instance for no information.
+        verify(delegator, times(1)).findCountByCondition(eq("SequenceValueItem"), any(), any(), any(), any());
+        verify(response, times(5)).setStatus(HttpServletResponse.SC_OK);
+    }
+
+    @Test
+    public void everyMethodOtherThanGetAndHeadIsRefusedWithTheAllowedOnes() throws Exception {
+        for (String method : new String[] {"POST", "PUT", "DELETE", "OPTIONS", "TRACE", "PATCH", "PROPFIND"}) {
+            HttpServletResponse refused = mock(HttpServletResponse.class);
+            when(refused.getWriter()).thenReturn(new PrintWriter(new StringWriter()));
+            at(LIVE);
+            when(request.getMethod()).thenReturn(method);
+
+            probe.doFilter(request, refused, chain);
+
+            verify(refused, times(1)).setStatus(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
+            verify(refused).setHeader("Allow", "GET, HEAD");
+            verify(refused, never()).setStatus(HttpServletResponse.SC_OK);
+        }
+    }
+
+    @Test
+    public void headAnswersExactlyWhatGetWouldWithoutTheChain() throws Exception {
+        at(LIVE);
+        when(request.getMethod()).thenReturn("HEAD");
+
+        probe.doFilter(request, response, chain);
+
+        // The container discards the body of a HEAD response itself, so the handler writes the same bytes
+        // and the status and headers are identical to GET's - which is what a probe configured for HEAD
+        // relies on.
+        verify(response).setStatus(HttpServletResponse.SC_OK);
+        verify(response).setHeader("Cache-Control", "no-store");
+        verify(chain, never()).doFilter(any(), any());
+    }
+
+    @Test
+    public void aPathThatIsNotAProbeIsPassedOnUntouched() throws Exception {
+        at("/control/main");
+
+        probe.doFilter(request, response, chain);
+
+        // Registered on two exact patterns, so this cannot normally happen - and if the mapping were ever
+        // widened by mistake, the request must go on to the rest of the chain rather than be answered here.
+        verify(chain).doFilter(request, response);
+        verify(response, never()).setStatus(HttpServletResponse.SC_OK);
+    }
+
+    @Test
+    public void everyProbeResponseForbidsCaching() throws Exception {
+        databaseAnswers(1L);
+        at(READY);
+
+        probe.doFilter(request, response, chain);
+
+        // A cached verdict is a stale verdict: an intermediary that held a 200 would keep answering it for
+        // an instance that had since failed.
+        verify(response).setHeader("Cache-Control", "no-store");
+    }
+
+    @Test
+    public void twoWebappsWithDifferentDelegatorsDoNotShareAVerdict() throws Exception {
+        databaseAnswers(1L);
+        at(READY);
+        probe.doFilter(request, response, chain);
+        verify(response).setStatus(HttpServletResponse.SC_OK);
+
+        // A second webapp in the same JVM, registered from its own web.xml against its own delegator whose
+        // database is down. The verdict cache is static and shared, so it must be keyed by the delegator it
+        // is a verdict about - otherwise this webapp would be reported ready on the strength of the first
+        // one's database.
+        Delegator other = mock(Delegator.class);
+        when(other.getDelegator()).thenReturn(other);
+        when(other.getDelegatorName()).thenReturn("a-different-delegator");
+        when(other.findCountByCondition(anyString(), any(), any(), any(), any()))
+                .thenThrow(new IllegalStateException("that database is unreachable"));
+        ServletContext otherContext = mock(ServletContext.class);
+        when(otherContext.getAttribute("delegator")).thenReturn(other);
+        FilterConfig otherConfig = mock(FilterConfig.class);
+        when(otherConfig.getServletContext()).thenReturn(otherContext);
+        HealthCheckServlet otherProbe = new HealthCheckServlet();
+        otherProbe.init(otherConfig);
+        HttpServletResponse otherResponse = mock(HttpServletResponse.class);
+        when(otherResponse.getWriter()).thenReturn(new PrintWriter(new StringWriter()));
+
+        otherProbe.doFilter(request, otherResponse, chain);
+
+        verify(otherResponse).setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+        verify(otherResponse, never()).setStatus(HttpServletResponse.SC_OK);
+    }
+
+    /**
+     * Points the request at a path within the webapp.
+     *
+     * @param path the path the container would report, with the context path already removed
+     */
+    private void at(String path) {
+        when(request.getServletPath()).thenReturn(path);
+        when(request.getPathInfo()).thenReturn(null);
+    }
+
+    /**
+     * Makes the readiness query succeed with the given row count.
+     *
+     * @param rows the count the delegator answers
+     * @throws Exception if the stub cannot be installed
+     */
+    private void databaseAnswers(long rows) throws Exception {
+        // Plain any() rather than any(Type.class): the fields-to-select and having arguments are null for
+        // this query, and a typed matcher does not match null.
+        when(delegator.findCountByCondition(anyString(), any(), any(), any(), any())).thenReturn(rows);
+    }
+
+    /**
+     * Makes the readiness query fail the way an unreachable database does.
+     *
+     * @throws Exception if the stub cannot be installed
+     */
+    private void databaseFails() throws Exception {
+        when(delegator.findCountByCondition(anyString(), any(), any(), any(), any()))
+                .thenThrow(new IllegalStateException("the connection pool is exhausted"));
+    }
+}

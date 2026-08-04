@@ -109,6 +109,20 @@ public final class ContentStoreFactory {
             return getContentStore();
         }
         String configured = EntityUtilProperties.getPropertyValue(RESOURCE, PROVIDER_PROPERTY, DATABASE, delegator);
+        String onFile = setting(PROVIDER_PROPERTY, DATABASE);
+        if (S3.equals(configured.trim().toLowerCase(Locale.ROOT)) && !S3.equals(onFile.trim().toLowerCase(Locale.ROOT))
+                && UtilValidate.isEmpty(setting("content.store.s3.bucket", ""))) {
+            // The SELECTOR can be overridden by a SystemProperty row while the s3 settings can not: they
+            // are read from the property file alone, so that no database row can repoint the client. A row
+            // asking for s3 on a fleet whose files carry no bucket would therefore make every content
+            // operation throw on each newly started instance. It is refused HERE, once, with the reason.
+            Debug.logWarning("A SystemProperty row sets " + PROVIDER_PROPERTY + "=" + S3 + ", but this instance's"
+                    + " content.properties declares no content.store.s3.bucket - and the s3 settings are read"
+                    + " from the property file only, so a database row cannot supply them. The row is ignored"
+                    + " and [" + onFile + "] storage is used. Configure the store through the environment"
+                    + " (OFBIZ_CONTENT_STORE_PROVIDER and OFBIZ_S3_*) and restart. See DOCKER.adoc.", MODULE);
+            return resolve(onFile);
+        }
         return resolve(configured);
     }
 
@@ -186,26 +200,50 @@ public final class ContentStoreFactory {
         if (provider.isEmpty()) {
             provider = DATABASE;
         }
+        // ONE read of the volatile field, into a local, for the whole of this method. Reading it twice
+        // would let a concurrent clearCache() null it between the two, and the second read would then be
+        // dereferenced as if the first had succeeded.
+        Resolution cached = resolution;
         if (DATABASE.equals(provider)) {
-            reportStaleConfiguration(DATABASE);
+            reportStaleConfiguration(cached, DATABASE);
             return null;
         }
         requireSingleTenantDeployment(provider);
-        String signature = provider + '\n' + (S3.equals(provider)
+        if (cached != null) {
+            // The FAST PATH, taken on every file-backed content operation. The configuration signature is
+            // deliberately NOT computed here: it is a SHA-256 over six property reads, and it is only
+            // needed to decide whether to REPORT a configuration change, which is worth doing once rather
+            // than on every read. It is therefore computed only while the provider is not yet built, and
+            // afterwards only until the change has been reported.
+            if (!cached.reported()) {
+                reportStaleConfiguration(cached, signature(provider));
+            }
+            return cached.store();
+        }
+        synchronized (CREATION_LOCK) {
+            if (resolution == null) {
+                ContentStore store = S3.equals(provider) ? new S3ContentStore() : new FileSystemContentStore();
+                resolution = new Resolution(signature(provider), store);
+                Debug.logInfo("Content storage provider [" + provider + "] is in use", MODULE);
+                return store;
+            }
+            cached = resolution;
+        }
+        reportStaleConfiguration(cached, signature(provider));
+        return cached.store();
+    }
+
+    /**
+     * Returns the signature a resolution is cached against.
+     *
+     * @param provider the provider name
+     * @return the signature
+     * @throws GeneralException if the provider's own configuration cannot be read
+     */
+    private static String signature(String provider) throws GeneralException {
+        return provider + '\n' + (S3.equals(provider)
                 ? S3ContentStore.configurationSignature()
                 : FileSystemContentStore.configurationSignature());
-        if (resolution == null) {
-            synchronized (CREATION_LOCK) {
-                if (resolution == null) {
-                    ContentStore store = S3.equals(provider) ? new S3ContentStore() : new FileSystemContentStore();
-                    resolution = new Resolution(signature, store);
-                    Debug.logInfo("Content storage provider [" + provider + "] is in use", MODULE);
-                    return store;
-                }
-            }
-        }
-        reportStaleConfiguration(signature);
-        return resolution.store();
     }
 
     /**
@@ -244,10 +282,10 @@ public final class ContentStoreFactory {
      * be streaming from. Saying so once is what turns a silently ignored change into an operator-visible
      * instruction to restart.
      *
+     * @param cached the resolution that is running, or null when none is
      * @param wanted the signature the configuration now asks for, or {@code database}
      */
-    private static void reportStaleConfiguration(String wanted) {
-        Resolution cached = resolution;
+    private static void reportStaleConfiguration(Resolution cached, String wanted) {
         if (cached == null || cached.signature().equals(wanted) || cached.reported()) {
             return;
         }

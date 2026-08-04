@@ -49,6 +49,29 @@ COPY plugin[s]/ plugins/
 COPY themes/ themes/
 COPY APACHE2_HEADER build.gradle common.gradle gradle.properties NOTICE settings.gradle dependencies.gradle .
 
+# Refuse to package a signing key. The two properties below are committed BLANK so that the value can be
+# injected at run time, and nothing in this stage fills them in - but a developer's working tree can arrive
+# here already carrying live keys, because "./gradlew generateSecretKeys" writes them into the tracked file
+# and "./gradlew loadAll" depends on that task (build.gradle: loadAll dependsOn generateSecretKeys). Its skip
+# test only matches a property that already has a value, so a blank anchor is always (re)generated. The COPY
+# above then brings those keys into the build context and distTar would seal them into an image layer that no
+# run-time override can remove - and every image built from that tree would share one signing key.
+# So check before packaging rather than after: this fails the image build with an actionable message instead.
+# Reverting is "git checkout -- framework/security/config/security.properties"; a local development run that
+# wants real keys should put them in an untracked config/security.properties override, which precedes
+# ofbiz.jar on the class path, exactly as the container does with the environment.
+RUN if grep -Eq '^(login\.secret_key_string|security\.token\.key)=.+' framework/security/config/security.properties; then \
+        echo 'ERROR: framework/security/config/security.properties carries a live signing key.' >&2; \
+        echo '       login.secret_key_string and security.token.key must be committed BLANK: they are' >&2; \
+        echo '       injected at run time from OFBIZ_LOGIN_SECRET_KEY and OFBIZ_JWT_TOKEN_KEY.' >&2; \
+        echo '       A value here would be packaged into an image layer permanently. Most likely a' >&2; \
+        echo '       "gradlew generateSecretKeys" - or a "gradlew loadAll", which depends on it - wrote' >&2; \
+        echo '       them. Restore the file with:' >&2; \
+        echo '         git checkout -- framework/security/config/security.properties' >&2; \
+        echo '       and keep local development keys in an untracked config/security.properties instead.' >&2; \
+        exit 1; \
+    fi
+
 # Build OFBiz while mounting a gradle cache.
 # "generateSecretKeys" is deliberately not run here: it writes live login.secret_key_string and
 # security.token.key values into framework/security/config/security.properties, which distTar then
@@ -123,12 +146,36 @@ RUN /ofbiz/bin/ofbiz --load-data
 # is configured; start this image with OFBIZ_POSTGRES_HOST and it loads the data and creates the admin
 # user in that database, because a marker written here can say nothing about it. Every marker the entry
 # point writes itself carries a digest of the configuration it applied.
+# They record only what has been done to the DATABASE. CONFIGURATION is not marker-gated at all - the entry
+# point renders it from the packaged sources on every start - so nothing baked here can suppress the
+# configuration a container's own environment asks for.
 RUN mkdir --parents /ofbiz/runtime/container_state
 RUN touch /ofbiz/runtime/container_state/data_loaded
 RUN touch /ofbiz/runtime/container_state/admin_loaded
 RUN touch /ofbiz/runtime/container_state/db_config_applied
 
 VOLUME ["/docker-entrypoint-hooks"]
+# THE VOLUME LAYOUT, and what each one holds. Read this before mounting or sharing any of them.
+#
+# /ofbiz/config    - the rendered configuration, and therefore THE SECRET-BEARING VOLUME. The entry point
+#                    writes the admin key, the forgot-password key, the JWT signing key, the object-store
+#                    secret key and the three database passwords into files here, in PLAINTEXT, mode 600,
+#                    owned by the ofbiz user. It OUTLIVES the container, so removing a secret from the
+#                    environment does not remove it from this volume - the entry point withdraws an
+#                    override it rendered itself, and its ledger lives here for exactly that reason, but a
+#                    volume kept after the container is gone still holds the last values written. Treat it
+#                    as a secret store: do not share it between deployments, and wipe or recreate it when
+#                    rotating. DOCKER.adoc carries the wipe and rotate procedure.
+# /ofbiz/runtime   - logs, the local content/upload directory and the database markers. Per instance.
+#                    Do NOT share the whole of it between instances; runtime/uploads alone may be shared,
+#                    and only with the filesystem content provider.
+# /ofbiz/lib-extra - operator-supplied jars, first on the class path after config. This is where a JMS
+#                    provider client library goes when distributed cache invalidation is switched on.
+#
+# /ofbiz/framework is deliberately NOT a volume. The Tomcat container descriptor there is patched in place
+# with the load-balancer settings, so it must come from the image on every recreation rather than from a
+# volume that could carry a previous container's values - which is why the entry point renders
+# configuration unconditionally instead of gating it on a marker.
 VOLUME ["/ofbiz/config", "/ofbiz/runtime", "/ofbiz/lib-extra"]
 
 
@@ -139,4 +186,25 @@ FROM runtimebase AS runtime
 USER ofbiz
 
 VOLUME ["/docker-entrypoint-hooks"]
+# THE VOLUME LAYOUT, and what each one holds. Read this before mounting or sharing any of them.
+#
+# /ofbiz/config    - the rendered configuration, and therefore THE SECRET-BEARING VOLUME. The entry point
+#                    writes the admin key, the forgot-password key, the JWT signing key, the object-store
+#                    secret key and the three database passwords into files here, in PLAINTEXT, mode 600,
+#                    owned by the ofbiz user. It OUTLIVES the container, so removing a secret from the
+#                    environment does not remove it from this volume - the entry point withdraws an
+#                    override it rendered itself, and its ledger lives here for exactly that reason, but a
+#                    volume kept after the container is gone still holds the last values written. Treat it
+#                    as a secret store: do not share it between deployments, and wipe or recreate it when
+#                    rotating. DOCKER.adoc carries the wipe and rotate procedure.
+# /ofbiz/runtime   - logs, the local content/upload directory and the database markers. Per instance.
+#                    Do NOT share the whole of it between instances; runtime/uploads alone may be shared,
+#                    and only with the filesystem content provider.
+# /ofbiz/lib-extra - operator-supplied jars, first on the class path after config. This is where a JMS
+#                    provider client library goes when distributed cache invalidation is switched on.
+#
+# /ofbiz/framework is deliberately NOT a volume. The Tomcat container descriptor there is patched in place
+# with the load-balancer settings, so it must come from the image on every recreation rather than from a
+# volume that could carry a previous container's values - which is why the entry point renders
+# configuration unconditionally instead of gating it on a marker.
 VOLUME ["/ofbiz/config", "/ofbiz/runtime", "/ofbiz/lib-extra"]

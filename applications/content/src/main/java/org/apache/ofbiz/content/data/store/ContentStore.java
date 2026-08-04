@@ -20,11 +20,12 @@ package org.apache.ofbiz.content.data.store;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Optional;
 
 import org.apache.ofbiz.base.util.GeneralException;
 
 /**
- * The five-method storage contract for file-backed {@code DataResource} content - {@code LOCAL_FILE},
+ * The six-method storage contract for file-backed {@code DataResource} content - {@code LOCAL_FILE},
  * {@code OFBIZ_FILE} and {@code CONTEXT_FILE} together with their {@code _BIN} variants - with one
  * implementation per storage backend.
  *
@@ -56,6 +57,11 @@ import org.apache.ofbiz.base.util.GeneralException;
  * atomic as far as a concurrent reader is concerned: the reader sees either the whole previous object
  * or the whole new one, never a mixture of the two. {@link #delete} is idempotent.
  *
+ * <p><strong>One size bound, {@link #MAX_OBJECT_BYTES}, governs the whole contract.</strong> It bounds
+ * what {@link #get} will read into memory and what a caller may {@link #put}, so an object written
+ * through this contract can always be read back through it. Content larger than that is streamed with
+ * {@link #openStream} rather than being handled as a byte array.
+ *
  * <p><strong>Logging.</strong> Where an implementation logs a storage operation it names the key, and
  * the container holding it where the provider has one, and never the content itself.
  *
@@ -66,29 +72,68 @@ import org.apache.ofbiz.base.util.GeneralException;
 public interface ContentStore {
 
     /**
+     * The largest object this contract handles as a byte array, 64 MiB.
+     *
+     * <p>ONE bound for the whole contract, so that what {@link #put} accepts is exactly what
+     * {@link #get} can read back. Larger content is streamed with {@link #openStream}.
+     */
+    long MAX_OBJECT_BYTES = 64L * 1024L * 1024L;
+
+    /**
+     * What a store holds for one key, without transferring the content itself.
+     *
+     * <p>Answered by {@link ContentStore#describe} from a metadata request - a {@code HeadObject} for an
+     * object store, a stat for a filesystem - so a caller can decide whether it needs the bytes at all.
+     *
+     * @param length the object's size in bytes
+     * @param modifiedAt the epoch millisecond the object was last written, or 0 when the store does not
+     *     report one
+     * @param entityTag the store's own opaque version tag for the object, or null when it reports none.
+     *     Compare it only for equality, and only against a tag from the same store.
+     */
+    record Description(long length, long modifiedAt, String entityTag) { }
+
+    /**
      * Stores the given content under the given key, replacing any object already held there.
      *
      * @param key the storage key
-     * @param data the content to store, never null
+     * @param data the content to store, never null and no larger than {@link #MAX_OBJECT_BYTES}
      * @throws GeneralException if the key breaks the key grammar or the provider is misconfigured
-     * @throws IOException if the store cannot be written
+     * @throws IOException if the store cannot be written or the content exceeds
+     *     {@link #MAX_OBJECT_BYTES}
      */
     void put(String key, byte[] data) throws GeneralException, IOException;
 
     /**
      * Returns the whole object held under the given key.
      *
-     * <p>The object is read into memory, so this is the bounded accessor: an object larger than the
-     * implementation's documented limit is refused with an {@link IOException} instead of being
-     * loaded. Use {@link #openStream} for content of unbounded size.
+     * <p>The object is read into memory, so this is the bounded accessor: an object larger than
+     * {@link #MAX_OBJECT_BYTES} is refused with an {@link IOException} instead of being loaded. Use
+     * {@link #openStream} for content of unbounded size.
      *
      * @param key the storage key
      * @return the object's bytes
      * @throws GeneralException if the key breaks the key grammar or the provider is misconfigured
      * @throws java.io.FileNotFoundException if this store does not hold the key
-     * @throws IOException if the store cannot be read or the object exceeds the implementation's limit
+     * @throws IOException if the store cannot be read or the object exceeds {@link #MAX_OBJECT_BYTES}
      */
     byte[] get(String key) throws GeneralException, IOException;
+
+    /**
+     * Reports what this store holds under the given key, without transferring the content.
+     *
+     * <p>The cheap question. A caller that already holds a copy of the content asks this first and
+     * transfers nothing when the copy still matches, which is what keeps a read from downloading an
+     * object it does not need - and what lets an instance whose filesystem is read-only serve content it
+     * already has.
+     *
+     * @param key the storage key
+     * @return what the store holds, or {@link Optional#empty()} when it holds no object under that key
+     * @throws GeneralException if the key breaks the key grammar or the provider is misconfigured
+     * @throws IOException if the store cannot answer. Absence is NOT a failure and is reported by the
+     *     empty result, so a caller can tell a missing object from a store that is unreachable.
+     */
+    Optional<Description> describe(String key) throws GeneralException, IOException;
 
     /**
      * Opens the object held under the given key for reading.

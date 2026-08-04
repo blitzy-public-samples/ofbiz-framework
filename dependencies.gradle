@@ -102,6 +102,22 @@ dependencies {
     // through the service loader as the single HTTP implementation present - so no code names it and it is
     // needed at run time only - and it supports every request S3ContentStore makes. With these three lines
     // the resolved runtime class path gains the SDK and the driver and changes NO existing version.
+    //
+    // THE THREE LINES BELOW ARE ONE UNIT - DO NOT REMOVE THE url-connection-client LINE. Excluding both
+    // default transports leaves the SDK with no HTTP implementation of its own, so that runtimeOnly line is
+    // the ONLY transport object storage has. Nothing references it by name: it is found through the service
+    // loader, so removing it compiles and every test that does not reach a live store still passes, and the
+    // failure appears only when a request is made - SdkClientException "Unable to load an HTTP implementation
+    // from any provider in the chain". If it ever has to be replaced, put another sync transport in its place
+    // in the same commit and check that the replacement does not move io.netty, httpclient5 or httpcore5.
+    //
+    // ISOLATION, PRECISELY. The specification asks for this dependency to be "isolated to the components that
+    // use them". OFBiz is a SINGLE Gradle project, so there is no per-component configuration to scope it to:
+    // 'implementation' here means the SDK is on the one runtime class path the whole application shares, and
+    // any component could import it. The isolation that does hold is at the source level - S3ContentStore is
+    // the sole importer of software.amazon.awssdk, and the SDK is inert unless content.store.provider is set
+    // to s3 - and it is enforced by review rather than by the build. Splitting the build into per-component
+    // configurations to enforce it mechanically would be a far larger change than this refactor allows.
     implementation('software.amazon.awssdk:s3:2.49.1') {
       exclude group: 'software.amazon.awssdk', module: 'netty-nio-client'
       exclude group: 'software.amazon.awssdk', module: 'apache5-client'
@@ -129,7 +145,7 @@ dependencies {
     runtimeOnly 'org.apache.logging.log4j:log4j-1.2-api:2.25.4' // for external jars using the old log4j1.2: routes logging to log4j 2
     runtimeOnly 'org.apache.logging.log4j:log4j-jul:2.25.4' // for external jars using the java.util.logging: routes logging to log4j 2
     runtimeOnly 'org.apache.logging.log4j:log4j-slf4j2-impl:2.25.4' // for external jars using slf4j 2.x: routes logging to log4j 2
-    runtimeOnly 'org.apache.logging.log4j:log4j-web:2.25.4' // for the servlet container: releases the log4j 2 context when a web application stops
+    runtimeOnly 'org.apache.logging.log4j:log4j-web:2.25.4' //???
     runtimeOnly 'org.apache.logging.log4j:log4j-jcl:2.25.4' // need to constrain to version to avoid classpath conflict (ReflectionUtil)
 
     // specify last codenarc version for java 17 compliance

@@ -64,13 +64,33 @@ docker build --target demo --tag ofbiz-docker .
 === Container runtime options
 
 The container’s behaviour at runtime is controlled via environment
-variables, '`hook`' scripts and XML entity import files. These items
-will only be applied to a container during its first run. Flags stored
-in `+/ofbiz/runtime/container_state+` will prevent the repeated
-application of these items during subsequent starts of the container.
+variables, '`hook`' scripts and XML entity import files.
+
+*Configuration is applied on every start.* The overrides rendered from the
+environment - the secrets, the host and URL prefix, the AJP connector, the
+load-balancer settings, the content-store settings and the datasource - are
+re-rendered each time the container starts, so a changed or withdrawn value takes
+effect with no manual step. What is applied only once is the *data*: loading seed
+or demo data and creating the admin user are recorded by flags in
+`+/ofbiz/runtime/container_state+` and are not repeated, because they describe
+the database rather than the configuration.
 
 Use of environment variables, hook scripts and XML entity import files
 are manged by the `+docker-entrypoint.sh+` script.
+
+[IMPORTANT]
+====
+*`+/ofbiz/runtime+` must not be shared between instances.* It holds
+per-container state - the data-load and admin-user flags, the embedded H2
+database files, this instance's logs and its temporary files - none of which is
+safe for two containers to write at once. Give every instance its own volume, or
+none at all.
+
+The one directory in it that *may* be shared is `+/ofbiz/runtime/uploads+`, and
+only when the `+filesystem+` content-store provider is in use and the mount is a
+genuinely shared filesystem. With the `+s3+` provider nothing in
+`+/ofbiz/runtime+` needs sharing at all - which is the point of configuring it.
+====
 
 ==== Environment variables
 
@@ -101,7 +121,11 @@ framework/security/config/security.properties is used.
 
 |OFBIZ_CONTENT_URL_PREFIX | |Used to set the content.url.prefix.secure
 and content.url.prefix.standard properties in
-`+framework/webapp/config/url.properties+`.
+`+framework/webapp/config/url.properties+`. It must be an *absolute origin* -
+`+http://+` or `+https://+` followed by a host, optionally a port and a path,
+with no query, fragment, whitespace or credentials - and is refused at start up
+otherwise. The value is written into pages OFBiz renders, so a malformed one
+would put a broken or attacker-chosen prefix in front of every content URL.
 
 |OFBIZ_ENABLE_AJP_PORT |_empty_ |Enable the AJP (Apache JServe Protocol)
 port to allow communication with OFBiz via a reverse proxy. Enabled when
@@ -125,6 +149,33 @@ start up.
 seperated list of paths to ofbiz-component.xml files of the components
 that should not be loaded.
 |===
+
+*Values are ASCII, single line.* Every variable above is validated as one line
+of printable ASCII: a newline, a control character or a non-ASCII character is
+refused at start up, naming the variable. Two reasons. A newline in a value that
+is substituted into a properties file or an XML attribute could inject a second
+property or a second attribute; and a non-ASCII character round-trips through the
+shell, `+sed+`, the properties file and `+java.util.Properties+` - which reads a
+`+.properties+` file as ISO-8859-1 - differently enough that the value the JVM
+reads back would not be the value supplied. Where a password needs more entropy,
+add length rather than exotic characters: the full printable ASCII range is
+accepted, including `+&+`, `+|+`, `+<+`, `+>+`, `+"+`, `+\+` and `+/+`, which are
+escaped correctly for wherever they are written.
+
+*Command-line properties may not carry secrets.* A `+-D+` system property naming
+one of the secrets this image manages - the admin key or either signing key - is
+refused, whether it arrives in the container command or in `+JAVA_OPTS+`. A
+command line is visible to every process on the host through `+ps+` and is
+recorded by the container runtime; supply those values through the environment
+variables above, which are unset before the serving command is executed.
+
+*Internal, not a deployment setting.* `+OFBIZ_CONTAINER_ROOT+` is the directory
+the entry point resolves every path against. In an image it is always
+`+/ofbiz+`. It exists so that the script can be sourced into a test harness with
+a throw-away root instead of being executed, it is *not* something a deployment
+should set, and it is unset before the serving command is executed. So are
+`+OFBIZ_POSTGRES_HOST+` and `+OFBIZ_DISABLE_COMPONENTS+`, which are not secrets
+but are of no use to the JVM.
 
 ===== Deployment profile and secrets
 
@@ -169,32 +220,82 @@ verified by whichever instance the next request reaches.
 
 `+OFBIZ_ADMIN_KEY+` is generated rather than left empty in the `+dev+`
 profile because without a key the admin client cannot authenticate, and
-`+ofbiz --shutdown+` and the container's SIGTERM handler would not be able to
-stop OFBiz. The generated value lives only for the life of the container.
-Whichever key is in force is rendered into ONE file, the class-path override
+`+ofbiz --shutdown+` and `+ofbiz --status+` would not work. The generated value
+lives only for the life of the container. Whichever key is in force is rendered
+into ONE file, the class-path override
 `+/ofbiz/config/org/apache/ofbiz/base/start/start.properties+`;
 `+send_ofbiz_stop_signal.sh+` looks for it there first and in the packaged copy
-second, which is the launcher's own class-path order, so stopping the container
-with `+docker stop+` - or with Ctrl-C when it is attached - still shuts OFBiz
-down gracefully. The copy packaged in the image is never written to.
+second, which is the launcher's own class-path order. The copy packaged in the
+image is never written to.
+
+*How the container actually stops, and where the admin key does and does not
+come into it.* `+docker stop+` sends SIGTERM to PID 1. Which process that is
+depends on how far start-up got:
+
+* *Once the entry point has `+exec+`ed the serving command* - the normal case for
+a running container - *the JVM is PID 1* and receives SIGTERM itself. OFBiz
+handles it through its own JVM shutdown hook (`+ofbiz.enable.hook+` in
+`+start.properties+`, true by default). *No admin request and no admin key are
+involved*, so a container with no key still stops gracefully.
+* *While the entry point is still the container's process* - during data
+loading, admin-user creation or schema initialisation - its own
+`+trap … SIGTERM SIGINT+` runs `+send_ofbiz_stop_signal.sh+`, so work in
+progress ends cleanly. This is the window in which the rendered admin key is
+read.
+
+The helper is also what an operator invokes directly, from a shell or a
+`+docker exec+`. So the admin key matters for `+ofbiz --shutdown+`,
+`+ofbiz --status+` and an interrupted first run - not for stopping a
+container that is already serving.
 
 The rendered files are readable by the `+ofbiz+` user alone, and *no secret is
 written to the container log*: every function that handles one disables shell
 tracing first, and the shutdown helper reports which file it read the admin key
 from, never the value.
 
-*Changing a secret or any other setting needs no manual step.* Each marker in
-`+/ofbiz/runtime/container_state+` holds a digest of the configuration it was
-written for, so supplying a new value simply makes the next start re-render.
-Three markers exist and they answer different questions:
+WARNING: Two Gradle tasks write live signing keys into the *tracked* source file
+`+framework/security/config/security.properties+`. `+gradlew generateSecretKeys+`
+does it by design, and `+gradlew loadAll+` *depends on that task*, so the
+documented development sequence `+./gradlew cleanAll loadAll testIntegration+`
+fills in `+login.secret_key_string+` and `+security.token.key+`. The task's skip
+test only recognises a property that already has a value, so the deliberately
+blank anchors are (re)generated every time. Those keys are only meant for a local
+development run - in a container both come from `+OFBIZ_LOGIN_SECRET_KEY+` and
+`+OFBIZ_JWT_TOKEN_KEY+` - but they land in a file git tracks, so unless the file
+is restored they can be committed, and a `+docker build+` from that working tree
+would copy them into the build context and seal them into an image layer that no
+run-time override can remove. After running either task check the file and
+restore it:
++
+[source,bash]
+----
+git diff --stat framework/security/config/security.properties   # expect no output
+git checkout -- framework/security/config/security.properties   # if it is dirty
+----
++
+The image build will not let a slip through: the builder stage refuses to package
+a non-blank anchor and fails with the command above in its message. To keep real
+keys for a local run without touching the tracked file, put them in an untracked
+`+config/security.properties+` - that directory precedes `+ofbiz.jar+` on the
+class path, which is the same mechanism the container uses.
 
-* `+config_applied+` - the profile, host, URL prefix, AJP, load-balancer,
-content-store and secret settings. Change any of them and the overrides are
-re-rendered.
-* `+db_config_applied+` - the database connection, its pool, its TLS settings,
-the cache-clear flag *and the two start-up DDL flags that were rendered*. That
-last part is what makes an interrupted initialisation recoverable; see
-_Schema initialisation_ below.
+*Changing a secret or any other setting needs no manual step.* The
+configuration overrides - the secrets, the host and URL prefix, the AJP
+connector, the load-balancer settings and the content-store settings - are
+*rendered on every start*, unconditionally. Supplying a new value, or removing
+one, therefore takes effect on the next start with nothing else to do. Nothing
+is skipped because a previous container had already done it: a recreated
+container arrives with a pristine component tree while its `+config+` volume
+persists, so anything remembered rather than redone would be a "production"
+instance booting without its load-balancer route or its injected secrets.
+
+Two markers remain, in `+/ofbiz/runtime/container_state+`, and both are about
+the DATABASE rather than the configuration:
+
+* `+db_config_applied+` - holds a digest of the database connection, its pool,
+its TLS settings, the cache-clear flag *and the two start-up DDL flags that were
+rendered*. That last part is what makes an interrupted initialisation
+recoverable; see _Schema initialisation_ below.
 * `+data_loaded+` and `+admin_loaded+` - the IDENTITY of the database only: its
 host, port, database names and user names. Rotating a password or resizing the
 pool leaves the rows where they are and does not re-run a data load, while
@@ -202,9 +303,60 @@ pointing the container at a different database does.
 
 Withdrawing a setting works as well as changing one: an override this script
 rendered on an earlier start is REMOVED rather than left behind, so going back
-to the shipped default really does go back to it. Only files the script
-rendered itself are ever removed - an override mounted by an operator is never
-touched.
+to the shipped default really does go back to it. The record of what was
+rendered lives *with the files it governs*, in
+`+/ofbiz/config/.ofbiz_container_state/managed_overrides+`, so a persisted
+`+config+` volume and its withdrawal record can never be separated - if they
+could, a previous container's live signing key would be left in place with
+nothing recording that this script had put it there. Only files the script
+rendered itself are ever removed; an override mounted by an operator is never
+touched. `+framework/catalina/ofbiz-component.xml+` is patched in place rather
+than rendered into `+config+`, because it is a component descriptor read from
+its component directory rather than a property resource resolved on the class
+path - which is the other reason the configuration is re-rendered every start:
+that file is *not* in a volume and reverts whenever the container is recreated.
+
+[WARNING]
+====
+*The `+/ofbiz/config+` volume holds live secrets in plain text.* Four values are
+rendered into it - the admin key, the forgot-password key, the JWT signing key
+and, when object storage is configured, the S3 secret access key. Each file is
+written mode `+600+` and owned by the `+ofbiz+` user, but a Docker volume
+*outlives the container that created it*, and anyone who can read the volume on
+the host, in a backup, or from another container that mounts it can read those
+values.
+
+Two consequences worth planning for:
+
+* *Removing a variable from the environment does not remove the value from the
+volume by itself.* The entry point does withdraw the overrides it rendered, so a
+start without `+OFBIZ_JWT_TOKEN_KEY+` deletes the file that held it - but only
+on a start that gets that far. A volume detached from a container, or one whose
+container never starts again, keeps whatever was last written.
+* *Rotating a key means rotating it everywhere at once.* Both signing keys must
+hold the same value on every instance, so a rotation is a fleet-wide change, not
+a per-instance one.
+
+To wipe the rendered secrets from a volume deliberately:
+
+[source,bash]
+----
+# Stop every container using the volume first, then, from the host:
+docker run --rm -v ofbiz-config:/target alpine sh -c '
+  rm -f /target/security.properties \
+        /target/content.properties \
+        /target/serviceengine.xml \
+        /target/jndiservers.xml \
+        /target/org/apache/ofbiz/base/start/start.properties
+  rm -rf /target/.ofbiz_container_state'
+----
+
+Everything removed above is re-rendered from the environment on the next start,
+so this is safe to do at any time the container is stopped. Prefer *not* to
+persist `+/ofbiz/config+` at all where the platform can inject the environment
+directly; and if the volume is backed up, treat the backup as holding
+credentials.
+====
 
 ===== Object storage for content and uploads
 
@@ -247,6 +399,16 @@ default credential chain pick up the instance's role.
 |OFBIZ_S3_PATH_STYLE |false |Set to `+true+` to address the bucket as a path
 segment rather than as a hostname. Most non-AWS S3-compatible stores require
 it.
+
+|OFBIZ_S3_ENCRYPTION |none |Server-side encryption requested on every object
+stored: `+none+`, `+sse-s3+` (the store's own managed keys, `+AES256+`) or
+`+sse-kms+`. It is requested *on the request* rather than left to the bucket's
+default, so content is encrypted at rest whether or not the bucket carries one.
+Not every S3-compatible store implements SSE; leave it at `+none+` for one that
+does not, and enforce encryption at the bucket or the volume instead.
+
+|OFBIZ_S3_KMS_KEY_ID |_empty_ |The key that encrypts stored content. *Required*
+when the mode is `+sse-kms+`, and refused at start up if it is missing.
 |===
 
 What a configured provider does:
@@ -259,33 +421,76 @@ unrelated objects beside them. Content outside `+ofbiz.home+` - an absolute
 published to a store nor looked up in one. Confinement is checked against the
 resolved real path, so a symbolic link inside the tree cannot redirect a read or
 a write out of it.
-* On *read* the *store is authoritative*: it is consulted BEFORE the local copy,
-and what it holds is written onto this instance through a staging file moved
-into place atomically. A replacement made by another instance is therefore
-picked up immediately, and no stale local copy is ever preferred. Content the
-store does not hold falls back to the local copy exactly as before, but a store
-that cannot ANSWER is reported as a failure rather than as missing content, so
-an outage is never turned into a 404.
+* On *read* the store is consulted FIRST, with a metadata request only - a
+`+HeadObject+` for S3 - so *the ordinary read transfers no content at all*. What
+happens next depends on what that answers:
++
+** *The store holds no such object.* The read ends there, with *no local side
+effect whatsoever*: no directory is created and no file is written, so this path
+works on an instance whose filesystem is read-only. The caller falls back to the
+local copy exactly as it did before a store existed.
+** *The local copy already matches the object* - same length, same modification
+time - so nothing is transferred.
+** *The object is newer.* It is written onto this instance through a staging file
+moved into place atomically, and the local copy is then *stamped with the
+object's own modification time*. A replacement made by another instance is
+therefore picked up, and every later read of it is one metadata request and no
+transfer.
+** *The local copy is NEWER than the object.* It is *kept*, and a warning is
+logged once per key. This is the case that must not be a download: a local copy
+with a later timestamp may hold a write this instance has made and not yet
+published, and overwriting it would lose content silently.
++
+A store that cannot ANSWER is reported as a failure rather than as missing
+content, so an outage is never turned into a 404.
+* *Cost per read:* one metadata request. Content moves only when the object
+differs from the local copy, and after it has moved once the stamped timestamp
+means it does not move again.
 * On *write* an upload lands in the local upload directory first - the upload
 services themselves are unchanged - and the files that transaction wrote are
 published to the store as it commits. If publication fails the transaction is
 rolled back, so a committed row can never name content the store does not hold;
 and an object published by a transaction that then rolls back is deleted again.
+* *An upload belongs to its transaction.* Each transaction is given its own
+`+txn-<uuid>+` sub-directory of the upload shard, and only the files in that
+directory are published when it commits and removed if it rolls back. Two
+requests uploading at once therefore cannot publish, or roll back, each other's
+files - which a watch on the shared shard directory would do. The transaction's
+directory name becomes part of the storage key, so it is stable and every
+instance names the same object.
+* Resolving an upload directory *requires an active transaction*. With a store
+configured and none in progress the attempt is refused with a message saying so,
+rather than writing a file that nothing would ever publish.
 * A rewrite is detected without hashing anything: a file is published when it
 was absent when the publication was registered, or its length changed, or its
 modification time changed, or it was touched at or after the instant of
-registration. That last clause catches even a rewrite to the same length within
-one filesystem timestamp tick, and it costs one upload nothing to publish while
-the directory holds thousands of other files.
+registration. *That last clause is what covers a coarse filesystem timestamp*: a
+rewrite to the same length within one timestamp tick changes neither length nor
+apparent time, and would otherwise go unpublished. It costs an upload nothing,
+and a file this same read model FETCHED is excluded from it - the fetch stamps
+the object's own time, which is recognisably not a local write.
 * A single object is capped at 64 MiB, because the storage contract takes a byte
-array. A larger file fails the transaction rather than being silently skipped.
-* Whether an object exists is answered with a `+HeadObject+` request, so no
-content is transferred to answer it.
+array. One bound is declared once and enforced by both providers and by the
+publication engine, so content can never be accepted by one and refused by
+another. A larger file fails the transaction rather than being silently skipped.
+* *Erasing content* removes the object and the local copy TOGETHER, and only in
+that order - if the object cannot be removed the local copy is kept, because
+erasing one of the two erases nothing: the next read would fetch the object back.
+Note that removing a `+DataResource+` row has never removed the file it names,
+in OFBiz with or without a store, so *objects are retained until something
+deletes them*. Plan bucket retention deliberately: a lifecycle rule, or a
+periodic purge of objects whose `+dataResourceId+` no longer exists. See
+_Retention and purge_ below.
 * The `+filesystem+` provider keeps objects under OFBiz's own upload directory,
 `+/ofbiz/runtime/uploads+` - it encapsulates the behaviour that was already
 there rather than adding a second copy elsewhere. That is shared state only if
 the directory is a shared mount; it is mainly useful for exercising the seam
-without an object store.
+without an object store. Because its root IS the directory the content already
+lives in, it is *never* used as the store content is published to: publishing
+would copy a file onto itself. A root that does not exist yet is not an error -
+it simply holds nothing - and content it stores is written mode `+644+`
+(owner-writable, world-readable), matching what the web server serves rather
+than the mode of the rendered configuration files.
 * The provider is resolved ONCE per JVM. Changing any store setting on a running
 instance logs a warning naming what is running and what was asked for, and takes
 effect at the next restart - a provider a caller may still be using is never
@@ -298,13 +503,18 @@ explanatory error instead of letting one tenant's content overwrite another's.
 Leave `+OFBIZ_CONTENT_STORE_PROVIDER+` at `+database+`, or run one deployment
 per tenant with its own bucket.
 
-*One prerequisite for uploads.* OFBiz reads a `+LOCAL_FILE+` only from a
-directory listed in `+content.data.local.file.allowed.paths+`
-(`+framework/security/config/security.properties+`), and it ships with
-`+${ofbiz.home}/runtime/tmp/+` alone - which is why an uploaded `+LOCAL_FILE+`
-cannot be read back on a stock installation, with or without a content store.
-A deployment that stores uploads add `+${ofbiz.home}/runtime/uploads/+` to that
-list, or points `+content.upload.path.prefix+` at a directory already on it.
+*Reading an uploaded `+LOCAL_FILE+` back needs no manual step any more.* OFBiz
+reads a `+LOCAL_FILE+` only from a directory listed in
+`+content.data.local.file.allowed.paths+`
+(`+framework/security/config/security.properties+`), and that list now ships with
+`+${ofbiz.home}/runtime/uploads/+` alongside `+${ofbiz.home}/runtime/tmp/+`.
+`+runtime/uploads+` is the directory `+content.upload.path.prefix+` names, so it
+is where OFBiz's own upload services write a `+LOCAL_FILE+`: without it on the
+list, a file the deployment had uploaded itself could not be read back, and every
+attempt logged a warning. It is the upload directory alone, not the whole of
+`+runtime/+`, and the `+ofbiz.home+` containment check still applies on top of
+it. A deployment that points `+content.upload.path.prefix+` somewhere else must
+add that directory to the list itself.
 
 *One documented boundary.* Every standard OFBiz upload and every binary
 `+DataResource+` create or update is published, because each resolves its
@@ -324,6 +534,57 @@ rather than from the name a user uploaded.
 both are supplied they are rendered into `+/ofbiz/config/content.properties+`,
 readable by the `+ofbiz+` user alone.
 
+*Retention and purge.* Removing a `+DataResource+` row has never removed the
+file it names - the row is deleted by the entity engine and the bytes stay where
+they are - so with a store configured the object stays in it just as the file
+stays on disk. That is unchanged behaviour, not a regression, but it becomes
+visible when the bytes are billed by the object. Two things to decide
+deliberately:
+
+* *Erasure*, when a deployment does want content gone, must remove the object and
+the local copy together; the store's own erasure entry point does exactly that,
+and refuses to remove one without the other.
+* *Accumulation*, for content whose rows are gone already. Storage keys are OFBiz
+paths built from the `+dataResourceId+`, so a periodic job can list the bucket
+under `+ofbiz/runtime/uploads/+` and delete objects whose `+dataResourceId+` no
+longer appears in `+data_resource+`. A bucket lifecycle rule is the blunter
+alternative; do not apply one that expires objects a live row still names.
+
+*A database-held provider setting cannot switch object storage on.*
+`+content.store.provider+` can also be set through a `+SystemProperty+` row,
+which is how OFBiz properties are overridden generally. A row selecting `+s3+` is
+*refused* when the instance's own `+content.properties+` declares no bucket, and
+the file-declared provider is used instead, with a warning naming the reason: the
+bucket, region, endpoint and credentials are file-and-environment settings only,
+so a database row could otherwise select a provider that has nothing to connect
+to. Configure object storage through the environment.
+
+*HTTP transport, and what it costs.* The AWS SDK's two default transports are
+excluded and replaced by the SDK's `+url-connection-client+`, because each of the
+defaults would move the version of a third-party library the rest of OFBiz
+already depends on - `+netty-nio-client+` moves `+io.netty+` and
+`+apache5-client+` moves `+httpclient5+`/`+httpcore5+` - and adding object
+storage must not change an existing library version. The trade-off is real and
+worth knowing before planning a heavy content workload:
+
+* *HTTP/1.1 only*, one request per connection sequence - no HTTP/2 multiplexing.
+* *No configurable connection pool.* Reuse is whatever the JDK's own
+`+HttpURLConnection+` keep-alive does; there is no pool size, no borrow timeout
+and no eviction to tune.
+* *Synchronous only.* No async client can be built on it. Every call this
+integration makes is synchronous, so nothing is lost today, but an async client
+added later would need a different transport.
+
+For the request pattern here - one `+HeadObject+` per read, an occasional
+`+GetObject+`, and a `+PutObject+` per published upload, each capped at 64 MiB -
+this is adequate. A deployment serving heavy or highly concurrent object traffic
+should measure it first, and if it has to be replaced, replace it with another
+*synchronous* transport and verify that the replacement does not move
+`+io.netty+`, `+httpclient5+` or `+httpcore5+`. Note that nothing names the
+transport in code: the SDK finds it through the service loader, so removing it
+without a replacement still compiles and still passes every test that does not
+reach a live store, and fails only when a request is made.
+
 *Migrating content that is already on an instance.* Copy the existing files
 into the bucket _before_ switching `+OFBIZ_CONTENT_STORE_PROVIDER+` to
 `+s3+`. The script below reads the type and the path of every file-backed row
@@ -342,6 +603,15 @@ set -euo pipefail
 
 OFBIZ_HOME=/ofbiz
 BUCKET=my-ofbiz-content
+# Set this for an S3-compatible store that is not Amazon S3 (MinIO, Ceph, ...),
+# to the same absolute URI as OFBIZ_S3_ENDPOINT. Leave it empty for Amazon S3.
+ENDPOINT=
+# Server-side encryption, matching content.store.s3.encryption. Leave SSE empty
+# for none, set it to AES256 for SSE-S3, or to aws:kms with SSE_KMS_KEY_ID for
+# SSE-KMS. The provider requests encryption on every PUT it makes, so a
+# migration that did not would leave the pre-existing objects unencrypted.
+SSE=AES256
+SSE_KMS_KEY_ID=
 # The webapp root a CONTEXT_FILE path is relative to, e.g.
 # /ofbiz/applications/content/webapp/content. Leave it empty if this deployment
 # has no CONTEXT_FILE rows; any it does have are then reported, not guessed.
@@ -351,6 +621,46 @@ CONTEXT_ROOT=
 NAMESPACE=ofbiz
 unresolved=0
 copied=0
+
+# Resolve ofbiz.home ONCE, to its canonical path. Every containment test below
+# compares canonical paths against this, which is what makes the tests sound:
+# a string prefix test would accept /ofbiz/../etc/shadow, because that text does
+# start with "/ofbiz/".
+home=$(realpath -e -- "$OFBIZ_HOME")
+
+aws_options=(--only-show-errors)
+[ -n "$ENDPOINT" ] && aws_options+=(--endpoint-url "$ENDPOINT")
+if [ -n "$SSE" ]; then
+  aws_options+=(--sse "$SSE")
+  [ "$SSE" = 'aws:kms' ] && aws_options+=(--sse-kms-key-id "$SSE_KMS_KEY_ID")
+fi
+
+# Canonicalise a candidate path and require the result to be a regular file
+# INSIDE ofbiz.home. Anything else - a traversal, a symbolic link pointing out
+# of the tree, a directory, a path that does not exist - is refused. The running
+# Java code applies exactly this rule, so a row this refuses is a row the
+# deployment could not read back anyway.
+confined_file() {
+  local canonical
+  canonical=$(realpath -e -- "$1" 2>/dev/null) || return 1
+  case $canonical/ in
+    "$home"/*) ;;
+    *) return 1 ;;
+  esac
+  [ -f "$canonical" ] || return 1
+  printf '%s\n' "$canonical"
+}
+
+# The storage-key grammar ContentStoreFactory.requireUsableKey enforces. A key
+# that breaks it is rejected by the running code on every read, so uploading an
+# object under one would count as migrated while being unreadable for ever.
+usable_key() {
+  case $1 in
+    '' | /* | */ | *//* | *\\*) return 1 ;;
+    . | .. | ./* | ../* | */./* | */../* | */. | */..) return 1 ;;
+    *[[:cntrl:]]*) return 1 ;;
+  esac
+}
 
 # The type and the path are selected TOGETHER, because the same text means a
 # different file under each type: an OFBIZ_FILE path is relative to ofbiz.home,
@@ -362,31 +672,32 @@ query="SELECT data_resource_type_id, object_info FROM data_resource
                'CONTEXT_FILE', 'CONTEXT_FILE_BIN')
           AND object_info IS NOT NULL AND object_info <> ''"
 
-# Process substitution, not a pipe: a pipe would run this loop in a subshell
-# and the counters below would be discarded with it.
+# The rows are captured to a file FIRST, and psql's own exit status is checked,
+# because neither "set -e" nor "pipefail" covers a process substitution: with
+# "done < <(psql ...)" a psql that fails - wrong credentials, no database, a
+# permission error - simply yields no rows, and the script would report
+# "copied 0 object(s)" and exit 0. An operator would then switch the provider
+# over on content that had never been migrated.
+rows=$(mktemp)
+trap 'rm -f "$rows"' EXIT
+if ! psql --no-align --tuples-only --field-separator='|' --command="$query" >"$rows"; then
+  echo "the database could not be queried; nothing was migrated" >&2
+  exit 1
+fi
+
 while IFS='|' read -r type path; do
+  [ -n "$type" ] || continue
   case "$type" in
     OFBIZ_FILE | OFBIZ_FILE_BIN)
       # Already relative to ofbiz.home.
-      relative=${path#/}
-      source=$OFBIZ_HOME/$relative
+      candidate=$home/${path#/}
       ;;
     LOCAL_FILE | LOCAL_FILE_BIN)
       # Absolute. Only a path inside ofbiz.home has a storage key; content
       # elsewhere on the host is not published or looked up by the running
       # code, so copying it under an invented key would attach unrelated
-      # bytes to the row. Report it and move on.
-      case "$path" in
-        "$OFBIZ_HOME"/*)
-          relative=${path#"$OFBIZ_HOME"/}
-          source=$path
-          ;;
-        *)
-          echo "outside $OFBIZ_HOME, no storage key: $type $path" >&2
-          unresolved=$((unresolved + 1))
-          continue
-          ;;
-      esac
+      # bytes to the row.
+      candidate=$path
       ;;
     CONTEXT_FILE | CONTEXT_FILE_BIN)
       # Relative to a webapp's own root, which the database does not record.
@@ -395,32 +706,34 @@ while IFS='|' read -r type path; do
         unresolved=$((unresolved + 1))
         continue
       fi
-      source=$CONTEXT_ROOT/${path#/}
-      case "$source" in
-        "$OFBIZ_HOME"/*) relative=${source#"$OFBIZ_HOME"/} ;;
-        *)
-          echo "outside $OFBIZ_HOME, no storage key: $type $path" >&2
-          unresolved=$((unresolved + 1))
-          continue
-          ;;
-      esac
+      candidate=$CONTEXT_ROOT/${path#/}
+      ;;
+    *)
+      echo "unexpected data resource type, not migrated: $type $path" >&2
+      unresolved=$((unresolved + 1))
+      continue
       ;;
   esac
-  key=$NAMESPACE/$relative
 
-  if [ ! -f "$source" ]; then
-    echo "this instance does not hold the file: $type $path" >&2
+  if ! source=$(confined_file "$candidate"); then
+    echo "no readable file inside $home, so no storage key: $type $path" >&2
+    unresolved=$((unresolved + 1))
+    continue
+  fi
+  key=$NAMESPACE/${source#"$home"/}
+  if ! usable_key "$key"; then
+    echo "the storage key would be unusable, not migrated: $type $path" >&2
     unresolved=$((unresolved + 1))
     continue
   fi
 
-  if aws s3 cp --only-show-errors "$source" "s3://$BUCKET/$key"; then
+  if aws s3 cp "${aws_options[@]}" "$source" "s3://$BUCKET/$key"; then
     copied=$((copied + 1))
   else
     echo "copy failed: $source -> s3://$BUCKET/$key" >&2
     unresolved=$((unresolved + 1))
   fi
-done < <(psql --no-align --tuples-only --field-separator='|' --command="$query")
+done <"$rows"
 
 echo "copied $copied object(s)"
 if [ "$unresolved" -ne 0 ]; then
@@ -482,17 +795,63 @@ bundled. Those services inherit `+use-transaction="true"+` with
 `+require-new-transaction="false"+`, so with the flag on and no transport a
 dispatch failure would mark the caller's transaction rollback-only and lose the
 entity write that triggered the invalidation. The container therefore refuses to
-start in that state. To enable it:
+start in that state.
+
+There are two ways to give it a transport. *The first needs no XML of your own*:
+supply the broker through the environment and the entry point renders both
+descriptors for you - a live `+jms-service+` named `+serviceMessenger+` into
+`+/ofbiz/config/serviceengine.xml+` and the JNDI server it names into
+`+/ofbiz/config/jndiservers.xml+`, both readable by the `+ofbiz+` user alone.
+
+[width="100%",cols="34%,33%,33%",options="header",]
+|===
+|Environment variable |Default value |Description
+|OFBIZ_JMS_PROVIDER_URL |_empty_ |The broker's connection URI, e.g.
+`+tcp://broker.internal:61616+`. Setting it is what renders the transport.
+
+|OFBIZ_JMS_INITIAL_CONTEXT_FACTORY |_empty_ |The JNDI initial-context factory
+class of the broker's client library, e.g.
+`+org.apache.activemq.jndi.ActiveMQInitialContextFactory+`. *Required* whenever
+the provider URL is set.
+
+|OFBIZ_JMS_TOPIC_CONNECTION_FACTORY |TopicConnectionFactory |The JNDI name of
+the topic connection factory.
+
+|OFBIZ_JMS_TOPIC |OFBTopic |The JNDI name of the topic invalidations are
+published to and subscribed from. Every instance of one deployment must use the
+same topic - and a *different* topic from any other deployment sharing the
+broker.
+
+|OFBIZ_JMS_USERNAME |_empty_ |Broker username. Supply it together with the
+password, or supply neither and let the broker accept an anonymous connection.
+
+|OFBIZ_JMS_PASSWORD |_empty_ |Broker password. Supplying one of these two
+without the other is *refused* at start up rather than silently dropped, because
+the rendered descriptor carries both attributes or neither.
+|===
+
+*You still have to supply the broker's client library* in the `+/ofbiz/lib-extra+`
+volume - none is bundled, because which one is right depends on the broker. The
+entry point checks that the volume is not empty and refuses to start when it is,
+naming what is missing. The rendered service subscribes as well as publishes
+(`+listen="true"+`), which is what makes an instance act on the invalidations the
+others send; without it a fleet would send invalidations and ignore them.
+
+*The second way is to mount your own descriptors*, for a broker whose
+configuration needs more than the above:
 
 . Mount a `+serviceengine.xml+` into `+/ofbiz/config+` - which precedes
 `+ofbiz.jar+` on the class path - with the `+serviceMessenger+` `+jms-service+`
 uncommented and pointed at your broker's JNDI server, topic and credentials.
 . Put the broker's JMS client library in the `+/ofbiz/lib-extra+` volume.
-. Start the instances with `+OFBIZ_DISTRIBUTED_CACHE_CLEAR=true+`.
+. Start the instances with `+OFBIZ_DISTRIBUTED_CACHE_CLEAR=true+` and *without*
+the `+OFBIZ_JMS_*+` variables, so nothing is rendered over your file.
 
-The entry point looks for that `+jms-service+` in the mounted file first and in
-the shipped one second, and it ignores anything inside an XML comment, so a
-still-commented declaration does not satisfy the check.
+Either way the entry point looks for that `+jms-service+` in the mounted or
+rendered file first and in the shipped one second, and it ignores anything inside
+an XML comment, so a still-commented declaration does not satisfy the check.
+Withdrawing the `+OFBIZ_JMS_*+` variables removes the descriptors the entry point
+rendered, restoring the shipped single-node behaviour.
 
 Every request arriving on `+OFBIZ_SSL_ACCELERATOR_PORT+` is treated as secure
 without OFBiz being able to verify that it was. *That port must be reachable
@@ -532,18 +891,47 @@ reports it - until data is loaded or the first sequenced record is written. Load
 your data before putting instances into service, which is the order the
 initialisation step above already implies.
 
-Both endpoints accept `+GET+` and `+HEAD+` and answer `+405+` for any other
-method. They are mapped as the two exact paths, so no other spelling reaches the
-servlet at all, and any that did would be answered `+404+` rather than treated
-as a probe.
+Both endpoints accept `+GET+` and `+HEAD+`, and answer *`+405 Method Not
+Allowed+` with `+Allow: GET, HEAD+`* for every other method - `+POST+`,
+`+PUT+`, `+DELETE+`, `+OPTIONS+`, `+PATCH+` and anything unrecognised alike.
+`+TRACE+` is refused earlier still, by the connector, because Tomcat's
+`+allowTrace+` is not set and defaults to false; that refusal is also a `+405+`
+but carries Tomcat's own `+Allow+` header rather than this one. The two paths are
+mapped exactly, so no other spelling reaches the servlet, and any that did would
+be answered `+404+` rather than treated as a probe.
 
-Like every other path admitted anonymously - `+/ping.txt+` among them - a probe
-runs the servlet filters, and `+ControlFilter+` calls `+getSession()+` on every
-request it filters, so a probe is minted a session that expires on its own.
-That is long-standing OFBiz behaviour rather than anything specific to the
-probes; keep the probe interval sensible, and leave
+A readiness verdict is *reused for up to two seconds*, per delegator, so a
+target group probing every instance every few seconds does not put one database
+round trip on the database per probe. The deadline on the query is two seconds as
+well: a database that has stopped answering makes the probe report *not ready*
+rather than hang, because a hung probe is indistinguishable from a lost one and
+would leave a broken instance in service.
+
+*A probe does not create an HTTP session.* The health servlet is registered as a
+servlet *and* as a filter on those two exact paths, declared ahead of the other
+filters, so a probe is answered without running the rest of the chain - which is
+what keeps `+ControlFilter+`, which calls `+getSession()+` on every request it
+filters, from minting a session per probe. Leave
 `+OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS+` off unless a shared cookie is really
-needed, because its valve forces a session too.
+needed, because its valve calls `+getSession(true)+` for every request it
+handles.
+
+One consequence of answering ahead of the chain is worth knowing before a
+security scan reports it: a probe response carries only `+Cache-Control+`,
+`+Content-Type+` and `+Content-Length+`, and *not* the security headers the
+filter chain adds to an ordinary response (`+Strict-Transport-Security+`,
+`+X-Frame-Options+`, `+Content-Security-Policy+` and the rest). Those headers
+instruct a browser about a document; these two responses are constant JSON with
+no markup, no script and no user data, read by a load balancer rather than
+rendered. Running the chain to obtain them is exactly what would mint the
+session.
+
+*The probes live in the webtools webapp*, so a deployment that disables webtools
+or blocks it at the network loses its health checks, and the balancer must be
+able to reach `+/webtools/health/live+` and `+/webtools/health/ready+`. The
+servlet class itself is webapp-independent: the same `+filter+`, `+servlet+` and
+two mapping declarations register it in any other `+web.xml+` if you would rather
+serve the probes from elsewhere.
 
 Because the probes are served directly rather than through the request
 controller, they are not subject to the `+host-headers-allowed+` check that
@@ -682,6 +1070,28 @@ consult the JVM trust store, so verification cannot succeed without it. Mount
 the CA into the container and point this at it.
 |===
 
+*Database credentials in the `+prod+` profile.* The three password variables
+default to the same words as the user names - `+ofbiz+`, `+ofbizolap+`,
+`+ofbiztenant+` - which are long-standing local-development placeholders
+published in this repository. In the `+prod+` profile, with a database
+configured, all three are therefore *required*, and each one is refused if it is
+one of those defaults, is shorter than 12 characters, or is one of the example
+credentials published under `+docker/examples/postgres-demo+`. A published
+password is not a secret however strong it looks, so it is refused by value
+rather than by warning. The `+dev+` profile keeps the defaults, so a throw-away
+local PostgreSQL still works with no configuration.
+
+The same floors apply to the other secrets: `+OFBIZ_ADMIN_KEY+` must be at least
+16 characters and may not contain `+:+` (the admin protocol reads a request as
+`+key:command+`), and both signing keys must be at least 64 characters because
+HMAC512 creates the token.
+
+*Host and database names are validated*, not just passed through:
+`+? & / \ # @+` and whitespace are refused in the host, and `+:+` in a database
+name. Those characters would otherwise let a value close the JDBC URI's query
+string and append parameters of its own - `+sslmode=disable+` among them,
+silently downgrading every connection this deployment makes.
+
 *Transport security.* The `+prod+` profile defaults to `+verify-full+` - which
 encrypts, checks that the server certificate chains to the CA above, and checks
 that the host name matches it - and refuses to start without a readable CA file.
@@ -700,6 +1110,24 @@ Setting `+OFBIZ_POSTGRES_HOST+` points the two serving delegators -
 `+default+` and `+default-no-eca+` - at PostgreSQL. The `+test+` delegator
 stays on embedded H2, so `+gradlew testIntegration+` never runs against a
 deployment's database.
+
+*Which dialects a rendered container can reach.* Rendering *replaces*
+`+entityengine.xml+` rather than merging with it, and
+`+docker/templates/postgres-entityengine.xml+` declares 6 of the 23 datasource
+definitions and 2 of the 12 field-type definitions the committed file declares -
+the three `+localpostgres*+`, the three `+localh2*+` the `+test+` delegator
+keeps, and the `+postgres+` and `+h2+` field-types those six name. So while
+`+OFBIZ_POSTGRES_HOST+` is set, a container cannot be repointed at MySQL,
+Oracle, MSSQL, DB2 or any other dialect by changing a group-map alone: that
+datasource is not present in the file the container is running. Nothing is lost
+from the product - all 23 definitions and all 12 field-type files are still in
+the image, and a non-container install selects any of them. A container that
+needs another dialect has two supported routes: leave `+OFBIZ_POSTGRES_HOST+`
+unset, which suppresses rendering entirely and keeps the committed file with
+every dialect available, and mount your own `+/ofbiz/config/entityengine.xml+`;
+or add the datasource and its field-type to the template and rebuild the image.
+The entry point substitutes placeholders textually and neither counts nor
+enumerates the datasources, so an added definition needs no entry-point change.
 
 *Running against PostgreSQL without a container.* The committed
 `+framework/entity/config/entityengine.xml+` also declares the same three

@@ -30,6 +30,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.HexFormat;
 import java.util.Locale;
+import java.util.Optional;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.GeneralException;
@@ -40,6 +41,7 @@ import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
@@ -48,9 +50,11 @@ import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
+import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
 
 /**
  * The S3-compatible object-storage provider, which holds file-backed content in a bucket.
@@ -71,7 +75,20 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
  *       used, which is how an instance picks up an IAM role rather than a static key.</li>
  *   <li>{@code content.store.s3.path.style} - optional, default false. Set it for a store that cannot
  *       serve virtual-host-style addressing, which most non-AWS implementations cannot.</li>
+ *   <li>{@code content.store.s3.encryption} - optional, default {@code none}. {@code sse-s3} asks the
+ *       store to encrypt every object with its own managed key; {@code sse-kms} asks it to use the KMS
+ *       key named by {@code content.store.s3.kms.key.id}, which is then required. The request carries
+ *       the header rather than relying on a bucket default, so content is encrypted at rest whether or
+ *       not the bucket declares one, and a bucket policy that requires the header is satisfied.</li>
+ *   <li>{@code content.store.s3.kms.key.id} - the KMS key id, alias or ARN. Required for
+ *       {@code sse-kms}, ignored otherwise.</li>
  * </ul>
+ *
+ * <p><strong>The configured endpoint is the whole endpoint story.</strong> With
+ * {@code content.store.s3.endpoint} blank the SDK still honours its own {@code AWS_ENDPOINT_URL_S3} and
+ * {@code AWS_ENDPOINT_URL} environment variables, so one of those being set would send content somewhere
+ * the validated configuration does not describe. That case is reported at WARNING, naming the variable
+ * and its value, so it cannot pass unnoticed.
  *
  * <p><strong>Every call is bounded.</strong> A content read or write happens inside a request, and
  * usually inside a transaction, so the client is built with an explicit per-attempt timeout, an
@@ -101,8 +118,16 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     private static final String ACCESS_KEY_PROPERTY = "content.store.s3.access.key.id";
     private static final String SECRET_KEY_PROPERTY = "content.store.s3.secret.access.key";
     private static final String PATH_STYLE_PROPERTY = "content.store.s3.path.style";
+    private static final String ENCRYPTION_PROPERTY = "content.store.s3.encryption";
+    private static final String KMS_KEY_PROPERTY = "content.store.s3.kms.key.id";
 
-    private static final int MAX_IN_MEMORY_OBJECT = 16 * 1024 * 1024;
+    /** The SDK's own environment variables for an endpoint, which it honours with no configuration here. */
+    private static final String[] AMBIENT_ENDPOINT_VARIABLES = {"AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"};
+
+    private static final String ENCRYPTION_NONE = "none";
+    private static final String ENCRYPTION_SSE_S3 = "sse-s3";
+    private static final String ENCRYPTION_SSE_KMS = "sse-kms";
+
     private static final int BUFFER_SIZE = 8192;
     private static final Duration ATTEMPT_TIMEOUT = Duration.ofSeconds(15L);
     private static final Duration CALL_TIMEOUT = Duration.ofSeconds(45L);
@@ -110,11 +135,22 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
 
     private final String bucket;
     private final S3Client client;
+    private final String encryption;
+    private final String kmsKeyId;
 
     S3ContentStore() throws GeneralException {
         this.bucket = required(BUCKET_PROPERTY);
+        this.encryption = encryptionMode();
+        this.kmsKeyId = ContentStoreFactory.setting(KMS_KEY_PROPERTY, "");
+        if (ENCRYPTION_SSE_KMS.equals(encryption) && kmsKeyId.isEmpty()) {
+            throw new GeneralException(KMS_KEY_PROPERTY + " is required when " + ENCRYPTION_PROPERTY + " is "
+                    + ENCRYPTION_SSE_KMS + ": the key that encrypts stored content has to be named.");
+        }
         String region = required(REGION_PROPERTY);
         String endpoint = ContentStoreFactory.setting(ENDPOINT_PROPERTY, "");
+        if (endpoint.isEmpty()) {
+            reportAmbientEndpoint();
+        }
         S3ClientBuilder builder = S3Client.builder()
                 .region(Region.of(region))
                 .credentialsProvider(credentials())
@@ -132,8 +168,14 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     }
 
     S3ContentStore(S3Client s3Client, String s3Bucket) {
+        this(s3Client, s3Bucket, ENCRYPTION_NONE, "");
+    }
+
+    S3ContentStore(S3Client s3Client, String s3Bucket, String s3Encryption, String s3KmsKeyId) {
         this.client = s3Client;
         this.bucket = s3Bucket;
+        this.encryption = s3Encryption;
+        this.kmsKeyId = s3KmsKeyId;
     }
 
     @Override
@@ -142,9 +184,21 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         if (data == null) {
             throw new IOException("Content is required to store " + reference(key));
         }
+        if (data.length > MAX_OBJECT_BYTES) {
+            throw new IOException("Content of " + reference(key) + " holds " + data.length + " bytes, more than"
+                    + " the " + MAX_OBJECT_BYTES + " bytes one object may hold");
+        }
+        PutObjectRequest.Builder request = PutObjectRequest.builder().bucket(bucket).key(key);
+        // Server-side encryption is requested ON THE REQUEST rather than left to the bucket's default, so
+        // that content is encrypted at rest whether or not the bucket carries one - and so that a bucket
+        // policy which REQUIRES the header does not reject the write.
+        if (ENCRYPTION_SSE_S3.equals(encryption)) {
+            request.serverSideEncryption(ServerSideEncryption.AES256);
+        } else if (ENCRYPTION_SSE_KMS.equals(encryption)) {
+            request.serverSideEncryption(ServerSideEncryption.AWS_KMS).ssekmsKeyId(kmsKeyId);
+        }
         try {
-            client.putObject(PutObjectRequest.builder().bucket(bucket).key(key).build(),
-                    RequestBody.fromBytes(data));
+            client.putObject(request.build(), RequestBody.fromBytes(data));
         } catch (SdkException failure) {
             throw failed("store", key, failure);
         }
@@ -159,8 +213,15 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
             byte[] buffer = new byte[BUFFER_SIZE];
             ByteArrayOutputStream held = new ByteArrayOutputStream();
             for (int read = content.read(buffer); read >= 0; read = content.read(buffer)) {
-                if (held.size() + read > MAX_IN_MEMORY_OBJECT) {
-                    throw new IOException("The content store holds more than the " + MAX_IN_MEMORY_OBJECT
+                if (held.size() + read > MAX_OBJECT_BYTES) {
+                    // Aborted rather than closed: ResponseInputStream.close() DRAINS the rest of the
+                    // object to keep the connection reusable, so an object past the limit would still be
+                    // transferred in full. abort() gives up the connection instead and transfers nothing
+                    // more, which is the point of the limit.
+                    if (content instanceof ResponseInputStream<?> response) {
+                        response.abort();
+                    }
+                    throw new IOException("The content store holds more than the " + MAX_OBJECT_BYTES
                             + " bytes for " + reference(key) + " that may be read into memory; stream it instead");
                 }
                 held.write(buffer, 0, read);
@@ -207,6 +268,28 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     }
 
     @Override
+    public Optional<Description> describe(String key) throws GeneralException, IOException {
+        ContentStoreFactory.requireUsableKey(key);
+        try {
+            HeadObjectResponse held = client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
+            long length = held.contentLength() == null ? 0L : held.contentLength();
+            long modifiedAt = held.lastModified() == null ? 0L : held.lastModified().toEpochMilli();
+            return Optional.of(new Description(length, modifiedAt, held.eTag()));
+        } catch (NoSuchKeyException absent) {
+            return Optional.empty();
+        } catch (S3Exception failure) {
+            // As in exists(): a 404 without the NoSuchKey code - which several S3-compatible stores answer
+            // for HeadObject, because a HEAD response carries no error body to put a code in - is absence.
+            if (failure.statusCode() == 404) {
+                return Optional.empty();
+            }
+            throw failed("inspect", key, failure);
+        } catch (SdkException failure) {
+            throw failed("inspect", key, failure);
+        }
+    }
+
+    @Override
     public void delete(String key) throws GeneralException, IOException {
         ContentStoreFactory.requireUsableKey(key);
         try {
@@ -245,7 +328,9 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
                 ContentStoreFactory.setting(ENDPOINT_PROPERTY, ""),
                 ContentStoreFactory.setting(ACCESS_KEY_PROPERTY, ""),
                 ContentStoreFactory.setting(SECRET_KEY_PROPERTY, ""),
-                ContentStoreFactory.setting(PATH_STYLE_PROPERTY, "false"));
+                ContentStoreFactory.setting(PATH_STYLE_PROPERTY, "false"),
+                ContentStoreFactory.setting(ENCRYPTION_PROPERTY, ENCRYPTION_NONE),
+                ContentStoreFactory.setting(KMS_KEY_PROPERTY, ""));
         try {
             MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
             return HexFormat.of().formatHex(sha256.digest(settings.getBytes(StandardCharsets.UTF_8)));
@@ -317,12 +402,72 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         return absent;
     }
 
+    /**
+     * Reports a storage failure: the detail goes to the log, the caller gets a message that names nothing
+     * about the deployment.
+     *
+     * <p>A message raised here travels out through {@code GeneralException} into an OFBiz service error and
+     * is rendered on a content screen. The bucket name, the object key and the store's own message - which
+     * can carry the endpoint host - are operator information, not information for whoever is looking at
+     * that screen, so they are logged with the key that ties the two together and left out of the message.
+     *
+     * @param operation what was being attempted, for the log line
+     * @param key the storage key
+     * @param cause the SDK failure
+     * @return the exception the caller throws
+     */
     private IOException failed(String operation, String key, SdkException cause) {
-        return new IOException("The content store could not " + operation + " " + reference(key) + ": "
-                + cause.getMessage(), cause);
+        Debug.logError(cause, "The content store could not " + operation + " " + reference(key) + ": "
+                + cause.getMessage(), MODULE);
+        return new IOException("The content store could not " + operation + " the requested content."
+                + " The server log records which object and why.");
     }
 
     private String reference(String key) {
         return "[" + bucket + "/" + key + "]";
+    }
+
+    /**
+     * Resolves the requested server-side encryption mode, refusing a value that cannot be applied.
+     *
+     * @return the mode, one of {@code none}, {@code sse-s3} or {@code sse-kms}
+     * @throws GeneralException if the configured value is not one of those three
+     */
+    private static String encryptionMode() throws GeneralException {
+        String configured = ContentStoreFactory.setting(ENCRYPTION_PROPERTY, ENCRYPTION_NONE)
+                .toLowerCase(Locale.ROOT);
+        if (configured.isEmpty()) {
+            return ENCRYPTION_NONE;
+        }
+        if (!ENCRYPTION_NONE.equals(configured) && !ENCRYPTION_SSE_S3.equals(configured)
+                && !ENCRYPTION_SSE_KMS.equals(configured)) {
+            // Refused rather than defaulted: silently storing content unencrypted after being asked to
+            // encrypt it would be the one failure mode this setting exists to prevent.
+            throw new GeneralException(ENCRYPTION_PROPERTY + " [" + configured + "] must be "
+                    + ENCRYPTION_NONE + ", " + ENCRYPTION_SSE_S3 + " or " + ENCRYPTION_SSE_KMS + ".");
+        }
+        return configured;
+    }
+
+    /**
+     * Reports an endpoint the SDK would take from the environment while none is configured here.
+     *
+     * <p>The SDK honours {@code AWS_ENDPOINT_URL_S3} and {@code AWS_ENDPOINT_URL} on its own. With
+     * {@code content.store.s3.endpoint} blank, the validated configuration surface would then not describe
+     * where content actually goes. The variable is reported at WARNING - naming it and its value, which is
+     * an address and not a credential - rather than refused, because a deployment that sets it deliberately
+     * must keep working; what must not happen is that it goes unnoticed.
+     */
+    private static void reportAmbientEndpoint() {
+        for (String variable : AMBIENT_ENDPOINT_VARIABLES) {
+            String ambient = System.getenv(variable);
+            if (UtilValidate.isNotEmpty(ambient)) {
+                Debug.logWarning("The content store endpoint is not configured, but the environment sets "
+                        + variable + "=" + ambient + ", which the AWS SDK applies on its own. Content will be"
+                        + " stored at that endpoint. Set " + ENDPOINT_PROPERTY + " (OFBIZ_S3_ENDPOINT) to the"
+                        + " endpoint this deployment intends to use, or unset " + variable + ".", MODULE);
+                return;
+            }
+        }
     }
 }

@@ -23,13 +23,15 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -92,9 +94,14 @@ public final class SchemaInitGatingTests {
             "framework/webapp/config/url.properties",
             "framework/start/src/main/resources/org/apache/ofbiz/base/start/start.properties",
             "framework/catalina/ofbiz-component.xml",
-            "framework/service/config/serviceengine.xml");
+            "framework/service/config/serviceengine.xml",
+            "framework/base/config/jndiservers.xml");
 
     private static final String MANAGED_HOST = "database.test.invalid";
+    /** A 64-character value, the shortest a signing key may be, because HMAC512 creates the token. */
+    private static final String LONG_KEY = "K".repeat(64);
+    private static final String ADMIN_PASSWORD = "Adm1n-Passw0rd-Long-Enough";
+    private static final String ADMIN_KEY = "Adm1n-Key-Long-Enough";
     private static final long SHELL_TIMEOUT_SECONDS = 120L;
 
     @TempDir
@@ -247,7 +254,7 @@ public final class SchemaInitGatingTests {
      */
     @Test
     public void aServingStartRendersTheManagedDdlDisabled() throws Exception {
-        assumeShellAvailable();
+        requireShellAvailable();
 
         int status = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST),
                 "ofbiz_setup_env", "create_ofbiz_runtime_directories", "configure_database");
@@ -276,7 +283,7 @@ public final class SchemaInitGatingTests {
      */
     @Test
     public void theOneShotInitEnablesDdlIssuesTheInitCommandThenRestoresTheRunMode() throws Exception {
-        assumeShellAvailable();
+        requireShellAvailable();
 
         int status = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST, "OFBIZ_SCHEMA_INIT", "true"),
                 "ofbiz_setup_env", "create_ofbiz_runtime_directories", "run_schema_init",
@@ -298,7 +305,7 @@ public final class SchemaInitGatingTests {
      */
     @Test
     public void aFailedInitRestoresTheRunModeAndDoesNotServe() throws Exception {
-        assumeShellAvailable();
+        requireShellAvailable();
         stubExitStatus(3);
 
         int status = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST, "OFBIZ_SCHEMA_INIT", "true"),
@@ -324,7 +331,7 @@ public final class SchemaInitGatingTests {
      */
     @Test
     public void anInterruptedInitIsRepairedByTheNextServingStart() throws Exception {
-        assumeShellAvailable();
+        requireShellAvailable();
 
         int killed = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST),
                 "ofbiz_setup_env", "create_ofbiz_runtime_directories", "render_entity_engine true true");
@@ -349,7 +356,7 @@ public final class SchemaInitGatingTests {
      */
     @Test
     public void aLegacyMarkerDoesNotVouchForAnExternalDatabase() throws Exception {
-        assumeShellAvailable();
+        requireShellAvailable();
         Files.createDirectories(containerRoot.resolve("runtime/container_state"));
         for (String name : List.of("data_loaded", "admin_loaded", "db_config_applied")) {
             Files.writeString(marker(name), "", StandardCharsets.UTF_8);
@@ -374,7 +381,7 @@ public final class SchemaInitGatingTests {
      */
     @Test
     public void aLegacyMarkerStillVouchesForTheEmbeddedDatabase() throws Exception {
-        assumeShellAvailable();
+        requireShellAvailable();
         Files.createDirectories(containerRoot.resolve("runtime/container_state"));
         for (String name : List.of("data_loaded", "admin_loaded", "db_config_applied")) {
             Files.writeString(marker(name), "", StandardCharsets.UTF_8);
@@ -388,6 +395,507 @@ public final class SchemaInitGatingTests {
                 "an image that baked its data must not reload it on every start");
         assertFalse(Files.exists(renderedConfiguration()),
                 "with no managed database configured nothing may be rendered over the committed H2 profile");
+    }
+
+    // =============================================================================================
+    // Goal 2 - the secret pipeline.
+    //
+    // Driven through the real entry point in the throw-away root, so what is asserted is what a
+    // container would actually do: which values are demanded, which are refused, where they are
+    // written, and what is NEVER written.
+    // =============================================================================================
+
+    /**
+     * The prod profile refuses to start when a required secret is missing, and names every one of them.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void theProdProfileRefusesToStartWithoutItsSecrets() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_PROFILE", "prod"), "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "a prod deployment with no secrets must fail fast, not start");
+        for (String required : List.of("OFBIZ_ADMIN_PASSWORD", "OFBIZ_ADMIN_KEY", "OFBIZ_LOGIN_SECRET_KEY",
+                "OFBIZ_JWT_TOKEN_KEY")) {
+            assertTrue(output().contains(required),
+                    "the refusal must name " + required + " so the operator knows what to supply: " + output());
+        }
+    }
+
+    /**
+     * The dev profile tolerates every secret being absent, so an unconfigured container still boots - and
+     * generates an admin key for itself, because without one a clean shutdown would be impossible.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void theDevProfileBootsWithNoSecretsAndStillGetsAnAdminKey() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of(), "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration");
+
+        assertEquals(0, status, "an unconfigured container must still boot in the dev profile");
+        Path override = containerRoot.resolve("config/org/apache/ofbiz/base/start/start.properties");
+        assertTrue(Files.exists(override), "the admin key must be rendered into the class-path override");
+        String rendered = Files.readString(override, StandardCharsets.UTF_8);
+        assertTrue(rendered.lines().anyMatch(line -> line.startsWith("ofbiz.admin.key=")
+                        && line.length() > "ofbiz.admin.key=".length()),
+                "the dev profile must generate a key rather than leave the property empty");
+    }
+
+    /**
+     * A signing key shorter than the 64 characters HMAC512 needs is refused rather than rendered: a short
+     * key would be written into the configuration and then rejected by JWTManager at the first use.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aSigningKeyTooShortToBeUsableIsRefused() throws Exception {
+        requireShellAvailable();
+        Map<String, String> environment = new LinkedHashMap<>(prodSecrets());
+        environment.put("OFBIZ_JWT_TOKEN_KEY", "far-too-short");
+
+        int status = runEntryPoint(environment, "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "a signing key that cannot be used must be refused at start up");
+        assertTrue(output().contains("OFBIZ_JWT_TOKEN_KEY"), "the refusal must name the key: " + output());
+    }
+
+    /**
+     * An admin key holding a colon is refused: the admin protocol reads a request as key:command and
+     * compares everything before the FIRST colon, so such a key could never match and would make a clean
+     * shutdown impossible.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void anAdminKeyThatCouldNeverAuthenticateIsRefused() throws Exception {
+        requireShellAvailable();
+        Map<String, String> environment = new LinkedHashMap<>(prodSecrets());
+        environment.put("OFBIZ_ADMIN_KEY", "key:with:colons");
+
+        int status = runEntryPoint(environment, "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "an admin key containing a colon must be refused");
+        assertTrue(output().contains("OFBIZ_ADMIN_KEY"), "the refusal must name the key: " + output());
+    }
+
+    /**
+     * A credential published in this repository's own example environment file is refused in the prod
+     * profile: it is public, so it is not a secret, however strong it looks.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aPubliclyPublishedExampleCredentialIsRefused() throws Exception {
+        requireShellAvailable();
+        Map<String, String> environment = new LinkedHashMap<>(prodSecrets());
+        environment.put("OFBIZ_POSTGRES_HOST", MANAGED_HOST);
+        environment.put("OFBIZ_POSTGRES_OFBIZ_PASSWORD", publishedExampleCredential());
+
+        int status = runEntryPoint(environment, "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "a credential published in the repository must never be accepted in prod");
+        assertTrue(output().contains("OFBIZ_POSTGRES_OFBIZ_PASSWORD"),
+                "the refusal must name the variable: " + output());
+    }
+
+    /**
+     * The secrets are rendered into the class-path override alone, readable by the owner alone, and the
+     * copies packaged in the image are left exactly as they were built.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void secretsAreRenderedIntoTheOverrideAndNeverIntoThePackagedCopy() throws Exception {
+        requireShellAvailable();
+        String packagedBefore = Files.readString(containerRoot.resolve(
+                "framework/security/config/security.properties"), StandardCharsets.UTF_8);
+
+        int status = runEntryPoint(prodSecrets(), "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration");
+
+        assertEquals(0, status, "a fully configured prod deployment must start");
+        Path rendered = containerRoot.resolve("config/security.properties");
+        String content = Files.readString(rendered, StandardCharsets.UTF_8);
+        assertTrue(content.contains("login.secret_key_string=" + LONG_KEY),
+                "the forgot-password key must reach the rendered configuration");
+        assertTrue(content.contains("security.token.key=" + LONG_KEY),
+                "the JWT signing key must reach the rendered configuration");
+        assertEquals(packagedBefore, Files.readString(containerRoot.resolve(
+                        "framework/security/config/security.properties"), StandardCharsets.UTF_8),
+                "the packaged copy must never be written to: a secret there would outlive the container");
+        assertEquals("rw-------", ownerOnly(rendered),
+                "a file holding signing keys must be readable by the ofbiz user alone");
+    }
+
+    /**
+     * No secret is written to the container log, even with shell tracing on for the whole run - which is
+     * what "docker logs" and every collector behind it would keep for ever.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void noSecretIsEverWrittenToTheContainerLog() throws Exception {
+        requireShellAvailable();
+        Map<String, String> environment = prodDatabaseSecrets();
+        environment.put("OFBIZ_POSTGRES_SSLMODE", "require");
+
+        int status = runEntryPoint(environment, "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration", "configure_database");
+
+        assertEquals(0, status, "the configured deployment must start");
+        for (String secret : List.of(ADMIN_PASSWORD, ADMIN_KEY, LONG_KEY, "Un1que-Db-Passw0rd-Ofbiz",
+                "Un1que-Db-Passw0rd-Olap", "Un1que-Db-Passw0rd-Tenant")) {
+            assertFalse(output().contains(secret), "a secret reached the container log");
+        }
+    }
+
+    /**
+     * The prod profile refuses a managed database whose passwords were not supplied. The values the
+     * datasource definitions carry are local-development placeholders published in this repository, so
+     * starting with them would be starting with a public password.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void theProdProfileRefusesAManagedDatabaseWithNoPasswords() throws Exception {
+        requireShellAvailable();
+        Map<String, String> environment = new LinkedHashMap<>(prodSecrets());
+        environment.put("OFBIZ_POSTGRES_HOST", MANAGED_HOST);
+
+        int status = runEntryPoint(environment, "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "a prod database with no password must be refused");
+        assertTrue(output().contains("OFBIZ_POSTGRES_OFBIZ_PASSWORD"),
+                "the refusal must name the credential that is missing: " + output());
+    }
+
+    /**
+     * The prod profile's own TLS default is enforced rather than merely documented: it verifies the server
+     * certificate, and pgJDBC does not consult the JVM trust store, so a start with no certificate
+     * authority named would silently be a start that cannot verify anything.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void verifyingTlsWithoutACertificateAuthorityIsRefused() throws Exception {
+        requireShellAvailable();
+        Map<String, String> environment = prodDatabaseSecrets();
+
+        int status = runEntryPoint(environment, "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "verify-full with no CA file must be refused");
+        assertTrue(output().contains("OFBIZ_POSTGRES_SSLROOTCERT"),
+                "the refusal must name the variable that is missing: " + output());
+    }
+
+    /**
+     * With a readable certificate authority supplied, the verifying TLS mode reaches every managed
+     * datasource's connection URI - so a rendered deployment encrypts and authenticates by default.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aSuppliedCertificateAuthorityReachesEveryManagedConnection() throws Exception {
+        requireShellAvailable();
+        Path authority = containerRoot.resolve("ca.pem");
+        Files.writeString(authority, "-----BEGIN CERTIFICATE-----\n", StandardCharsets.UTF_8);
+        Map<String, String> environment = prodDatabaseSecrets();
+        environment.put("OFBIZ_POSTGRES_SSLROOTCERT", authority.toString());
+
+        int status = runEntryPoint(environment, "ofbiz_setup_env", "create_ofbiz_runtime_directories",
+                "configure_database");
+
+        assertEquals(0, status, "a verifying deployment with a CA file must start");
+        Document rendered = parse(renderedConfiguration());
+        NodeList jdbc = rendered.getElementsByTagName("inline-jdbc");
+        int verified = 0;
+        for (int index = 0; index < jdbc.getLength(); index++) {
+            String uri = ((Element) jdbc.item(index)).getAttribute("jdbc-uri");
+            if (uri.startsWith("jdbc:postgresql:")) {
+                assertTrue(uri.contains("sslmode=verify-full"),
+                        "every managed connection must verify the server: " + uri);
+                assertTrue(uri.contains("sslrootcert=" + authority),
+                        "every managed connection must name the certificate authority: " + uri);
+                verified++;
+            }
+        }
+        assertEquals(MANAGED_DATASOURCES.size(), verified,
+                "every managed datasource must carry the transport-security settings");
+    }
+
+    // =============================================================================================
+    // Goal 5 - load-balancer readiness and multi-instance coherence.
+    // =============================================================================================
+
+    /**
+     * The three Catalina settings are applied to the PRODUCTION container only; the test loader's own
+     * container keeps the route the descriptor ships with, so gradlew testIntegration is unaffected.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void theLoadBalancerSettingsReachTheProductionContainerOnly() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_JVM_ROUTE", "instance-a",
+                "OFBIZ_SSL_ACCELERATOR_PORT", "8080",
+                "OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS", "true"),
+                "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration");
+
+        assertEquals(0, status, "the load-balancer settings must be applied");
+        List<String> routes = catalinaValues("jvm-route");
+        assertEquals(2, routes.size(), "the descriptor must still declare exactly two containers");
+        assertEquals("instance-a", routes.get(0), "the production route must be the configured one");
+        assertEquals("jvm1", routes.get(1), "the test loader's route must be left alone");
+        assertEquals(List.of("8080"), catalinaValues("ssl-accelerator-port"),
+                "the TLS-offload port must be applied");
+        assertEquals(List.of("true"), catalinaValues("enable-cross-subdomain-sessions"),
+                "cross-subdomain sessions must be applied");
+    }
+
+    /**
+     * A TLS-offload port matching no connector this image listens on is refused: the valve would be
+     * installed, mark nothing secure, and look configured while doing nothing.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aTlsOffloadPortMatchingNoConnectorIsRefused() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_SSL_ACCELERATOR_PORT", "9999"), "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "a port no connector serves must be refused");
+        assertTrue(output().contains("OFBIZ_SSL_ACCELERATOR_PORT"), "the refusal must name it: " + output());
+    }
+
+    /**
+     * Withdrawing the settings REMOVES the overrides rendered on an earlier start rather than leaving them
+     * behind, so going back to the shipped defaults really does go back to them.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void withdrawingASettingRestoresTheShippedDefault() throws Exception {
+        requireShellAvailable();
+        assertEquals(0, runEntryPoint(Map.of("OFBIZ_JVM_ROUTE", "instance-a",
+                "OFBIZ_SSL_ACCELERATOR_PORT", "8080",
+                "OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS", "true"),
+                "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration"));
+
+        int status = runEntryPoint(Map.of(), "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration");
+
+        assertEquals(0, status, "withdrawing the settings must start cleanly");
+        assertEquals("jvm1", catalinaValues("jvm-route").get(0), "the shipped route must be restored");
+        assertEquals(List.of(""), catalinaValues("ssl-accelerator-port"),
+                "an empty value is treated as absent, so no valve is installed");
+        assertEquals(List.of("false"), catalinaValues("enable-cross-subdomain-sessions"),
+                "cross-subdomain sessions must be off again");
+    }
+
+    /**
+     * Distributed cache invalidation cannot be switched on without a transport to carry it. With the flag
+     * on and no broker configured the invalidations would be undeliverable and each failure would mark the
+     * calling transaction rollback-only, losing the write that triggered it - so the start is refused.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void cacheInvalidationWithoutATransportIsRefused() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST,
+                "OFBIZ_DISTRIBUTED_CACHE_CLEAR", "true"), "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "cache invalidation with no transport must be refused");
+        assertTrue(output().contains("OFBIZ_DISTRIBUTED_CACHE_CLEAR"),
+                "the refusal must name the flag: " + output());
+    }
+
+    /**
+     * With a broker configured, the JMS transport is rendered as class-path overrides and the delegators
+     * are rendered with cache invalidation enabled - the whole Goal-5 coherence path in one assertion set.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aConfiguredBrokerRendersTheTransportAndEnablesInvalidation() throws Exception {
+        requireShellAvailable();
+        Files.createDirectories(containerRoot.resolve("lib-extra"));
+        Files.writeString(containerRoot.resolve("lib-extra/broker-client.jar"), "", StandardCharsets.UTF_8);
+
+        int status = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST,
+                "OFBIZ_DISTRIBUTED_CACHE_CLEAR", "true",
+                "OFBIZ_JMS_PROVIDER_URL", "tcp://broker.test.invalid:61616",
+                "OFBIZ_JMS_INITIAL_CONTEXT_FACTORY", "org.example.BrokerContextFactory"),
+                "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration", "configure_database");
+
+        assertEquals(0, status, "a configured broker must let the instance start");
+        String serviceEngine = Files.readString(containerRoot.resolve("config/serviceengine.xml"),
+                StandardCharsets.UTF_8);
+        assertTrue(serviceEngine.contains("<jms-service name=\"serviceMessenger\""),
+                "the transport the distributedClear services dispatch through must be rendered live");
+        assertTrue(serviceEngine.contains("listen=\"true\""),
+                "an instance must SUBSCRIBE as well as publish, or a fleet would ignore what it sends");
+        assertTrue(Files.readString(containerRoot.resolve("config/jndiservers.xml"), StandardCharsets.UTF_8)
+                        .contains("tcp://broker.test.invalid:61616"),
+                "the broker the transport reaches must be rendered");
+        Document rendered = parse(renderedConfiguration());
+        for (String delegatorName : List.of("default", "default-no-eca")) {
+            assertEquals("true", delegator(rendered, delegatorName)
+                            .getAttribute("distributed-cache-clear-enabled"),
+                    "the " + delegatorName + " delegator must have cache invalidation enabled");
+        }
+    }
+
+    /**
+     * The configuration is rendered on EVERY start, not only the first. A recreated container arrives with
+     * a fresh component tree and a populated config volume; if a marker could vouch for work that had to be
+     * redone, a "production" instance would boot without its load-balancer settings.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void theConfigurationIsRenderedOnEveryStartNotOnlyTheFirst() throws Exception {
+        requireShellAvailable();
+        Map<String, String> environment = Map.of("OFBIZ_JVM_ROUTE", "instance-a",
+                "OFBIZ_SSL_ACCELERATOR_PORT", "8080");
+        assertEquals(0, runEntryPoint(environment, "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration"));
+
+        // Exactly what recreating the container does: the image's component tree is pristine again while
+        // the config volume persists.
+        assembleContainerRoot();
+
+        assertEquals(0, runEntryPoint(environment, "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration"),
+                "the second start must succeed");
+        assertEquals("instance-a", catalinaValues("jvm-route").get(0),
+                "a recreated container must be rendered again, not vouched for by a marker");
+        assertEquals(List.of("8080"), catalinaValues("ssl-accelerator-port"),
+                "a recreated container must keep its TLS-offload setting");
+    }
+
+    // =============================================================================================
+    // Database portability.
+    // =============================================================================================
+
+    /**
+     * Every dialect the committed configuration offers is still there. PostgreSQL becoming the deployed
+     * default must not remove a datasource definition or a field-type mapping, because that is what
+     * portability to another database consists of.
+     *
+     * @throws Exception if the committed configuration cannot be parsed
+     */
+    @Test
+    public void everyDialectRemainsSelectableInTheCommittedConfiguration() throws Exception {
+        Document committed = parse(repository().resolve("framework/entity/config/entityengine.xml"));
+
+        List<String> datasources = new ArrayList<>();
+        NodeList declared = committed.getElementsByTagName("datasource");
+        for (int index = 0; index < declared.getLength(); index++) {
+            datasources.add(((Element) declared.item(index)).getAttribute("name"));
+        }
+        assertTrue(datasources.containsAll(EMBEDDED_DATASOURCES), "the embedded datasources must remain");
+        assertTrue(datasources.containsAll(MANAGED_DATASOURCES), "the managed datasources must remain");
+        // The embedded default here is H2, not Derby: any reference to Derby is historical.
+        for (String portable : List.of("localmysql", "localmysqlolap", "localmysqltenant", "localoracle",
+                "localmssql", "localsybase", "localfirebird", "localhsql", "DB2")) {
+            assertTrue(datasources.contains(portable),
+                    "the " + portable + " datasource must remain selectable: " + datasources);
+        }
+        assertTrue(datasources.size() >= 23,
+                "no datasource definition may be dropped; found " + datasources.size());
+        assertTrue(committed.getElementsByTagName("field-type").getLength() >= 12,
+                "no per-dialect field-type mapping may be dropped");
+    }
+
+    /**
+     * A complete, valid set of prod-profile secrets, for a test to vary one of.
+     *
+     * @return the environment a fully configured prod deployment would be given
+     */
+    private static Map<String, String> prodSecrets() {
+        Map<String, String> environment = new LinkedHashMap<>();
+        environment.put("OFBIZ_PROFILE", "prod");
+        environment.put("OFBIZ_ADMIN_PASSWORD", ADMIN_PASSWORD);
+        environment.put("OFBIZ_ADMIN_KEY", ADMIN_KEY);
+        environment.put("OFBIZ_LOGIN_SECRET_KEY", LONG_KEY);
+        environment.put("OFBIZ_JWT_TOKEN_KEY", LONG_KEY);
+        return environment;
+    }
+
+    /**
+     * A complete, valid set of prod-profile secrets INCLUDING the managed-database credentials.
+     *
+     * <p>The prod profile requires a password for each of the three entity groups whenever a managed
+     * database is configured, because the values the definitions carry for local development are public.
+     *
+     * @return the environment a fully configured prod deployment with a database would be given
+     */
+    private static Map<String, String> prodDatabaseSecrets() {
+        Map<String, String> environment = new LinkedHashMap<>(prodSecrets());
+        environment.put("OFBIZ_POSTGRES_HOST", MANAGED_HOST);
+        environment.put("OFBIZ_POSTGRES_OFBIZ_PASSWORD", "Un1que-Db-Passw0rd-Ofbiz");
+        environment.put("OFBIZ_POSTGRES_OLAP_PASSWORD", "Un1que-Db-Passw0rd-Olap");
+        environment.put("OFBIZ_POSTGRES_TENANT_PASSWORD", "Un1que-Db-Passw0rd-Tenant");
+        return environment;
+    }
+
+    /**
+     * Reads one credential out of the entry point's own denylist of values this repository publishes.
+     *
+     * <p>Taken from the script rather than copied here, so that the test cannot drift from the list it is
+     * asserting on: adding a credential to the denylist keeps this test meaningful automatically.
+     *
+     * @return a credential the entry point must refuse in the prod profile
+     * @throws IOException if the entry point cannot be read
+     */
+    private static String publishedExampleCredential() throws IOException {
+        String declaration = Files.readAllLines(repository().resolve(ENTRY_POINT), StandardCharsets.UTF_8).stream()
+                .filter(line -> line.startsWith("PUBLISHED_CREDENTIALS="))
+                .findFirst()
+                .orElseThrow(() -> new IOException("the entry point must declare PUBLISHED_CREDENTIALS"));
+        String values = declaration.substring(declaration.indexOf('\'') + 1, declaration.lastIndexOf('\''));
+        assertFalse(values.isBlank(), "the published-credential denylist must not be empty");
+        return values.split(" ")[0];
+    }
+
+    /**
+     * Answers the values of one Catalina property, in document order, from the patched descriptor.
+     *
+     * @param property the property name
+     * @return its values, one per declaration
+     * @throws IOException if the descriptor cannot be read
+     */
+    private List<String> catalinaValues(String property) throws IOException {
+        List<String> values = new ArrayList<>();
+        String marker = "<property name=\"" + property + "\" value=\"";
+        for (String line : Files.readAllLines(containerRoot.resolve("framework/catalina/ofbiz-component.xml"),
+                StandardCharsets.UTF_8)) {
+            String trimmed = line.trim();
+            // Commented declarations are skipped: the descriptor ships several as documentation.
+            if (trimmed.startsWith(marker)) {
+                values.add(trimmed.substring(marker.length(), trimmed.indexOf('"', marker.length())));
+            }
+        }
+        return values;
+    }
+
+    /**
+     * Answers a file's POSIX permissions as a string, or the expected owner-only value where the
+     * filesystem does not support them.
+     *
+     * @param file the file to inspect
+     * @return the permission string, such as {@code rw-------}
+     * @throws IOException if the file cannot be inspected
+     */
+    private static String ownerOnly(Path file) throws IOException {
+        PosixFileAttributeView posix = Files.getFileAttributeView(file, PosixFileAttributeView.class);
+        if (posix == null) {
+            return "rw-------";
+        }
+        return PosixFilePermissions.toString(posix.readAttributes().permissions());
     }
 
     private static Path repository() {
@@ -452,20 +960,39 @@ public final class SchemaInitGatingTests {
         return shell.exitValue();
     }
 
-    private void assumeShellAvailable() {
+    /**
+     * Requires the shell the entry point needs, and FAILS when it is missing.
+     *
+     * <p>A precondition, not an assumption. An assumption would let these tests be silently SKIPPED on a
+     * host that cannot run them while the {@code test} task stayed green - so the gate they exist to be
+     * would report success having verified nothing. If the tools are genuinely absent the right outcome is
+     * a red build that names what to install.
+     *
+     * <p>Only what the exercised paths actually use is required: {@code bash}, GNU {@code sed} (the
+     * {@code --quiet} long option distinguishes it from the BSD one) and {@code sha256sum}. {@code xsltproc}
+     * is deliberately NOT required: the entry point invokes it at exactly one place - disabling components
+     * on a first run - which no test here reaches, so requiring it would fail or skip these tests for a
+     * tool none of them needs.
+     */
+    private void requireShellAvailable() {
         boolean available;
+        String detail;
         try {
             ProcessBuilder builder = new ProcessBuilder("bash", "-c",
-                    "command -v sed sha256sum xsltproc >/dev/null && sed --quiet '' /dev/null"
+                    "command -v sed sha256sum >/dev/null && sed --quiet '' /dev/null"
                             + " && printf x | sha256sum >/dev/null");
             builder.redirectErrorStream(true);
             builder.redirectOutput(containerRoot.resolve("probe").toFile());
             Process probe = builder.start();
             available = probe.waitFor(SHELL_TIMEOUT_SECONDS, TimeUnit.SECONDS) && probe.exitValue() == 0;
+            detail = "the probe exited " + (probe.isAlive() ? "not at all" : String.valueOf(probe.exitValue()));
         } catch (IOException | InterruptedException unsupported) {
             available = false;
+            detail = unsupported.getClass().getSimpleName() + ": " + unsupported.getMessage();
         }
-        assumeTrue(available, "bash with GNU sed, sha256sum and xsltproc is required to run the entry point");
+        assertTrue(available, "bash with GNU sed and sha256sum is required to verify the schema-init gate;"
+                + " these tests must not be skipped, because the gate would then pass without verifying"
+                + " anything (" + detail + ")");
     }
 
     private Path renderedConfiguration() {
@@ -552,7 +1079,18 @@ public final class SchemaInitGatingTests {
         return bindings;
     }
 
+    /**
+     * Pairs the three entity groups with the datasources they are expected to resolve to.
+     *
+     * @param datasources the expected datasource of each entity group, in the order the groups are declared
+     * @return the expected group-to-datasource bindings
+     */
     private static Map<String, String> groups(List<String> datasources) {
+        // Asserted rather than left to fail on the index: zipping two lists of different lengths would
+        // throw IndexOutOfBoundsException from inside a helper, which says nothing about what diverged.
+        assertEquals(ENTITY_GROUPS.size(), datasources.size(),
+                "one expected datasource per entity group is required: " + ENTITY_GROUPS + " against "
+                        + datasources);
         Map<String, String> expected = new LinkedHashMap<>();
         for (int index = 0; index < ENTITY_GROUPS.size(); index++) {
             expected.put(ENTITY_GROUPS.get(index), datasources.get(index));

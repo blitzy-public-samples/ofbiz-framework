@@ -62,6 +62,21 @@ under the License.
  -
  - The committed framework/entity/config/entityengine.xml is unchanged by rendering: a checkout with no
  - database environment variables still boots on embedded H2.
+ -
+ - DIALECT AVAILABILITY IS NARROWER IN A RENDERED CONTAINER, deliberately. This file declares 6 of the 23
+ - datasource definitions and 2 of the 12 field-type definitions the committed
+ - framework/entity/config/entityengine.xml declares: the three localpostgres* the delegators resolve to,
+ - the three localh2* the test delegator keeps, and the "postgres" and "h2" field-types those six name.
+ - Because a rendered /ofbiz/config/entityengine.xml REPLACES the committed file rather than merging with
+ - it, the definitions absent here are absent from the running container - so a container cannot be
+ - repointed at MySQL, Oracle, MSSQL, DB2 or any other dialect by setting a group-map alone.
+ - Nothing is lost from the product: all 23 definitions and all 12 field-type files remain in the source
+ - tree and in ofbiz.jar, and a non-container install still selects any of them. A container that needs a
+ - dialect other than PostgreSQL leaves OFBIZ_POSTGRES_HOST unset - which suppresses rendering entirely and
+ - keeps the committed file, with every dialect available - and mounts its own /ofbiz/config/entityengine.xml,
+ - or extends this template with the definition it needs. Adding a datasource here requires nothing but the
+ - definition and its field-type: the entry point substitutes placeholders textually and neither counts nor
+ - enumerates the datasources. DOCKER.adoc records this in the database section.
 -->
 <entity-config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="https://ofbiz.apache.org/dtds/entity-config.xsd">

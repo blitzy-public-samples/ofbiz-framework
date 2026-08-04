@@ -59,18 +59,27 @@ set -e
 trap shutdown_ofbiz SIGTERM SIGINT
 
 # The container's OFBiz directory, which is also this script's working directory. A variable rather than
-# a literal so that the functions below resolve every path against one root that can be overridden when
-# they are sourced instead of executed. In an image it is always /ofbiz.
+# a literal so that the functions below resolve every path against one root, which lets this script be
+# SOURCED into a test harness with a throw-away root instead of being executed. In an image it is always
+# /ofbiz, it is INTERNAL to this script and its tests rather than a deployment setting, it is documented
+# as such in DOCKER.adoc, and it is unset before the serving command is executed.
 OFBIZ_CONTAINER_ROOT="${OFBIZ_CONTAINER_ROOT:-/ofbiz}"
 
+# Per-container state that records what has been done to the DATABASE. It lives under /ofbiz/runtime
+# because the demo image bakes empty markers there, and because it describes the database rather than the
+# configuration. /ofbiz/runtime as a whole must NOT be shared between instances - only runtime/uploads
+# may be, and only with the filesystem content provider; DOCKER.adoc says so.
 CONTAINER_STATE_DIR="$OFBIZ_CONTAINER_ROOT/runtime/container_state"
 CONTAINER_DATA_LOADED="$CONTAINER_STATE_DIR/data_loaded"
 CONTAINER_ADMIN_LOADED="$CONTAINER_STATE_DIR/admin_loaded"
-CONTAINER_CONFIG_APPLIED="$CONTAINER_STATE_DIR/config_applied"
 CONTAINER_DB_CONFIG_APPLIED="$CONTAINER_STATE_DIR/db_config_applied"
-# The overrides this script has rendered into the config directory. Only a file listed here is ever
-# removed again, so an override an operator mounted themselves is never touched.
-CONTAINER_MANAGED_OVERRIDES="$CONTAINER_STATE_DIR/managed_overrides"
+# The overrides this script has rendered into the config directory. It lives WITH the files it governs,
+# inside /ofbiz/config, rather than in the runtime volume: the two are separate volumes with separate
+# lifetimes, and a ledger that outlived its artefacts - or artefacts that outlived their ledger - is how
+# a recreated container ends up unable to withdraw a previous container's live signing key. Only a file
+# listed here is ever removed again, so an override an operator mounted themselves is never touched.
+CONTAINER_CONFIG_STATE_DIR="$OFBIZ_CONTAINER_ROOT/config/.ofbiz_container_state"
+CONTAINER_MANAGED_OVERRIDES="$CONTAINER_CONFIG_STATE_DIR/managed_overrides"
 
 # The files this script reads from and renders to. The shipped copies under /ofbiz/framework and
 # /ofbiz/applications are the sources; the rendered copies under /ofbiz/config are what the JVM reads.
@@ -81,6 +90,10 @@ START_PROPERTIES_SOURCE="framework/start/src/main/resources/org/apache/ofbiz/bas
 START_PROPERTIES_OVERRIDE="config/org/apache/ofbiz/base/start/start.properties"
 CATALINA_COMPONENT="framework/catalina/ofbiz-component.xml"
 SERVICE_ENGINE_SOURCE="framework/service/config/serviceengine.xml"
+SERVICE_ENGINE_OVERRIDE="config/serviceengine.xml"
+JNDI_SERVERS_SOURCE="framework/base/config/jndiservers.xml"
+JNDI_SERVERS_OVERRIDE="config/jndiservers.xml"
+JNDI_SERVER_NAME="ofbizjms"
 ENTITY_ENGINE_TEMPLATE="templates/postgres-entityengine.xml"
 ENTITY_ENGINE_OVERRIDE="config/entityengine.xml"
 
@@ -102,10 +115,14 @@ config_fatal() {
 # contain those characters.
 # $1 - variable name, for the message. $2 - the value.
 require_single_line() {
-  local unprintable
-  unprintable=$(printf '%s' "$2" | LC_ALL=C tr --delete '[:print:]' | wc --bytes)
-  if [ "$unprintable" -ne 0 ]; then
-    config_fatal "$1 must contain printable characters only. A line break, a tab or another control character cannot be represented in the property and XML files this script renders."
+  local controls nonascii
+  controls=$(printf '%s' "$2" | LC_ALL=C tr --delete --complement '[:cntrl:]' | wc --bytes)
+  if [ "$controls" -ne 0 ]; then
+    config_fatal "$1 must not contain a control character. A line break, a tab or any other control character cannot be represented in the property and XML files this script renders."
+  fi
+  nonascii=$(printf '%s' "$2" | LC_ALL=C tr --delete '\000-\177' | wc --bytes)
+  if [ "$nonascii" -ne 0 ]; then
+    config_fatal "$1 must contain ASCII characters only. This is a separate restriction from the control-character one above: a Java .properties file is decoded as ISO-8859-1, so a UTF-8 value rendered into one would be read back as different characters - silently, and for a secret that means a value nothing can reproduce. Choose an ASCII value."
   fi
 }
 
@@ -130,15 +147,20 @@ xml_attribute_value() {
 }
 
 ###############################################################################
-# Escape an already destination-encoded value for use as the REPLACEMENT text of a sed s|...|...| or
-# s@...@...@ program: a backslash and an ampersand are special there, and so are both delimiters this
-# script uses. Always applied LAST, after properties_value or xml_attribute_value.
+# Escape an already destination-encoded value for use as the REPLACEMENT text of a sed s-program: a
+# backslash and an ampersand are special in replacement text, and a delimiter would end the replacement
+# early. Every delimiter this script uses is escaped - '|', '@' and '/' - rather than only the ones a
+# particular call site happens to use, so a value cannot depend on which delimiter its call site chose.
+# An escaped delimiter is read back as the character itself whatever the delimiter in force is.
+# Always applied LAST, after properties_value or xml_attribute_value.
 # $1 - the value. Writes the escaped value to stdout.
 sed_replacement() {
   printf '%s' "$1" | LC_ALL=C sed \
     --expression='s@\\@\\\\@g' \
     --expression='s@&@\\\&@g' \
-    --expression='s@|@\\|@g'
+    --expression='s@|@\\|@g' \
+    --expression='s@/@\\/@g' \
+    --expression='s@\x40@\\\x40@g'
 }
 
 ###############################################################################
@@ -152,21 +174,19 @@ xml_substitution() {
 }
 
 ###############################################################################
-# The digest of the configuration this container would render now, for a marker file.
-# A marker records WHAT was applied rather than merely THAT something was, so a persisted runtime volume
-# can be reused after an environment change - or after an interrupted schema initialisation - without
-# silently carrying the previous configuration forward. A marker written by an older image, or baked into
-# the demo image, holds no digest and therefore matches nothing, so the configuration is applied.
-# Secrets take part in the digest so that rotating one re-applies the configuration; what reaches the
-# marker file is the digest alone, so the plaintext settings are not persisted there.
-# $1 - "config", or the startup-DDL mode that was rendered for the database marker.
+# The digest of the configuration a marker file records.
+#
+# A marker records WHAT was applied rather than merely THAT something was, so a persisted volume - or a
+# marker baked into the demo image - cannot silently carry a previous configuration forward. A marker
+# written by an older image, or baked into the demo image, holds no digest and therefore matches nothing.
+# Configuration itself is no longer marker-gated at all (see apply_configuration): the markers that remain
+# describe the DATABASE, where the question "has this already been done" cannot be answered by re-doing it.
+# What reaches a marker file is the digest alone, so no plaintext setting is persisted there.
+# $1 - "data", "admin", or the startup-DDL mode that was rendered for the database marker.
 configuration_digest() {
   { set +x; } 2>/dev/null
   local payload
   case "$1" in
-  config)
-    payload="config/1|$OFBIZ_PROFILE|$OFBIZ_HOST|$OFBIZ_CONTENT_URL_PREFIX|$OFBIZ_ENABLE_AJP_PORT|$OFBIZ_AJP_BIND_ADDRESS|$OFBIZ_JVM_ROUTE|$OFBIZ_SSL_ACCELERATOR_PORT|$OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS|$OFBIZ_DISABLE_COMPONENTS|$OFBIZ_CONTENT_STORE_PROVIDER|$OFBIZ_S3_BUCKET|$OFBIZ_S3_REGION|$OFBIZ_S3_ENDPOINT|$OFBIZ_S3_PATH_STYLE|$OFBIZ_S3_ACCESS_KEY_ID|$OFBIZ_S3_SECRET_ACCESS_KEY|$OFBIZ_ADMIN_KEY|$OFBIZ_LOGIN_SECRET_KEY|$OFBIZ_JWT_TOKEN_KEY"
-    ;;
   data | admin)
     # Only the IDENTITY of the database decides whether it has already been populated. A rotated
     # password, a resized pool, a changed TLS mode or a flipped cache-clear flag leave the rows exactly
@@ -186,12 +206,15 @@ configuration_digest() {
 }
 
 ###############################################################################
-marker_matches() {
-  [ -f "$1" ] && [ "$(cat "$1")" = "$2" ]
-}
-
-###############################################################################
+# Write a marker, creating its directory first.
+#
+# The image creates runtime/container_state at build time, but a bind mount of an empty host directory over
+# /ofbiz/runtime hides it, and then the redirection below would fail with "No such file or directory" and
+# take the whole start-up down with it under "set -e" - after the configuration had already been rendered.
+# Creating the directory costs nothing and makes an empty bind mount behave like a fresh named volume.
+# $1 - the marker path, $2 - the digest it must hold
 mark_applied() {
+  mkdir --parents "$(dirname "$1")"
   printf '%s' "$2" >"$1"
 }
 
@@ -219,7 +242,16 @@ data_marker_covers() {
 }
 
 ###############################################################################
+# Record that this script rendered the given override, so that a later start can withdraw it again.
+#
+# The directory is created here rather than relied on: create_ofbiz_runtime_directories makes it, and
+# _main does run that first, but a ledger append that depends on another function having run would fail
+# under set -e AFTER the configuration had been rendered - leaving a container whose overrides are in
+# place and unrecorded, which is exactly the state that can never be withdrawn. One mkdir removes the
+# ordering dependency altogether.
+# $1 - the override path
 own_override() {
+  mkdir --parents "$CONTAINER_CONFIG_STATE_DIR"
   if ! grep --quiet --line-regexp --fixed-strings "$1" "$CONTAINER_MANAGED_OVERRIDES" 2>/dev/null; then
     echo "$1" >>"$CONTAINER_MANAGED_OVERRIDES"
   fi
@@ -257,8 +289,36 @@ require_enum() {
 require_positive_integer() {
   case "$2" in
   '' | *[!0-9]*) config_fatal "$1=$2 must be a positive integer" ;;
-  0*[!0] | 0) config_fatal "$1=$2 must be a positive integer" ;;
+  # Every leading-zero spelling is refused, "0" and "00" included, rather than only some of them: the
+  # values these guard become a TCP port or a pool size, and a rendered "007" is not what the operator
+  # wrote even where it happens to parse.
+  0*) config_fatal "$1=$2 must be a positive integer written without a leading zero" ;;
   esac
+}
+
+###############################################################################
+# Refuse a value that would change the STRUCTURE of the JDBC URI it is rendered into.
+#
+# The host and the database name are rendered into "jdbc:postgresql://host:port/database?parameters".
+# XML escaping protects the FILE; it does nothing about the URI, so a database name carrying
+# "?sslmode=disable&x=1" renders a URI whose FIRST query string is the attacker's - and pgJDBC honours the
+# first - which silently downgrades a connection this deployment validated as verify-full to plaintext.
+# Rejected rather than percent-encoded, because no legitimate host or database name contains any of these.
+# $1 - variable name, for the message. $2 - the value. $3 - "database" to also refuse ':'.
+require_uri_component() {
+  require_single_line "$1" "$2"
+  case "$2" in
+  *'?'* | *'&'* | *'/'* | *[\\]* | *'#'* | *' '* | *'@'*)
+    config_fatal "$1 must not contain '?', '&', '/', '\\', '#', '@' or a space: it is rendered into the database connection URI, where any of those can add or replace a connection parameter. A value carrying '?sslmode=disable' would downgrade a connection this deployment requires TLS for."
+    ;;
+  esac
+  if [ "$3" = "database" ]; then
+    case "$2" in
+    *':'*)
+      config_fatal "$1 must not contain ':': it is rendered into the database connection URI, where ':' separates the host from the port."
+      ;;
+    esac
+  fi
 }
 
 ###############################################################################
@@ -313,12 +373,47 @@ ofbiz_setup_env() {
   esac
 
   OFBIZ_ADMIN_USER=${OFBIZ_ADMIN_USER:-admin}
+  # Validated as well as escaped. It is substituted into the admin-user data template, and the template is
+  # a SINGLE-LINE sed program, so a value able to introduce a ';' or a '#' could end one expression and
+  # comment out the next - which is the expression that sets the password, leaving a SUPER admin with the
+  # password the template ships. The escaping below closes that on its own; this allow-list means the
+  # value never has to be trusted to have been escaped correctly.
+  case "$OFBIZ_ADMIN_USER" in
+  '' | *[!A-Za-z0-9._@-]*)
+    config_fatal "OFBIZ_ADMIN_USER=$OFBIZ_ADMIN_USER must be 1 to 250 characters from A-Z, a-z, 0-9, '.', '_', '@' and '-'. It becomes a userLoginId, which OFBiz stores as a 250-character identifier."
+    ;;
+  esac
+  if [ "${#OFBIZ_ADMIN_USER}" -gt 250 ]; then
+    config_fatal "OFBIZ_ADMIN_USER is longer than the 250 characters a userLoginId holds."
+  fi
 
   OFBIZ_HOST=${OFBIZ_HOST:-}
   OFBIZ_CONTENT_URL_PREFIX=${OFBIZ_CONTENT_URL_PREFIX:-}
   OFBIZ_ENABLE_AJP_PORT=${OFBIZ_ENABLE_AJP_PORT:-}
   require_single_line OFBIZ_HOST "$OFBIZ_HOST"
   require_single_line OFBIZ_CONTENT_URL_PREFIX "$OFBIZ_CONTENT_URL_PREFIX"
+  # It is rendered into content.url.prefix.secure and content.url.prefix.standard, which OFBiz prefixes
+  # onto content URLs, so it has to be an ABSOLUTE origin. A relative or malformed value produces links
+  # that resolve against whatever host served the page, which is how a content URL ends up pointing
+  # somewhere the deployment did not choose.
+  if [ -n "$OFBIZ_CONTENT_URL_PREFIX" ]; then
+    case "$OFBIZ_CONTENT_URL_PREFIX" in
+    https://?*) ;;
+    http://?*)
+      if [ "$OFBIZ_PROFILE" = "prod" ]; then
+        config_fatal "OFBIZ_CONTENT_URL_PREFIX=$OFBIZ_CONTENT_URL_PREFIX is plain http, which is refused in the prod profile: every content URL built from it would be fetched unencrypted. Use an https origin."
+      fi
+      ;;
+    *)
+      config_fatal "OFBIZ_CONTENT_URL_PREFIX=$OFBIZ_CONTENT_URL_PREFIX must be an absolute origin beginning http:// or https://, for example https://content.example.com. It is prefixed onto content URLs, so a relative value resolves against whichever host served the page."
+      ;;
+    esac
+    case "$OFBIZ_CONTENT_URL_PREFIX" in
+    *[[:space:]]* | *'"'* | *"'"*)
+      config_fatal "OFBIZ_CONTENT_URL_PREFIX must not contain whitespace or a quote character."
+      ;;
+    esac
+  fi
 
   OFBIZ_POSTGRES_PORT=${OFBIZ_POSTGRES_PORT:-5432}
   require_positive_integer OFBIZ_POSTGRES_PORT "$OFBIZ_POSTGRES_PORT"
@@ -337,19 +432,41 @@ ofbiz_setup_env() {
   OFBIZ_POSTGRES_TENANT_DB=${OFBIZ_POSTGRES_TENANT_DB:-ofbiztenant}
   OFBIZ_POSTGRES_TENANT_USER=${OFBIZ_POSTGRES_TENANT_USER:-ofbiztenant}
   OFBIZ_POSTGRES_TENANT_PASSWORD=${OFBIZ_POSTGRES_TENANT_PASSWORD:-ofbiztenant}
-  # Every one of these reaches the rendered XML through a sed substitution, so a value carrying a line
-  # break or another control character has to be refused here rather than corrupt the file. The check
-  # never echoes the value, so it is safe to run on the passwords with tracing off.
-  require_single_line OFBIZ_POSTGRES_HOST "${OFBIZ_POSTGRES_HOST:-}"
-  require_single_line OFBIZ_POSTGRES_OFBIZ_DB "$OFBIZ_POSTGRES_OFBIZ_DB"
+  # Every one of these reaches the rendered XML through a sed substitution, so a value carrying a control
+  # character has to be refused here rather than corrupt the file. The host and the three database names
+  # reach the connection URI as well, where a value carrying '?' or '&' could add or replace a connection
+  # parameter, so they are held to the stricter rule. None of these checks ever echoes a value, so it is
+  # safe to run them on the passwords with tracing off.
+  require_uri_component OFBIZ_POSTGRES_HOST "${OFBIZ_POSTGRES_HOST:-}"
+  require_uri_component OFBIZ_POSTGRES_OFBIZ_DB "$OFBIZ_POSTGRES_OFBIZ_DB" database
   require_single_line OFBIZ_POSTGRES_OFBIZ_USER "$OFBIZ_POSTGRES_OFBIZ_USER"
   require_single_line OFBIZ_POSTGRES_OFBIZ_PASSWORD "$OFBIZ_POSTGRES_OFBIZ_PASSWORD"
-  require_single_line OFBIZ_POSTGRES_OLAP_DB "$OFBIZ_POSTGRES_OLAP_DB"
+  require_uri_component OFBIZ_POSTGRES_OLAP_DB "$OFBIZ_POSTGRES_OLAP_DB" database
   require_single_line OFBIZ_POSTGRES_OLAP_USER "$OFBIZ_POSTGRES_OLAP_USER"
   require_single_line OFBIZ_POSTGRES_OLAP_PASSWORD "$OFBIZ_POSTGRES_OLAP_PASSWORD"
-  require_single_line OFBIZ_POSTGRES_TENANT_DB "$OFBIZ_POSTGRES_TENANT_DB"
+  require_uri_component OFBIZ_POSTGRES_TENANT_DB "$OFBIZ_POSTGRES_TENANT_DB" database
   require_single_line OFBIZ_POSTGRES_TENANT_USER "$OFBIZ_POSTGRES_TENANT_USER"
   require_single_line OFBIZ_POSTGRES_TENANT_PASSWORD "$OFBIZ_POSTGRES_TENANT_PASSWORD"
+  refuse_published_credential OFBIZ_POSTGRES_OFBIZ_PASSWORD "$OFBIZ_POSTGRES_OFBIZ_PASSWORD"
+  refuse_published_credential OFBIZ_POSTGRES_OLAP_PASSWORD "$OFBIZ_POSTGRES_OLAP_PASSWORD"
+  refuse_published_credential OFBIZ_POSTGRES_TENANT_PASSWORD "$OFBIZ_POSTGRES_TENANT_PASSWORD"
+  # A managed database in production must be given real passwords. The three defaults above exist so that
+  # a throw-away local PostgreSQL works with no configuration; they are in this file, in DOCKER.adoc's
+  # default column and in every clone, so in the prod profile the literal default is refused by NAME - the
+  # comparison is against the known literal, not a strength test - and a supplied password has a length
+  # floor. Nothing here echoes a value.
+  if [ "$OFBIZ_PROFILE" = "prod" ] && [ -n "${OFBIZ_POSTGRES_HOST:-}" ]; then
+    local missingDb="" group
+    [ "$OFBIZ_POSTGRES_OFBIZ_PASSWORD" != "ofbiz" ] || missingDb="$missingDb OFBIZ_POSTGRES_OFBIZ_PASSWORD"
+    [ "$OFBIZ_POSTGRES_OLAP_PASSWORD" != "ofbizolap" ] || missingDb="$missingDb OFBIZ_POSTGRES_OLAP_PASSWORD"
+    [ "$OFBIZ_POSTGRES_TENANT_PASSWORD" != "ofbiztenant" ] || missingDb="$missingDb OFBIZ_POSTGRES_TENANT_PASSWORD"
+    if [ -n "$missingDb" ]; then
+      config_fatal "OFBIZ_PROFILE=prod with a managed database requires every database password to be supplied. These still hold the default this repository ships, which is public:$missingDb. See DOCKER.adoc."
+    fi
+    for group in OFBIZ_POSTGRES_OFBIZ_PASSWORD OFBIZ_POSTGRES_OLAP_PASSWORD OFBIZ_POSTGRES_TENANT_PASSWORD; do
+      require_minimum_length "$group" "${!group}" 12 "a database password is a deployment secret, and a short one is guessable at the rate a database will accept attempts."
+    done
+  fi
   set -x
 
   OFBIZ_DB_POOL_MIN=${OFBIZ_DB_POOL_MIN:-2}
@@ -399,8 +516,65 @@ ofbiz_setup_env() {
 
   OFBIZ_DISTRIBUTED_CACHE_CLEAR=${OFBIZ_DISTRIBUTED_CACHE_CLEAR:-false}
   require_enum OFBIZ_DISTRIBUTED_CACHE_CLEAR "$OFBIZ_DISTRIBUTED_CACHE_CLEAR" true false
-  if [ "$OFBIZ_DISTRIBUTED_CACHE_CLEAR" = "true" ] && ! jms_transport_configured; then
-    config_fatal "OFBIZ_DISTRIBUTED_CACHE_CLEAR=true requires a message transport, and none is configured. The distributedClear* services are declared engine=\"jms\" location=\"serviceMessenger\", and the jms-service of that name is shipped commented out in $SERVICE_ENGINE_SOURCE, so with the flag on and no transport every cache invalidation would be undeliverable and would mark the caller's transaction rollback-only. Mount a serviceengine.xml into the config directory with that jms-service uncommented and configured for your broker, put the broker's JMS client library in lib-extra, and start again. See DOCKER.adoc."
+
+  # The message transport that carries a cache invalidation to the other instances. Supplying
+  # OFBIZ_JMS_PROVIDER_URL is what asks this script to CONFIGURE one: it renders the serviceMessenger
+  # jms-service - which OFBiz ships commented out - and the JNDI server it names, into the config
+  # directory, which precedes ofbiz.jar on the class path. Nothing is rendered when it is unset, and an
+  # operator who prefers to mount their own descriptors is still free to.
+  OFBIZ_JMS_PROVIDER_URL=${OFBIZ_JMS_PROVIDER_URL:-}
+  OFBIZ_JMS_INITIAL_CONTEXT_FACTORY=${OFBIZ_JMS_INITIAL_CONTEXT_FACTORY:-}
+  OFBIZ_JMS_TOPIC_CONNECTION_FACTORY=${OFBIZ_JMS_TOPIC_CONNECTION_FACTORY:-TopicConnectionFactory}
+  OFBIZ_JMS_TOPIC=${OFBIZ_JMS_TOPIC:-OFBTopic}
+  OFBIZ_JMS_USERNAME=${OFBIZ_JMS_USERNAME:-}
+  require_single_line OFBIZ_JMS_PROVIDER_URL "$OFBIZ_JMS_PROVIDER_URL"
+  require_single_line OFBIZ_JMS_INITIAL_CONTEXT_FACTORY "$OFBIZ_JMS_INITIAL_CONTEXT_FACTORY"
+  require_single_line OFBIZ_JMS_TOPIC_CONNECTION_FACTORY "$OFBIZ_JMS_TOPIC_CONNECTION_FACTORY"
+  require_single_line OFBIZ_JMS_TOPIC "$OFBIZ_JMS_TOPIC"
+  require_single_line OFBIZ_JMS_USERNAME "$OFBIZ_JMS_USERNAME"
+  { set +x; } 2>/dev/null
+  OFBIZ_JMS_PASSWORD=${OFBIZ_JMS_PASSWORD:-}
+  require_single_line OFBIZ_JMS_PASSWORD "$OFBIZ_JMS_PASSWORD"
+  refuse_published_credential OFBIZ_JMS_PASSWORD "$OFBIZ_JMS_PASSWORD"
+  # The broker credential is a PAIR, exactly as the object-store credential is. The rendered descriptor
+  # carries both attributes or neither, so a password supplied without a username would be silently
+  # DISCARDED and the broker connection would then fail authentication for a reason nothing in the
+  # configuration shows. Refuse the half-supplied pair instead of dropping the value.
+  if [ -n "$OFBIZ_JMS_PASSWORD" ] && [ -z "$OFBIZ_JMS_USERNAME" ]; then
+    set -x
+    config_fatal "OFBIZ_JMS_PASSWORD is set but OFBIZ_JMS_USERNAME is empty. The JMS credential is rendered as a pair, so the password would be discarded and the broker connection would fail to authenticate. Supply both, or neither and let the broker accept an anonymous connection."
+  fi
+  if [ -n "$OFBIZ_JMS_USERNAME" ] && [ -z "$OFBIZ_JMS_PASSWORD" ]; then
+    set -x
+    config_fatal "OFBIZ_JMS_USERNAME is set but OFBIZ_JMS_PASSWORD is empty. Supply both, or neither and let the broker accept an anonymous connection."
+  fi
+  set -x
+  if [ -n "$OFBIZ_JMS_PROVIDER_URL" ]; then
+    if [ -z "$OFBIZ_JMS_INITIAL_CONTEXT_FACTORY" ]; then
+      config_fatal "OFBIZ_JMS_PROVIDER_URL requires OFBIZ_JMS_INITIAL_CONTEXT_FACTORY, the JNDI initial-context-factory class of your broker's client library - for example org.apache.activemq.jndi.ActiveMQInitialContextFactory. OFBiz reaches the topic through JNDI, so it cannot be derived from the URL. See DOCKER.adoc."
+    fi
+    if [ -z "$OFBIZ_JMS_TOPIC_CONNECTION_FACTORY" ] || [ -z "$OFBIZ_JMS_TOPIC" ]; then
+      config_fatal "OFBIZ_JMS_TOPIC_CONNECTION_FACTORY and OFBIZ_JMS_TOPIC must not be empty: they are the JNDI names of the connection factory and of the topic that carries cache invalidations."
+    fi
+    if [ "$OFBIZ_DISTRIBUTED_CACHE_CLEAR" != "true" ]; then
+      echo "WARNING: OFBIZ_JMS_PROVIDER_URL is set but OFBIZ_DISTRIBUTED_CACHE_CLEAR is not true, so the transport is configured and nothing uses it. Set OFBIZ_DISTRIBUTED_CACHE_CLEAR=true to make the instances invalidate each other's entity caches."
+    fi
+    # The broker's client library is NOT bundled - it is provider specific and OFBiz ships no JMS client -
+    # so it has to be mounted. An empty lib-extra with a transport configured is a certain
+    # misconfiguration: the initial-context-factory class could not possibly be loaded.
+    if [ -d "$OFBIZ_CONTAINER_ROOT/lib-extra" ] \
+      && [ -z "$(find "$OFBIZ_CONTAINER_ROOT/lib-extra" -maxdepth 1 -name '*.jar' -print -quit)" ]; then
+      config_fatal "OFBIZ_JMS_PROVIDER_URL is set but $OFBIZ_CONTAINER_ROOT/lib-extra holds no jar. This image bundles NO JMS client library, because the library is specific to the broker, so $OFBIZ_JMS_INITIAL_CONTEXT_FACTORY cannot be loaded and every cache invalidation would fail. Mount your broker's JMS client library into /ofbiz/lib-extra, which precedes ofbiz.jar on the class path. See DOCKER.adoc."
+    fi
+  fi
+
+  # The order is ENFORCED: the flag cannot be switched on without a transport to carry the invalidations,
+  # because the distributedClear* services are declared engine="jms" location="serviceMessenger" and
+  # inherit use-transaction, so an undeliverable invalidation marks the caller's transaction rollback-only
+  # and loses the entity write that triggered it.
+  if [ "$OFBIZ_DISTRIBUTED_CACHE_CLEAR" = "true" ] && [ -z "$OFBIZ_JMS_PROVIDER_URL" ] \
+    && ! jms_transport_configured; then
+    config_fatal "OFBIZ_DISTRIBUTED_CACHE_CLEAR=true requires a message transport, and none is configured. The distributedClear* services are declared engine=\"jms\" location=\"serviceMessenger\", and the jms-service of that name is shipped commented out in $SERVICE_ENGINE_SOURCE, so with the flag on and no transport every cache invalidation would be undeliverable and would mark the caller's transaction rollback-only. Either set OFBIZ_JMS_PROVIDER_URL and OFBIZ_JMS_INITIAL_CONTEXT_FACTORY and mount your broker's JMS client library in /ofbiz/lib-extra - this script then renders the serviceMessenger jms-service and its JNDI server for you - or mount your own serviceengine.xml into the config directory with that jms-service uncommented. See DOCKER.adoc."
   fi
 
   OFBIZ_JVM_ROUTE=${OFBIZ_JVM_ROUTE-jvm1}
@@ -455,14 +629,23 @@ ofbiz_setup_env() {
   OFBIZ_S3_REGION=${OFBIZ_S3_REGION:-}
   OFBIZ_S3_ENDPOINT=${OFBIZ_S3_ENDPOINT:-}
   OFBIZ_S3_PATH_STYLE=${OFBIZ_S3_PATH_STYLE:-false}
+  OFBIZ_S3_ENCRYPTION=${OFBIZ_S3_ENCRYPTION:-none}
+  OFBIZ_S3_KMS_KEY_ID=${OFBIZ_S3_KMS_KEY_ID:-}
   require_enum OFBIZ_S3_PATH_STYLE "$OFBIZ_S3_PATH_STYLE" true false
+  require_enum OFBIZ_S3_ENCRYPTION "$OFBIZ_S3_ENCRYPTION" none sse-s3 sse-kms
   require_single_line OFBIZ_S3_BUCKET "$OFBIZ_S3_BUCKET"
   require_single_line OFBIZ_S3_REGION "$OFBIZ_S3_REGION"
   require_single_line OFBIZ_S3_ENDPOINT "$OFBIZ_S3_ENDPOINT"
+  require_single_line OFBIZ_S3_KMS_KEY_ID "$OFBIZ_S3_KMS_KEY_ID"
   if [ "$OFBIZ_CONTENT_STORE_PROVIDER" = "s3" ]; then
     if [ -z "$OFBIZ_S3_BUCKET" ] || [ -z "$OFBIZ_S3_REGION" ]; then
       config_fatal "OFBIZ_CONTENT_STORE_PROVIDER=s3 requires OFBIZ_S3_BUCKET and OFBIZ_S3_REGION."
     fi
+  fi
+  # Refused here as well as in the provider, so a deployment that asked for KMS encryption without naming
+  # a key is told at container start rather than on the first content operation.
+  if [ "$OFBIZ_S3_ENCRYPTION" = "sse-kms" ] && [ -z "$OFBIZ_S3_KMS_KEY_ID" ]; then
+    config_fatal "OFBIZ_S3_ENCRYPTION=sse-kms requires OFBIZ_S3_KMS_KEY_ID to name the key that encrypts stored content."
   fi
   # A plain http endpoint exposes the object content and the authorization metadata of every request -
   # the access-key identifier and the request signature among it - to anyone on the path, so it is
@@ -478,6 +661,29 @@ ofbiz_setup_env() {
   OFBIZ_DISABLE_COMPONENTS=${OFBIZ_DISABLE_COMPONENTS-plugins/birt/ofbiz-component.xml}
 
   resolve_deployment_secrets
+}
+
+###############################################################################
+# Refuse a secret supplied as a JVM system property on the command line.
+#
+# A -D property reaches /proc/<pid>/cmdline, which every process on the host can read, and it reaches
+# "ps" output and any process collector - so a secret passed that way is readable by anything that can
+# look at the process table (CWE-214). Every secret this script handles has an environment variable, and
+# every one of them is rendered into a file readable by the ofbiz user alone, so there is never a reason
+# to pass one on the command line. Checked for the arguments this container was given AND for the two
+# variables the launcher appends to the JVM command line itself.
+# $@ - the command this container will execute
+refuse_secret_command_line() {
+  local names='ofbiz.admin.key login.secret_key_string security.token.key content.store.s3.access.key.id content.store.s3.secret.access.key'
+  local haystack="$* ${JAVA_OPTS:-} ${OFBIZ_OPTS:-}"
+  local name
+  for name in $names; do
+    case "$haystack" in
+    *"-D$name="*)
+      config_fatal "The system property $name must not be set on the command line or in JAVA_OPTS/OFBIZ_OPTS: it would put a secret into /proc/<pid>/cmdline and into the process table, where any process on the host can read it. Supply it through its environment variable instead; DOCKER.adoc lists them."
+      ;;
+    esac
+  done
 }
 
 ###############################################################################
@@ -500,6 +706,15 @@ resolve_deployment_secrets() {
   fi
 
   OFBIZ_ADMIN_PASSWORD=${OFBIZ_ADMIN_PASSWORD:-ofbiz}
+  require_single_line OFBIZ_ADMIN_PASSWORD "$OFBIZ_ADMIN_PASSWORD"
+  refuse_published_credential OFBIZ_ADMIN_PASSWORD "$OFBIZ_ADMIN_PASSWORD"
+  if [ "$OFBIZ_PROFILE" = "prod" ]; then
+    # A floor as well as a presence check. The presence check above proves a value was supplied; it says
+    # nothing about the value, and prod accepted a one-character password until this floor existed. The
+    # admin account is a SUPER login, so its password is the most valuable secret in the deployment.
+    require_minimum_length OFBIZ_ADMIN_PASSWORD "$OFBIZ_ADMIN_PASSWORD" 12 \
+      "it is the password of a SUPER admin login that can reach every webapp and every service."
+  fi
 
   # Generated rather than left empty in the dev profile: with no key at all the AdminClient cannot
   # authenticate, so "ofbiz --shutdown" and the SIGTERM handler below could not stop the container. The
@@ -514,11 +729,18 @@ resolve_deployment_secrets() {
     ;;
   esac
   require_single_line OFBIZ_ADMIN_KEY "$OFBIZ_ADMIN_KEY"
+  refuse_published_credential OFBIZ_ADMIN_KEY "$OFBIZ_ADMIN_KEY"
+  # 16 characters, which is what the generated per-container key already has 32 of. The key authenticates
+  # a request that can shut the instance down, and it is checked with no rate limit at all.
+  require_minimum_length OFBIZ_ADMIN_KEY "$OFBIZ_ADMIN_KEY" 16 \
+    "it authenticates a request that can stop this instance, and AdminServerContainer rate-limits nothing."
 
   OFBIZ_LOGIN_SECRET_KEY=${OFBIZ_LOGIN_SECRET_KEY:-}
   OFBIZ_JWT_TOKEN_KEY=${OFBIZ_JWT_TOKEN_KEY:-}
   require_single_line OFBIZ_LOGIN_SECRET_KEY "$OFBIZ_LOGIN_SECRET_KEY"
   require_single_line OFBIZ_JWT_TOKEN_KEY "$OFBIZ_JWT_TOKEN_KEY"
+  refuse_published_credential OFBIZ_LOGIN_SECRET_KEY "$OFBIZ_LOGIN_SECRET_KEY"
+  refuse_published_credential OFBIZ_JWT_TOKEN_KEY "$OFBIZ_JWT_TOKEN_KEY"
   if [ -n "$OFBIZ_JWT_TOKEN_KEY" ] && [ ${#OFBIZ_JWT_TOKEN_KEY} -lt 64 ]; then
     config_fatal "OFBIZ_JWT_TOKEN_KEY must be at least 64 characters: JWTManager rejects a shorter key."
   fi
@@ -533,6 +755,7 @@ resolve_deployment_secrets() {
   OFBIZ_S3_SECRET_ACCESS_KEY=${OFBIZ_S3_SECRET_ACCESS_KEY:-}
   require_single_line OFBIZ_S3_ACCESS_KEY_ID "$OFBIZ_S3_ACCESS_KEY_ID"
   require_single_line OFBIZ_S3_SECRET_ACCESS_KEY "$OFBIZ_S3_SECRET_ACCESS_KEY"
+  refuse_published_credential OFBIZ_S3_SECRET_ACCESS_KEY "$OFBIZ_S3_SECRET_ACCESS_KEY"
   if { [ -n "$OFBIZ_S3_ACCESS_KEY_ID" ] && [ -z "$OFBIZ_S3_SECRET_ACCESS_KEY" ]; } \
     || { [ -z "$OFBIZ_S3_ACCESS_KEY_ID" ] && [ -n "$OFBIZ_S3_SECRET_ACCESS_KEY" ]; }; then
     config_fatal "OFBIZ_S3_ACCESS_KEY_ID and OFBIZ_S3_SECRET_ACCESS_KEY are supplied together, or neither is supplied and the AWS SDK's default credential chain is used."
@@ -542,12 +765,49 @@ resolve_deployment_secrets() {
 }
 
 ###############################################################################
+# Credentials this repository PUBLISHES, under docker/examples/postgres-demo. They are in every clone,
+# every fork and every mirror of it, so a deployment using one has no secret at all - and an example is
+# exactly what gets copied into a first deployment and then forgotten. Refused outright, in both profiles.
+PUBLISHED_CREDENTIALS='Ab6SqDD2YM2lmEsvao- P7TFUtQHSuvha8gSxMME 4oXET73QGriblUejjbvR 20wganpfDASBtBXY7GQ6'
+
+###############################################################################
+# Refuse a value that is one of the credentials this repository publishes.
+#
+# It does NOT touch the shell's trace setting, exactly as require_single_line does not: a helper that
+# turned tracing back on would re-enable it inside a caller that had deliberately turned it off, and every
+# secret handled after that point would reach the container log (CWE-532). CALL IT WITH TRACING OFF. Its
+# own message names the variable and never the value.
+# $1 - variable name, for the message. $2 - the value.
+refuse_published_credential() {
+  local published
+  for published in $PUBLISHED_CREDENTIALS; do
+    if [ "$2" = "$published" ]; then
+      config_fatal "$1 is one of the example credentials published in this repository under docker/examples/postgres-demo, so it is public. Generate a new value; the examples exist to show the shape of a deployment, not to be deployed."
+    fi
+  done
+}
+
+###############################################################################
+# Refuse a secret shorter than a floor. Never echoes the value; call it with tracing off, as above.
+# $1 - variable name. $2 - the value. $3 - the minimum length. $4 - why.
+require_minimum_length() {
+  if [ "${#2}" -lt "$3" ]; then
+    config_fatal "$1 must be at least $3 characters: $4"
+  fi
+}
+
+###############################################################################
 # Create the runtime container state directory used to track which initialisation
 # steps have been run for the container.
 # This directory should be hosted on a volume that persists for the life of the container.
 create_ofbiz_runtime_directories() {
   if [ ! -d "$CONTAINER_STATE_DIR" ]; then
     mkdir --parents "$CONTAINER_STATE_DIR"
+  fi
+  # The configuration ledger lives beside the overrides it governs, in the config volume, so the two
+  # cannot be given different lifetimes by a volume change.
+  if [ ! -d "$CONTAINER_CONFIG_STATE_DIR" ]; then
+    mkdir --parents "$CONTAINER_CONFIG_STATE_DIR"
   fi
 }
 
@@ -622,14 +882,23 @@ load_admin_user() {
     SALT=$(tr --delete --complement A-Za-z0-9 </dev/urandom | head --bytes=16)
     SALT_AND_PASSWORD="${SALT}${OFBIZ_ADMIN_PASSWORD}"
 
-    SHA1SUM_ASCII_HEX=$(printf "$SALT_AND_PASSWORD" | sha1sum | cut --delimiter=' ' --fields=1 --zero-terminated | tr --delete '\000')
+    # printf '%s' rather than printf "$value": the password is DATA, and passing it as the format string
+    # makes printf interpret it - "A%sB" hashes as "AB", "p\tq" gains a tab - so the hash would not be the
+    # hash of the password the operator supplied and the admin could not log in with it.
+    SHA1SUM_ASCII_HEX=$(printf '%s' "$SALT_AND_PASSWORD" | sha1sum | cut --delimiter=' ' --fields=1 --zero-terminated | tr --delete '\000')
 
-    SHA1SUM_ESCAPED_STRING=$(printf "$SHA1SUM_ASCII_HEX" | sed -e 's/\(..\)\.\?/\\x\1/g')
+    SHA1SUM_ESCAPED_STRING=$(printf '%s' "$SHA1SUM_ASCII_HEX" | sed -e 's/\(..\)\.\?/\\x\1/g')
+    # This one IS a format string on purpose: it holds \xNN escapes that printf has to interpret to
+    # produce the raw digest bytes that are then base64url encoded. It is derived from a hex digest, so it
+    # can only ever contain [0-9a-f\x].
+    # shellcheck disable=SC2059
     SHA1SUM_BASE64=$(printf "$SHA1SUM_ESCAPED_STRING" | basenc --base64url --wrap=0 | tr --delete '=')
 
     ENCODED_PASSWORD_HASH="\$SHA\$${SALT}\$${SHA1SUM_BASE64}"
 
-    sed "s/@userLoginId@/$(xml_substitution "$OFBIZ_ADMIN_USER")/g; s/currentPassword=\".*\"/currentPassword=\"$(sed_replacement "$ENCODED_PASSWORD_HASH")\"/g;" framework/resources/templates/AdminUserLoginData.xml >"$TMPFILE"
+    # '|' as the delimiter, as every other substitution in this script uses, and both values escaped for
+    # it. With '/' the user name would have had to be trusted not to contain one.
+    sed "s|@userLoginId@|$(xml_substitution "$OFBIZ_ADMIN_USER")|g; s|currentPassword=\".*\"|currentPassword=\"$(sed_replacement "$ENCODED_PASSWORD_HASH")\"|g;" framework/resources/templates/AdminUserLoginData.xml >"$TMPFILE"
     set -x
 
     "$OFBIZ_CONTAINER_ROOT"/bin/ofbiz --load-data "file=$TMPFILE"
@@ -720,7 +989,14 @@ apply_security_properties() {
 #
 # ONE destination. The launcher puts config/ ahead of the packaged copy on the class path, so this is the
 # file the JVM reads, and docker/send_ofbiz_stop_signal.sh searches the same two paths in the same order,
-# so it is also the file that authenticates the shutdown request the container's SIGTERM handler sends.
+# so it is also the file that authenticates an admin request the helper sends.
+# The helper is reached in two situations, and neither is the ordinary shutdown of a running server. The
+# SIGTERM/SIGINT trap at the top of this script calls it while THIS script is still the container's
+# process - during data loading, admin-user creation or schema initialisation - so that work in progress
+# ends cleanly. Once "exec" has replaced this script with the serving command the JVM is the container's
+# process and receives the signal itself, which OFBiz handles through its own JVM shutdown hook, with no
+# admin request and no key involved. The other situation is an operator invoking "ofbiz --shutdown",
+# "ofbiz --status" or the helper directly.
 # The copy shipped inside the image is left exactly as it was built - a secret is never written into it.
 #
 # Tracing is disabled for the whole function so that the key does not reach the container log.
@@ -745,7 +1021,8 @@ apply_admin_key() {
 apply_content_store() {
   if [ "$OFBIZ_CONTENT_STORE_PROVIDER" = "database" ] && [ -z "$OFBIZ_S3_BUCKET" ] && [ -z "$OFBIZ_S3_REGION" ] \
     && [ -z "$OFBIZ_S3_ENDPOINT" ] && [ -z "$OFBIZ_S3_ACCESS_KEY_ID" ] && [ -z "$OFBIZ_S3_SECRET_ACCESS_KEY" ] \
-    && [ "$OFBIZ_S3_PATH_STYLE" = "false" ]; then
+    && [ "$OFBIZ_S3_PATH_STYLE" = "false" ] && [ "$OFBIZ_S3_ENCRYPTION" = "none" ] \
+    && [ -z "$OFBIZ_S3_KMS_KEY_ID" ]; then
     # The shipped content.properties already says exactly this. An override this script wrote on an
     # earlier start is REMOVED rather than left behind, so going back to database storage really does go
     # back to it instead of leaving the previous provider and its credentials active on a persisted
@@ -762,11 +1039,76 @@ apply_content_store() {
     --expression="s|^content.store.s3.access.key.id=.*|content.store.s3.access.key.id=$(property_substitution "$OFBIZ_S3_ACCESS_KEY_ID")|" \
     --expression="s|^content.store.s3.secret.access.key=.*|content.store.s3.secret.access.key=$(property_substitution "$OFBIZ_S3_SECRET_ACCESS_KEY")|" \
     --expression="s|^content.store.s3.path.style=.*|content.store.s3.path.style=$(property_substitution "$OFBIZ_S3_PATH_STYLE")|" \
+    --expression="s|^content.store.s3.encryption=.*|content.store.s3.encryption=$(property_substitution "$OFBIZ_S3_ENCRYPTION")|" \
+    --expression="s|^content.store.s3.kms.key.id=.*|content.store.s3.kms.key.id=$(property_substitution "$OFBIZ_S3_KMS_KEY_ID")|" \
     "$CONTENT_PROPERTIES_SOURCE" >config/content.properties
   chmod 600 config/content.properties
   set -x
   own_override "config/content.properties"
   echo "Rendered config/content.properties with the [$OFBIZ_CONTENT_STORE_PROVIDER] content store provider"
+}
+
+###############################################################################
+# Render the JMS transport that carries distributed cache invalidation.
+#
+# TWO overrides, both into the config directory, because OFBiz reaches a JMS topic through JNDI and the
+# two halves of that live in two files:
+#   config/serviceengine.xml - the jms-service named serviceMessenger, which the distributedClear*
+#                              services in framework/entityext/servicedef/services.xml are declared
+#                              against. The packaged file ships it COMMENTED OUT; this renders a live one.
+#   config/jndiservers.xml   - the jndi-server that jms-service names, carrying the broker's provider URL
+#                              and its initial-context-factory.
+# Both are INSERTED immediately before the closing element of the packaged file rather than by replacing
+# its commented example, so the render does not depend on that comment's exact text. Both packaged files
+# are read-only sources and are never written to; both are resolved from the class path, which puts
+# /ofbiz/config ahead of ofbiz.jar, so the rendered copies are the ones OFBiz reads.
+#
+# What this does NOT ship is the broker or its client library: OFBiz bundles no JMS client, and the
+# library is specific to the provider, so it has to be mounted into /ofbiz/lib-extra. That requirement is
+# checked in ofbiz_setup_env and stated in DOCKER.adoc.
+#
+# Tracing is disabled for the whole function so that the broker password does not reach the container log.
+render_jms_transport() {
+  { set +x; } 2>/dev/null
+  local jndiServer connectionFactory topic credentials
+  jndiServer=$(xml_substitution "$JNDI_SERVER_NAME")
+  connectionFactory=$(xml_substitution "$OFBIZ_JMS_TOPIC_CONNECTION_FACTORY")
+  topic=$(xml_substitution "$OFBIZ_JMS_TOPIC")
+  credentials=""
+  if [ -n "$OFBIZ_JMS_USERNAME" ]; then
+    credentials=" username=\"$(xml_substitution "$OFBIZ_JMS_USERNAME")\" password=\"$(xml_substitution "$OFBIZ_JMS_PASSWORD")\""
+  fi
+
+  # listen="true": this instance SUBSCRIBES to the topic as well as publishing to it, which is what makes
+  # it act on the invalidations the other instances send - without it a fleet would send invalidations and
+  # ignore them. No client-id is set, deliberately: one shared by every instance of a fleet would collide,
+  # and a non-durable topic subscriber needs none.
+  sed \
+    --expression="s|^\( *\)</service-engine>|\1    <jms-service name=\"serviceMessenger\" send-mode=\"all\">\n\1        <server jndi-server-name=\"$jndiServer\" jndi-name=\"$connectionFactory\" topic-queue=\"$topic\" type=\"topic\"$credentials listen=\"true\"/>\n\1    </jms-service>\n\1</service-engine>|" \
+    "$SERVICE_ENGINE_SOURCE" >"$SERVICE_ENGINE_OVERRIDE"
+  # Readable by the ofbiz user alone: with a broker username and password supplied, this file holds them.
+  chmod 600 "$SERVICE_ENGINE_OVERRIDE"
+
+  sed \
+    --expression="s|^\( *\)</jndi-config>|\1<jndi-server name=\"$jndiServer\" context-provider-url=\"$(xml_substitution "$OFBIZ_JMS_PROVIDER_URL")\" initial-context-factory=\"$(xml_substitution "$OFBIZ_JMS_INITIAL_CONTEXT_FACTORY")\"/>\n\1</jndi-config>|" \
+    "$JNDI_SERVERS_SOURCE" >"$JNDI_SERVERS_OVERRIDE"
+  set -x
+  own_override "$SERVICE_ENGINE_OVERRIDE"
+  own_override "$JNDI_SERVERS_OVERRIDE"
+
+  # Read back. A jms-service that did not land, or landed twice, would leave every invalidation
+  # undeliverable while the configuration looked complete, so the start is refused instead. Two
+  # occurrences are expected in the rendered service engine: the shipped commented example, and this one.
+  local services jndiServers
+  services=$(grep --count '<jms-service name="serviceMessenger"' "$SERVICE_ENGINE_OVERRIDE" || true)
+  jndiServers=$(grep --count "<jndi-server name=\"$JNDI_SERVER_NAME\"" "$JNDI_SERVERS_OVERRIDE" || true)
+  if [ "$services" -ne 2 ] || [ "$jndiServers" -ne 1 ]; then
+    config_fatal "The JMS transport was not rendered as expected (serviceMessenger occurrences=$services, expected 2 - the shipped commented example plus the one rendered here - and $JNDI_SERVER_NAME occurrences=$jndiServers, expected 1). Refusing to start rather than run with cache invalidation that cannot be delivered."
+  fi
+  if ! jms_transport_configured; then
+    config_fatal "The rendered $SERVICE_ENGINE_OVERRIDE holds no UNCOMMENTED jms-service named serviceMessenger. Refusing to start rather than run with cache invalidation that cannot be delivered."
+  fi
+  echo "Rendered $SERVICE_ENGINE_OVERRIDE and $JNDI_SERVERS_OVERRIDE: entity-cache invalidations are carried by the topic $OFBIZ_JMS_TOPIC reached through $OFBIZ_JMS_PROVIDER_URL. The broker's own JMS client library must be present in /ofbiz/lib-extra."
 }
 
 ###############################################################################
@@ -831,22 +1173,32 @@ apply_load_balancer_settings() {
 # Changed property files need to be placed in the config directory so they appear earlier in the
 # classpath and override the build-time copies of the properties in ofbiz.jar.
 #
-# The marker records the DIGEST of the configuration that was applied, not merely that something was, so
-# a persisted runtime volume - or a marker baked into the demo image - cannot suppress a configuration
-# the environment now asks for.
+# UNCONDITIONAL, deliberately, and NOT gated by a marker. Configuration is rendered from the packaged
+# sources on every start, so what the JVM reads is always what this container's environment asks for.
+# Marker-gating it could not be made safe: the files it governs do not all live in one volume - the
+# property overrides are in /ofbiz/config, the Tomcat descriptor is patched in place under /ofbiz/framework
+# which is NOT a volume and is therefore pristine from the image on every recreation - so a marker in
+# either volume can outlive or be outlived by the artefacts it vouches for, and a "production" instance
+# would then come up without its load-balancer settings, without its injected secrets and on the embedded
+# database, reporting healthy the whole time. Every step below is idempotent: each renders from a packaged
+# source that is never written to, and the in-place descriptor patch reads its own result back and refuses
+# to start if it is not what was asked for.
 apply_configuration() {
-  local digest
-  digest=$(configuration_digest config)
-  if marker_matches "$CONTAINER_CONFIG_APPLIED" "$digest"; then
-    return 0
-  fi
-
   run_init_hooks before-config-applied /docker-entrypoint-hooks/before-config-applied.d/*
 
   apply_security_properties
   apply_admin_key
   apply_content_store
   apply_load_balancer_settings
+
+  if [ -n "$OFBIZ_JMS_PROVIDER_URL" ]; then
+    render_jms_transport
+  else
+    # Withdrawn rather than left behind, so removing the transport from the environment really does go
+    # back to single-node caching instead of leaving the previous container's broker configured.
+    disown_override "$SERVICE_ENGINE_OVERRIDE"
+    disown_override "$JNDI_SERVERS_OVERRIDE"
+  fi
 
   if [ -n "$OFBIZ_CONTENT_URL_PREFIX" ]; then
     sed \
@@ -862,7 +1214,6 @@ apply_configuration() {
     disable_components "$OFBIZ_DISABLE_COMPONENTS"
   fi
 
-  mark_applied "$CONTAINER_CONFIG_APPLIED" "$digest"
   run_init_hooks after-config-applied /docker-entrypoint-hooks/after-config-applied.d/*
 }
 
@@ -939,22 +1290,17 @@ render_entity_engine() {
 # embedded H2 database exactly as it always has - and an entity-engine override this script wrote on an
 # earlier start is removed, so withdrawing the database environment really does go back to H2.
 #
-# The marker holds the digest of the database configuration INCLUDING the startup-DDL mode that was
-# rendered, so it can only be matched by a start that wants exactly what is already on disk. A marker
-# left by an interrupted schema initialisation records DDL enabled and therefore never matches a serving
-# start, which re-renders with DDL disabled before serving anything.
+# UNCONDITIONAL, like apply_configuration and for the same reason. A serving start ALWAYS renders the run
+# mode, so an initialisation that was interrupted after enabling start-up DDL cannot leave a configuration
+# a serving instance would inherit - there is no marker to match and therefore no way to skip the render.
+# The marker is still written, as a RECORD of the mode that was applied for an operator to read, but
+# nothing depends on it any more.
 configure_database() {
-  local digest
-  digest=$(configuration_digest "false false")
-  if marker_matches "$CONTAINER_DB_CONFIG_APPLIED" "$digest"; then
-    return 0
-  fi
-
   if [ -n "$OFBIZ_POSTGRES_HOST" ]; then
     render_entity_engine false false
   else
     disown_override "$ENTITY_ENGINE_OVERRIDE"
-    mark_applied "$CONTAINER_DB_CONFIG_APPLIED" "$digest"
+    mark_applied "$CONTAINER_DB_CONFIG_APPLIED" "$(configuration_digest "false false")"
   fi
 }
 
@@ -997,6 +1343,7 @@ _main() {
   # refuses to start a prod deployment with a missing secret, nor the validation that refuses an unusable
   # port, address, TLS mode or cache-clear configuration.
   ofbiz_setup_env
+  refuse_secret_command_line "$@"
 
   if [ -z "$OFBIZ_SKIP_INIT" ]; then
     create_ofbiz_runtime_directories
@@ -1037,6 +1384,12 @@ _main() {
   unset OFBIZ_DB_POOL_MAX
   unset OFBIZ_SCHEMA_INIT
   unset OFBIZ_DISTRIBUTED_CACHE_CLEAR
+  unset OFBIZ_JMS_PROVIDER_URL
+  unset OFBIZ_JMS_INITIAL_CONTEXT_FACTORY
+  unset OFBIZ_JMS_TOPIC_CONNECTION_FACTORY
+  unset OFBIZ_JMS_TOPIC
+  unset OFBIZ_JMS_USERNAME
+  unset OFBIZ_JMS_PASSWORD
   unset OFBIZ_JVM_ROUTE
   unset OFBIZ_SSL_ACCELERATOR_PORT
   unset OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS
@@ -1047,6 +1400,13 @@ _main() {
   unset OFBIZ_S3_ACCESS_KEY_ID
   unset OFBIZ_S3_SECRET_ACCESS_KEY
   unset OFBIZ_S3_PATH_STYLE
+  unset OFBIZ_S3_ENCRYPTION
+  unset OFBIZ_S3_KMS_KEY_ID
+  # Not secrets, but not the JVM's business either: these three are read by this script alone, and one of
+  # them - OFBIZ_CONTAINER_ROOT - is internal to it and its tests.
+  unset OFBIZ_POSTGRES_HOST
+  unset OFBIZ_DISABLE_COMPONENTS
+  unset OFBIZ_CONTAINER_ROOT
 
   exec "$@"
 }

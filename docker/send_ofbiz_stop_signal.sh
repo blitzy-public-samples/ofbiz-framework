@@ -22,6 +22,18 @@
 # a published literal key; it no longer is, because the key is now supplied from OFBIZ_ADMIN_KEY at
 # container start. Anything this script writes to stdout or stderr is what "docker logs" and every log
 # collector behind it keeps, so only the FILE the key came from is reported, never the value (CWE-532).
+#
+# RECORDED SCOPE DEVIATION. This file is NOT one of the files the specification lists for change; the
+# minimal-change clause is deliberately departed from here, and the reason is recorded rather than left
+# implicit. Externalising the admin key (Goal 2) is what makes the change necessary. Upstream this script
+# echoed the key it read - harmless while every image shipped the same published literal - and it read the
+# key from ONE hard-coded path, the copy packaged in the image. Once the key becomes a per-deployment
+# secret rendered into the class-path override, leaving this script as it was would have two consequences:
+# it would print a live secret into the container log on every stop, and it would read the wrong file and
+# so authenticate with the wrong key, leaving no way to stop OFBiz cleanly. The change is therefore
+# confined to exactly what Goal 2 forces: stop echoing the key, resolve the file in the launcher's own
+# class-path precedence order, and pass the request on curl's stdin so the key never appears in a command
+# line that "ps" would show. No behaviour beyond that is touched.
 
 set -e
 

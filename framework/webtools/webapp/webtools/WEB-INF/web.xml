@@ -26,10 +26,12 @@ under the License.
     <context-param>
         <param-name>entityDelegatorName</param-name>
         <param-value>default</param-value>
+        <!--<description>The Name of the Entity Delegator to use, defined in entityengine.xml</description>-->
     </context-param>
     <context-param>
         <param-name>localDispatcherName</param-name>
         <param-value>webtools</param-value>
+        <!--<description>A unique name used to identify/recognize the local dispatcher for the Service Engine</description>-->
     </context-param>
     <context-param>
         <description>The location of the main-decorator screen to use for this webapp; referred to as a context variable
@@ -39,21 +41,33 @@ under the License.
         <param-value>component://webtools/widget/CommonScreens.xml</param-value>
     </context-param>
 
+    <!-- Load-balancer health probes. HealthCheckServlet is registered BOTH as this filter and as the
+         servlet declared further down, mapped to the same two exact paths, and this filter-mapping is
+         declared FIRST so that it runs before ControlFilter.
+         That ordering is the point of it. ControlFilter calls getSession() unconditionally, before it
+         looks at the path, so a probe that reached it would allocate an HttpSession every few seconds
+         for the life of the deployment - and each of those sessions, on expiry, costs a transaction and
+         a query in ControlEventListener to finalise a visit that never happened. Answering in the
+         filter means the rest of the chain never runs for a probe. Anything that is not one of the two
+         probe paths is passed straight through, so this mapping cannot affect any other request. -->
+    <filter>
+        <display-name>HealthCheckFilter</display-name>
+        <filter-name>HealthCheckFilter</filter-name>
+        <filter-class>org.apache.ofbiz.webapp.control.HealthCheckServlet</filter-class>
+    </filter>
     <filter>
         <display-name>ControlFilter</display-name>
         <filter-name>ControlFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.ControlFilter</filter-class>
         <!-- The two load-balancer probe paths are admitted without authentication, exactly as /ping.txt
-             already is, and the HealthCheckServlet declared below answers them. This is the whole of the
-             health registration: a servlet, a servlet-mapping and these two allowedPaths entries. No
-             filter is added and no filter ordering changes.
+             already is. They are kept here as defence in depth: the HealthCheckFilter above answers a
+             probe before this filter runs, so these entries matter only if that mapping is ever removed,
+             and then a probe still reaches the servlet anonymously rather than being redirected.
              The entries are the two EXACT paths, never the /health prefix: allowedPaths is matched with
              startsWith, so a single /health entry would admit every /health* spelling anonymously -
              /healthz/live, /health-internal - none of which is a probe. With the exact entries the only
              other spellings admitted are longer ones of these same two paths, which match no servlet and
-             get the container's own 404. Such a request runs this filter, so it is minted a session just
-             as a request to /ping.txt or /control is: that is this filter's long standing behaviour for
-             every path it admits and the health registration neither worsens nor addresses it. -->
+             get the container's own 404. -->
         <init-param>
             <param-name>allowedPaths</param-name>
             <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp:/health/live:/health/ready</param-value>
@@ -79,6 +93,11 @@ under the License.
         <filter-class>org.apache.ofbiz.webapp.control.SameSiteFilter</filter-class>
     </filter>
     <filter-mapping>
+        <filter-name>HealthCheckFilter</filter-name>
+        <url-pattern>/health/live</url-pattern>
+        <url-pattern>/health/ready</url-pattern>
+    </filter-mapping>
+    <filter-mapping>
         <filter-name>ControlFilter</filter-name>
         <url-pattern>/*</url-pattern>
     </filter-mapping>
@@ -102,6 +121,7 @@ under the License.
         <listener-class>org.apache.ofbiz.webapp.control.LoginEventListener</listener-class>
     </listener>
     <!-- NOTE: not all app servers support mounting implementations of the HttpSessionActivationListener interface -->
+    <!-- <listener><listener-class>org.apache.ofbiz.webapp.control.ControlActivationEventListener</listener-class></listener> -->
 
     <servlet>
         <description>Main Control Servlet</description>
@@ -119,7 +139,12 @@ under the License.
          the WEBTOOLS base permission, and reached anonymously because the two exact paths are listed in
          ControlFilter's allowedPaths above. Two exact url-patterns rather than a prefix, so that only
          these two paths reach the class at all. The servlet takes no init-param and is loaded on demand:
-         nothing it holds is created until the first probe arrives. -->
+         nothing it holds is created until the first probe arrives.
+         ACCEPTED CONSTRAINT: the probes live in the webtools admin webapp, so a deployment that disables
+         or network-isolates webtools loses its health checks, and the load balancer has to be able to
+         reach /webtools/health/live and /webtools/health/ready. That is where the plan places them; the
+         class itself is webapp-independent and the same eight lines register it in any other web.xml.
+         DOCKER.adoc records the constraint. -->
     <servlet>
         <description>Health and readiness check servlet for load balancer probes</description>
         <display-name>HealthCheckServlet</display-name>
@@ -159,6 +184,22 @@ under the License.
     | "503"   ; Service Unavailable
     | "504"   ; Gateway Time-out
     | "505"   ; HTTP Version not supported
+    -->
+
+    <!--
+      <security-constraint>
+        <web-resource-collection>
+          <web-resource-name>Entire Site</web-resource-name>
+          <description>Entire Site</description>
+          <url-pattern>/*</url-pattern>
+        </web-resource-collection>
+    -->
+    <!-- For enabling SSL, specify CONFIDENTIAL or INTEGRAL. -->
+    <!--
+        <user-data-constraint>
+          <transport-guarantee>CONFIDENTIAL</transport-guarantee>
+        </user-data-constraint>
+      </security-constraint>
     -->
 
 </web-app>

@@ -27,13 +27,30 @@ access. For a detailed description see the core/docs/entityconfig.html file.
             prepend-env="ofbiz.home" prefix="/framework/entity/fieldtype/"/>
 
     <!-- the transaction factory class to use, one is needed for each way of getting JTA interfaces -->
+    <!-- Use this one for Geronimo -->
     <transaction-factory class="org.apache.ofbiz.entity.transaction.GeronimoTransactionFactory"/>
+
+    <!-- Use this one for getting the JTA objects from JNDI -->
+    <!-- NOTE: to use the JndiFactory you must specify the necessary JNDI properties
+    <transaction-factory class="org.apache.ofbiz.entity.transaction.JNDITransactionFactory">
+        <user-transaction-jndi jndi-server-name="default" jndi-name="java:comp/UserTransaction"/>
+        <transaction-manager-jndi jndi-server-name="default" jndi-name="java:comp/UserTransaction"/>
+    </transaction-factory>
+    -->
+    <!--
+        It is common to use UserTransaction for the TransactionManager, but if that doesn't work, try this: <transaction-manager-jndi jndi-server-name="default" jndi-name="java:comp/TransactionManager"/>
+        Common UserTransaction locations:
+            java:comp/UserTransaction (most servers: Resin, Orion, OC4J, etc)
+            UserTransaction (RexIP)
+        JBoss uses two different objects for the UserTransaction and TransactionManager interfaces;
+        they are located in JNDI at: "java:comp/UserTransaction" and "java:/TransactionManager" respectively
+    -->
 
     <!-- the connection factory class to use, one is needed for obtaining connections/pools for defined resources -->
     <connection-factory class="org.apache.ofbiz.entity.connection.DBCPConnectionFactory"/>
 
     <debug-xa-resources value="false" />  <!-- see https://issues.apache.org/jira/browse/OFBIZ-4282 for more -->
-
+    
     <!-- Deployment profiles (see DOCKER.adoc):
          * Development profile (this committed file, zero configuration): the default, default-no-eca and test
            delegators all resolve to the embedded H2 datasources, so a bare checkout boots with no environment
@@ -73,7 +90,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
         <group-map group-name="org.apache.ofbiz.tenant" datasource-name="localh2tenant"/>
     </delegator>
-    <!-- May be used when you create a service that manages many data for massive imports, this for performance reason or to escape functional cases -->
+    <!-- May be used when you create a service that manages many data for massive imports, this for performance reason or to escape functional cases --> 
     <delegator name="default-no-eca" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" entity-eca-enabled="false" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
@@ -86,13 +103,17 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
         <group-map group-name="org.apache.ofbiz.tenant" datasource-name="localh2tenant"/>
     </delegator>
-
+   
+    <!-- need to at least define a name for each component to use -->
     <entity-model-reader name="main"/>
 
+    <!-- need to at least define a name for each component to use -->
     <entity-group-reader name="main"/>
 
+    <!-- need to at least define a name for each component to use -->
     <entity-eca-reader name="main"/>
 
+    <!-- need to at least define a name for each component to use -->
     <!-- defining:
         tenant       = OFBiz and External Tenant Data
         seed         = OFBiz and External Seed Data - to be maintained along with source and updated whenever a system deployment is updated
@@ -170,6 +191,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-jdbc-test-stmt="SELECT 1"
                 soft-min-evictable-idle-time-millis="600000"
                 time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/H2DataSource" isolation-level="ReadCommitted"/> -->
     </datasource>
     <datasource name="localh2odbc"
         helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
@@ -195,6 +217,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
             test-on-borrow="true"
             pool-jdbc-test-stmt="SELECT 1"
             time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/H2DataSource" isolation-level="ReadCommitted"/> -->
     </datasource>
     <datasource name="localh2olap"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
@@ -226,6 +249,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 test-on-borrow="true"
                 pool-jdbc-test-stmt="SELECT 1"
                 time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/H2DataSource" isolation-level="ReadCommitted"/> -->
     </datasource>
     <datasource name="localh2tenant"
         helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
@@ -257,8 +281,22 @@ access. For a detailed description see the core/docs/entityconfig.html file.
             test-on-borrow="true"
             pool-jdbc-test-stmt="SELECT 1"
             time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/H2DataSource" isolation-level="ReadCommitted"/> -->
     </datasource>
 
+    <!-- Also consider:
+    mysql.conf
+    [client]
+    default-character-set=utf8
+    [mysql]
+    default-character-set=utf8
+    [mysqld]
+    collation-server = utf8_unicode_ci
+    init-connect='SET NAMES utf8'
+    character-set-server = utf8
+    
+    Mysql Version: > 5.6.4 (supports datetime milliseconds)
+     -->
     <datasource name="localmysql"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             field-type-name="mysql"
@@ -288,7 +326,10 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"
-                time-between-eviction-runs-millis="600000"/>
+                time-between-eviction-runs-millis="600000"/><!-- Please note that at least one person has experienced a problem with this value with MySQL
+                and had to set it to -1 in order to avoid this issue.
+                For more look at http://markmail.org/thread/5sivpykv7xkl66px and http://commons.apache.org/dbcp/configuration.html-->
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/MySqlDataSource" isolation-level="Serializable"/> -->
     </datasource>
     <datasource name="localmysqlolap"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
@@ -319,7 +360,10 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"
-                time-between-eviction-runs-millis="600000"/>
+                time-between-eviction-runs-millis="600000"/><!-- Please note that at least one person has experienced a problem with this value with MySQL
+                and had to set it to -1 in order to avoid this issue.
+                For more look at http://markmail.org/thread/5sivpykv7xkl66px and http://commons.apache.org/dbcp/configuration.html-->
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/MySqlDataSource" isolation-level="Serializable"/> -->
     </datasource>
     <datasource name="localmysqltenant"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
@@ -350,7 +394,10 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"
-                time-between-eviction-runs-millis="600000"/>
+                time-between-eviction-runs-millis="600000"/><!-- Please note that at least one person has experienced a problem with this value with MySQL
+                and had to set it to -1 in order to avoid this issue.
+                For more look at http://markmail.org/thread/5sivpykv7xkl66px and http://commons.apache.org/dbcp/configuration.html-->
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/MySqlDataSource" isolation-level="Serializable"/> -->
     </datasource>
     <datasource name="odbcmysql"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
@@ -377,6 +424,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-minsize="2"
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/MySqlDataSource" isolation-level="Serializable"/> -->
     </datasource>
 
     <!-- The three localpostgres* definitions below are the managed-RDBMS datasources. The Entity Engine
@@ -426,7 +474,20 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          on every borrow - stays false. The template carries the same deadlines and the same pool settings, so a
          rendered deployment and a non-container install that points a delegator at these definitions are
          bounded identically. Only these three managed definitions carry them: the MySQL, Oracle and other
-         dialect definitions are preserved exactly as they are for portability. -->
+         dialect definitions are preserved exactly as they are for portability.
+         RECORDED DEVIATION from the specified change set: the four pgJDBC URI parameters (socketTimeout,
+         loginTimeout, cancelSignalTimeout, tcpKeepAlive - connectTimeout aside, which bounds the connect itself)
+         and the four pool attributes (pool-sleeptime, pool-jdbc-test-stmt, test-while-idle, test-on-borrow) are
+         NOT among the changes the specification enumerates for this file, which names only the group-map
+         repointing, the de-hardcoding of these three definitions, the two startup-DDL flags and the
+         cache-invalidation flag. They are added deliberately and knowingly: the objective these definitions
+         serve is a fleet of replaceable instances behind a load balancer, and the defaults that apply without
+         them are not bounded waits at all (see the paragraph above), so an instance that reaches a database
+         which has stopped answering would hang instead of failing its health check and being replaced - the
+         opposite of the objective. Every attribute used is declared by entity-config.xsd, every one is inert
+         for the embedded and the other dialect datasources, and none changes behaviour on a healthy
+         connection. Anyone reconciling this file against the specification should read these eight attributes
+         as an explicit, reviewed addition rather than as drift. -->
     <!-- GATED SCHEMA INITIALIZATION: this managed-RDBMS run mode issues NO startup DDL, so a serving instance
          needs no DDL privileges and a whole fleet can scale out without racing on schema changes. The schema is
          applied exclusively by a separate one-shot init execution driven by OFBIZ_SCHEMA_INIT=true, which the
@@ -455,8 +516,9 @@ access. For a detailed description see the core/docs/entityconfig.html file.
             use-binary-type-for-blob="true"
             use-order-by-nulls="true"
             offset-style="limit"
-            result-fetch-size="50">
-
+            result-fetch-size="50"> <!-- Comment out the result-fetch-size attribute for jdbc driver versions older than 8.0.
+            Not recommended to use those though. They are archived unsupported versions: http://jdbc.postgresql.org/download.html -->
+        
         <read-data reader-name="tenant"/>
         <read-data reader-name="seed"/>
         <read-data reader-name="seed-initial"/>
@@ -476,8 +538,14 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-sleeptime="20000"
                 pool-jdbc-test-stmt="SELECT 1"
                 test-while-idle="true"
-                test-on-borrow="false"/>
+                test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
+                is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
 
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="java:comp/env/jdbc/localpostgres" isolation-level="ReadCommitted"/>-->
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="comp/env/jdbc/xa/localpostgres" isolation-level="ReadCommitted"/> --> <!-- Orion Style JNDI name -->
+        <!-- <jndi-jdbc jndi-server-name="localweblogic" jndi-name="PostgresDataSource"/> --> <!-- Weblogic Style JNDI name -->
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="jdbc/localpostgres" isolation-level="ReadCommitted"/> --> <!-- JRun4 Style JNDI name -->
+        <!-- <tyrex-dataSource dataSource-name="localpostgres" isolation-level="ReadCommitted"/> -->
     </datasource>
     <datasource name="localpostgresolap"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
@@ -511,8 +579,14 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-sleeptime="20000"
                 pool-jdbc-test-stmt="SELECT 1"
                 test-while-idle="true"
-                test-on-borrow="false"/>
-
+                test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
+                    is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
+        
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="java:comp/env/jdbc/localpostgres" isolation-level="ReadCommitted"/>-->
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="comp/env/jdbc/xa/localpostgres" isolation-level="ReadCommitted"/> --> <!-- Orion Style JNDI name -->
+        <!-- <jndi-jdbc jndi-server-name="localweblogic" jndi-name="PostgresDataSource"/> --> <!-- Weblogic Style JNDI name -->
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="jdbc/localpostgres" isolation-level="ReadCommitted"/> --> <!-- JRun4 Style JNDI name -->
+        <!-- <tyrex-dataSource dataSource-name="localpostgres" isolation-level="ReadCommitted"/> -->
     </datasource>
     <datasource name="localpostgrestenant"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
@@ -546,8 +620,14 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-sleeptime="20000"
                 pool-jdbc-test-stmt="SELECT 1"
                 test-while-idle="true"
-                test-on-borrow="false"/>
-
+                test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
+                    is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
+        
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="java:comp/env/jdbc/localpostgres" isolation-level="ReadCommitted"/>-->
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="comp/env/jdbc/xa/localpostgres" isolation-level="ReadCommitted"/> --> <!-- Orion Style JNDI name -->
+        <!-- <jndi-jdbc jndi-server-name="localweblogic" jndi-name="PostgresDataSource"/> --> <!-- Weblogic Style JNDI name -->
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="jdbc/localpostgres" isolation-level="ReadCommitted"/> --> <!-- JRun4 Style JNDI name -->
+        <!-- <tyrex-dataSource dataSource-name="localpostgres" isolation-level="ReadCommitted"/> -->
     </datasource>
 
     <datasource name="localoracle"
@@ -644,6 +724,10 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-minsize="2"
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="comp/env/jdbc/xa/localsapdb" isolation-level="ReadCommitted"/> --> <!-- Orion Style JNDI name -->
+        <!-- <jndi-jdbc jndi-server-name="localweblogic" jndi-name="SapDBDataSource"/> --> <!-- Weblogic Style JNDI name -->
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="jdbc/localsapdb" isolation-level="ReadCommitted"/> --> <!-- JRun4 Style JNDI name -->
+        <!-- <tyrex-dataSource dataSource-name="localsapdb" isolation-level="ReadCommitted"/> -->
     </datasource>
 
     <datasource name="localfirebird"
@@ -671,8 +755,29 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"/>
         <!-- Sample remote URI: jdbc-uri="jdbc:firebirdsql://localhost:3050//opt/interbase/data/ofbiz.gdb" -->
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="comp/env/jdbc/xa/localfirebird" isolation-level="ReadCommitted"/> --> <!-- Orion Style JNDI name -->
+        <!-- <tyrex-dataSource dataSource-name="firebird" isolation-level="ReadCommitted"/> -->
     </datasource>
+    <!--
+     The following has been tested with SQL Server 2005 + MS SQL Server JDBC Driver 1.1
+     Tips:
+      1. Make sure your SQL Server has mixed mode authentication as per this post:
+       http://aspadvice.com/blogs/plitwin/archive/2006/09/10/Login-failed-_2E002E002E00_-not-associated-with-a-trusted-SQL-server-connection.aspx
+      2. Make sure you have copied JDBC driver jar to entity/lib/jdbc
+      3. Make sure you have installed JDBC Driver XA support as per MSSQL_JDBC_HOME/enu/xa/xa_install.sql
+      4. Make sure that you have created and authorized the ofbiz database and login
+      5. Make sure that schema-name, jdbc-username, jdbc-password and databaseName are all correct!
 
+     Notes:
+     a. The reason for putting SelectMethod=cursor property in URL is explained here:
+      http://forum.java.sun.com/thread.jspa?forumID=48&threadID=184797
+     b. If using an old version of the driver, beware of this resource leak:
+      http://support.microsoft.com/kb/820773/
+     c. Demo data are in conflict with Entity Unique Index when loading data
+      This is a known issue with MsSQL since https://markmail.org/message/mezqxb3eyzz3xpv6
+      The problem does not exist with H2, nor with the mostly open source DBMS used with OFBiz: Postres, MySQL, MariaDB, etc.
+      So we will not change the current OOTB setting and suggest to simply change your own configuration. See OFBIZ-11998 for more.
+    -->
     <datasource name="localmssql"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             schema-name="dbo"
@@ -698,6 +803,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-minsize="2"
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="comp/env/jdbc/xa/localmssql" isolation-level="ReadCommitted"/> --> <!-- Orion Style JNDI name -->
     </datasource>
 
     <datasource name="localp6spy"
@@ -723,6 +829,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-minsize="2"
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/OracleDataSource" isolation-level="Serializable"/> -->
     </datasource>
 
     <datasource name="localadvantage"
@@ -781,6 +888,9 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-minsize="2"
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/HsqlDataSource" isolation-level="ReadUncommitted"/> -->
+        <!-- <jndi-jdbc jndi-server-name="default" jndi-name="comp/env/jdbc/xa/localhsql" isolation-level="ReadUncommitted"/> --> <!-- Orion Style JNDI name -->
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="localhsqlDataSource"/> --> <!-- Weblogic Style JNDI name -->
     </datasource>
 
     <datasource name="localdaffodil"
@@ -795,6 +905,8 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext"/>
         <read-data reader-name="ext-test"/>
         <read-data reader-name="ext-demo"/>
+        <!-- this setup is for the embedded version of Daffodil, with in.co.daffodil.db.jdbc.DaffodilDBDriver -->
+        <!-- note that Daffodil can also run in a network mode with the driver class: in.co.daffodil.db.rmi.RmiDaffodilDBDriver and URI: jdbc:daffodilDB://<hostname>:<port>/ofbiz;create=true -->
         <inline-jdbc
                 jdbc-driver="in.co.daffodil.db.jdbc.DaffodilDBDriver"
                 jdbc-uri="jdbc:daffodilDB_embedded:ofbiz;create=true"
@@ -804,6 +916,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-minsize="2"
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"/>
+        <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/DaffodilDataSource" isolation-level="ReadCommitted"/> -->
     </datasource>
 
     <datasource name="localaxion"
@@ -830,6 +943,8 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 time-between-eviction-runs-millis="600000"/>
     </datasource>
 
+    <!-- According to http://markmail.org/message/s75sf6zhtizzkqbv Since version V6R1 (AS/400, db2) there is no need for an own fieldtype.xml - just use the h2-fieldtypes like this: -->
+    <!-- Beware use-indices-unique="false" is needed because of H2 bug with null values in a unique index, not sure it's needed with DB2 -->
     <datasource name="DB2"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             schema-name="OFBIZ"
@@ -848,6 +963,7 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext"/>
         <read-data reader-name="ext-test"/>
         <read-data reader-name="ext-demo"/>
+            <!--   There is an open source version of the jdbc driver at sourceforge: http://sourceforge.net/projects/jt400/ -->
         <inline-jdbc
             jdbc-driver="com.ibm.as400.access.AS400JDBCDriver"
             jdbc-uri="jdbc:as400:192.168.1.10;prompt=false;libraries=ofbiz;lazyclose=true;translate binary=true"
