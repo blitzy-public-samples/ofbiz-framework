@@ -41,20 +41,15 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.Comparator;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
-import java.util.TreeMap;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -94,6 +89,7 @@ import org.apache.ofbiz.common.email.NotificationServices;
 import org.apache.ofbiz.content.content.UploadContentAndImage;
 import org.apache.ofbiz.content.data.store.ContentStore;
 import org.apache.ofbiz.content.data.store.ContentStoreFactory;
+import org.apache.ofbiz.content.data.store.FileSystemContentStore;
 import org.apache.ofbiz.entity.Delegator;
 import org.apache.ofbiz.entity.GenericEntityException;
 import org.apache.ofbiz.entity.GenericValue;
@@ -498,7 +494,33 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      *    when contextRoot or a subdirectory inside it is a mount point, causing canonical paths
      *    to diverge. Path traversal via ".." is still blocked by the normalization step.
      */
+    /**
+     * Validates that a CONTEXT_FILE location is inside its webapp root, and binds it to the transaction.
+     *
+     * <p>The validation is unchanged. The binding is the content-store seam for the two frozen service
+     * methods that write a CONTEXT_FILE - {@code DataServices.createFileMethod} and
+     * {@code updateFileMethod} - because this is the one method of this class they call after composing
+     * the File they are about to write. Without it, a CONTEXT_FILE write would never reach an external
+     * store. The binding does nothing at all unless a store is configured, and publishes only what the
+     * transaction actually changed.
+     *
+     * @param file the location to validate
+     * @param contextRoot the webapp root the location must be inside
+     * @throws GeneralException if the location resolves outside the webapp root
+     */
     static void checkContextFileBoundary(File file, String contextRoot) throws GeneralException {
+        assertInsideContextRoot(file, contextRoot);
+        bindWrittenFile(file);
+    }
+
+    /**
+     * Validates that a location is inside a webapp root, with no side effect.
+     *
+     * @param file the location to validate
+     * @param contextRoot the webapp root the location must be inside
+     * @throws GeneralException if the location resolves outside the webapp root
+     */
+    private static void assertInsideContextRoot(File file, String contextRoot) throws GeneralException {
         try {
             String canonicalAllowed = new File(contextRoot).getCanonicalPath();
             String canonicalFilePath = file.getCanonicalPath();
@@ -650,7 +672,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
 
         if ("LOCAL_FILE".equals(dataResourceTypeId) || "LOCAL_FILE_BIN".equals(dataResourceTypeId)) {
             file = FileUtil.getFile(objectInfo);
-            if (!file.exists() && !materialiseFromStore(dataResourceTypeId, file, contextRoot)) {
+            if (!readFromStore(dataResourceTypeId, file, contextRoot) && !file.exists()) {
                 throw new FileNotFoundException("No file found: " + (objectInfo));
             }
             if (!file.isAbsolute()) {
@@ -665,7 +687,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 sep = "/";
             }
             file = FileUtil.getFile(prefix + sep + objectInfo);
-            if (!file.exists() && !materialiseFromStore(dataResourceTypeId, file, contextRoot)) {
+            if (!readFromStore(dataResourceTypeId, file, contextRoot) && !file.exists()) {
                 throw new FileNotFoundException("No file found: " + (prefix + sep + objectInfo));
             }
             SecurityUtil.checkOfbizFileAllowList(file);
@@ -679,12 +701,15 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 sep = "/";
             }
             file = FileUtil.getFile(contextRoot + sep + objectInfo);
-            checkContextFileBoundary(file, contextRoot);
-            if (!file.exists() && !materialiseFromStore(dataResourceTypeId, file, contextRoot)) {
+            assertInsideContextRoot(file, contextRoot);
+            if (!readFromStore(dataResourceTypeId, file, contextRoot) && !file.exists()) {
                 throw new FileNotFoundException("No file found: " + (contextRoot + sep + objectInfo));
             }
         }
 
+        // The one file DataServices.createBinaryFileMethod and updateBinaryFileMethod are about to write
+        // is watched from here, so their writes reach the store for every one of the six file types.
+        bindWrittenFile(file);
         return file;
     }
 
@@ -708,26 +733,14 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     }
 
     public static String getDataResourceContentUploadPath(boolean absolute) {
-        String initialPath = UtilProperties.getPropertyValue("content", "content.upload.path.prefix");
-        double maxFiles = UtilProperties.getPropertyNumber("content", "content.upload.max.files");
-        if (maxFiles < 1) {
-            maxFiles = 250;
-        }
-
-        String uploadPath = getDataResourceContentUploadPath(initialPath, maxFiles, absolute);
-        publishOnCommit(absoluteUploadPath(uploadPath, absolute));
+        String uploadPath = FileSystemContentStore.getUploadPath(absolute);
+        bindUploadDirectory(uploadPath, absolute);
         return uploadPath;
     }
 
     public static String getDataResourceContentUploadPath(Delegator delegator, boolean absolute) {
-        String initialPath = EntityUtilProperties.getPropertyValue("content", "content.upload.path.prefix", delegator);
-        double maxFiles = UtilProperties.getPropertyNumber("content", "content.upload.max.files");
-        if (maxFiles < 1) {
-            maxFiles = 250;
-        }
-
-        String uploadPath = getDataResourceContentUploadPath(initialPath, maxFiles, absolute);
-        publishOnCommit(absoluteUploadPath(uploadPath, absolute));
+        String uploadPath = FileSystemContentStore.getUploadPath(delegator, absolute);
+        bindUploadDirectory(uploadPath, absolute);
         return uploadPath;
     }
 
@@ -739,101 +752,11 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * Handles creating sub-directories for file storage; using a max number of files per directory
      * @param initialPath the top level location where all files should be stored
      * @param maxFiles the max number of files to place in a directory
-     * @return the absolute path to the directory where the file should be placed
+     * @param absolute whether to answer an absolute path rather than an {@code ofbiz.home}-relative one
+     * @return the path to the directory where the file should be placed
      */
     public static String getDataResourceContentUploadPath(String initialPath, double maxFiles, boolean absolute) {
-        String ofbizHome = System.getProperty("ofbiz.home");
-
-        if (!initialPath.startsWith("/")) {
-            initialPath = "/" + initialPath;
-        }
-
-        // descending comparator
-        Comparator<Object> desc = (o1, o2) -> {
-            if ((Long) o1 > (Long) o2) {
-                return -1;
-            } else if ((Long) o1 < (Long) o2) {
-                return 1;
-            }
-            return 0;
-        };
-
-        // check for the latest subdirectory
-        String parentDir = ofbizHome + initialPath;
-        File parent = FileUtil.getFile(parentDir);
-        TreeMap<Long, File> dirMap = new TreeMap<>(desc);
-        if (parent.exists()) {
-            File[] subs = parent.listFiles();
-            if (subs != null) {
-                for (File sub : subs) {
-                    if (sub.isDirectory()) {
-                        dirMap.put(sub.lastModified(), sub);
-                    }
-                }
-            }
-        } else {
-            // if the parent doesn't exist; create it now
-            boolean created = parent.mkdir();
-            if (!created) {
-                Debug.logWarning("Unable to create top level upload directory [" + parentDir + "].", MODULE);
-            }
-        }
-
-        // first item in map is the most current directory
-        File latestDir = null;
-        if (UtilValidate.isNotEmpty(dirMap)) {
-            latestDir = dirMap.values().iterator().next();
-            if (latestDir != null) {
-                File[] dirList = latestDir.listFiles();
-                if (dirList != null) {
-                    int length = dirList.length;
-                    if (length >= maxFiles) {
-                        latestDir = makeNewDirectory(parent);
-                    }
-                }
-            }
-        } else {
-            latestDir = makeNewDirectory(parent);
-        }
-        String name = "";
-        if (latestDir != null) {
-            name = latestDir.getName();
-        }
-
-        Debug.logInfo("Directory Name : " + name, MODULE);
-        if (absolute) {
-            return latestDir.getAbsolutePath().replace('\\', '/');
-        }
-        return initialPath + "/" + name;
-    }
-
-    /**
-     * Resolves an upload path to the absolute directory it names.
-     *
-     * @param uploadPath the value returned to the caller, absolute or {@code ofbiz.home}-relative
-     * @param absolute whether that value is already absolute
-     * @return the absolute directory path, or the given value when it is empty
-     */
-    private static String absoluteUploadPath(String uploadPath, boolean absolute) {
-        if (UtilValidate.isEmpty(uploadPath) || absolute) {
-            return uploadPath;
-        }
-        return System.getProperty("ofbiz.home") + uploadPath;
-    }
-
-    private static File makeNewDirectory(File parent) {
-        File latestDir = null;
-        boolean newDir = false;
-        while (!newDir) {
-            latestDir = new File(parent, "" + System.currentTimeMillis());
-            if (!latestDir.exists()) {
-                if (!latestDir.mkdir()) {
-                    Debug.logError("Directory: " + latestDir.getName() + ", couldn't be created", MODULE);
-                }
-                newDir = true;
-            }
-        }
-        return latestDir;
+        return FileSystemContentStore.getUploadPath(initialPath, maxFiles, absolute);
     }
 
     // -------------------------------------------------------------------------------------------------
@@ -843,42 +766,59 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     // has always been read from and written to the local filesystem of the instance that handled the
     // request, which is the one piece of durable state that keeps an instance from being replaceable.
     // What follows is the whole of the seam that lets that content live in a store every instance can
-    // reach instead. Nothing else in this class, and nothing in the content component's entity model or
-    // service signatures, changes:
+    // reach instead. No entity definition and no service signature changes.
     //
-    //   materialiseFromStore - the READ side, called from getContentFile and renderFile only when the
-    //                          local copy is ABSENT. The local copy is always preferred, so a deployment
-    //                          that configures no store behaves exactly as it did before, and one that
-    //                          does keeps serving content written before the store existed. A copy read
-    //                          from the store is left on disk as a cache; it is not durable state,
-    //                          because the store holds the same bytes.
-    //   publishOnCommit      - the WRITE side, called from getDataResourceContentUploadPath. It has to be
-    //                          there rather than at a file-writing method, because the service that
-    //                          actually writes an uploaded file - createFileMethod, reached through
-    //                          createAnonFile - resolves its own File from the objectInfo composed by the
-    //                          caller and never calls this class. Resolving the upload directory is the
-    //                          one step every upload does pass through.
-    //   storeKey             - the shared naming rule: content is named by its own ofbiz.home-relative
-    //                          path, so one key means the same object on every instance and in every
-    //                          provider. Content outside ofbiz.home has no key and is never published.
+    //   readFromStore    the READ side, called from getContentFile and renderFile BEFORE the local file
+    //                    is consulted, which is what makes the store AUTHORITATIVE: an object the store
+    //                    holds is copied onto this instance on every resolution, so no instance can go
+    //                    on serving a copy of content another instance has since replaced. Content the
+    //                    store does not hold falls back to the local file, so content written before the
+    //                    store was configured keeps being served. The filesystem provider needs none of
+    //                    this - its root IS the upload directory, so the local file already is the
+    //                    stored object - and the seam answers false for it immediately.
+    //
+    //   bindUploadDirectory / bindWrittenFile
+    //                    the WRITE side. Both bind a publication to the transaction that is doing the
+    //                    writing, and the two of them together cover every path that writes file-backed
+    //                    content:
+    //                      * getContentFile is where DataServices.createBinaryFileMethod and
+    //                        updateBinaryFileMethod resolve the ONE file they are about to write, for
+    //                        every one of the six file types, so that file is watched by name; and
+    //                      * getDataResourceContentUploadPath is where an upload resolves the directory
+    //                        that createFileMethod then writes into. That service composes its own File
+    //                        from the objectInfo the caller built and never calls this class, so the
+    //                        directory is the one point every upload does pass through, and it is
+    //                        watched for the files the transaction adds or rewrites.
+    //                    Publication runs in beforeCompletion, while the transaction is still active,
+    //                    and any failure rolls it back: a committed DataResource row therefore always
+    //                    names content the store holds. An object published by a transaction that then
+    //                    fails to commit is deleted again in afterCompletion, so a rolled-back write
+    //                    leaves no orphan.
+    //
+    //   storeKey         the naming rule: KEY_NAMESPACE followed by the content's own
+    //                    ofbiz.home-relative POSIX path, which for uploaded content already ends in the
+    //                    immutable dataResourceId. Content outside ofbiz.home has no key and is neither
+    //                    published nor looked up, so no path outside the deployment is reachable through
+    //                    a store. ContentStoreFactory refuses to activate any store at all in a
+    //                    multi-tenant deployment, because this seam cannot establish a tenant scope at
+    //                    every one of its call sites; DOCKER.adoc carries that and the one-bucket-per-
+    //                    deployment rule.
     //
     // The seam is inert unless content.store.provider names a provider: ContentStoreFactory answers null
     // for the shipped 'database' value, and no store code runs at all.
     // -------------------------------------------------------------------------------------------------
 
-    /** Upload directories already bound to a publication in the transaction on this thread. */
-    private static final ThreadLocal<Set<String>> PENDING_PUBLICATIONS = ThreadLocal.withInitial(HashSet::new);
+    /** The key space every storage key lives under, so one bucket can safely hold unrelated objects. */
+    private static final String KEY_NAMESPACE = "ofbiz";
 
-    /** Buffer size used to digest and to copy content. */
-    private static final int STORE_BUFFER_SIZE = 8192;
+    /** The largest file this seam publishes in one object, bounded because ContentStore.put takes bytes. */
+    private static final long MAX_PUBLISHED_FILE = 64L * 1024L * 1024L;
+
+    /** Publications already bound to the transaction on this thread, by watched identity. */
+    private static final ThreadLocal<Set<String>> PENDING_PUBLICATIONS = ThreadLocal.withInitial(HashSet::new);
 
     /**
      * Returns the storage key naming the given content, or null when it cannot have one.
-     *
-     * <p>The key is the content's {@code ofbiz.home}-relative POSIX path, which is what makes one key
-     * mean the same object on every instance. Content outside {@code ofbiz.home} - an absolute
-     * {@code LOCAL_FILE} pointing somewhere else on the host - has no key, so it is neither published
-     * nor looked up, and no path outside the deployment can be reached through a store.
      *
      * @param file the content's location on this instance
      * @return the storage key, or null when the location is not inside {@code ofbiz.home}
@@ -893,35 +833,36 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         if (!target.startsWith(root) || target.equals(root)) {
             return null;
         }
-        return root.relativize(target).toString().replace(File.separatorChar, '/');
+        return KEY_NAMESPACE + "/" + root.relativize(target).toString().replace(File.separatorChar, '/');
     }
 
     /**
-     * Reads content the configured store holds onto this instance, so a local read can answer it.
+     * Copies the content the configured store holds onto this instance, so that a local read answers it.
      *
-     * <p>Called only when the local copy is absent. The copy is written through a staging file in the
+     * <p>Called before the local copy is consulted, so the store is authoritative and a replacement made
+     * by another instance is picked up immediately. The copy is written through a staging file in the
      * destination's own directory and moved into place atomically, so a concurrent reader never sees a
      * half-written file.
      *
-     * <p><strong>Absence is not failure.</strong> Content the store does not hold answers false, and the
-     * caller reports it missing exactly as it did before a store existed. A store that cannot answer, or
-     * a local copy that cannot be written, raises a {@link GeneralException} instead: reporting a fault
-     * as missing content would turn an outage into a 404 and hide it from the operator.
+     * <p><strong>Absence is not failure.</strong> Content the store does not hold answers false and the
+     * caller falls back to the local copy exactly as it did before a store existed. A store that cannot
+     * answer, or a local copy that cannot be written, raises a {@link GeneralException} instead:
+     * reporting a fault as missing content would turn an outage into a 404 and hide it from the operator.
      *
      * @param dataResourceTypeId the resource type, which decides which location check applies
      * @param file the location the content would be read from on this instance
      * @param contextRoot the webapp root for a CONTEXT_FILE, otherwise ignored
-     * @return true when the content is now on this instance
+     * @return true when the store's copy of the content is now on this instance
      * @throws GeneralException if a store is configured but could not be resolved or could not answer
      */
-    private static boolean materialiseFromStore(String dataResourceTypeId, File file, String contextRoot)
+    private static boolean readFromStore(String dataResourceTypeId, File file, String contextRoot)
             throws GeneralException {
-        String key = storeKey(file);
-        if (key == null) {
+        ContentStore store = ContentStoreFactory.getContentStore();
+        if (store == null || store instanceof FileSystemContentStore) {
             return false;
         }
-        ContentStore store = ContentStoreFactory.getContentStore();
-        if (store == null || !authorisedLocation(dataResourceTypeId, file, contextRoot)) {
+        String key = storeKey(file);
+        if (key == null || !authorisedLocation(dataResourceTypeId, file, contextRoot)) {
             return false;
         }
         Path target = file.toPath().toAbsolutePath();
@@ -935,7 +876,9 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
             Files.move(staged, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             staged = null;
-            Debug.logInfo("Content [" + key + "] was read from the content store onto this instance", MODULE);
+            if (Debug.verboseOn()) {
+                Debug.logVerbose("Content [" + key + "] was read from the content store onto this instance", MODULE);
+            }
             return true;
         } catch (FileNotFoundException absent) {
             return false;
@@ -954,7 +897,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * <p>The same check the read would apply to the file afterwards, applied before anything is written
      * to it. Without it, an {@code objectInfo} value could name any path inside {@code ofbiz.home} and
      * have store content written there. A refused location answers false rather than raising, so the
-     * caller reports the content missing exactly as it did before a store existed.
+     * caller behaves exactly as it did before a store existed.
      *
      * @param dataResourceTypeId the resource type
      * @param file the location
@@ -974,7 +917,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 if (UtilValidate.isEmpty(contextRoot)) {
                     return false;
                 }
-                checkContextFileBoundary(file, contextRoot);
+                assertInsideContextRoot(file, contextRoot);
             } else {
                 return false;
             }
@@ -988,103 +931,100 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     }
 
     /**
+     * Binds the one file a caller has just resolved, and is about to write, to its transaction.
+     *
+     * <p>A read resolves a file too, and cannot be told apart from a write here, so the publication is
+     * registered either way: at commit the file is published only if it actually changed, and a read
+     * changes nothing. That is why the check is a length and modification-time comparison of one named
+     * file rather than anything that reads content.
+     *
+     * @param file the file that was resolved, may be null when the resource type is not file backed
+     */
+    private static void bindWrittenFile(File file) {
+        if (file == null || file.getParentFile() == null) {
+            return;
+        }
+        bindPublication(file.getParentFile(), Set.of(file.getName()), false);
+    }
+
+    /**
      * Binds the content written into an upload directory to the transaction that resolved it.
      *
-     * <p>Publication runs in {@code beforeCompletion}, while the transaction is still active, and a
-     * failure marks it for rollback. That is what couples the two durable writes: a committed
-     * {@code DataResource} row always names content the store holds, because the row cannot commit
-     * unless the publication succeeded first. The reverse leftover - an object published by a
-     * transaction that then fails to commit for its own reasons - is harmless: nothing names it, and the
-     * next attempt writes the same key again.
+     * <p>It is deliberately FAIL-FAST. With an external store configured, an upload that cannot be bound
+     * to a transaction would commit a row naming content only this instance can read, so the resolution
+     * is refused instead. Nothing here runs when no store is configured, which is the shipped default.
      *
-     * <p>It is deliberately FAIL-FAST rather than best-effort. With a store configured, an upload that
-     * cannot be bound to a transaction would commit a row naming content only this instance can read, so
-     * the resolution is refused instead. Nothing here runs when no store is configured, which is the
-     * shipped default.
-     *
-     * @param directoryPath the absolute path of the upload directory that was resolved
+     * @param uploadPath the value returned to the caller
+     * @param absolute whether that value is already absolute
      */
-    private static void publishOnCommit(String directoryPath) {
+    private static void bindUploadDirectory(String uploadPath, boolean absolute) {
+        if (UtilValidate.isEmpty(uploadPath)) {
+            return;
+        }
+        String path = absolute ? uploadPath : System.getProperty("ofbiz.home") + uploadPath;
+        bindPublication(FileUtil.getFile(path), null, true);
+    }
+
+    /**
+     * Registers a publication of a directory, or of named files inside it, with the current transaction.
+     *
+     * @param directory the directory to watch
+     * @param names the file names to watch, or null to watch every direct child
+     * @param writing whether this is a write path, where the absence of a usable transaction is a fault
+     */
+    private static void bindPublication(File directory, Set<String> names, boolean writing) {
         ContentStore store;
         try {
             store = ContentStoreFactory.getContentStore();
         } catch (GeneralException e) {
+            if (!writing) {
+                Debug.logError(e, "The configured content store could not be resolved", MODULE);
+                return;
+            }
             throw new IllegalStateException("An upload directory cannot be prepared: the configured content store"
                     + " could not be resolved, so content written into it could not be published to it", e);
         }
-        if (store == null || UtilValidate.isEmpty(directoryPath)) {
+        if (store == null || store instanceof FileSystemContentStore) {
+            // Database storage, or a filesystem store whose root IS the upload directory: the content is
+            // already exactly where the deployment says it lives, so there is nothing to publish.
             return;
         }
-        File directory = FileUtil.getFile(directoryPath);
         if (storeKey(directory) == null) {
+            if (!writing) {
+                return;
+            }
             throw new IllegalStateException("An upload directory outside the OFBiz home directory cannot be"
                     + " published to the content store: [" + directory.getAbsolutePath() + "]");
         }
-        String identity = directory.getAbsolutePath();
+        String identity = directory.getAbsolutePath() + (names == null ? "" : names);
         try {
             if (TransactionUtil.getStatus() != Status.STATUS_ACTIVE) {
+                if (!writing) {
+                    // A resolution outside a transaction is a read: there is no write to publish, and
+                    // nothing to bind a publication to.
+                    return;
+                }
                 throw new IllegalStateException("An upload directory was resolved outside an active transaction"
                         + " while a content store is configured, so content written into it could not be published"
                         + " before the row naming it commits. Resolve the upload path inside the transaction that"
                         + " writes the file.");
             }
             if (!PENDING_PUBLICATIONS.get().add(identity)) {
-                // Already bound in this transaction. Two resolutions of one directory are one piece of
-                // work, and it is the state at commit that decides what that work is, so the first
-                // binding covers the second.
+                // Already bound in this transaction. Two resolutions of one target are one piece of work,
+                // and it is the state at commit that decides what that work is, so the first binding
+                // covers the second.
                 return;
             }
-            TransactionUtil.registerSynchronization(new ContentPublication(store, directory, snapshot(directory)));
+            TransactionUtil.registerSynchronization(new ContentPublication(store, directory, names, identity));
         } catch (GenericTransactionException e) {
             PENDING_PUBLICATIONS.get().remove(identity);
+            if (!writing) {
+                Debug.logError(e, "A content store publication could not be bound to the current transaction",
+                        MODULE);
+                return;
+            }
             throw new IllegalStateException("An upload directory cannot be prepared: a publication to the content"
                     + " store could not be bound to the transaction that resolved it", e);
-        }
-    }
-
-    /**
-     * Records what every file directly inside an upload directory holds, before anything is written.
-     *
-     * <p>Direct children and regular files only: an upload lands as a file in the directory the upload
-     * path named, and descending further would make one upload's commit responsible for every file the
-     * deployment has ever placed below that tree.
-     *
-     * @param directory the upload directory
-     * @return what each file in it holds, by file name
-     */
-    private static Map<String, FileState> snapshot(File directory) {
-        File[] children = directory.listFiles();
-        if (children == null) {
-            return Map.of();
-        }
-        Map<String, FileState> held = new LinkedHashMap<>();
-        for (File child : children) {
-            FileState state = FileState.of(child);
-            if (state != null) {
-                held.put(child.getName(), state);
-            }
-        }
-        return held;
-    }
-
-    /**
-     * Returns the SHA-256 digest of a file's content, or null when it cannot be read.
-     *
-     * @param file the file to digest
-     * @return the digest as lower-case hexadecimal, or null
-     */
-    private static String contentDigest(File file) {
-        try (InputStream content = Files.newInputStream(file.toPath())) {
-            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
-            byte[] buffer = new byte[STORE_BUFFER_SIZE];
-            for (int read = content.read(buffer); read >= 0; read = content.read(buffer)) {
-                sha256.update(buffer, 0, read);
-            }
-            return HexFormat.of().formatHex(sha256.digest());
-        } catch (IOException | NoSuchAlgorithmException unreadable) {
-            Debug.logWarning(unreadable, "The content of [" + file.getAbsolutePath() + "] could not be digested, so"
-                    + " whether it changed cannot be established from its content", MODULE);
-            return null;
         }
     }
 
@@ -1103,72 +1043,44 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     }
 
     /**
-     * What one file held at a point in time: its length and the digest of its content.
+     * What one file held when a publication was registered.
      *
-     * <p>The digest, not the modification time, is what decides whether a file changed. A rewrite that
-     * produces content of the same length within one filesystem timestamp tick - re-uploading a
-     * different image of the same size, for instance - leaves length and timestamp identical, and a
-     * comparison built on them would skip it and leave the store holding the previous content for ever.
-     * The length is compared first only because it settles the common case without reading the file
-     * twice.
-     *
-     * @param length how many bytes the file held
-     * @param digest the SHA-256 of its content, or null when it could not be read
+     * @param length how many bytes it held
+     * @param modifiedAt when it was last modified
      */
-    private record FileState(long length, String digest) {
-
-        /**
-         * Records what a file holds now.
-         *
-         * @param file the file
-         * @return its state, or null when it is not a regular file
-         */
-        private static FileState of(File file) {
-            if (!file.isFile()) {
-                return null;
-            }
-            return new FileState(file.length(), contentDigest(file));
-        }
-
-        /**
-         * Reports whether this state differs from what was recorded earlier.
-         *
-         * @param earlier what the file held before, or null when it did not exist
-         * @return true when the content must be published
-         */
-        private boolean differsFrom(FileState earlier) {
-            return earlier == null || earlier.length() != length() || !Objects.equals(earlier.digest(), digest());
-        }
+    private record FileFacts(long length, long modifiedAt) {
     }
 
     /**
-     * Publishes the content an upload directory gained or changed, before its transaction commits.
+     * Publishes the content a transaction wrote, before that transaction commits.
      *
-     * <p>Registered by {@link #publishOnCommit} once per directory per transaction. Immutable apart from
-     * the directory it watches, and used only by the transaction that registered it.
+     * <p>Registered by {@link #bindPublication} once per watched identity per transaction, and used only
+     * by the transaction that registered it.
      */
     private static final class ContentPublication implements Synchronization {
 
         private final ContentStore store;
         private final File directory;
-        private final Map<String, FileState> before;
+        private final Set<String> names;
+        private final String identity;
+        private final Map<String, FileFacts> before;
+        private final long registeredAt;
+        private final List<String> published = new LinkedList<>();
 
-        private ContentPublication(ContentStore store, File directory, Map<String, FileState> before) {
+        private ContentPublication(ContentStore store, File directory, Set<String> names, String identity) {
             this.store = store;
             this.directory = directory;
-            this.before = before;
+            this.names = names;
+            this.identity = identity;
+            this.registeredAt = System.currentTimeMillis();
+            this.before = snapshot(directory, names);
         }
 
         @Override
         public void beforeCompletion() {
-            File[] children = directory.listFiles();
-            if (children == null) {
-                return;
-            }
-            for (File child : children) {
-                FileState now = FileState.of(child);
-                if (now != null && now.differsFrom(before.get(child.getName()))) {
-                    publish(child, now.length());
+            for (File candidate : candidates()) {
+                if (changed(candidate)) {
+                    publish(candidate);
                 }
             }
         }
@@ -1176,31 +1088,103 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         @Override
         public void afterCompletion(int status) {
             Set<String> pending = PENDING_PUBLICATIONS.get();
-            pending.remove(directory.getAbsolutePath());
+            pending.remove(identity);
             if (pending.isEmpty()) {
                 // Removed rather than left empty, so a pooled thread does not carry the entry for the
                 // life of the JVM.
                 PENDING_PUBLICATIONS.remove();
             }
+            if (status == Status.STATUS_COMMITTED || published.isEmpty()) {
+                return;
+            }
+            // The transaction did not commit, so no row names the objects this publication wrote.
+            // Removing them again is what stops a rolled-back write leaving an orphan behind for ever.
+            for (String key : published) {
+                try {
+                    store.delete(key);
+                    Debug.logInfo("Content [" + key + "] was removed from the content store, because the"
+                            + " transaction that wrote it did not commit", MODULE);
+                } catch (GeneralException | IOException failure) {
+                    Debug.logError(failure, "Content [" + key + "] was published by a transaction that did not"
+                            + " commit and could not be removed again, so it is now an orphan in the content"
+                            + " store", MODULE);
+                }
+            }
+        }
+
+        /**
+         * Returns the files this publication is responsible for.
+         *
+         * @return the watched files
+         */
+        private List<File> candidates() {
+            if (names != null) {
+                List<File> named = new LinkedList<>();
+                for (String name : names) {
+                    named.add(new File(directory, name));
+                }
+                return named;
+            }
+            File[] children = directory.listFiles();
+            if (children == null) {
+                // Being unable to inspect the directory is a publication FAILURE and never a quiet
+                // success: returning here would let the transaction commit rows naming content that was
+                // never published.
+                throw refuse(directory.getAbsolutePath(),
+                        new IOException("the upload directory could not be listed"));
+            }
+            return Arrays.asList(children);
+        }
+
+        /**
+         * Reports whether a watched file was written by this transaction.
+         *
+         * @param candidate the watched file
+         * @return true when it must be published
+         */
+        private boolean changed(File candidate) {
+            if (!candidate.isFile()) {
+                return false;
+            }
+            FileFacts earlier = before.get(candidate.getName());
+            // No digest is taken, deliberately. A file this transaction wrote either was not there when
+            // the publication was registered, or its length changed, or its modification time changed,
+            // or it was touched at or after the instant the publication was registered - and that last
+            // clause catches even a rewrite to the same length inside one filesystem timestamp tick.
+            // Hashing every file in the directory instead would make one upload pay for every byte the
+            // shard already holds, twice, inside the transaction.
+            return earlier == null
+                    || earlier.length() != candidate.length()
+                    || earlier.modifiedAt() != candidate.lastModified()
+                    || candidate.lastModified() >= registeredAt;
         }
 
         /**
          * Publishes one file, refusing the transaction when the store will not take it.
          *
          * @param file the file to publish
-         * @param length how many bytes it holds
          */
-        private void publish(File file, long length) {
+        private void publish(File file) {
             String key = storeKey(file);
             if (key == null) {
-                refuse(file.getAbsolutePath(), null);
-                return;
+                throw refuse(file.getAbsolutePath(),
+                        new IOException("the file is not inside the OFBiz home directory"));
             }
-            try (InputStream content = Files.newInputStream(file.toPath())) {
-                store.put(key, content, length);
+            if (Files.isSymbolicLink(file.toPath())) {
+                throw refuse(key, new IOException("the file is a symbolic link, and only a regular file inside the"
+                        + " deployment is published to the content store"));
+            }
+            long length = file.length();
+            if (length > MAX_PUBLISHED_FILE) {
+                throw refuse(key, new IOException("the file holds " + length + " bytes, more than the "
+                        + MAX_PUBLISHED_FILE + " bytes this seam publishes as one object"));
+            }
+            try {
+                store.put(key, Files.readAllBytes(file.toPath()));
+                published.add(key);
                 Debug.logInfo("Content [" + key + "] was published to the content store", MODULE);
             } catch (GeneralException | IOException failure) {
-                refuse(key, failure);
+                throw refuse(key, failure);
             }
         }
 
@@ -1214,9 +1198,10 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
          * merely logs.
          *
          * @param reference what could not be published
-         * @param failure why, or null when the content has no storage key
+         * @param failure why
+         * @return the exception the caller throws
          */
-        private void refuse(String reference, Throwable failure) {
+        private IllegalStateException refuse(String reference, Throwable failure) {
             String message = "Content [" + reference + "] could not be published to the content store, so the"
                     + " transaction that wrote it is rolled back rather than committing a row that names content"
                     + " the fleet cannot read";
@@ -1227,7 +1212,41 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 Debug.logError(e, "The transaction could not be marked for rollback after a content store"
                         + " publication failed", MODULE);
             }
-            throw new IllegalStateException(message, failure);
+            return new IllegalStateException(message, failure);
+        }
+
+        /**
+         * Records what the watched files held before anything was written.
+         *
+         * <p>Direct children and regular files only: an upload lands as a file in the directory the
+         * upload path named, and descending further would make one upload's commit responsible for every
+         * file the deployment has ever placed below that tree.
+         *
+         * @param directory the watched directory
+         * @param names the watched file names, or null to watch every direct child
+         * @return what each watched file held, by file name
+         */
+        private static Map<String, FileFacts> snapshot(File directory, Set<String> names) {
+            Map<String, FileFacts> held = new LinkedHashMap<>();
+            if (names != null) {
+                for (String name : names) {
+                    File child = new File(directory, name);
+                    if (child.isFile()) {
+                        held.put(name, new FileFacts(child.length(), child.lastModified()));
+                    }
+                }
+                return held;
+            }
+            File[] children = directory.listFiles();
+            if (children == null) {
+                return held;
+            }
+            for (File child : children) {
+                if (child.isFile()) {
+                    held.put(child.getName(), new FileFacts(child.length(), child.lastModified()));
+                }
+            }
+            return held;
         }
     }
 
@@ -1644,7 +1663,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             if (!file.isAbsolute()) {
                 throw new GeneralException("File (" + objectInfo + ") is not absolute");
             }
-            if (!file.exists() && !materialiseFromStore(dataResourceTypeId, file, rootDir)) {
+            if (!readFromStore(dataResourceTypeId, file, rootDir) && !file.exists()) {
                 throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
             }
             SecurityUtil.checkLocalFileAllowList(file);
@@ -1658,7 +1677,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 sep = "/";
             }
             File file = FileUtil.getFile(prefix + sep + objectInfo);
-            if (!file.exists() && !materialiseFromStore(dataResourceTypeId, file, rootDir)) {
+            if (!readFromStore(dataResourceTypeId, file, rootDir) && !file.exists()) {
                 throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
             }
             SecurityUtil.checkOfbizFileAllowList(file);
@@ -1672,8 +1691,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 sep = "/";
             }
             File file = FileUtil.getFile(prefix + sep + objectInfo);
-            checkContextFileBoundary(file, rootDir);
-            if (!file.exists() && !materialiseFromStore(dataResourceTypeId, file, rootDir)) {
+            assertInsideContextRoot(file, rootDir);
+            if (!readFromStore(dataResourceTypeId, file, rootDir) && !file.exists()) {
                 throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
             }
             try (InputStreamReader in = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {

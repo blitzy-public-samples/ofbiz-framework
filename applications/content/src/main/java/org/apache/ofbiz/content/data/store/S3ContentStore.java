@@ -18,11 +18,17 @@
  *******************************************************************************/
 package org.apache.ofbiz.content.data.store;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
+import java.util.HexFormat;
 import java.util.Locale;
 
 import org.apache.ofbiz.base.util.Debug;
@@ -33,6 +39,7 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
@@ -41,17 +48,16 @@ import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
-import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 
 /**
- * The S3-compatible object-storage provider.
+ * The S3-compatible object-storage provider, which holds file-backed content in a bucket.
  *
- * <p>It is built on the AWS SDK for Java v2 synchronous {@link S3Client}, configured from
- * {@code applications/content/config/content.properties} - which
- * {@code docker/docker-entrypoint.sh} renders from the {@code OFBIZ_S3_*} environment variables:
+ * <p>It is built on the AWS SDK for Java v2 synchronous {@link S3Client}, configured from the
+ * {@code content} property resource - which {@code docker/docker-entrypoint.sh} renders from the
+ * {@code OFBIZ_S3_*} environment variables:
  *
  * <ul>
  *   <li>{@code content.store.s3.bucket} - required.</li>
@@ -67,7 +73,18 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
  *       serve virtual-host-style addressing, which most non-AWS implementations cannot.</li>
  * </ul>
  *
- * <p>Timeouts, retries and the HTTP client are the SDK's own defaults; nothing here overrides them.
+ * <p><strong>Every call is bounded.</strong> A content read or write happens inside a request, and
+ * usually inside a transaction, so an object store that stops answering must not be able to hold a
+ * request thread until the operating system gives up on the socket. The client is therefore built with
+ * an explicit per-attempt timeout, an explicit overall API-call timeout that spans retries, and a
+ * bounded number of attempts. When the budget is exhausted the SDK raises, this provider translates
+ * that into an {@link IOException}, and the caller fails the request rather than hanging: a store that
+ * cannot answer is reported as a failure and never as missing content.
+ *
+ * <p><strong>Transport.</strong> An {@code https} endpoint is expected. A plain {@code http} endpoint
+ * is accepted so that a store reached over a network the deployment controls end to end still works,
+ * but it is logged as a warning, and the container entry point refuses it outright in the {@code prod}
+ * profile.
  *
  * <p>Absence is separated from failure as {@link ContentStore} requires: a key the bucket does not
  * hold becomes {@link FileNotFoundException}, while every other SDK failure - credentials, network,
@@ -89,7 +106,19 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     private static final String PATH_STYLE_PROPERTY = "content.store.s3.path.style";
 
     /** The largest object {@link #get} will read into memory. */
-    private static final long MAX_IN_MEMORY_OBJECT = 16L * 1024L * 1024L;
+    private static final int MAX_IN_MEMORY_OBJECT = 16 * 1024 * 1024;
+
+    /** How much of a bounded read is copied at a time. */
+    private static final int BUFFER_SIZE = 8192;
+
+    /** How long one attempt at a single request may take. */
+    private static final Duration ATTEMPT_TIMEOUT = Duration.ofSeconds(15L);
+
+    /** How long a request may take in total, retries included. */
+    private static final Duration CALL_TIMEOUT = Duration.ofSeconds(45L);
+
+    /** How many attempts one request is given before it is failed. */
+    private static final int MAX_ATTEMPTS = 3;
 
     private final String bucket;
     private final S3Client client;
@@ -106,6 +135,11 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         S3ClientBuilder builder = S3Client.builder()
                 .region(Region.of(region))
                 .credentialsProvider(credentials())
+                .overrideConfiguration(ClientOverrideConfiguration.builder()
+                        .apiCallAttemptTimeout(ATTEMPT_TIMEOUT)
+                        .apiCallTimeout(CALL_TIMEOUT)
+                        .retryStrategy(retry -> retry.maxAttempts(MAX_ATTEMPTS))
+                        .build())
                 .forcePathStyle(Boolean.parseBoolean(
                         ContentStoreFactory.setting(PATH_STYLE_PROPERTY, "false")));
         if (!endpoint.isEmpty()) {
@@ -114,15 +148,31 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         this.client = builder.build();
     }
 
+    /**
+     * Package-private test seam: builds a store around an already-constructed client.
+     *
+     * <p>It exists so that {@code ContentStoreFactoryTest} can exercise every operation of this
+     * provider against a mocked {@link S3Client}, with no AWS configuration, no credential resolution
+     * and no network access. Production code never uses it - the configuration-driven constructor above
+     * is the only route {@link ContentStoreFactory} takes.
+     *
+     * @param s3Client the client to issue requests with
+     * @param s3Bucket the bucket to address
+     */
+    S3ContentStore(S3Client s3Client, String s3Bucket) {
+        this.client = s3Client;
+        this.bucket = s3Bucket;
+    }
+
     @Override
-    public void put(String key, InputStream content, long length) throws GeneralException, IOException {
+    public void put(String key, byte[] data) throws GeneralException, IOException {
         ContentStoreFactory.requireUsableKey(key);
-        if (content == null || length < 0L) {
-            throw new IOException("Content of a known, non-negative length is required to store " + reference(key));
+        if (data == null) {
+            throw new IOException("Content is required to store " + reference(key));
         }
         try {
-            client.putObject(PutObjectRequest.builder().bucket(bucket).key(key).contentLength(length).build(),
-                    RequestBody.fromInputStream(content, length));
+            client.putObject(PutObjectRequest.builder().bucket(bucket).key(key).build(),
+                    RequestBody.fromBytes(data));
         } catch (SdkException failure) {
             throw failed("store", key, failure);
         }
@@ -130,16 +180,20 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
 
     @Override
     public byte[] get(String key) throws GeneralException, IOException {
-        ContentStoreFactory.requireUsableKey(key);
-        long held = size(key);
-        if (held > MAX_IN_MEMORY_OBJECT) {
-            throw new IOException("The content store holds " + held + " bytes for " + reference(key) + ", more than"
-                    + " the " + MAX_IN_MEMORY_OBJECT + " bytes that may be read into memory; stream it instead");
-        }
-        try {
-            return client.getObjectAsBytes(GetObjectRequest.builder().bucket(bucket).key(key).build()).asByteArray();
-        } catch (NoSuchKeyException absent) {
-            throw absence(key, absent);
+        // Read through the response stream and stop as soon as the limit is passed. Asking the store how
+        // large the object is and then reading it are two separate operations, and an object replaced
+        // between them would defeat the limit, so the bytes actually read are what is bounded.
+        try (InputStream content = openStream(key)) {
+            byte[] buffer = new byte[BUFFER_SIZE];
+            ByteArrayOutputStream held = new ByteArrayOutputStream();
+            for (int read = content.read(buffer); read >= 0; read = content.read(buffer)) {
+                if (held.size() + read > MAX_IN_MEMORY_OBJECT) {
+                    throw new IOException("The content store holds more than the " + MAX_IN_MEMORY_OBJECT
+                            + " bytes for " + reference(key) + " that may be read into memory; stream it instead");
+                }
+                held.write(buffer, 0, read);
+            }
+            return held.toByteArray();
         } catch (SdkException failure) {
             throw failed("read", key, failure);
         }
@@ -152,6 +206,8 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
             return client.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build());
         } catch (NoSuchKeyException absent) {
             throw absence(key, absent);
+        } catch (S3Exception failure) {
+            throw notFoundOrFailure("read", key, failure);
         } catch (SdkException failure) {
             throw failed("read", key, failure);
         }
@@ -161,10 +217,20 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     public boolean exists(String key) throws GeneralException, IOException {
         ContentStoreFactory.requireUsableKey(key);
         try {
-            head(key);
+            client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
             return true;
-        } catch (FileNotFoundException absent) {
+        } catch (NoSuchKeyException absent) {
             return false;
+        } catch (S3Exception failure) {
+            // A store that answers 404 without the NoSuchKey code - which several S3-compatible
+            // implementations do for HeadObject, because a HEAD response carries no error body to put a
+            // code in - is reporting absence just as much as NoSuchKeyException is.
+            if (failure.statusCode() == 404) {
+                return false;
+            }
+            throw failed("inspect", key, failure);
+        } catch (SdkException failure) {
+            throw failed("inspect", key, failure);
         }
     }
 
@@ -192,21 +258,31 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     /**
      * Returns the signature {@link ContentStoreFactory} caches a resolution against.
      *
-     * <p>It covers every setting the client is constructed from, so a change to any of them resolves a
-     * new client rather than keeping one that no longer matches the configuration. The secret access
-     * key is represented by its length alone: rotating it must still invalidate the cache, and a
-     * signature is held in memory next to the cache rather than being treated as secret material.
+     * <p>It is a SHA-256 digest of every setting the client is constructed from, the secret access key
+     * included in full, so that rotating a credential to a different value of the same length still
+     * resolves a new client. A digest rather than the values themselves: the signature is held in
+     * memory next to the cache and compared on every resolution, and a one-way digest cannot give a
+     * credential back.
      *
      * @return the signature
      */
     static String configurationSignature() {
-        return String.join("\n",
+        String settings = String.join("\n",
                 ContentStoreFactory.setting(BUCKET_PROPERTY, ""),
                 ContentStoreFactory.setting(REGION_PROPERTY, ""),
                 ContentStoreFactory.setting(ENDPOINT_PROPERTY, ""),
                 ContentStoreFactory.setting(ACCESS_KEY_PROPERTY, ""),
-                Integer.toString(ContentStoreFactory.setting(SECRET_KEY_PROPERTY, "").length()),
+                ContentStoreFactory.setting(SECRET_KEY_PROPERTY, ""),
                 ContentStoreFactory.setting(PATH_STYLE_PROPERTY, "false"));
+        try {
+            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(sha256.digest(settings.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException unavailable) {
+            // SHA-256 is mandatory on every Java platform, so this cannot happen. Failing loudly rather
+            // than falling back to the settings themselves keeps a credential out of the signature.
+            throw new IllegalStateException("SHA-256 is required to sign the content store configuration",
+                    unavailable);
+        }
     }
 
     /**
@@ -254,7 +330,8 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         if ("http".equals(scheme)) {
             Debug.logWarning("The content store endpoint [" + endpoint + "] is plain http, so object content and"
                     + " the credentials that sign for it cross the network unencrypted. Use https unless the"
-                    + " endpoint is reached over a network the deployment controls end to end.", MODULE);
+                    + " endpoint is reached over a network the deployment controls end to end; the container"
+                    + " entry point refuses plain http in the prod profile.", MODULE);
         }
         return uri;
     }
@@ -275,41 +352,18 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     }
 
     /**
-     * Returns how many bytes the bucket holds for a key.
+     * Translates an S3 error that may be a 404 into absence, and anything else into failure.
      *
+     * @param operation what was attempted, for the message
      * @param key the storage key
-     * @return the object's length in bytes
-     * @throws FileNotFoundException if the bucket holds no such key
-     * @throws IOException if the store cannot answer
+     * @param failure what the SDK reported
+     * @return the exception to throw
      */
-    private long size(String key) throws IOException {
-        return head(key).contentLength();
-    }
-
-    /**
-     * Reads an object's metadata with HeadObject, which is the existence check this provider uses.
-     *
-     * @param key the storage key
-     * @return the object's metadata
-     * @throws FileNotFoundException if the bucket holds no such key
-     * @throws IOException if the store cannot answer
-     */
-    private HeadObjectResponse head(String key) throws IOException {
-        try {
-            return client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
-        } catch (NoSuchKeyException absent) {
-            throw absence(key, absent);
-        } catch (S3Exception failure) {
-            // A store that answers 404 without the NoSuchKey code - which several S3-compatible
-            // implementations do for HeadObject, because a HEAD response carries no error body to put a
-            // code in - is reporting absence just as much as NoSuchKeyException is.
-            if (failure.statusCode() == 404) {
-                throw absence(key, failure);
-            }
-            throw failed("read", key, failure);
-        } catch (SdkException failure) {
-            throw failed("read", key, failure);
+    private IOException notFoundOrFailure(String operation, String key, S3Exception failure) {
+        if (failure.statusCode() == 404) {
+            return absence(key, failure);
         }
+        return failed(operation, key, failure);
     }
 
     /**

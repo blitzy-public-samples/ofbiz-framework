@@ -118,6 +118,11 @@ FROM runtimebase AS demo
 USER ofbiz
 
 RUN /ofbiz/bin/ofbiz --load-data
+# These markers are EMPTY, and an empty marker vouches only for the embedded H2 database baked into this
+# image alongside it. docker/docker-entrypoint.sh honours an empty marker only when no external database
+# is configured; start this image with OFBIZ_POSTGRES_HOST and it loads the data and creates the admin
+# user in that database, because a marker written here can say nothing about it. Every marker the entry
+# point writes itself carries a digest of the configuration it applied.
 RUN mkdir --parents /ofbiz/runtime/container_state
 RUN touch /ofbiz/runtime/container_state/data_loaded
 RUN touch /ofbiz/runtime/container_state/admin_loaded

@@ -92,24 +92,21 @@ dependencies {
       exclude group: 'pull-parser', module: 'pull-parser'
       exclude group: 'xpp3', module: 'xpp3'
     }
-    // S3 client for the content-store provider (applications/content/.../data/store/S3ContentStore.java).
-    //
-    // The async transport graph is excluded deliberately. S3ContentStore builds only the SYNCHRONOUS
-    // S3Client, which resolves software.amazon.awssdk:apache5-client; the s3 module additionally declares
-    // netty-nio-client for the async client this deployment never constructs, and that module is the sole
-    // source of io.netty on the runtime class path. Left in, its io.netty 4.1.136 requirement wins the
-    // conflict resolution against the 4.1.75/4.1.80 requests made by unrelated components (LDAP/CAS), so
-    // adding an object-store provider would silently change the Netty version those components run on -
-    // which the plan forbids: the two new dependencies must be "isolated to the components that use them"
-    // and no existing dependency version may change (technical specification sections 0.2.1 and 0.5.1).
-    // Excluding the module removes the async client, its HTTP/2 codec and the entire Netty tree with it.
-    //
-    // If an async S3 client is ever needed, add netty-nio-client back as an explicit, version-pinned
-    // dependency and re-check the Netty resolution of every other consumer first - do not simply drop
-    // this exclusion.
+    // S3 client for the content-store provider (S3ContentStore). Its two default transports are replaced
+    // by the SDK's own URLConnection one, because each of them would otherwise CHANGE THE VERSION of a
+    // third-party library already on the runtime class path, which this addition must not do:
+    // netty-nio-client (async only - S3ContentStore never builds an async client) moves
+    // io.netty:netty-common from 4.1.80.Final to 4.1.136.Final for the LDAP/CAS plugin, and apache5-client
+    // moves httpclient5 from 5.4.4 to 5.6.2 and httpcore5/httpcore5-h2 from 5.3.4 to 5.4.3 for
+    // esapi/antisamy. url-connection-client depends on nothing outside the SDK, the SDK discovers it
+    // through the service loader as the single HTTP implementation present - so no code names it and it is
+    // needed at run time only - and it supports every request S3ContentStore makes. With these three lines
+    // the resolved runtime class path gains the SDK and the driver and changes NO existing version.
     implementation('software.amazon.awssdk:s3:2.49.1') {
       exclude group: 'software.amazon.awssdk', module: 'netty-nio-client'
+      exclude group: 'software.amazon.awssdk', module: 'apache5-client'
     }
+    runtimeOnly 'software.amazon.awssdk:url-connection-client:2.49.1'
 
     testImplementation 'org.junit.jupiter:junit-jupiter-api:6.1.0'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:6.1.0'
@@ -125,11 +122,8 @@ dependencies {
     runtimeOnly 'org.apache.axis2:axis2-transport-http:1.8.2'
     runtimeOnly 'org.apache.axis2:axis2-transport-local:1.8.2'
     runtimeOnly 'com.h2database:h2:2.4.240'
-    // JDBC driver for the localpostgres* datasources. Bundling it here rather than downloading it at
-    // container start pins the deployed driver version in this file and makes it auditable from the image
-    // alone. Note that the generated start script places lib-extra ahead of lib on the class path, so a
-    // copy of this artefact left in the /ofbiz/lib-extra volume would shadow the version declared here.
-    // Keep this on the current 42.7.x line.
+    // JDBC driver for the localpostgres* datasources, bundled here instead of downloaded at container
+    // start so the deployed version is pinned in this file. Keep it on the current 42.7.x line.
     runtimeOnly 'org.postgresql:postgresql:42.7.13'
     runtimeOnly 'org.apache.geronimo.specs:geronimo-jaxrpc_1.1_spec:2.1'
     runtimeOnly 'org.apache.logging.log4j:log4j-1.2-api:2.25.4' // for external jars using the old log4j1.2: routes logging to log4j 2

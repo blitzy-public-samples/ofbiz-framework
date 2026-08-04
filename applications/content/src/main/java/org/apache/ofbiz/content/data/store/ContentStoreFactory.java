@@ -19,39 +19,47 @@
 package org.apache.ofbiz.content.data.store;
 
 import java.util.Locale;
-import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.GeneralException;
 import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.base.util.UtilValidate;
+import org.apache.ofbiz.entity.Delegator;
+import org.apache.ofbiz.entity.util.EntityUtilProperties;
 
 /**
  * Resolves the configured {@link ContentStore}, or reports that content storage is unchanged.
  *
- * <p>The backend is named by the {@code content.store.provider} property of
- * {@code applications/content/config/content.properties}, which
- * {@code docker/docker-entrypoint.sh} renders from {@code OFBIZ_CONTENT_STORE_PROVIDER}:
+ * <p>The backend is named by the {@code content.store.provider} property of the {@code content}
+ * resource, which {@code docker/docker-entrypoint.sh} renders from
+ * {@code OFBIZ_CONTENT_STORE_PROVIDER}:
  *
  * <ul>
- *   <li>{@code database} - the shipped default, and what an unset or unrecognised value falls back to.
- *       {@code DataResource} content keeps being stored the way it always has been, and this factory
- *       returns {@code null}: there is no external store, and the S3 client is never constructed.</li>
- *   <li>{@code filesystem} - {@link FileSystemContentStore}, rooted at {@code runtime/contentstore}
- *       inside the deployment. It becomes a fleet-wide store when that directory is a shared mount, and
- *       it needs no credentials, which makes it the way to run the store seam without an object store.</li>
+ *   <li>{@code database} - the shipped default, and what an unset, blank or unrecognised value falls
+ *       back to. {@code DataResource} content keeps being stored the way it always has been, this
+ *       factory returns {@code null}, and no storage client is ever constructed.</li>
+ *   <li>{@code filesystem} - {@link FileSystemContentStore}, rooted at the upload directory named by
+ *       {@code content.upload.path.prefix}. It needs no credentials and changes nothing about where
+ *       content is written; it becomes a fleet-wide store when that directory is a shared mount.</li>
  *   <li>{@code s3} - {@link S3ContentStore}, an S3-compatible object store reached with the bucket,
  *       region, endpoint, credentials and addressing style declared by the remaining
  *       {@code content.store.s3.*} properties.</li>
  * </ul>
  *
- * <p>Configuration is read with {@link UtilProperties}, which is the resource the container entry point
- * renders, so the read seam and the write seam resolve the same provider from the same place. Resolution
- * is cached against a signature of the configuration it was built from, so the S3 client is constructed
- * once rather than per call and a configuration change is picked up by rebuilding rather than by
- * restarting. A superseded store that holds resources is closed.
+ * <p><strong>{@code null} is the documented database-mode signal.</strong> An unrecognised value is
+ * never fatal: it is logged once as a warning naming the offending value and then treated as
+ * {@code database}, so a typo cannot stop a deployment from starting.
  *
- * <p>Thread safe: the cached resolution is held in an {@link AtomicReference}.
+ * <p><strong>Resolution happens once per JVM.</strong> The provider is built on first use and cached
+ * together with a signature of the configuration it was built from. A later configuration change - a
+ * rotated credential, a different bucket, a different provider - is reported as a warning and takes
+ * effect on the next restart; the cached provider is deliberately neither replaced nor closed while it
+ * is running, because a caller may still be reading a stream it opened, and closing a provider out from
+ * under that caller would turn a configuration change into a failed request. In a container deployment
+ * configuration arrives from the environment at start, so a change is a redeploy in any case.
+ *
+ * <p>Thread safe: creation is serialised and the cached resolution is published through a volatile
+ * field, so concurrent callers share one provider and none of them can observe a half-built one.
  *
  * @see ContentStore
  */
@@ -64,23 +72,16 @@ public final class ContentStoreFactory {
 
     private static final String PROVIDER_PROPERTY = "content.store.provider";
 
-    /**
-     * Where the filesystem provider keeps content, relative to {@code ofbiz.home}.
-     *
-     * <p>A fixed location rather than a setting: the deployment already says whether content is held
-     * off the instance by naming a provider, and a second setting for where would only add a way to
-     * point one instance at a directory another cannot see. Mount it to share it.
-     */
-    private static final String FILESYSTEM_ROOT = "runtime/contentstore";
-
     private static final String DATABASE = "database";
     private static final String FILESYSTEM = "filesystem";
     private static final String S3 = "s3";
 
-    private static final AtomicReference<Resolution> RESOLUTION = new AtomicReference<>();
+    /** Guards construction so that two concurrent callers cannot build two providers. */
+    private static final Object CREATION_LOCK = new Object();
 
-    private ContentStoreFactory() {
-    }
+    private static volatile Resolution resolution;
+
+    private ContentStoreFactory() { }
 
     /**
      * Returns the configured content store, or {@code null} when content storage is unchanged.
@@ -89,30 +90,47 @@ public final class ContentStoreFactory {
      * @throws GeneralException if a provider is named but its configuration is incomplete or unusable
      */
     public static ContentStore getContentStore() throws GeneralException {
-        String provider = setting(PROVIDER_PROPERTY, DATABASE).toLowerCase(Locale.ROOT);
-        if (DATABASE.equals(provider)) {
-            return null;
+        return resolve(setting(PROVIDER_PROPERTY, DATABASE));
+    }
+
+    /**
+     * Returns the configured content store, honouring a {@code SystemProperty} row for the given
+     * delegator ahead of the property file.
+     *
+     * @param delegator the delegator whose configuration applies, may be null
+     * @return the configured store, or null for {@code database} storage, which is the default
+     * @throws GeneralException if a provider is named but its configuration is incomplete or unusable
+     */
+    public static ContentStore getContentStore(Delegator delegator) throws GeneralException {
+        if (delegator == null) {
+            return getContentStore();
         }
-        if (!FILESYSTEM.equals(provider) && !S3.equals(provider)) {
-            // Refused rather than guessed at: silently storing content somewhere other than where the
-            // deployment asked for it is how content goes missing. Reported once per distinct value by
-            // the caller's own error handling, which is what turns this into a start-up-visible fault.
-            throw new GeneralException("Unrecognised " + PROVIDER_PROPERTY + " [" + provider + "]. It must be "
-                    + DATABASE + ", " + FILESYSTEM + " or " + S3 + ", or be left unset for " + DATABASE + " storage.");
+        String configured = EntityUtilProperties.getPropertyValue(RESOURCE, PROVIDER_PROPERTY, DATABASE, delegator);
+        return resolve(configured);
+    }
+
+    /**
+     * Package-private test seam: drops the cached provider, closing it if it holds resources, so that a
+     * subsequent {@link #getContentStore()} re-resolves {@code content.store.provider} from
+     * configuration.
+     *
+     * <p>Production code never calls this - the provider is resolved once and cached for the life of the
+     * JVM. It exists so that {@code ContentStoreFactoryTest} can exercise several provider values within
+     * a single JVM, which is impossible while a static resolution is cached. Closing here is safe in a
+     * way that closing on supersede is not: a test holds no open stream when it resets.
+     */
+    static void clearCache() {
+        synchronized (CREATION_LOCK) {
+            Resolution dropped = resolution;
+            resolution = null;
+            if (dropped != null && dropped.store() instanceof AutoCloseable closeable) {
+                try {
+                    closeable.close();
+                } catch (Exception e) {
+                    Debug.logWarning(e, "A discarded content store could not be closed", MODULE);
+                }
+            }
         }
-        String signature = provider + '\n' + (S3.equals(provider)
-                ? S3ContentStore.configurationSignature()
-                : filesystemRoot());
-        Resolution cached = RESOLUTION.get();
-        if (cached != null && cached.signature().equals(signature)) {
-            return cached.store();
-        }
-        ContentStore store = S3.equals(provider)
-                ? new S3ContentStore()
-                : new FileSystemContentStore(filesystemRoot());
-        release(RESOLUTION.getAndSet(new Resolution(signature, store)));
-        Debug.logInfo("Content storage provider [" + provider + "] is in use", MODULE);
-        return store;
     }
 
     /**
@@ -133,9 +151,8 @@ public final class ContentStoreFactory {
      * <p>Every provider validates through here, so one key is accepted or refused identically whatever
      * backend is configured, and no provider has to be trusted to repeat the checks correctly. The
      * grammar is deliberately narrow: a relative POSIX path whose segments are all non-empty and
-     * neither {@code .} nor {@code ..}. That is what a key derived from content's own
-     * {@code ofbiz.home}-relative path always looks like, and it leaves no spelling that could resolve
-     * outside a filesystem provider's root or address an unintended object in a bucket.
+     * neither {@code .} nor {@code ..}. That leaves no spelling that could resolve outside a filesystem
+     * provider's root or address an unintended object in a bucket.
      *
      * @param key the storage key to check
      * @throws GeneralException if the key is empty or breaks the grammar
@@ -162,43 +179,126 @@ public final class ContentStoreFactory {
     }
 
     /**
-     * Resolves the filesystem provider's root inside this deployment.
+     * Resolves a configured provider name to the store that serves it.
      *
-     * @return the absolute path of {@link #FILESYSTEM_ROOT}
-     * @throws GeneralException if {@code ofbiz.home} is not set, so nothing can be resolved against it
+     * @param configured the value of {@code content.store.provider}
+     * @return the store, or null for database storage
+     * @throws GeneralException if a provider is named but its configuration is incomplete or unusable
      */
-    private static String filesystemRoot() throws GeneralException {
-        String home = System.getProperty("ofbiz.home");
-        if (UtilValidate.isEmpty(home)) {
-            throw new GeneralException("The filesystem content store cannot be resolved: ofbiz.home is not set");
+    private static ContentStore resolve(String configured) throws GeneralException {
+        String provider = configured == null ? DATABASE : configured.trim().toLowerCase(Locale.ROOT);
+        if (!provider.isEmpty() && !DATABASE.equals(provider) && !FILESYSTEM.equals(provider) && !S3.equals(provider)) {
+            // Logged and defaulted rather than thrown: refusing to start over a typo in one property
+            // would make a mis-typed deployment worse off than the shipped default, which is the
+            // behaviour this factory guarantees.
+            Debug.logWarning("Unrecognised " + PROVIDER_PROPERTY + " [" + configured + "]. It must be " + DATABASE
+                    + ", " + FILESYSTEM + " or " + S3 + "; falling back to " + DATABASE + " storage.", MODULE);
+            provider = DATABASE;
         }
-        return home + "/" + FILESYSTEM_ROOT;
+        if (provider.isEmpty()) {
+            provider = DATABASE;
+        }
+        if (DATABASE.equals(provider)) {
+            reportStaleConfiguration(DATABASE);
+            return null;
+        }
+        requireSingleTenantDeployment(provider);
+        String signature = provider + '\n' + (S3.equals(provider)
+                ? S3ContentStore.configurationSignature()
+                : FileSystemContentStore.configurationSignature());
+        if (resolution == null) {
+            synchronized (CREATION_LOCK) {
+                if (resolution == null) {
+                    ContentStore store = S3.equals(provider) ? new S3ContentStore() : new FileSystemContentStore();
+                    resolution = new Resolution(signature, store);
+                    Debug.logInfo("Content storage provider [" + provider + "] is in use", MODULE);
+                    return store;
+                }
+            }
+        }
+        reportStaleConfiguration(signature);
+        return resolution.store();
     }
 
     /**
-     * Closes a superseded store that holds resources, so a re-resolution cannot leak a client.
+     * Refuses to activate a store in a multi-tenant deployment.
      *
-     * @param superseded the resolution the cache no longer holds, possibly null
+     * <p>A storage key is derived from the content's own {@code ofbiz.home}-relative path, and that path
+     * is the same for every tenant: two tenants of one deployment generate {@code dataResourceId} values
+     * from their own sequences, so they can name the same object and one tenant's content would overwrite
+     * or be served in place of another's. The seam that derives the key - the file-resolution methods of
+     * {@code DataResourceWorker} - is reached without a delegator on some of its paths, so the tenant
+     * cannot be established there and cannot be folded into the key.
+     *
+     * <p>Rather than leave that hole open, an external store is refused outright while
+     * {@code general.properties multitenant} is {@code Y}. Content storage then stays exactly as it is
+     * today for a multi-tenant deployment, which is safe, and the operator is told why. DOCKER.adoc
+     * carries this and the rule that each deployment uses its own bucket.
+     *
+     * @param provider the provider that was asked for
+     * @throws GeneralException if this deployment is multi-tenant
      */
-    private static void release(Resolution superseded) {
-        if (superseded == null || !(superseded.store() instanceof AutoCloseable closeable)) {
+    private static void requireSingleTenantDeployment(String provider) throws GeneralException {
+        if (UtilProperties.propertyValueEqualsIgnoreCase("general", "multitenant", "Y")) {
+            throw new GeneralException("The [" + provider + "] content store cannot be used by a multi-tenant"
+                    + " deployment (general.properties multitenant=Y): a storage key is derived from the content's"
+                    + " own path, which carries no tenant, so one tenant's content could overwrite another's."
+                    + " Leave " + PROVIDER_PROPERTY + " at " + DATABASE + ", or run one deployment per tenant with"
+                    + " its own bucket. See DOCKER.adoc.");
+        }
+    }
+
+    /**
+     * Warns, at most once, when the configuration no longer matches the provider that is already
+     * running.
+     *
+     * <p>The running provider is kept: replacing it would have to close a client that a caller may still
+     * be streaming from. Saying so once is what turns a silently ignored change into an operator-visible
+     * instruction to restart.
+     *
+     * @param wanted the signature the configuration now asks for, or {@code database}
+     */
+    private static void reportStaleConfiguration(String wanted) {
+        Resolution cached = resolution;
+        if (cached == null || cached.signature().equals(wanted) || cached.reported()) {
             return;
         }
-        try {
-            closeable.close();
-        } catch (Exception e) {
-            // Logged and swallowed: the replacement store is already in the cache and serving, and a
-            // client that will never be used again failing to shut down cannot be acted on by a caller.
-            Debug.logWarning(e, "A superseded content store could not be closed", MODULE);
-        }
+        cached.markReported();
+        String running = cached.signature().substring(0, cached.signature().indexOf('\n'));
+        String asked = DATABASE.equals(wanted) ? DATABASE : wanted.substring(0, wanted.indexOf('\n'));
+        Debug.logWarning("The content storage configuration now asks for [" + asked + "] but this instance resolved ["
+                + running + "] when it started. The running provider is kept, because a caller may still be reading"
+                + " from it; restart the instance to apply the change.", MODULE);
     }
 
     /**
      * A cached store together with the configuration signature it was built from.
-     *
-     * @param signature the configuration this store reflects
-     * @param store the store built from it
      */
-    private record Resolution(String signature, ContentStore store) {
+    private static final class Resolution {
+
+        private final String signature;
+        private final ContentStore store;
+        private volatile boolean reported;
+
+        private Resolution(String signature, ContentStore store) {
+            this.signature = signature;
+            this.store = store;
+        }
+
+        private String signature() {
+            return signature;
+        }
+
+        private ContentStore store() {
+            return store;
+        }
+
+        private boolean reported() {
+            return reported;
+        }
+
+        private void markReported() {
+            this.reported = true;
+        }
     }
 }

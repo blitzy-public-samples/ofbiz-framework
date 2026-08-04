@@ -27,35 +27,37 @@ import org.apache.ofbiz.base.util.GeneralException;
  * The storage contract for file-backed content, with one implementation per storage backend.
  *
  * <p>File-backed {@code DataResource} content - {@code LOCAL_FILE}, {@code OFBIZ_FILE} and
- * {@code CONTEXT_FILE} and their {@code _BIN} variants - has always lived on the local filesystem of
- * the instance that wrote it, which is what stops an instance from being freely replaceable. This
- * interface is the seam that lets that content live somewhere every instance can reach instead. It is
- * selected by configuration through {@link ContentStoreFactory}; when no provider is configured the
- * content component keeps storing content exactly where it always did, so an unconfigured deployment
- * behaves as it did before this interface existed.
+ * {@code CONTEXT_FILE} together with their {@code _BIN} variants - has always lived on the local
+ * filesystem of the instance that wrote it, which is the one piece of durable state that stops an
+ * instance from being freely replaceable. This interface is the seam that lets that content live
+ * somewhere every instance can reach instead.
  *
- * <p><strong>Keys.</strong> A key is the {@code ofbiz.home}-relative POSIX path of the content, for
- * example {@code runtime/uploads/1717171717171/10000.png}. It carries no leading slash, no empty
- * segment, no {@code .} or {@code ..} segment, no backslash and no control character; a key that
- * breaks that grammar is rejected with a {@link GeneralException} rather than resolved. Deriving the
- * key from the content's own path is what makes one key mean the same object on every instance and in
- * every provider.
+ * <p><strong>Selection.</strong> An implementation is chosen at run time by
+ * {@link ContentStoreFactory} from the {@code content.store.provider} property of the {@code content}
+ * resource. The three accepted values are {@code database} (the shipped default), {@code filesystem}
+ * and {@code s3}. Under {@code database} - and under an unset or unrecognised value - <em>no
+ * implementation of this interface is used at all</em>: the pre-existing {@code DataResource}
+ * database-storage path runs completely unchanged and no storage client is ever constructed.
+ *
+ * <p><strong>Keys.</strong> A key is an opaque, provider-relative POSIX path. It carries no leading
+ * or trailing slash, no empty segment, no {@code .} or {@code ..} segment, no backslash and no
+ * control character; a key that breaks that grammar is rejected with a {@link GeneralException}
+ * rather than resolved. Deriving the key from the content's own scoped, {@code ofbiz.home}-relative
+ * path is what makes one key mean the same object on every instance and in every provider.
  *
  * <p><strong>Absence is not failure.</strong> {@link #get} and {@link #openStream} report an object
- * this store does not hold by throwing {@link java.io.FileNotFoundException} - and nothing else throws it.
- * Every other outcome, a provider or network fault included, is an {@link IOException} that is not a
- * {@code FileNotFoundException}, or a {@link GeneralException} for a configuration or key fault.
- * Callers depend on that distinction: content that is genuinely absent is a 404, while a store that
- * cannot answer must not be reported as missing content.
+ * this store does not hold by throwing {@link java.io.FileNotFoundException} - and nothing else
+ * throws it. Every other outcome, a provider or network fault included, is an {@link IOException}
+ * that is not a {@code FileNotFoundException}, or a {@link GeneralException} for a configuration or
+ * key fault. Callers depend on that distinction: content that is genuinely absent is a 404, while a
+ * store that cannot answer must never be reported as missing content.
  *
  * <p><strong>Replacement is atomic.</strong> A {@link #put} that replaces an existing object is
  * atomic as far as a concurrent reader is concerned: the reader sees either the whole previous object
  * or the whole new one, never a mixture of the two.
  *
  * <p><strong>Logging.</strong> Implementations log the storage key, and the container that holds it
- * where the provider has one, and never the content itself. Keys name content by
- * {@code dataResourceId} rather than by the name a user uploaded, so they are safe to log and are
- * what makes a log line actionable.
+ * where the provider has one, and never the content itself.
  *
  * <p>Implementations are thread safe.
  *
@@ -67,12 +69,11 @@ public interface ContentStore {
      * Stores the given content under the given key, replacing any object already held there.
      *
      * @param key the storage key
-     * @param content the content to store; read to {@code length} bytes and not closed by this method
-     * @param length the number of bytes to read from {@code content}, never negative
+     * @param data the content to store, never null
      * @throws GeneralException if the key breaks the key grammar or the provider is misconfigured
-     * @throws IOException if the content cannot be read or the store cannot be written
+     * @throws IOException if the store cannot be written
      */
-    void put(String key, InputStream content, long length) throws GeneralException, IOException;
+    void put(String key, byte[] data) throws GeneralException, IOException;
 
     /**
      * Returns the whole object held under the given key.
@@ -93,7 +94,7 @@ public interface ContentStore {
      * Opens the object held under the given key for reading.
      *
      * @param key the storage key
-     * @return a stream over the object's bytes, which the caller closes
+     * @return a stream over the object's bytes, positioned at the start, which the caller closes
      * @throws GeneralException if the key breaks the key grammar or the provider is misconfigured
      * @throws java.io.FileNotFoundException if this store does not hold the key
      * @throws IOException if the store cannot be read

@@ -60,9 +60,11 @@ access. For a detailed description see the core/docs/entityconfig.html file.
            ofbiz.jar on the classpath) when OFBIZ_POSTGRES_HOST is set, repointing the default and
            default-no-eca group-maps to localpostgres / localpostgresolap / localpostgrestenant. Connection
            parameters come from OFBIZ_POSTGRES_HOST, OFBIZ_POSTGRES_PORT (default 5432),
-           OFBIZ_POSTGRES_{OFBIZ,OLAP,TENANT}_{DB,USER,PASSWORD}, OFBIZ_DB_POOL_MIN (default 2) and
-           OFBIZ_DB_POOL_MAX (default 250); the two startup-DDL flags come from OFBIZ_SCHEMA_INIT and the
-           cache-invalidation flag from OFBIZ_DISTRIBUTED_CACHE_CLEAR, both defaulting to false.
+           OFBIZ_POSTGRES_{OFBIZ,OLAP,TENANT}_{DB,USER,PASSWORD}, OFBIZ_DB_POOL_MIN (default 2),
+           OFBIZ_DB_POOL_MAX (default 250) and the transport security OFBIZ_POSTGRES_SSLMODE (verify-full in
+           the prod profile) with OFBIZ_POSTGRES_SSLROOTCERT; the two startup-DDL flags come from
+           OFBIZ_SCHEMA_INIT and the cache-invalidation flag from OFBIZ_DISTRIBUTED_CACHE_CLEAR, both
+           defaulting to false.
          The test delegator ALWAYS stays on embedded H2 in both profiles: the deployed-profile template defines
          its own localh2* datasources for exactly that reason, so gradlew loadAll and gradlew testIntegration are
          unaffected, in a container as well as locally.
@@ -80,7 +82,9 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          require-new-transaction false, so with the flag on and no transport configured a dispatch failure marks
          the caller's transaction rollback only and loses the entity write that triggered the invalidation.
          Configure the broker, supply its client library in /ofbiz/lib-extra and activate the serviceMessenger
-         jms-service first; DOCKER.adoc carries the procedure. -->
+         jms-service first; DOCKER.adoc carries the procedure. The container entry point ENFORCES that order: it
+         refuses to start when OFBIZ_DISTRIBUTED_CACHE_CLEAR is true and no uncommented jms-service of that name
+         is found, so the flag cannot be switched on without a transport to carry the invalidations. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
@@ -433,30 +437,26 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          MAINTENANCE RULE: never write an at-sign delimited placeholder name anywhere in THIS file, not even in
          a comment, and describe placeholders by the attribute they occupy as the comments here do. The template
          is a sed source and a name written in prose would be substituted there too.
-         NO COMMITTED PASSWORD, FAIL CLOSED: these three definitions carry no jdbc-password at all.
-         jdbc-password is optional in entity-config.xsd while jdbc-username is required, so the long standing
-         ofbiz username default for a locally installed PostgreSQL is kept (a username on its own cannot
-         authenticate) and the password is replaced by an explicit jdbc-password-lookup.
-         EntityConfig.getJdbcPassword resolves that lookup against framework/base/config/passwords.properties,
-         which deliberately contains NO jdbc-password.localpostgres* entry, so opening one of these connections
-         without externalized credentials throws GenericEntityConfException naming the missing property rather
-         than silently authenticating with a password that is public in the source tree. Supply the password
-         through the deployed profile (the template substitutes it from the environment) or, for a local
-         PostgreSQL, add the jdbc-password.localpostgres* property to a passwords.properties that is not
-         committed. The application's other secrets live in framework/security/config/security.properties and
+         LOCAL-DEVELOPMENT PLACEHOLDERS: the host, database, username and password below are the long standing
+         defaults for a PostgreSQL installed on the developer's own machine, exactly as the mysql, oracle and
+         other dialect definitions beside them keep theirs. They are placeholders, not deployment credentials:
+         a deployed container never uses them as written, because the entry point renders the template with the
+         host, database, username and password taken from the environment and puts the result first on the
+         classpath. A developer pointing a delegator at these three edits them locally, or supplies a
+         jdbc-password-lookup naming a property in a passwords.properties that is not committed.
+         The secrets that ARE externalised by this refactor - the admin key, the forgot-password key and the
+         JWT signing key - live in framework/security/config/security.properties and
          framework/start/src/main/resources/org/apache/ofbiz/base/start/start.properties, which ship without a
          value and are injected from the environment at deploy time; none of them belongs here.
-         TLS VERIFIED HERE, DRIVER DEFAULT IN THE RENDERED PROFILE: the URIs below pin sslmode=verify-full,
-         which encrypts the connection, checks that the server certificate chains to a trusted root and checks
-         that the hostname matches it. That is spelled out because pgJDBC's own default, sslmode=prefer,
-         silently falls back to an UNENCRYPTED connection when the server declines TLS. verify-full needs a
-         trusted root and pgJDBC does not consult the JVM trust store by default: it reads sslrootcert, whose
-         default is a file under the runtime user's home directory. The rendered deployed profile therefore
-         leaves the query string without an sslmode, so that a container can reach a database whose CA it has
-         not been given, and a deployment that requires verification appends sslmode and sslrootcert to the
-         template's jdbc-uri values - see the template and DOCKER.adoc. Enforce it from the server as well, with
-         a hostssl rule in pg_hba.conf or rds.force_ssl on a managed instance: a server-side rule cannot be
-         forgotten the way a per-client setting can.
+         TLS: the URIs below leave sslmode at the pgJDBC default, because they address 127.0.0.1 - a loopback
+         connection that never crosses a network - and a checkout provisions no certificate authority for
+         anything stronger. Every connection that DOES cross a network is a rendered one, and the entry point
+         puts sslmode and sslrootcert into each rendered URI from OFBIZ_POSTGRES_SSLMODE and
+         OFBIZ_POSTGRES_SSLROOTCERT, defaulting the prod profile to verify-full and refusing to start without a
+         readable CA file - pgJDBC does not consult the JVM trust store, it reads sslrootcert. A local install
+         that does reach PostgreSQL over a network should add sslmode=verify-full and sslrootcert to the URI
+         here. Enforce it from the server as well, with a hostssl rule in pg_hba.conf or rds.force_ssl on a
+         managed instance: a server-side rule cannot be forgotten the way a per-client setting can.
          EVERY NETWORK WAIT IS BOUNDED: each URI below pins the pgJDBC deadlines and each pool below pins its
          borrow wait, because the value that applies when either is absent is not a deadline at all. pgJDBC
          leaves socketTimeout and loginTimeout at 0, which means NO LIMIT, so a thread that reaches a database
@@ -515,9 +515,9 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbiz?sslmode=verify-full&amp;connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
+                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbiz?connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
                 jdbc-username="ofbiz"
-                jdbc-password-lookup="localpostgres"
+                jdbc-password="ofbiz"
                 isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"
@@ -556,9 +556,9 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbizolap?sslmode=verify-full&amp;connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
+                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbizolap?connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
                 jdbc-username="ofbiz"
-                jdbc-password-lookup="localpostgresolap"
+                jdbc-password="ofbiz"
                 isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"
@@ -597,9 +597,9 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbiztenant?sslmode=verify-full&amp;connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
+                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbiztenant?connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
                 jdbc-username="ofbiz"
-                jdbc-password-lookup="localpostgrestenant"
+                jdbc-password="ofbiz"
                 isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"

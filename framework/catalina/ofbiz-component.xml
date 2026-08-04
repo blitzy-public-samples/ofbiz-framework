@@ -109,8 +109,8 @@ under the License.
                  OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS by docker-entrypoint.sh. Enable it only when instances are
                  served under several sub-domains of one parent domain and a shared session cookie is genuinely
                  required: the valve calls request.getSession(true), so it forces a session for every request it
-                 handles, health probes included. HealthCheckServlet discards the session created for a probe and
-                 suppresses its cookie, so a probe still leaves no session behind. -->
+                 handles, health probes included - the same thing ControlFilter already does for every path it
+                 admits, and one more reason to keep this off unless a shared cookie is actually needed. -->
             <property name="enable-cross-subdomain-sessions" value="false"/>
         </property>
         <property name="ajp-connector" value="connector">

@@ -45,36 +45,17 @@ under the License.
         <display-name>ControlFilter</display-name>
         <filter-name>ControlFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.ControlFilter</filter-class>
-        <!-- The two load-balancer probe paths are admitted without authentication here, exactly as
-             /ping.txt already is, and the HealthCheckServlet declared below answers them. This is the
-             whole of the health registration: a servlet, a servlet-mapping and these two allowedPaths
-             entries. No filter is added and no filter ordering changes.
-
-             THE ENTRIES ARE THE TWO EXACT PATHS, never the /health prefix. allowedPaths is matched with
-             startsWith, so a single /health entry would admit every /health* spelling to this chain
-             anonymously - /healthz/live, /health-internal - none of which is a probe. With the exact
-             entries, the only near misses admitted are LONGER SPELLINGS of these two: /health/live-x,
-             /health/ready/anything and so on.
-
-             THOSE NEAR MISSES ARE ANSWERED BY THE SERVLET, NOT BY THE CONTAINER, and that is why its
-             servlet-mapping below is /health/* rather than the two exact paths. ControlFilter calls
-             getSession() unconditionally, and it does so BEFORE it consults this allow-list, so a
-             session exists by the time any decision is taken - for an admitted near miss just as much
-             as for a probe. Letting the container's default servlet answer a near miss with 404 left
-             that session in place to expire on its own, so anything that could reach this webapp could
-             mint unbounded sessions through /health/live-<nonce> (CWE-400). With /health/* every
-             spelling this allow-list admits reaches HealthCheckServlet, which discards the session
-             created for the request before it routes, and then answers 404 for anything that is not
-             exactly one of the two probe paths. The 404 an operator sees is unchanged; what changes is
-             that nothing accumulates behind it.
-
-             A probe therefore runs this chain like any other admitted anonymous path, which means
-             ControlFilter's and ContextFilter's unconditional getSession() applies to it too.
-             HealthCheckServlet invalidates a session minted for a probe and suppresses its cookie, so a
-             probe still leaves no session behind. Readiness resolves its delegator from this webapp's
-             own entityDelegatorName context-param rather than from the ServletContext attribute that
-             ContextFilter rewrites on a tenant request, so a probe's verdict is always this instance's
-             own datasource. -->
+        <!-- The two load-balancer probe paths are admitted without authentication, exactly as /ping.txt
+             already is, and the HealthCheckServlet declared below answers them. This is the whole of the
+             health registration: a servlet, a servlet-mapping and these two allowedPaths entries. No
+             filter is added and no filter ordering changes.
+             The entries are the two EXACT paths, never the /health prefix: allowedPaths is matched with
+             startsWith, so a single /health entry would admit every /health* spelling anonymously -
+             /healthz/live, /health-internal - none of which is a probe. With the exact entries the only
+             other spellings admitted are longer ones of these same two paths, which match no servlet and
+             get the container's own 404. Such a request runs this filter, so it is minted a session just
+             as a request to /ping.txt or /control is: that is this filter's long standing behaviour for
+             every path it admits and the health registration neither worsens nor addresses it. -->
         <init-param>
             <param-name>allowedPaths</param-name>
             <param-value>/ping.txt:/error:/control:/select:/index.html:/index.jsp:/default.html:/default.jsp:/health/live:/health/ready</param-value>
@@ -139,18 +120,9 @@ under the License.
 
     <!-- Load-balancer health probes, mapped outside /control/* so they carry neither the OFBTOOLS nor
          the WEBTOOLS base permission, and reached anonymously because the two exact paths are listed in
-         ControlFilter's allowedPaths above.
-
-         The url-pattern is the /health/ PREFIX so that this servlet - and not the container's default
-         servlet - answers every spelling that allow-list admits, including a near miss such as
-         /health/live-x. That is what lets it discard the session ControlFilter minted before the
-         allow-list was even consulted; see the note on the allowedPaths entries above. The ROUTE is
-         still exactly two paths: HealthCheckServlet.isProbePath is the single definition of a probe
-         path, and the servlet answers 404 for anything else, so the prefix mapping widens what reaches
-         this class without widening what it serves.
-
-         The servlet takes no init-param and is loaded on demand: nothing it holds is created until the
-         first probe arrives. -->
+         ControlFilter's allowedPaths above. Two exact url-patterns rather than a prefix, so that only
+         these two paths reach the class at all. The servlet takes no init-param and is loaded on demand:
+         nothing it holds is created until the first probe arrives. -->
     <servlet>
         <description>Health and readiness check servlet for load balancer probes</description>
         <display-name>HealthCheckServlet</display-name>
@@ -159,7 +131,8 @@ under the License.
     </servlet>
     <servlet-mapping>
         <servlet-name>HealthCheckServlet</servlet-name>
-        <url-pattern>/health/*</url-pattern>
+        <url-pattern>/health/live</url-pattern>
+        <url-pattern>/health/ready</url-pattern>
     </servlet-mapping>
 
     <welcome-file-list>

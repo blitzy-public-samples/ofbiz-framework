@@ -1,4 +1,4 @@
-/*
+/*******************************************************************************
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,395 +15,285 @@
  * KIND, either express or implied.  See the License for the
  * specific language governing permissions and limitations
  * under the License.
- */
+ *******************************************************************************/
 package org.apache.ofbiz.content.data.store;
 
+import java.io.ByteArrayInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.ofbiz.base.util.Debug;
+import org.apache.ofbiz.base.util.GeneralException;
+import org.apache.ofbiz.base.util.UtilProperties;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectResponse;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectResponse;
+
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-
-import java.io.ByteArrayInputStream;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.attribute.FileTime;
-import java.util.LinkedHashMap;
-import java.util.Map;
-
-import org.apache.ofbiz.base.util.GeneralException;
-import org.apache.ofbiz.base.util.UtilProperties;
-import org.apache.ofbiz.content.data.DataResourceWorker;
-import org.apache.ofbiz.entity.transaction.TransactionUtil;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
- * Provider selection, the provider contract, and the worker's storage seam.
+ * Provider selection and S3-provider behaviour, as pure unit tests.
  *
- * <p>Every test runs offline: {@code ofbiz.home} is redirected at a temporary directory and the provider
- * under test is the filesystem one, which is the provider that can be observed without a network. The S3
- * provider is exercised for the things that do not need a bucket - its configuration contract, and that a
- * store which cannot answer reports a failure rather than absence.
+ * <p>Nothing here opens a database connection, resolves a delegator, starts a transaction, writes a file
+ * or reaches the network. Selection is exercised by varying {@code content.store.provider} in memory and
+ * asserting only what {@code ContentStoreFactory} answers; the S3 provider is exercised against a Mockito
+ * mock of the SDK client, passed in through the provider's package-private test seam, so no AWS
+ * configuration, credential resolution or endpoint is involved.
  *
- * <p>Configuration is set with {@code UtilProperties.setPropertyValueInMemory}, and every value this class
- * changes is restored afterwards, because that call lasts for the life of the JVM and the properties are
- * shared with every other test in the same run.
+ * <p>The class is {@code final} because Checkstyle's {@code DesignForExtension} does not exempt
+ * {@code @BeforeEach} and {@code @AfterEach} - only the JUnit 4 lifecycle annotations - and this class
+ * needs both.
+ *
+ * <p>Every value it changes is restored afterwards. {@code UtilProperties.setPropertyValueInMemory}
+ * mutates the shared, cached {@code Properties} instance for the resource, and Gradle runs the whole unit
+ * tier in one JVM, so an unrestored override would change what other test classes observe.
  */
 public final class ContentStoreFactoryTest {
 
+    /** The property resource the factory and the providers read. */
     private static final String RESOURCE = "content";
-    private static final String PROVIDER = "content.store.provider";
-    private static final String S3_BUCKET = "content.store.s3.bucket";
-    private static final String S3_REGION = "content.store.s3.region";
-    private static final String S3_ENDPOINT = "content.store.s3.endpoint";
-    private static final String S3_ACCESS_KEY = "content.store.s3.access.key.id";
-    private static final String S3_SECRET_KEY = "content.store.s3.secret.access.key";
-    private static final String S3_PATH_STYLE = "content.store.s3.path.style";
 
-    /** Every property this class writes, so that each is restored whatever a test did to it. */
-    private static final String[] TOUCHED = {PROVIDER, S3_BUCKET, S3_REGION, S3_ENDPOINT, S3_ACCESS_KEY,
-        S3_SECRET_KEY, S3_PATH_STYLE};
+    private static final String PROVIDER_KEY = "content.store.provider";
+    private static final String BUCKET_KEY = "content.store.s3.bucket";
+    private static final String REGION_KEY = "content.store.s3.region";
+    private static final String ENDPOINT_KEY = "content.store.s3.endpoint";
+    private static final String ACCESS_KEY_KEY = "content.store.s3.access.key.id";
+    private static final String SECRET_KEY_KEY = "content.store.s3.secret.access.key";
+    private static final String PATH_STYLE_KEY = "content.store.s3.path.style";
 
-    @TempDir
-    private Path home;
+    /** Every key this test writes, and therefore every key it has to put back. */
+    private static final List<String> MANAGED_KEYS = List.of(PROVIDER_KEY, BUCKET_KEY, REGION_KEY, ENDPOINT_KEY,
+            ACCESS_KEY_KEY, SECRET_KEY_KEY, PATH_STYLE_KEY);
 
-    private final Map<String, String> committed = new LinkedHashMap<>();
-    private String committedOfbizHome;
+    /** A storage key of the shape the content-store seam derives from an uploaded file's own path. */
+    private static final String KEY = "ofbiz/runtime/uploads/1700000000000/10000.png";
+
+    /** The bucket the mocked client is addressed with. Obviously fake, like every fixture here. */
+    private static final String BUCKET = "test-bucket";
+
+    private final Map<String, String> original = new LinkedHashMap<>();
+    private boolean logErrorOn;
 
     @BeforeEach
-    public void redirectDeploymentAtATemporaryDirectory() throws IOException {
-        assertNotNull(UtilProperties.getProperties(RESOURCE), "the [" + RESOURCE + "] resource must resolve");
-        for (String property : TOUCHED) {
-            committed.put(property, UtilProperties.getPropertyValue(RESOURCE, property));
+    public void initialize() {
+        System.setProperty("ofbiz.home", System.getProperty("user.dir"));
+        // A resource that cannot be resolved would make setPropertyValueInMemory a silent no-op, and every
+        // selection assertion below would then be reading the committed value instead of the written one.
+        assertNotNull(UtilProperties.getProperties(RESOURCE), "the content resource must resolve on the class path");
+        for (String key : MANAGED_KEYS) {
+            original.put(key, UtilProperties.getPropertyValue(RESOURCE, key));
         }
-        committedOfbizHome = System.getProperty("ofbiz.home");
-        System.setProperty("ofbiz.home", home.toString());
-        Files.createDirectories(home.resolve("runtime/uploads"));
+        logErrorOn = Debug.isOn(Debug.ERROR); // save the current setting (to be restored after the tests)
+        Debug.set(Debug.ERROR, false); // disable error logging
+        ContentStoreFactory.clearCache();
     }
 
     @AfterEach
-    public void restoreTheCommittedConfiguration() {
-        for (Map.Entry<String, String> property : committed.entrySet()) {
-            UtilProperties.setPropertyValueInMemory(RESOURCE, property.getKey(), property.getValue());
+    public void restore() {
+        for (Map.Entry<String, String> held : original.entrySet()) {
+            UtilProperties.setPropertyValueInMemory(RESOURCE, held.getKey(), held.getValue());
         }
-        if (committedOfbizHome == null) {
-            System.clearProperty("ofbiz.home");
-        } else {
-            System.setProperty("ofbiz.home", committedOfbizHome);
-        }
-    }
-
-    // ---------------------------------------------------------------------------------------------
-    // Provider selection
-    // ---------------------------------------------------------------------------------------------
-
-    @Test
-    public void theShippedDefaultSelectsNoProvider() throws GeneralException {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "database");
-        assertNull(ContentStoreFactory.getContentStore(),
-                "database storage must resolve no external provider, so the seam stays inert");
+        original.clear();
+        ContentStoreFactory.clearCache(); // drop and close whatever a test resolved
+        Debug.set(Debug.ERROR, logErrorOn); // restore the error log setting
     }
 
     @Test
-    public void anUnsetProviderSelectsNoProvider() throws GeneralException {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "");
-        assertNull(ContentStoreFactory.getContentStore(), "an unset provider must fall back to database storage");
+    public void anUnsetProviderResolvesToDatabaseMode() throws GeneralException {
+        select("");
+
+        assertNull(ContentStoreFactory.getContentStore(), "an unset provider must leave content storage unchanged");
     }
 
     @Test
-    public void filesystemSelectsTheFilesystemProvider() throws GeneralException {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "filesystem");
-        assertInstanceOf(FileSystemContentStore.class, ContentStoreFactory.getContentStore());
+    public void anExplicitDatabaseProviderResolvesToDatabaseMode() throws GeneralException {
+        select("database");
+
+        assertNull(ContentStoreFactory.getContentStore(), "database storage must resolve no provider at all");
+    }
+
+    @Test
+    public void theFilesystemProviderIsResolved() throws GeneralException {
+        select("filesystem");
+
+        ContentStore store = ContentStoreFactory.getContentStore();
+
+        assertNotNull(store, "the filesystem provider must be resolved");
+        assertTrue(store instanceof FileSystemContentStore, "the filesystem provider must be resolved");
+    }
+
+    @Test
+    public void theS3ProviderIsResolved() throws GeneralException {
+        configureS3();
+        select("s3");
+
+        ContentStore store = ContentStoreFactory.getContentStore();
+
+        assertNotNull(store, "the s3 provider must be resolved");
+        assertTrue(store instanceof S3ContentStore, "the s3 provider must be resolved");
+    }
+
+    @Test
+    public void anUnrecognisedProviderFallsBackToDatabaseModeWithoutThrowing() {
+        select("nonsense");
+
+        // Both halves of the contract in one assertion: resolution must not throw, and what it answers
+        // must be database mode. A block lambda is void-only, so it binds to Executable unambiguously.
+        assertDoesNotThrow(() -> {
+            assertNull(ContentStoreFactory.getContentStore(),
+                    "an unrecognised provider must fall back to database storage");
+        }, "an unrecognised provider must never stop an instance from starting");
     }
 
     @Test
     public void theProviderNameIsCaseInsensitive() throws GeneralException {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "FileSystem");
-        assertInstanceOf(FileSystemContentStore.class, ContentStoreFactory.getContentStore());
+        select("Database");
+        assertNull(ContentStoreFactory.getContentStore(), "the provider name must be matched case insensitively");
+
+        configureS3();
+        select("S3");
+        assertTrue(ContentStoreFactory.getContentStore() instanceof S3ContentStore,
+                "the provider name must be matched case insensitively");
     }
 
     @Test
-    public void s3SelectsTheS3Provider() throws GeneralException {
-        configureS3("http://127.0.0.1:1/");
-        assertInstanceOf(S3ContentStore.class, ContentStoreFactory.getContentStore());
+    public void theProviderNameIsTrimmed() throws GeneralException {
+        configureS3();
+        select(" s3 ");
+
+        assertTrue(ContentStoreFactory.getContentStore() instanceof S3ContentStore,
+                "a provider name with surrounding space must still be matched");
     }
 
     @Test
-    public void anUnrecognisedProviderIsRefused() {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "gcs");
-        GeneralException refused = assertThrows(GeneralException.class, ContentStoreFactory::getContentStore);
-        assertTrue(refused.getMessage().contains("gcs"), "the refusal must name the value it refused");
+    public void oneProviderIsResolvedOncePerJvm() throws GeneralException {
+        select("filesystem");
+
+        ContentStore first = ContentStoreFactory.getContentStore();
+        ContentStore second = ContentStoreFactory.getContentStore();
+
+        assertSame(first, second, "the resolved provider must be reused rather than rebuilt per call");
     }
 
     @Test
-    public void oneResolutionIsReusedUntilTheConfigurationChanges() throws GeneralException {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "filesystem");
-        assertSameInstance(ContentStoreFactory.getContentStore(), ContentStoreFactory.getContentStore());
-        configureS3("http://127.0.0.1:1/");
-        assertInstanceOf(S3ContentStore.class, ContentStoreFactory.getContentStore(),
-                "a changed configuration must resolve a new provider rather than reuse the cached one");
-    }
+    public void everyOperationIsIssuedAgainstTheConfiguredBucket() throws GeneralException, IOException {
+        S3Client client = mock(S3Client.class);
+        ContentStore store = new S3ContentStore(client, BUCKET);
+        byte[] content = "the content".getBytes(StandardCharsets.UTF_8);
 
-    // ---------------------------------------------------------------------------------------------
-    // The S3 provider's configuration contract
-    // ---------------------------------------------------------------------------------------------
+        when(client.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                .thenReturn(PutObjectResponse.builder().build());
+        store.put(KEY, content);
+        verify(client).putObject(any(PutObjectRequest.class), any(RequestBody.class));
 
-    @Test
-    public void s3RequiresABucketAndARegion() {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "s3");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_REGION, "us-east-1");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_BUCKET, "");
-        assertTrue(assertThrows(GeneralException.class, ContentStoreFactory::getContentStore)
-                .getMessage().contains(S3_BUCKET));
+        when(client.getObject(any(GetObjectRequest.class))).thenReturn(response(content));
+        assertArrayEquals(content, store.get(KEY), "get must answer the bytes the bucket holds");
 
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_BUCKET, "a-bucket");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_REGION, "");
-        assertTrue(assertThrows(GeneralException.class, ContentStoreFactory::getContentStore)
-                .getMessage().contains(S3_REGION));
-    }
-
-    @Test
-    public void s3RefusesHalfACredentialPair() {
-        configureS3("");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_SECRET_KEY, "");
-        assertTrue(assertThrows(GeneralException.class, ContentStoreFactory::getContentStore)
-                .getMessage().contains(S3_SECRET_KEY), "half a credential pair must be refused, not half-applied");
-    }
-
-    @Test
-    public void s3RefusesAnEndpointThatIsNotAnAbsoluteHttpUri() {
-        configureS3("s3.example.internal:9000");
-        assertTrue(assertThrows(GeneralException.class, ContentStoreFactory::getContentStore)
-                .getMessage().contains(S3_ENDPOINT));
-    }
-
-    @Test
-    public void s3AcceptsAnEndpointOverrideWithPathStyleAddressing() throws GeneralException {
-        configureS3("https://s3.example.internal:9000");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_PATH_STYLE, "true");
-        assertInstanceOf(S3ContentStore.class, ContentStoreFactory.getContentStore());
-    }
-
-    // ---------------------------------------------------------------------------------------------
-    // The provider contract, exercised against the filesystem provider
-    // ---------------------------------------------------------------------------------------------
-
-    @Test
-    public void contentRoundTripsThroughEveryOperation() throws GeneralException, IOException {
-        ContentStore store = new FileSystemContentStore(home.resolve("store").toString());
-        byte[] content = "the-content".getBytes(StandardCharsets.UTF_8);
-
-        assertFalse(store.exists("runtime/uploads/1/10000.txt"), "nothing is held before a put");
-        store.put("runtime/uploads/1/10000.txt", new ByteArrayInputStream(content), content.length);
-
-        assertTrue(store.exists("runtime/uploads/1/10000.txt"));
-        assertArrayEquals(content, store.get("runtime/uploads/1/10000.txt"));
-        try (InputStream opened = store.openStream("runtime/uploads/1/10000.txt")) {
-            assertArrayEquals(content, opened.readAllBytes());
+        when(client.getObject(any(GetObjectRequest.class))).thenReturn(response(content));
+        try (InputStream opened = store.openStream(KEY)) {
+            assertArrayEquals(content, opened.readAllBytes(), "openStream must answer the same bytes");
         }
 
-        store.delete("runtime/uploads/1/10000.txt");
-        assertFalse(store.exists("runtime/uploads/1/10000.txt"));
-        store.delete("runtime/uploads/1/10000.txt");
+        when(client.headObject(any(HeadObjectRequest.class)))
+                .thenReturn(HeadObjectResponse.builder().contentLength((long) content.length).build());
+        assertTrue(store.exists(KEY), "exists must be true for a key the bucket holds");
+
+        when(client.deleteObject(any(DeleteObjectRequest.class))).thenReturn(DeleteObjectResponse.builder().build());
+        store.delete(KEY);
+        verify(client).deleteObject(any(DeleteObjectRequest.class));
     }
 
     @Test
-    public void aReplacementOfEqualLengthIsVisibleInFull() throws GeneralException, IOException {
-        ContentStore store = new FileSystemContentStore(home.resolve("store").toString());
-        put(store, "runtime/uploads/1/10000.txt", "first-version");
-        put(store, "runtime/uploads/1/10000.txt", "secnd-version");
-        assertEquals("secnd-version", new String(store.get("runtime/uploads/1/10000.txt"), StandardCharsets.UTF_8),
-                "a replacement of the same length must replace the whole object");
+    public void absenceIsReportedAsAbsenceAndNothingElseIs() throws GeneralException, IOException {
+        S3Client client = mock(S3Client.class);
+        ContentStore store = new S3ContentStore(client, BUCKET);
+
+        when(client.headObject(any(HeadObjectRequest.class))).thenThrow(NoSuchKeyException.builder().build());
+        assertFalse(store.exists(KEY), "exists must answer false, not throw, for a key the bucket does not hold");
+
+        when(client.getObject(any(GetObjectRequest.class))).thenThrow(NoSuchKeyException.builder().build());
+        assertThrows(FileNotFoundException.class, () -> store.get(KEY),
+                "an absent object must be reported as absence so that a caller answers 404");
+        assertThrows(FileNotFoundException.class, () -> store.openStream(KEY),
+                "an absent object must be reported as absence so that a caller answers 404");
     }
 
     @Test
-    public void absenceIsReportedAsFileNotFoundAndNothingElseIs() throws GeneralException, IOException {
-        ContentStore store = new FileSystemContentStore(home.resolve("store").toString());
-        assertThrows(FileNotFoundException.class, () -> store.get("runtime/uploads/1/absent.txt"));
-        assertThrows(FileNotFoundException.class, () -> store.openStream("runtime/uploads/1/absent.txt"));
-        assertFalse(store.exists("runtime/uploads/1/absent.txt"));
-    }
+    public void aKeyThatBreaksTheGrammarIsRefused() {
+        ContentStore store = new S3ContentStore(mock(S3Client.class), BUCKET);
+        byte[] content = new byte[0];
 
-    @Test
-    public void aKeyThatBreaksTheGrammarIsRefused() throws GeneralException {
-        ContentStore store = new FileSystemContentStore(home.resolve("store").toString());
-        for (String key : new String[] {"", "/absolute/path", "runtime//uploads/x", "runtime/../../escape",
-                "runtime\\uploads\\x", "runtime/uploads/"}) {
-            assertThrows(GeneralException.class, () -> store.exists(key), "key [" + key + "] must be refused");
-        }
-    }
-
-    // ---------------------------------------------------------------------------------------------
-    // The worker's storage seam
-    // ---------------------------------------------------------------------------------------------
-
-    @Test
-    public void aStandardUploadIsPublishedOnCommitAndReadBackAfterTheLocalCopyIsGone()
-            throws GeneralException, IOException {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "filesystem");
-        ContentStore store = ContentStoreFactory.getContentStore();
-
-        Path uploaded = uploadInOneTransaction("10000.txt", "the-uploaded-content");
-        String key = home.relativize(uploaded).toString();
-        assertTrue(store.exists(key), "an upload must be published to the store by the time its transaction commits");
-        assertEquals("the-uploaded-content", new String(store.get(key), StandardCharsets.UTF_8));
-
-        // The standard upload service records this exact absolute path as a LOCAL_FILE objectInfo, so the
-        // read has to pass the LOCAL_FILE allow-list before the provider is consulted. Removing the local
-        // copy is what a replaced instance looks like.
-        Files.delete(uploaded);
-        File resolved = DataResourceWorker.getContentFile("LOCAL_FILE", uploaded.toString(), null);
-        assertTrue(resolved.exists(), "the local copy must be read back from the store");
-        assertEquals("the-uploaded-content", Files.readString(resolved.toPath()));
-    }
-
-    @Test
-    public void aRewriteOfEqualLengthAndUnchangedModificationTimeIsStillPublished()
-            throws GeneralException, IOException {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "filesystem");
-        ContentStore store = ContentStoreFactory.getContentStore();
-
-        Path uploaded = uploadInOneTransaction("10000.txt", "first-version");
-        String key = home.relativize(uploaded).toString();
-        FileTime unchanged = Files.getLastModifiedTime(uploaded);
-
-        boolean began = TransactionUtil.begin();
-        DataResourceWorker.getDataResourceContentUploadPath(true);
-        Files.writeString(uploaded, "secnd-version", StandardCharsets.UTF_8);
-        Files.setLastModifiedTime(uploaded, unchanged);
-        assertEquals("first-version".length(), Files.size(uploaded), "the rewrite must be of equal length");
-        assertEquals(unchanged, Files.getLastModifiedTime(uploaded), "the rewrite must keep the timestamp");
-        commit(began);
-
-        assertEquals("secnd-version", new String(store.get(key), StandardCharsets.UTF_8),
-                "a rewrite that changes neither length nor timestamp must still be published, or the store"
-                        + " keeps serving the previous content for ever");
-    }
-
-    @Test
-    public void aPublicationFailureRollsTheTransactionBack() throws GeneralException {
-        // An endpoint that refuses every connection: the store cannot take the content, and a row naming it
-        // must therefore not be committed.
-        configureS3("http://127.0.0.1:1/");
-        assertNotNull(ContentStoreFactory.getContentStore());
-
-        boolean began = TransactionUtil.begin();
-        assertThrows(Exception.class, () -> {
-            String directory = DataResourceWorker.getDataResourceContentUploadPath(true);
-            Files.writeString(Path.of(directory, "10000.txt"), "unpublishable", StandardCharsets.UTF_8);
-            commit(began);
-        }, "the commit must fail when the content could not be published");
-    }
-
-    @Test
-    public void aStoreThatCannotAnswerIsAFailureAndNotAnAbsence() throws IOException {
-        configureS3("http://127.0.0.1:1/");
-        Path absent = home.resolve("runtime/uploads/1/10000.txt");
-        Files.createDirectories(absent.getParent());
-
-        Exception raised = assertThrows(Exception.class, () ->
-                DataResourceWorker.getContentFile("LOCAL_FILE", absent.toString(), null));
-        assertInstanceOf(GeneralException.class, raised,
-                "a store that cannot answer must raise a failure, not report the content missing");
-        assertFalse(raised instanceof FileNotFoundException,
-                "FileNotFoundException means the store does not hold the content, which is not what happened");
-    }
-
-    @Test
-    public void theSeamIsInertUnderTheShippedDefault() throws GeneralException, IOException {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "database");
-
-        Path uploaded = uploadInOneTransaction("10000.txt", "local-only");
-        assertFalse(Files.exists(home.resolve("runtime/contentstore")),
-                "database storage must publish nothing at all");
-        assertTrue(Files.exists(uploaded), "the upload must still be where it has always been");
-    }
-
-    // ---------------------------------------------------------------------------------------------
-    // Fixtures
-    // ---------------------------------------------------------------------------------------------
-
-    /**
-     * Resolves an upload directory inside a transaction, writes a file into it and commits, which is the
-     * sequence {@code attachUploadToDataResource} performs for a LOCAL_FILE upload.
-     *
-     * @param name the file name the upload service would compose from the dataResourceId
-     * @param content what to write
-     * @return the file that was written
-     * @throws IOException if the file cannot be written
-     * @throws GeneralException if the transaction cannot be begun or committed
-     */
-    private Path uploadInOneTransaction(String name, String content) throws IOException, GeneralException {
-        boolean began = TransactionUtil.begin();
-        String directory = DataResourceWorker.getDataResourceContentUploadPath(true);
-        Path uploaded = Path.of(directory, name);
-        Files.writeString(uploaded, content, StandardCharsets.UTF_8);
-        commit(began);
-        return uploaded;
+        assertThrows(GeneralException.class, () -> store.put("", content), "an empty key must be refused");
+        assertThrows(GeneralException.class, () -> store.put("/absolute", content), "a rooted key must be refused");
+        assertThrows(GeneralException.class, () -> store.put("trailing/", content),
+                "a key ending in a separator must be refused");
+        assertThrows(GeneralException.class, () -> store.put("a//b", content),
+                "a key with an empty segment must be refused");
+        assertThrows(GeneralException.class, () -> store.put("a/../b", content),
+                "a key with a relative segment must be refused");
+        assertThrows(GeneralException.class, () -> store.put("a\\b", content),
+                "a key with a backslash must be refused");
     }
 
     /**
-     * Commits, reporting a rolled-back transaction as a checked failure.
+     * Selects a storage provider and drops the cached resolution so the next call re-reads it.
      *
-     * @param began whether this test began the transaction
-     * @throws GeneralException if the transaction could not be committed
+     * @param provider the value to write to {@code content.store.provider}
      */
-    private static void commit(boolean began) throws GeneralException {
-        try {
-            TransactionUtil.commit(began);
-        } catch (Exception e) {
-            throw new GeneralException(e);
-        }
+    private static void select(String provider) {
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER_KEY, provider);
+        ContentStoreFactory.clearCache();
     }
 
     /**
-     * Stores content under a key.
-     *
-     * @param store the store
-     * @param key the storage key
-     * @param content what to store
-     * @throws GeneralException if the key is unusable
-     * @throws IOException if the store cannot be written
+     * Writes obviously fake S3 settings, complete enough for the SDK to build a client entirely offline.
      */
-    private static void put(ContentStore store, String key, String content) throws GeneralException, IOException {
-        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
-        store.put(key, new ByteArrayInputStream(bytes), bytes.length);
+    private static void configureS3() {
+        UtilProperties.setPropertyValueInMemory(RESOURCE, BUCKET_KEY, BUCKET);
+        UtilProperties.setPropertyValueInMemory(RESOURCE, REGION_KEY, "us-east-1");
+        UtilProperties.setPropertyValueInMemory(RESOURCE, ENDPOINT_KEY, "http://127.0.0.1:1");
+        UtilProperties.setPropertyValueInMemory(RESOURCE, ACCESS_KEY_KEY, "test-access-key");
+        UtilProperties.setPropertyValueInMemory(RESOURCE, SECRET_KEY_KEY, "test-secret-key");
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PATH_STYLE_KEY, "true");
     }
 
     /**
-     * Declares a complete, valid S3 configuration with the given endpoint.
+     * Builds the response the mocked client answers a GetObject with.
      *
-     * @param endpoint the endpoint to declare, which may be blank for Amazon S3
+     * @param content the bytes the bucket is pretending to hold
+     * @return the response stream
      */
-    private static void configureS3(String endpoint) {
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER, "s3");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_BUCKET, "a-bucket");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_REGION, "us-east-1");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_ENDPOINT, endpoint);
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_ACCESS_KEY, "an-access-key");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_SECRET_KEY, "a-secret-key");
-        UtilProperties.setPropertyValueInMemory(RESOURCE, S3_PATH_STYLE, "true");
-    }
-
-    /**
-     * Asserts that two resolutions returned the very same provider instance.
-     *
-     * @param first the first resolution
-     * @param second the second resolution
-     */
-    private static void assertSameInstance(ContentStore first, ContentStore second) {
-        assertSame(first, second, "an unchanged configuration must reuse one provider instance");
+    private static ResponseInputStream<GetObjectResponse> response(byte[] content) {
+        return new ResponseInputStream<>(GetObjectResponse.builder().contentLength((long) content.length).build(),
+                new ByteArrayInputStream(content));
     }
 }

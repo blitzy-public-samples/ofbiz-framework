@@ -21,31 +21,44 @@ under the License.
  - The Entity Engine configuration a CONTAINER uses when it is pointed at a managed PostgreSQL database.
  -
  - docker/docker-entrypoint.sh renders this file into /ofbiz/config/entityengine.xml - a directory that
- - precedes ofbiz.jar on the class path - when OFBIZ_POSTGRES_HOST is set, substituting these tokens:
+ - precedes ofbiz.jar on the class path - when OFBIZ_POSTGRES_HOST is set. Every attribute value below
+ - that reads as an upper-case name delimited by two "at" signs is a placeholder the entry point
+ - substitutes. Those placeholder names are deliberately NOT spelled out in this comment: the
+ - substitution is a global one, so naming them here would copy live database passwords into the
+ - comments of the rendered file. What is substituted, and from where:
  -
- -   @HOST@ @PORT@                              OFBIZ_POSTGRES_HOST, OFBIZ_POSTGRES_PORT (default 5432)
- -   @OFBIZ_DB@ @OFBIZ_USERNAME@ @OFBIZ_PASSWORD@     OFBIZ_POSTGRES_OFBIZ_{DB,USER,PASSWORD}
- -   @OLAP_DB@ @OLAP_USERNAME@ @OLAP_PASSWORD@        OFBIZ_POSTGRES_OLAP_{DB,USER,PASSWORD}
- -   @TENANT_DB@ @TENANT_USERNAME@ @TENANT_PASSWORD@  OFBIZ_POSTGRES_TENANT_{DB,USER,PASSWORD}
- -   @CHECK_ON_START@ @ADD_MISSING_ON_START@    both false for a serving instance; both true for the
- -                                              one-shot OFBIZ_SCHEMA_INIT=true run
- -   @DISTRIBUTED_CACHE_CLEAR@                  OFBIZ_DISTRIBUTED_CACHE_CLEAR (default false)
- -   @DB_POOL_MIN@ @DB_POOL_MAX@                OFBIZ_DB_POOL_MIN (default 2), OFBIZ_DB_POOL_MAX
- -                                              (default 250). Both are PER-INSTANCE bounds, so a fleet
- -                                              of n instances can open up to n * max connections per
- -                                              entity group; keep that within the server's
- -                                              max_connections.
+ -   jdbc-uri host and port      OFBIZ_POSTGRES_HOST, OFBIZ_POSTGRES_PORT (default 5432)
+ -   jdbc-uri database name,     OFBIZ_POSTGRES_OFBIZ_{DB,USER,PASSWORD} for localpostgres, and the
+ -   jdbc-username,              matching OFBIZ_POSTGRES_OLAP_* and OFBIZ_POSTGRES_TENANT_* triples for
+ -   jdbc-password               localpostgresolap and localpostgrestenant
+ -   check-on-start,             both false for a serving instance; both true for the one-shot
+ -   add-missing-on-start        OFBIZ_SCHEMA_INIT=true run
+ -   distributed-cache-clear-    OFBIZ_DISTRIBUTED_CACHE_CLEAR (default false). The entry point refuses
+ -   enabled                     to start with it on unless a jms-service named serviceMessenger really
+ -                               is configured: the distributedClear* services are declared
+ -                               engine="jms" location="serviceMessenger", and that jms-service ships
+ -                               commented out, so with the flag on and no transport every cache
+ -                               invalidation would be undeliverable and would mark the calling
+ -                               transaction rollback-only.
+ -   pool-minsize,               OFBIZ_DB_POOL_MIN (default 2), OFBIZ_DB_POOL_MAX (default 250). Both
+ -   pool-maxsize                are PER-INSTANCE bounds, so a fleet of n instances can open up to
+ -                               n * max connections per entity group; keep that within the server's
+ -                               max_connections.
  -
  - Every network wait is bounded, because pgJDBC leaves socketTimeout and loginTimeout at 0 - NO LIMIT -
  - when they are absent, so a thread that reaches a database which has stopped answering would block for as
  - long as the kernel keeps the connection open. The values below are the ones the committed
  - framework/entity/config/entityengine.xml uses for the same datasources.
  -
- - TLS is left to the driver's own default, sslmode=prefer, which encrypts when the server offers TLS and
- - falls back to plaintext when it does not. A deployment that must VERIFY the server's certificate appends
- - "&amp;sslmode=verify-full&amp;sslrootcert=/path/to/ca.crt" to the jdbc-uri values below - pgJDBC does not
- - consult the JVM trust store by default - through a /docker-entrypoint-hooks/before-config-applied.d
- - script or a mounted copy of this template. See DOCKER.adoc.
+ - TLS is NOT left to the driver's own default. pgJDBC's default, sslmode=prefer, encrypts when the server
+ - offers TLS and falls back to PLAINTEXT when it does not, so the entry point inserts sslmode - and
+ - sslrootcert when one was given - immediately in front of the connection-timeout parameter of every
+ - PostgreSQL jdbc-uri below, from OFBIZ_POSTGRES_SSLMODE and OFBIZ_POSTGRES_SSLROOTCERT. The prod profile
+ - defaults to verify-full and refuses to start without a readable certificate authority file, because
+ - pgJDBC does not consult the JVM trust store; a development profile keeps prefer. That insertion anchors
+ - on the connection-timeout parameter that opens each query string, so that parameter has to stay first
+ - in every PostgreSQL jdbc-uri here; the embedded H2 URIs separate their parameters with ';' and are left
+ - alone. See DOCKER.adoc.
  -
  - The committed framework/entity/config/entityengine.xml is unchanged by rendering: a checkout with no
  - database environment variables still boots on embedded H2.
@@ -63,9 +76,11 @@ under the License.
 
     <debug-xa-resources value="false" />  <!-- see https://issues.apache.org/jira/browse/OFBIZ-4282 for more -->
 
-    <!-- The two SERVING delegators resolve to the managed PostgreSQL datasources. distributed-cache-clear-enabled
-         is a placeholder because more than one instance sharing one database has to invalidate the others' entity
-         caches; it stays false for a single instance, which is the default. -->
+    <!-- The two SERVING delegators resolve to the managed PostgreSQL datasources. Their
+         distributed-cache-clear-enabled placeholder comes from OFBIZ_DISTRIBUTED_CACHE_CLEAR: more than one
+         instance sharing one database has to invalidate the others' entity caches, and it stays false for a
+         single instance, which is the default. The entry point refuses to start with it on unless a
+         serviceMessenger jms-service is configured to carry those invalidations. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="@DISTRIBUTED_CACHE_CLEAR@">
         <group-map group-name="org.apache.ofbiz" datasource-name="localpostgres"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localpostgresolap"/>
