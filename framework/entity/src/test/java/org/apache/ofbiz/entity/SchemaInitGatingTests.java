@@ -19,6 +19,8 @@
 package org.apache.ofbiz.entity;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,13 +32,13 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 
-import org.apache.ofbiz.base.test.ShellDriver;
 import org.apache.ofbiz.entity.config.model.Datasource;
 import org.apache.ofbiz.entity.config.model.DelegatorElement;
 import org.apache.ofbiz.entity.config.model.EntityConfig;
@@ -68,12 +70,12 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * <i>run mode</i> that issues no start up DDL, so a serving instance needs no DDL privilege and a
  * scaled-out fleet cannot race on schema changes. Schema changes are applied exclusively by a
  * separate one-shot init execution, for which the container entry point renders the very same two
- * attributes as {@code true}. Both halves are asserted here - the run mode on the committed model,
- * the init mode by executing the entry point - and the one-shot execution as a whole, including the
- * {@code readers=none} load and the exit before the serving command, additionally in
- * {@code SchemaInitEntryPointTests}. No committed constant is used as a stand-in for the init mode:
- * a constant cannot fail when the machinery that would produce it is deleted, so crediting one as
- * init-mode coverage would report protection that does not exist.</li>
+ * attributes as {@code true}. Both halves are asserted here - the run mode on the committed model, the
+ * init mode by executing the entry point - and so is the one-shot execution as a whole, including the
+ * {@code readers=none} load, the verdicts that judge it and the restoration of the run mode before the
+ * execution exits. No committed constant is used as a stand-in for the init mode: a constant cannot
+ * fail when the machinery that would produce it is deleted, so crediting one as init-mode coverage
+ * would report protection that does not exist.</li>
  * <li><b>Objective 5 - multi-instance coherence.</b> Distributed cache invalidation is
  * configuration-driven and must remain disabled in the committed configuration, so an unconfigured
  * checkout keeps the pre-existing single-node cache behaviour exactly.</li>
@@ -82,16 +84,13 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * <p>Just as importantly, these tests pin the <i>backward-compatible local run</i>: the
  * {@code test} delegator stays bound to H2 so {@code gradlew loadAll} and {@code gradlew
  * testIntegration} do not target the managed datasources, and the embedded H2 datasources keep both
- * start up DDL flags enabled so a bare checkout still self-provisions. Those embedded flags are
- * pinned here at the one moment this class can see them change:
+ * start up DDL flags enabled so a bare checkout still self-provisions. Those embedded flags are pinned
+ * on both artifacts, because they can regress on either one independently:
+ * {@link #embeddedDatasourcesKeepTheirStartupDdlInTheCommittedConfiguration()} reads the committed
+ * model, which is what a bare checkout and the unit and integration tiers run on, and
  * {@link #schemaModeChangesReRenderTheManagedDdlFlagsOnAReusedStateVolume(Path)} reads the file the
- * deployed profile actually runs on, which is generated at every container start and therefore
- * cannot be reviewed once and trusted afterwards. The committed half is left to
- * {@code EntityEngineConfigContractTests}, which asserts an exact dialect, DDL-flag and driver tuple
- * for {@code localh2}, {@code localh2olap} and {@code localh2tenant} <i>together</i> and then
- * establishes the parse asymmetry by removing the attributes from a cloned element and re-parsing.
- * This class states the posture the rendered file must have; that suite states the committed grammar
- * it rests on.</p>
+ * deployed profile actually runs on, which is generated at every container start and therefore cannot
+ * be reviewed once and trusted afterwards.</p>
  *
  * <p>PostgreSQL becomes the default only for the deployed profile, which the container entry point
  * renders from {@code docker/templates/postgres-entityengine.xml} when the database environment
@@ -175,6 +174,12 @@ public final class SchemaInitGatingTests {
      * {@code ofbiz.jar} on the runtime class path, so this file is the configuration the engine reads.
      */
     private static final String RENDERED_CONFIGURATION = "config/entityengine.xml";
+
+    /** Stands for "do not write this attribute at all", which is a distinct posture from writing it false. */
+    private static final String ABSENT_ATTRIBUTE = "absent";
+
+    /** Printed after the serving-mode DDL gate returns, so an allowed start can be told from a refused one. */
+    private static final String GATE_ACCEPTED = "SERVING-DDL-POSTURE-ACCEPTED";
     /** The three managed-RDBMS datasources the deployed profile binds the frozen entity groups to. */
     private static final List<String> MANAGED_DATASOURCES =
             List.of("localpostgres", "localpostgresolap", "localpostgrestenant");
@@ -282,8 +287,8 @@ public final class SchemaInitGatingTests {
      * observable by every suite that runs afterwards in the same JVM. It happens to write the same
      * {@code user.dir} value several sibling suites also write, but a test may not rest on a
      * coincidence of values it does not control, and the suites that do need a different value —
-     * {@code SecurityUtilTest}, {@code AdminKeyConfigTests} and the content-store provider suites —
-     * are exactly the ones that would be affected if this class ran between one of their
+     * {@code SecurityUtilTest} and the content-store provider suites — are exactly the ones that
+     * would be affected if this class ran between one of their
      * assertions. Restoring symmetrically removes the question altogether. Nothing else global is
      * changed: no file is written, no connection is opened and no engine state is mutated.</p>
      */
@@ -337,6 +342,42 @@ public final class SchemaInitGatingTests {
                     + " must not check the schema on start up, so a serving instance issues no DDL");
             assertFalse(managed.getAddMissingOnStart(), datasourceName
                     + " must not add missing schema objects on start up: DDL belongs to the one-shot init only");
+        }
+    }
+
+    /**
+     * The other half of AAP Objective 4, and of the backward-compatible local run it must not break: the
+     * embedded H2 datasources keep both start up DDL flags ENABLED in the committed configuration.
+     *
+     * <p>This is the assertion that stops the run-mode change above from being applied too widely. The
+     * managed datasources issue no DDL because a fleet shares one database; an embedded H2 database is a
+     * file belonging to the single JVM that opens it, is never part of a fleet, and is what makes a bare
+     * checkout self-provision - {@code gradlew loadAll} and {@code gradlew testIntegration} both depend
+     * on the engine applying the entity model to it on start up. Turning these flags off to match the
+     * managed ones would leave a fresh checkout with no schema at all, which is exactly the regression
+     * AAP 0.6.1 calls out when it requires the H2 development and test path to be preserved.</p>
+     *
+     * <p>The <em>resolved</em> flags are asserted, for the same asymmetry
+     * {@link #managedRdbmsRunModeHasDdlDisabled()} describes: here it is {@code add-missing-on-start}
+     * whose literal is load-bearing, since it resolves to {@code false} the moment the attribute is
+     * absent or misspelled, and a schema check that may not add what it finds missing would leave a bare
+     * checkout unprovisioned while the configuration still looked correct.</p>
+     *
+     * <p>The committed configuration is the one asserted here;
+     * {@link #schemaModeChangesReRenderTheManagedDdlFlagsOnAReusedStateVolume(Path)} asserts the same
+     * posture on every configuration the container renders, whichever mode it renders the managed
+     * datasources in.</p>
+     */
+    @Test
+    public void embeddedDatasourcesKeepTheirStartupDdlInTheCommittedConfiguration() {
+        for (String datasourceName : EMBEDDED_DATASOURCES) {
+            Datasource embedded = EntityConfig.getDatasource(datasourceName);
+            assertNotNull(embedded, "the embedded datasource " + datasourceName + " must stay declared: the"
+                    + " committed delegators and the test delegator resolve to it");
+            assertTrue(embedded.getCheckOnStart(), datasourceName + " must keep checking the schema on start"
+                    + " up: it is what makes a bare checkout self-provision, and H2 never joins a fleet");
+            assertTrue(embedded.getAddMissingOnStart(), datasourceName + " must keep adding missing schema"
+                    + " objects on start up, so gradlew loadAll and testIntegration need no schema step");
         }
     }
 
@@ -659,11 +700,15 @@ public final class SchemaInitGatingTests {
      * the flag as {@code "true".equalsIgnoreCase(value)}, so an absent attribute also resolves to
      * {@code false} and cannot be told apart here from the committed literal. The
      * <i>explicitness</i> of that literal still matters, because it is the anchor the entry point
-     * rewrites, and it is pinned by the purpose-built sibling contract test:
-     * {@code EntityEngineConfigContractTests} (in {@code org.apache.ofbiz.entity.config.model},
-     * whose package-private DOM constructors it can reach) compares the raw attribute text of every
-     * delegator in the authoritative file, so deleting the attribute fails
-     * {@code delegatorCacheAndEcaAttributesAreExactlyTheCommittedLiterals}. Contrast
+     * rewrites, and it is enforced where the substitution happens rather than here: the entry point's
+     * {@code require_rendered_cache_clear_mode} re-reads its own rendered file and refuses the start up
+     * when the attribute is missing from either default delegator - "the anchor the entry point
+     * substitutes has been removed or reformatted" - or carries any value other than the one this start
+     * requested, and it refuses a render that put the attribute on the {@code test} delegator at all.
+     * Deleting the committed literal therefore breaks the container start rather than passing
+     * unnoticed, and
+     * {@link #containerEntryPointRendersTheCacheTransportBeforeItValidatesItAndOnEveryStart()} holds
+     * that renderer to running on every start. Contrast
      * {@code check-on-start}, whose absence flips the meaning to {@code true}: there the literal is
      * load-bearing for the resolved posture itself, which is why
      * {@link #managedRdbmsRunModeHasDdlDisabled()} catches its removal directly.</p>
@@ -1136,9 +1181,9 @@ public final class SchemaInitGatingTests {
     /**
      * Runs one of the entry point's two schema-init verdicts over a synthetic log and asserts the outcome.
      *
-     * <p>The entry point is sourced with its trailing {@code _main "$@"} line removed, exactly as
-     * {@code AdminKeyConfigTests} does, so one function can be invoked as a black box without starting
-     * OFBiz. The verdicts print an explanation when they refuse and print nothing when they accept, so
+     * <p>The entry point is sourced with its trailing {@code _main "$@"} line removed - the one line
+     * that would otherwise run the whole start up - so one function can be invoked as a black box
+     * without starting OFBiz. The verdicts print an explanation when they refuse and print nothing when they accept, so
      * "accepted" is simply empty output.</p>
      *
      * @param workDir a per-test temporary directory
@@ -1216,9 +1261,9 @@ public final class SchemaInitGatingTests {
     /**
      * Sources the real entry point and calls one of its pure verdict functions over a synthetic log.
      *
-     * <p>The entry point is sourced with its trailing {@code _main "$@"} line removed, exactly as
-     * {@code AdminKeyConfigTests} does, so one function can be invoked as a black box without starting
-     * OFBiz. Every verdict prints an explanation when it refuses and prints nothing when it accepts, so
+     * <p>The entry point is sourced with its trailing {@code _main "$@"} line removed - the one line
+     * that would otherwise run the whole start up - so one function can be invoked as a black box
+     * without starting OFBiz. Every verdict prints an explanation when it refuses and prints nothing when it accepts, so
      * "accepted" is simply empty output - which is also why no verdict may print anything else.</p>
      *
      * @param workDir a per-test temporary directory
@@ -1553,14 +1598,14 @@ public final class SchemaInitGatingTests {
      * configured to subscribe, that a client library is on the class path, and that something answers on the
      * broker's port; the companion test below holds the start up log to exactly that boundary.</p>
      *
-     * <p><b>That an invalidation reaches a peer is proved elsewhere, and automatically.</b>
-     * {@code framework/entityext/src/test/java/org/apache/ofbiz/entityext/cache/DistributedCacheInvalidationPropagationTests}
-     * drives the production publisher and the production consumer against two instances' caches and asserts the
-     * whole hop for every kind of invalidation the engine raises, including that a consumer applies the clear
-     * locally so it cannot re-publish it. It runs in the same required build gate as this test, so neither the
-     * start up conditions here nor the propagation there depends on an operator remembering to check it. Running
-     * two containers, for which {@code DOCKER.adoc} carries the procedure, remains worthwhile for the one thing
-     * neither test can cover: a specific broker, client library, credentials and topic.</p>
+     * <p><b>That an invalidation reaches a peer is not this refactor's mechanism to prove.</b> The
+     * publisher, the consumer and the service definitions that route between them are OFBiz's own
+     * {@code DistributedCacheClear} and {@code EntityCacheServices}, unchanged here and covered by the
+     * framework's own tiers; what this refactor adds is the per-delegator flag and the start up conditions
+     * asserted above, and those are what this test holds. The hop itself depends on a specific broker,
+     * client library, credentials and topic, none of which exist in this tree - only the JMS API is
+     * bundled - so it is verified against a deployment's own broker, for which {@code DOCKER.adoc}
+     * carries the two-container procedure and the log lines to watch.</p>
      */
     @Test
     public void containerEntryPointRequiresASubscriberAndStartupConnectivityEvidenceForTheTransport() {
@@ -2589,6 +2634,214 @@ public final class SchemaInitGatingTests {
     }
 
     /**
+     * AAP 0.6.4, for a configuration this container did not render: an operator-owned external datasource must
+     * state BOTH startup DDL flags as the exact literal {@code false}, or the start is refused.
+     *
+     * <p>{@code /ofbiz/config} is a declared volume, and the documented way to run against MySQL, Oracle or a
+     * PostgreSQL this image does not parameterise is to mount an {@code entityengine.xml} there and leave the
+     * managed-database variables unset. Nothing renders that file, so nothing else has checked its DDL posture -
+     * which makes this gate the only thing standing between a mounted configuration and a whole fleet issuing
+     * {@code CREATE} and {@code ALTER} against one shared database.
+     *
+     * <p>All nine combinations are driven, because the two flags fail in different ways and only one of the nine
+     * is the posture the plan names:
+     *
+     * <ul>
+     * <li>An ABSENT {@code check-on-start} reads as ENABLED - {@code Datasource.java} parses it as
+     * {@code !"false".equals(value)} - so every instance reads the whole schema on every boot and needs metadata
+     * privileges the fleet is not meant to hold.</li>
+     * <li>An {@code add-missing-on-start} of {@code "true"} under a {@code check-on-start} of {@code "false"}
+     * issues nothing today, only because the engine consults the second flag solely when the first is enabled.
+     * It is a declared intent to create objects, one edit away from a fleet that does.</li>
+     * </ul>
+     *
+     * <p>So "would any DDL happen right now" is deliberately NOT the test. Both flags must say so.
+     *
+     * @param workDir a per-test temporary directory
+     * @throws Exception if the entry point could not be executed
+     */
+    @Test
+    public void anOperatorOwnedExternalDatasourceMustStateBothDdlFlagsFalse(@TempDir Path workDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "the entry point is shell, so these checks need bash");
+        Path home = prepareEntryPointHome(workDir);
+
+        for (String checkOnStart : List.of("false", "true", ABSENT_ATTRIBUTE)) {
+            for (String addMissing : List.of("false", "true", ABSENT_ATTRIBUTE)) {
+                writeExternalDatasourceConfiguration(home, "jdbc:postgresql://db.internal:5432/ofbiz",
+                        checkOnStart, addMissing);
+                ProbeRun run = servingDdlPostureVerdict(workDir, home, false);
+                String posture = "check-on-start=" + checkOnStart + " add-missing-on-start=" + addMissing;
+
+                if ("false".equals(checkOnStart) && "false".equals(addMissing)) {
+                    assertEquals(0, run.exitCode(), "the one posture AAP 0.6.4 names for run mode must be"
+                            + " accepted [" + posture + "]. Output was:\n" + run.output());
+                    assertTrue(run.output().contains(GATE_ACCEPTED), "an accepted posture must let the start"
+                            + " continue [" + posture + "]. Output was:\n" + run.output());
+                    continue;
+                }
+
+                assertNotEquals(0, run.exitCode(), "a serving instance must not start from a non-embedded"
+                        + " datasource whose DDL posture is [" + posture + "], because nothing else has"
+                        + " checked it. Output was:\n" + run.output());
+                assertFalse(run.output().contains(GATE_ACCEPTED), "a refused start must not continue ["
+                        + posture + "]. Output was:\n" + run.output());
+                // The refusal has to name the flag that is wrong, or an operator cannot act on it. The
+                // severest case - the schema check on AND missing objects to be added - is reported as DDL
+                // being enabled rather than as one attribute being unset.
+                String expected;
+                if (!"false".equals(checkOnStart) && "true".equals(addMissing)) {
+                    expected = "leaves startup DDL enabled";
+                } else if (!"false".equals(checkOnStart)) {
+                    expected = "does not set check-on-start=\"false\"";
+                } else {
+                    expected = "does not set add-missing-on-start=\"false\"";
+                }
+                assertTrue(run.output().contains(expected), "the refusal for [" + posture + "] must say ["
+                        + expected + "]. Output was:\n" + run.output());
+                assertTrue(run.output().contains("supplied by this deployment"), "the refusal must name whose"
+                        + " file it is, because a mounted file is corrected by its author and a render is"
+                        + " corrected by re-rendering. Output was:\n" + run.output());
+            }
+        }
+    }
+
+    /**
+     * The DDL posture is judged for a SHARED database and for nothing else: an embedded datasource keeps its
+     * startup DDL, and an H2 reached over the network does not count as embedded.
+     *
+     * <p>This is the shape of the guarantee rather than an exception to it. An embedded database is a file on
+     * one container's own volume: it is single-instance by construction, it never joins a fleet, and applying
+     * the entity model to it on every boot is exactly what makes an unconfigured checkout run with nothing
+     * configured (AAP 0.6.4, 0.7.1). The hazard is a database several instances would issue {@code CREATE} and
+     * {@code ALTER} against, which is every non-embedded one - so {@code jdbc:h2:tcp://} is judged even though
+     * {@code jdbc:h2:} alone is not.
+     *
+     * @param workDir a per-test temporary directory
+     * @throws Exception if the entry point could not be executed
+     */
+    @Test
+    public void onlyASharedDatabaseIsJudgedAndAnEmbeddedOneKeepsItsStartupDdl(@TempDir Path workDir)
+            throws Exception {
+        assumeTrue(isBashAvailable(), "the entry point is shell, so these checks need bash");
+        Path home = prepareEntryPointHome(workDir);
+
+        writeExternalDatasourceConfiguration(home, "jdbc:h2:./runtime/data/h2/ofbiz", "true", "true");
+        ProbeRun embedded = servingDdlPostureVerdict(workDir, home, false);
+        assertEquals(0, embedded.exitCode(), "an embedded datasource is single-instance by construction and"
+                + " keeps its startup DDL, which is what makes a zero-configuration run work. Output was:\n"
+                + embedded.output());
+
+        writeExternalDatasourceConfiguration(home, "jdbc:h2:tcp://h2.internal:9092/ofbiz", "true", "true");
+        ProbeRun remote = servingDdlPostureVerdict(workDir, home, false);
+        assertNotEquals(0, remote.exitCode(), "an H2 reached over the network is a database several instances"
+                + " share, so it must be judged exactly like PostgreSQL. Output was:\n" + remote.output());
+
+        writeExternalDatasourceConfiguration(home, "jdbc:h2:tcp://h2.internal:9092/ofbiz", "false", "false");
+        ProbeRun stated = servingDdlPostureVerdict(workDir, home, false);
+        assertEquals(0, stated.exitCode(), "and it must be accepted once it states the run-mode posture, or"
+                + " the refusal above would be about the dialect rather than about the posture. Output was:\n"
+                + stated.output());
+    }
+
+    /**
+     * Init mode is the one execution that may carry the DDL posture the serving gate refuses.
+     *
+     * <p>{@code OFBIZ_SCHEMA_INIT=true} exists to apply the entity model exactly once, so it renders both flags
+     * true on purpose and cannot be judged by the gate that refuses them. The pair below is what makes the
+     * exemption meaningful: the SAME configuration is accepted in init mode and refused in serving mode, so the
+     * exemption is the mode and not the file.
+     *
+     * @param workDir a per-test temporary directory
+     * @throws Exception if the entry point could not be executed
+     */
+    @Test
+    public void theServingDdlGateExemptsInitModeAndOnlyInitMode(@TempDir Path workDir) throws Exception {
+        assumeTrue(isBashAvailable(), "the entry point is shell, so these checks need bash");
+        Path home = prepareEntryPointHome(workDir);
+        writeExternalDatasourceConfiguration(home, "jdbc:postgresql://db.internal:5432/ofbiz", "true", "true");
+
+        ProbeRun initialising = servingDdlPostureVerdict(workDir, home, true);
+        assertEquals(0, initialising.exitCode(), "init mode is the execution that applies the schema, so the"
+                + " DDL posture it needs must not be refused. Output was:\n" + initialising.output());
+
+        ProbeRun serving = servingDdlPostureVerdict(workDir, home, false);
+        assertNotEquals(0, serving.exitCode(), "the same configuration must be refused when the instance is"
+                + " about to serve, or the exemption would be about the file rather than the mode. Output"
+                + " was:\n" + serving.output());
+    }
+
+    /**
+     * Writes an operator-owned {@code config/entityengine.xml}: no generated marker, serving delegators mapped
+     * to one datasource of the caller's choosing, and exactly the DDL attributes asked for.
+     *
+     * <p>Unmarked on purpose. The marker is what tells the entry point a file is its own render, so a file
+     * without one is the deployment's own configuration - the case that nothing else in this script has checked
+     * and the case this gate exists for.
+     *
+     * @param home the sandbox that stands in for the container's {@code /ofbiz}
+     * @param jdbcUri the connection URI, which decides whether the datasource counts as embedded
+     * @param checkOnStart the {@code check-on-start} literal, or {@link #ABSENT_ATTRIBUTE} to omit it
+     * @param addMissingOnStart the {@code add-missing-on-start} literal, or {@link #ABSENT_ATTRIBUTE} to omit it
+     * @throws IOException if the configuration could not be written
+     */
+    private static void writeExternalDatasourceConfiguration(Path home, String jdbcUri, String checkOnStart,
+            String addMissingOnStart) throws IOException {
+        StringBuilder attributes = new StringBuilder();
+        if (!ABSENT_ATTRIBUTE.equals(checkOnStart)) {
+            attributes.append("\n            check-on-start=\"").append(checkOnStart).append('"');
+        }
+        if (!ABSENT_ATTRIBUTE.equals(addMissingOnStart)) {
+            attributes.append("\n            add-missing-on-start=\"").append(addMissingOnStart).append('"');
+        }
+        String configuration = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                + "<entity-config>\n"
+                + "    <delegator name=\"default\" entity-model-reader=\"main\" entity-group-reader=\"main\""
+                + " entity-eca-reader=\"main\">\n"
+                + "        <group-map group-name=\"org.apache.ofbiz\" datasource-name=\"deploymentdb\"/>\n"
+                + "    </delegator>\n"
+                + "    <delegator name=\"default-no-eca\" entity-model-reader=\"main\""
+                + " entity-group-reader=\"main\" entity-eca-enabled=\"false\">\n"
+                + "        <group-map group-name=\"org.apache.ofbiz\" datasource-name=\"deploymentdb\"/>\n"
+                + "    </delegator>\n"
+                + "    <datasource name=\"deploymentdb\""
+                + "\n            helper-class=\"org.apache.ofbiz.entity.datasource.GenericHelperDAO\""
+                + "\n            field-type-name=\"postgres\"" + attributes + ">\n"
+                + "        <inline-jdbc jdbc-driver=\"org.postgresql.Driver\" jdbc-uri=\"" + jdbcUri + "\""
+                + " jdbc-username=\"deployment\" jdbc-password=\"deployment\"/>\n"
+                + "    </datasource>\n"
+                + "</entity-config>\n";
+        Path override = home.resolve(RENDERED_CONFIGURATION);
+        Files.createDirectories(override.getParent());
+        Files.writeString(override, configuration, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Drives the entry point's real serving-mode DDL gate against whatever configuration the sandbox holds.
+     *
+     * <p>The two variables the function reads are set the way {@code _main} sets them, and nothing else is
+     * stubbed: the group maps, the datasource lookup and the embedded-URI classification all run for real. A
+     * sentinel is printed after the call so that a run which was ALLOWED to continue can be told from one that
+     * was refused, without inferring it from the exit status alone.
+     *
+     * @param workDir a per-test temporary directory
+     * @param home the sandbox the configuration was written into
+     * @param initialising whether the run is an {@code OFBIZ_SCHEMA_INIT=true} execution
+     * @return the exit status and combined output of the run
+     * @throws Exception if the entry point could not be executed
+     */
+    private static ProbeRun servingDdlPostureVerdict(Path workDir, Path home, boolean initialising)
+            throws Exception {
+        return runEntryPointAllowingRefusal(workDir, home,
+                "ENTITY_ENGINE_SOURCE=" + shellQuote("framework/entity/config/entityengine.xml") + "\n"
+                        + "ENTITY_ENGINE_OVERRIDE=" + shellQuote(RENDERED_CONFIGURATION) + "\n"
+                        + "RESOLVED_SCHEMA_INIT=" + (initialising ? "true" : "false") + "\n"
+                        + "require_serving_mode_ddl_safety\n"
+                        + "printf '%s\\n' " + shellQuote(GATE_ACCEPTED) + "\n",
+                Map.of());
+    }
+
+    /**
      * Runs a fragment of shell against the real entry point, sourced as a library, and returns what it
      * printed. A non-zero exit fails the test with that output, because every start driven here is one
      * the entry point must accept.
@@ -2673,5 +2926,132 @@ public final class SchemaInitGatingTests {
      */
     private static List<String> placeholdersIn(String rendered) {
         return PLACEHOLDER.matcher(rendered).results().map(result -> result.group()).toList();
+    }
+
+    /**
+     * Runs a shell script from this suite, safely, and reports what it did.
+     *
+     * <p>Nested here rather than shared from another component's test tree, because the schema-init gating
+     * test is the only authorised new test in this module (plan section 0.2.1) and a shared test fixture
+     * would be a second, unauthorised file. The content-store suite carries its own copy for the same
+     * reason; the two are independent by design.
+     *
+     * <p>Two properties matter and are easy to get wrong:
+     *
+     * <ul>
+     * <li><strong>Draining before waiting makes a deadline ineffective.</strong> Reading the child's output
+     * to its end before {@code waitFor(timeout, unit)} means the READ blocks, and a read has no deadline: a
+     * child that writes nothing and never exits would hang the build. The output is therefore drained on a
+     * thread of its own and the bounded wait comes first.</li>
+     * <li><strong>A child that outruns its deadline has to be killed.</strong> {@code waitFor} returning
+     * {@code false} leaves the process running and nothing in a test JVM will reap it, so it is destroyed
+     * forcibly and only then is its output collected.</li>
+     * </ul>
+     *
+     * <p>Every run replaces, rather than adds to, the {@code OFBIZ_*} part of the environment, so a value
+     * exported into the build agent's own environment cannot steer a case that did not ask for it.
+     * {@code SHELLOPTS}/{@code BASHOPTS} go with them: bash reads {@code SHELLOPTS} at start up, so an
+     * inherited {@code xtrace} would fill the merged output these cases assert on with trace lines.
+     */
+    private static final class ShellDriver {
+
+        private ShellDriver() { }
+
+        /**
+         * What one run of a script produced.
+         *
+         * @param exitCode the exit status, or {@code -1} when the run was killed for outrunning its deadline
+         * @param output everything the run wrote to stdout and stderr, interleaved
+         * @param timedOut whether the run was killed rather than allowed to finish
+         */
+        private record Run(int exitCode, String output, boolean timedOut) {
+
+            /**
+             * Reports whether the run finished successfully.
+             *
+             * @return true when it exited zero within its deadline
+             */
+            private boolean succeeded() {
+                return !timedOut && exitCode == 0;
+            }
+        }
+
+        /**
+         * Reports whether a POSIX shell is available to drive a script at all.
+         *
+         * @return true when {@code bash} can be started
+         */
+        private static boolean isBashAvailable() {
+            try {
+                Process probe = new ProcessBuilder("bash", "-c", "exit 0").redirectErrorStream(true).start();
+                probe.getInputStream().close();
+                return probe.waitFor(10L, TimeUnit.SECONDS) && probe.exitValue() == 0;
+            } catch (IOException unavailable) {
+                return false;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+
+        /**
+         * Runs a script, waits for it, kills it if it outruns its deadline, and collects its output.
+         *
+         * @param script the script to run
+         * @param workingDirectory the directory to run it in
+         * @param environment the variables to run it with; every inherited {@code OFBIZ_} variable is
+         *     removed first
+         * @param timeoutSeconds how long it may take
+         * @return what the run produced
+         * @throws IOException if the process cannot be started
+         */
+        private static Run run(Path script, Path workingDirectory, Map<String, String> environment,
+                long timeoutSeconds) throws IOException {
+            ProcessBuilder builder = new ProcessBuilder("bash", script.toString());
+            builder.directory(workingDirectory.toFile());
+            builder.redirectErrorStream(true);
+            builder.environment().keySet().removeIf(name -> name.startsWith("OFBIZ_")
+                    || "SHELLOPTS".equals(name) || "BASHOPTS".equals(name));
+            builder.environment().putAll(environment);
+
+            Process process = builder.start();
+            StringBuilder collected = new StringBuilder();
+            Thread drain = new Thread(() -> {
+                try (InputStream output = process.getInputStream()) {
+                    byte[] buffer = new byte[8192];
+                    for (int read = output.read(buffer); read >= 0; read = output.read(buffer)) {
+                        synchronized (collected) {
+                            collected.append(new String(buffer, 0, read, StandardCharsets.UTF_8));
+                        }
+                    }
+                } catch (IOException closed) {
+                    // The stream closes when the process ends or is destroyed; nothing left to read.
+                    synchronized (collected) {
+                        collected.append("[output stream closed: ").append(closed.getMessage()).append(']');
+                    }
+                }
+            }, "schema-init-shell-drain");
+            drain.setDaemon(true);
+            drain.start();
+
+            boolean finished;
+            try {
+                finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+                if (!finished) {
+                    process.destroyForcibly();
+                    process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
+                }
+                // Bounded, because a drain still blocked in a read the kill has not yet unblocked must not
+                // become a second unbounded wait; whatever it collected by then is what the failure reports.
+                drain.join(TimeUnit.SECONDS.toMillis(5L));
+            } catch (InterruptedException interrupted) {
+                process.destroyForcibly();
+                Thread.currentThread().interrupt();
+                throw new UncheckedIOException(new IOException("the shell run was interrupted", interrupted));
+            }
+            synchronized (collected) {
+                return new Run(finished ? process.exitValue() : -1, collected.toString(), !finished);
+            }
+        }
     }
 }

@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  *******************************************************************************/
-package org.apache.ofbiz.base.test;
+package org.apache.ofbiz.content.data.store;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -57,7 +57,7 @@ import java.util.concurrent.TimeUnit;
  * environment may well carry {@code OFBIZ_} values, and inheriting one would make a test's outcome depend on
  * where it ran.
  */
-public final class ShellDriver {
+final class ShellDriver {
 
     /** How long a driven script may take before it is treated as wedged rather than slow. */
     public static final long DEFAULT_TIMEOUT_SECONDS = 120L;

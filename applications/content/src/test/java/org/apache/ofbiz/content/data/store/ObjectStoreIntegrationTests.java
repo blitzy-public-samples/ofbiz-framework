@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -49,7 +49,6 @@ import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.entity.Delegator;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.function.Executable;
@@ -80,12 +79,15 @@ import org.junit.jupiter.api.function.Executable;
  * other's objects. Every key written is recorded and deleted after each test, and the deletion is asserted, so
  * a failing test cannot leave the bucket holding its fixtures.
  *
- * <p>Carries the {@code external-services} JUnit tag, so it is excluded from the offline {@code test} task and
- * is the content of {@code testExternalServices}.
+ * <p><strong>Gated by the settings, not by a build task.</strong> When the {@code ofbiz.test.s3.*} settings
+ * are absent every case here is SKIPPED, with a message naming what to supply, so the unit tier stays
+ * offline and reaches no network. A skip is reported as a skip - it never counts as a pass - which is what
+ * keeps an unconfigured run from looking like a verified one. Supply the settings, as system properties or
+ * as the matching {@code OFBIZ_TEST_S3_*} environment variables, and the whole class runs against the
+ * store; the environment form is the one that reaches Gradle's forked test JVM without any build change.
  *
  * @see ContentStoreFactoryTest
  */
-@Tag("external-services")
 public final class ObjectStoreIntegrationTests {
 
     /** The name this class logs under. */
@@ -99,13 +101,14 @@ public final class ObjectStoreIntegrationTests {
     private static final String PROPERTY_S3_SECRET_ACCESS_KEY = "content.store.s3.secret.access.key";
     private static final String PROPERTY_S3_PATH_STYLE = "content.store.s3.path.style";
     private static final String PROPERTY_S3_KEY_PREFIX = "content.store.s3.key.prefix";
+    private static final String PROPERTY_S3_INSECURE_ENDPOINT = "content.store.s3.insecure.endpoint.allowed";
     private static final String PROPERTY_LOCAL_FALLBACK = "content.store.local.fallback";
 
     /** Every property this class writes, and therefore every property it has to put back. */
     private static final String[] MUTATED_PROPERTIES = {
         PROPERTY_PROVIDER, PROPERTY_S3_BUCKET, PROPERTY_S3_REGION, PROPERTY_S3_ENDPOINT,
         PROPERTY_S3_ACCESS_KEY_ID, PROPERTY_S3_SECRET_ACCESS_KEY, PROPERTY_S3_PATH_STYLE,
-        PROPERTY_S3_KEY_PREFIX, PROPERTY_LOCAL_FALLBACK,
+        PROPERTY_S3_KEY_PREFIX, PROPERTY_S3_INSECURE_ENDPOINT, PROPERTY_LOCAL_FALLBACK,
     };
 
     /**
@@ -212,7 +215,9 @@ public final class ObjectStoreIntegrationTests {
         ContentStore store = ContentStoreFactory.getContentStore();
         assertNotNull(store, "the object store must be selected for this test to mean anything");
         Delegator delegator = ContentStoreTestSupport.seamDelegator("default", null);
-        String key = record(ContentStoreFactory.storeKey(store, delegator, RESOURCE_ID, null));
+        // Under the content's OWN path, which is the key both providers use: the seam derives it from the
+        // location the row records, so a fixture keyed by anything else would never be found.
+        String key = record(ContentStoreFactory.storeKey(store, "runtime/uploads/round-trip.txt"));
         byte[] inTheBucket = "the authoritative copy in the object store".getBytes(StandardCharsets.UTF_8);
 
         store.put(key, inTheBucket);
@@ -250,8 +255,7 @@ public final class ObjectStoreIntegrationTests {
             throws Exception {
         System.setProperty("ofbiz.home", home.toString());
         ContentStore store = ContentStoreFactory.getContentStore();
-        String key = record(ContentStoreFactory.storeKey(store,
-                ContentStoreTestSupport.seamDelegator("default", null), "90010", null));
+        String key = record(ContentStoreFactory.storeKey(store, "runtime/uploads/90010.bin"));
         byte[] longer = new byte[64 * 1024];
         for (int index = 0; index < longer.length; index++) {
             longer[index] = (byte) (index % 251);
@@ -287,8 +291,7 @@ public final class ObjectStoreIntegrationTests {
             throws Exception {
         System.setProperty("ofbiz.home", home.toString());
         ContentStore store = ContentStoreFactory.getContentStore();
-        String key = record(ContentStoreFactory.storeKey(store,
-                ContentStoreTestSupport.seamDelegator("default", null), "90011", null));
+        String key = record(ContentStoreFactory.storeKey(store, "runtime/uploads/90011.bin"));
         int length = 10 * 1024 * 1024 + 7;
         Path staged = home.resolve("large.bin");
         try (OutputStream out = Files.newOutputStream(staged)) {
@@ -353,39 +356,55 @@ public final class ObjectStoreIntegrationTests {
     }
 
     /**
-     * One resource identifier under two tenancies reaches two objects in the store, and neither tenancy can
-     * read the other's.
+     * One row means one piece of content, whichever delegator reads it and whichever provider is configured.
      *
-     * <p>Asserted against a real store rather than against the key builder alone, because what matters is that
-     * the two keys address two OBJECTS. A store that normalised keys - collapsing a path segment, folding case
-     * - would produce two distinct keys that named one object, and every offline assertion about the keys would
-     * still pass while one tenant read another's content.
+     * <p>This is the property that replaced tenant-scoped object keys, and it is asserted against a real store
+     * because it is a statement about which OBJECT a row reaches. Filesystem mode's storage tree IS the
+     * deployment's own content tree, so its key can only be the content's path; giving the object store a
+     * different key shape would have made one {@code DataResource} row name different content depending on which
+     * provider was configured, and would have made content impossible to copy between the two - which is exactly
+     * what a deployment does during the migration window {@code content.store.local.fallback} exists to cover.
+     *
+     * <p>What separates content here is what separates it on a filesystem: the paths. Two rows recording two
+     * paths reach two objects, and two deployments sharing one bucket are separated by
+     * {@code content.store.s3.key.prefix} - which
+     * {@link #thePerRunKeyPrefixSeparatesOneRunsObjectsFromAnothersInTheSameBucket} asserts directly, against the
+     * same store.
      *
      * @param home a per-test temporary directory standing in for {@code ofbiz.home}
      * @throws Exception if the store cannot be reached, which fails the test
      */
     @Test
-    public void oneIdentifierUnderTwoTenanciesReachesTwoObjects(@TempDir Path home) throws Exception {
+    public void oneRowMeansOneObjectWhicheverDelegatorReadsIt(@TempDir Path home) throws Exception {
         System.setProperty("ofbiz.home", home.toString());
         Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Files.writeString(uploads.resolve("tenanted.txt"), "never served in this test");
+        Files.writeString(uploads.resolve("shared.txt"), "never served in this test");
+        Files.writeString(uploads.resolve("other.txt"), "never served in this test either");
         ContentStoreFactory.clearCache();
         ContentStore store = ContentStoreFactory.getContentStore();
         Delegator base = ContentStoreTestSupport.seamDelegator("default", null);
         Delegator tenant = ContentStoreTestSupport.seamDelegator("default", "DEMO1");
-        String baseKey = record(ContentStoreFactory.storeKey(store, base, RESOURCE_ID, null));
-        String tenantKey = record(ContentStoreFactory.storeKey(store, tenant, RESOURCE_ID, null));
-        assertNotEquals(baseKey, tenantKey, "two tenancies must not share one key");
+        String sharedKey = record(ContentStoreFactory.storeKey(store, "runtime/uploads/shared.txt"));
+        String otherKey = record(ContentStoreFactory.storeKey(store, "runtime/uploads/other.txt"));
+        assertNotEquals(sharedKey, otherKey, "two paths must reach two objects");
 
-        store.put(baseKey, "the base tenancy's content".getBytes(StandardCharsets.UTF_8));
-        store.put(tenantKey, "the DEMO1 tenancy's content".getBytes(StandardCharsets.UTF_8));
+        store.put(sharedKey, "the content that row names".getBytes(StandardCharsets.UTF_8));
+        store.put(otherKey, "the content the other row names".getBytes(StandardCharsets.UTF_8));
 
-        assertEquals("the base tenancy's content", ContentStoreTestSupport.renderedThroughSeam("OFBIZ_FILE",
-                "/runtime/uploads/tenanted.txt", null, base, RESOURCE_ID),
-                "the base delegator must reach the base tenancy's object");
-        assertEquals("the DEMO1 tenancy's content", ContentStoreTestSupport.renderedThroughSeam("OFBIZ_FILE",
-                "/runtime/uploads/tenanted.txt", null, tenant, RESOURCE_ID),
-                "a tenant delegator must reach its own object and never the base tenancy's");
+        // One row, two delegators, one object: the key is the content's path and nothing about the reader takes
+        // part in it, which is what keeps the two providers agreeing about what a row means.
+        assertEquals("the content that row names", ContentStoreTestSupport.renderedThroughSeam("OFBIZ_FILE",
+                "/runtime/uploads/shared.txt", null, base, RESOURCE_ID),
+                "the base delegator must reach the object the row's path names");
+        assertEquals("the content that row names", ContentStoreTestSupport.renderedThroughSeam("OFBIZ_FILE",
+                "/runtime/uploads/shared.txt", null, tenant, RESOURCE_ID),
+                "a tenant delegator reading the same row must reach the same object, because the row names the"
+                        + " content and the reader does not");
+        // And a different row still reaches a different object, so the above is not "every read returns the same
+        // thing".
+        assertEquals("the content the other row names", ContentStoreTestSupport.renderedThroughSeam("OFBIZ_FILE",
+                "/runtime/uploads/other.txt", null, base, RESOURCE_ID),
+                "a row recording another path must reach that path's object");
     }
 
     /**
@@ -406,7 +425,7 @@ public final class ObjectStoreIntegrationTests {
         System.setProperty("ofbiz.home", home.toString());
         Delegator delegator = ContentStoreTestSupport.seamDelegator("default", null);
         ContentStore mine = ContentStoreFactory.getContentStore();
-        String key = record(ContentStoreFactory.storeKey(mine, delegator, "90015", null));
+        String key = record(ContentStoreFactory.storeKey(mine, "runtime/uploads/90015.bin"));
         byte[] content = "written under this run's prefix".getBytes(StandardCharsets.UTF_8);
 
         mine.put(key, content);
@@ -448,8 +467,8 @@ public final class ObjectStoreIntegrationTests {
         System.setProperty("ofbiz.home", home.toString());
         ContentStore store = ContentStoreFactory.getContentStore();
         Delegator delegator = ContentStoreTestSupport.seamDelegator("default", null);
-        String never = ContentStoreFactory.storeKey(store, delegator, "90012", null);
-        String once = record(ContentStoreFactory.storeKey(store, delegator, "90013", null));
+        String never = ContentStoreFactory.storeKey(store, "runtime/uploads/90012.bin");
+        String once = record(ContentStoreFactory.storeKey(store, "runtime/uploads/90013.bin"));
 
         store.delete(never);
         assertFalse(store.exists(never), "an object that was never written must not exist");
@@ -472,8 +491,7 @@ public final class ObjectStoreIntegrationTests {
     public void bothReadsReportAnAbsentKeyAsFileNotFoundRatherThanNull(@TempDir Path home) throws Exception {
         System.setProperty("ofbiz.home", home.toString());
         ContentStore store = ContentStoreFactory.getContentStore();
-        String absent = ContentStoreFactory.storeKey(store,
-                ContentStoreTestSupport.seamDelegator("default", null), "90014", null);
+        String absent = ContentStoreFactory.storeKey(store, "runtime/uploads/90014.bin");
 
         assertFalse(store.exists(absent), "the store must report the key as absent");
         assertThrows(FileNotFoundException.class, () -> store.get(absent),
@@ -483,11 +501,14 @@ public final class ObjectStoreIntegrationTests {
     }
 
     /**
-     * Installs the configuration in memory, from the injected settings, failing when one is missing.
+     * Installs the configuration in memory from the injected settings, skipping the case when one is missing.
      *
-     * <p>A missing setting fails rather than skips, which is the whole point of this class living in a task of
-     * its own: a check that skips reports success for a contract nothing verified, and the two contracts here
-     * are ones the deployment relies on.
+     * <p>A missing setting SKIPS rather than fails, because the unit tier has to pass on a machine with no
+     * object store and must reach no network. It is an assumption rather than a silent return so that the
+     * skip is recorded, with the settings named, in the test report: an unconfigured run therefore says
+     * plainly that it verified nothing here, instead of reporting a pass for a contract nothing exercised.
+     * Nothing is defaulted - a default endpoint would send this deployment's credentials somewhere it was
+     * not told to, and a default credential would be a credential committed to the repository.
      */
     private void applyConfiguration() {
         Set<String> missing = new LinkedHashSet<>();
@@ -496,14 +517,10 @@ public final class ObjectStoreIntegrationTests {
                 missing.add(setting);
             }
         }
-        if (!missing.isEmpty()) {
-            fail("the object-store checks need a real S3-compatible store and these settings were not supplied: "
-                    + missing + ". Supply each as -D<name>=<value>, as -P<name>=<value>, or as the matching"
-                    + " OFBIZ_TEST_S3_* environment variable, and run ./gradlew testExternalServices. They are"
-                    + " deliberately not defaulted: a default endpoint would send this deployment's credentials"
-                    + " somewhere it was not told to, and a default credential would be a credential committed"
-                    + " to the repository.");
-        }
+        assumeTrue(missing.isEmpty(), () -> "the object-store checks need a real S3-compatible store and these"
+                + " settings were not supplied: " + missing + ". Supply each as a -D<name>=<value> system"
+                + " property or as the matching OFBIZ_TEST_S3_* environment variable - the environment form is"
+                + " the one that reaches Gradle's forked test JVM.");
         UtilProperties.setPropertyValueInMemory("content", PROPERTY_S3_ENDPOINT,
                 injected("ofbiz.test.s3.endpoint"));
         UtilProperties.setPropertyValueInMemory("content", PROPERTY_S3_REGION, injected("ofbiz.test.s3.region"));
@@ -518,6 +535,16 @@ public final class ObjectStoreIntegrationTests {
         UtilProperties.setPropertyValueInMemory("content", PROPERTY_S3_PATH_STYLE,
                 pathStyle == null ? "true" : pathStyle);
         UtilProperties.setPropertyValueInMemory("content", PROPERTY_S3_KEY_PREFIX, namespace);
+        // Derived from the endpoint the operator supplied rather than inherited from whatever another test
+        // left in this JVM. A loopback store needs no permission and an https store needs none either, so
+        // the value is "true" only for the case that genuinely requires it - a plaintext store somewhere
+        // other than this host, which is a store the operator deliberately pointed this suite at. That the
+        // permission is REQUIRED for such an endpoint is proved by ContentStoreFactoryTest; stating it here
+        // is what stops these checks passing because an earlier test relaxed the control and left it off.
+        String endpoint = injected("ofbiz.test.s3.endpoint");
+        UtilProperties.setPropertyValueInMemory("content", PROPERTY_S3_INSECURE_ENDPOINT,
+                endpoint != null && endpoint.regionMatches(true, 0, "http://", 0, "http://".length())
+                        ? "true" : "false");
         UtilProperties.setPropertyValueInMemory("content", PROPERTY_LOCAL_FALLBACK, "false");
         UtilProperties.setPropertyValueInMemory("content", PROPERTY_PROVIDER, "s3");
         ContentStoreFactory.clearCache();

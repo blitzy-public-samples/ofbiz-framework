@@ -37,20 +37,27 @@ import java.net.URLConnection;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import javax.transaction.Status;
 import javax.transaction.Synchronization;
@@ -148,6 +155,27 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * thousand distinct resources have already told them that, so the set must not grow with the catalogue.
      */
     private static final int REPORTED_FALLBACK_KEY_LIMIT = 1024;
+
+    /**
+     * The targets a resolution outside an active transaction has already been reported for, so that a location
+     * resolved on every read is reported once.
+     */
+    private static final Set<String> REPORTED_UNBOUND_TARGETS = ConcurrentHashMap.newKeySet();
+
+    /**
+     * The greatest number of targets {@link #REPORTED_UNBOUND_TARGETS} holds, which is what keeps a deployment
+     * with a great many of them from filling its log.
+     */
+    private static final int REPORTED_TARGET_LIMIT = 1024;
+
+    /**
+     * The targets a write-through is already registered for in the transaction running on this thread.
+     *
+     * <p>Per thread because a transaction is per thread, and cleared entry by entry as each registration
+     * completes. It exists so that two resolutions of one location inside one transaction are one publish: the
+     * state at commit decides what is published, so the second registration would only repeat the first.
+     */
+    private static final ThreadLocal<Set<String>> PENDING_WRITE_THROUGHS = ThreadLocal.withInitial(HashSet::new);
 
     /**
      * Traverses the DataCategory parent/child structure and put it in categoryNode. Returns non-null error string if there is an error.
@@ -883,16 +911,228 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
 
     public static File getContentFile(String dataResourceTypeId, String objectInfo, String contextRoot)
             throws GeneralException, FileNotFoundException {
-        // No content-storage seam here, deliberately. This method resolves a WRITE TARGET as often as it
-        // resolves a read location: the registered createFile, createBinaryFile and updateBinaryFile services
-        // take the File it returns and write to it directly, so the location it names has to be the one the
-        // caller's bytes will land in, and an absent location has to stay final. Reading a provider's content
-        // into that location instead would hand a writer a stale copy and then lose its write, and reporting an
-        // absent location as present would let a writer believe a file it never created is there. The read paths
-        // that may legitimately be served from a provider - renderFile and getDataResourceStream - carry the
-        // resource identity a provider key needs and consult it themselves; see the class comment below.
-        return resolveContentLocation(dataResourceTypeId, objectInfo, contextRoot, true);
+        // The first of the resolution seams the plan names (plan sections 0.4.1 and 0.6.3), and the only one that
+        // has to serve BOTH directions: the registered createBinaryFile and updateBinaryFile services take the
+        // File this returns and open their own FileOutputStream on it, while ContentWorker and the report
+        // templates dereference it to read. The frozen contract is the same either way - a non-null File that
+        // exists, or a refusal - so both are served by the same two steps.
+        //
+        // 1. The location is READ THROUGH the store when this instance has no copy of it. Content published by
+        //    another instance leaves nothing on this one's disk, so a File contract that only ever looked at
+        //    local disk would have failed on every instance except the one that received the upload - which is
+        //    precisely the state a fleet is in. So an absent, provider-backed location is reconstructed at its
+        //    own path from the store before absence is called final: see materialiseIfStoreHolds, which is also
+        //    why a WRITER cannot be handed a temporary file it would write into and lose.
+        // 2. The location is WRITTEN THROUGH to the store when the transaction that resolved it commits: see
+        //    registerWriteThrough. Publishing at commit rather than at write time is what keeps the store from
+        //    ever holding bytes the deployment's own validation rejected, and keeps a rollback from removing
+        //    content it never owned.
+        //
+        // Inert unless an object store is configured. In database mode there is no provider; in filesystem mode
+        // the provider's tree IS this tree, so there is nothing to read through and nothing to publish. Either
+        // way the single statement this method used to be is what runs.
+        //
+        // Resolved with no delegator, because the frozen signature carries none and the services that call it are
+        // out of the plan's scope. That costs nothing where it matters: WHICH provider is selected is a deployment
+        // value read from content.properties alone and never from a SystemProperty row - see
+        // ContentStoreFactory.DEPLOYMENT_PROPERTIES - so this resolves the same provider a delegator would. What
+        // it does mean is that the tunables this path consults, the whole-read ceiling among them, are the
+        // committed ones rather than any per-delegator override; a deployment that overrides them through a
+        // SystemProperty row applies that override to the read seams, which do carry a delegator.
+        ContentStore store = ContentStoreFactory.getContentStore(null);
+        if (!ContentStoreFactory.publicationRequired(store)) {
+            return resolveContentLocation(dataResourceTypeId, objectInfo, contextRoot, ABSENCE_IS_FINAL);
+        }
+        File file = resolveContentLocation(dataResourceTypeId, objectInfo, contextRoot,
+                absent -> !materialiseIfStoreHolds(store, dataResourceTypeId, absent));
+        if (file == null) {
+            return null;
+        }
+        String key = providerKey(store, dataResourceTypeId, file);
+        if (key != null) {
+            registerWriteThrough(store, file, () -> scanFile(file), null);
+        }
+        return file;
     }
+
+    /**
+     * Reconstructs a provider-backed location this instance holds no copy of, and reports whether it now holds
+     * one.
+     *
+     * <p><strong>Why the content's own path, and not a temporary file.</strong> The frozen contract of
+     * {@link #getContentFile} is a {@code File}, and the caller may be about to WRITE to it - the binary content
+     * services do exactly that. Handing back a temporary copy would send that write to a temporary file and lose
+     * it silently, which is worse than the failure it replaced. Reconstructing the content at the location the
+     * row names cannot lose a write: the caller overwrites the location it was always going to overwrite, the
+     * write-through registered alongside publishes it, and nothing has to be cleaned up afterwards because the
+     * file is the deployment's own content and not a copy of it. The local tree becomes a read-through cache of
+     * the store, which is what makes an instance replaceable rather than what makes it stateful: everything on it
+     * can be reconstructed by any other instance from the store.
+     *
+     * <p><strong>Authorised before anything is written.</strong> The branch that will report absence applies the
+     * resource type's own allow list AFTER its presence check, so this cannot rely on that having happened: it
+     * applies the same checks itself first, and refuses a location the allow list would refuse rather than
+     * creating it. A location outside {@code ofbiz.home} has no key at all and is never reconstructed.
+     *
+     * <p><strong>Absence in the store is not an error here.</strong> It answers false and the caller's own branch
+     * then raises the {@link FileNotFoundException} it has always raised, with the location string that branch
+     * built. That is what keeps a resource that genuinely does not exist reporting exactly what it reported
+     * before this seam existed.
+     *
+     * @param store the provider serving this operation, never null
+     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
+     * @param file the resolved location that holds nothing on this instance
+     * @return {@code true} when the location now holds the store's content
+     * @throws GeneralException if the location is one the resource type's allow list refuses, or the provider
+     *     cannot be reached
+     */
+    private static boolean materialiseIfStoreHolds(ContentStore store, String dataResourceTypeId, File file)
+            throws GeneralException {
+        String key = providerKey(store, dataResourceTypeId, file);
+        if (key == null) {
+            return false;
+        }
+        requireAuthorisedLocation(dataResourceTypeId, file);
+        try (ContentStore.ContentStream content = store.openStream(key)) {
+            writeLocalCopy(file, content);
+            Debug.logInfo("The content store holds " + content.length() + " bytes under [" + key + "] that this"
+                    + " instance had no copy of, so the copy was reconstructed from the store", MODULE);
+            return true;
+        } catch (FileNotFoundException absentInStore) {
+            Debug.logVerbose(absentInStore, "The content store holds nothing under [" + key + "] either, so the"
+                    + " content does not exist", MODULE);
+            return false;
+        } catch (IOException e) {
+            // Reported, not propagated: this runs where the caller expects either a File or the absence its own
+            // branch reports, and a store that cannot be read is not the same as content that does not exist.
+            // The caller's own refusal follows, and this line is what tells an operator why.
+            Debug.logError(e, "The content store could not be read for [" + key + "], so this instance's missing"
+                    + " copy of it could not be reconstructed", MODULE);
+            return false;
+        }
+    }
+
+    /**
+     * Applies the allow list the resource type carries, before a location is created rather than after.
+     *
+     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
+     * @param file the resolved location
+     * @throws GeneralException if the location is not one this resource type may name
+     */
+    private static void requireAuthorisedLocation(String dataResourceTypeId, File file) throws GeneralException {
+        if ("LOCAL_FILE".equals(dataResourceTypeId) || "LOCAL_FILE_BIN".equals(dataResourceTypeId)) {
+            SecurityUtil.checkLocalFileAllowList(file);
+            return;
+        }
+        SecurityUtil.checkOfbizFileAllowList(file);
+    }
+
+    /**
+     * Writes a local copy of content the store holds, atomically, at the location the row names.
+     *
+     * <p>Staged in the destination's own directory and moved onto the destination, so that a concurrent reader
+     * never observes a half-written file and two instances - or two threads - reconstructing the same content at
+     * once cannot interleave their bytes. Missing directories are created, because the instance that received the
+     * upload created them and this one never did.
+     *
+     * @param file the location to reconstruct
+     * @param content the store's content, positioned at its first byte
+     * @throws IOException if the copy cannot be written
+     */
+    private static void writeLocalCopy(File file, InputStream content) throws IOException {
+        Path target = file.toPath();
+        Path directory = target.getParent();
+        if (directory != null) {
+            Files.createDirectories(directory);
+        }
+        Path staging = Files.createTempFile(directory == null ? target.toAbsolutePath().getParent() : directory,
+                ".ofbiz-content-cache-", ".tmp");
+        try {
+            Files.copy(content, staging, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                Files.move(staging, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException notAtomic) {
+                // Documented fallback for a filesystem that cannot rename atomically. The window it opens is the
+                // one every such filesystem opens, and it is narrower than writing the destination directly.
+                Debug.logVerbose(notAtomic, "This filesystem cannot move a staged content copy atomically, so the"
+                        + " reconstruction is not atomic either", MODULE);
+                Files.move(staging, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            staging = null;
+        } finally {
+            if (staging != null) {
+                Files.deleteIfExists(staging);
+            }
+        }
+    }
+
+    /**
+     * Derives the storage key a provider holds a resolved location's content under, or reports that the location
+     * is not provider-backed at all.
+     *
+     * <p>Two exclusions, and they are the whole of the decision:
+     *
+     * <ul>
+     * <li><strong>{@code CONTEXT_FILE} and {@code CONTEXT_FILE_BIN} are never provider-backed.</strong> Their
+     * content is a webapp's own static files, which ship inside the container image: every instance already has
+     * an identical copy, there is no durable local state to externalise, and making them provider-backed would
+     * instead require every instance's static files to be uploaded before it could serve them. The render path
+     * has always read them locally, so excluding them here is what makes the two directions agree - one backend
+     * for writes and another for reads is how the same resource comes to be written to one place and read from
+     * another.</li>
+     * <li><strong>A location outside {@code ofbiz.home} is not provider-backed.</strong> An absolute
+     * {@code LOCAL_FILE} elsewhere on the host is state an operator placed deliberately; no key describes it, and
+     * the read seams read it from where it is.</li>
+     * <li><strong>A relative location is not provider-backed.</strong> {@code LOCAL_FILE} refuses one, and it
+     * refuses it AFTER it has reported absence - so a relative, absent location has always raised
+     * {@link FileNotFoundException} rather than the refusal, and which of the two it raises is part of the frozen
+     * behaviour. Treating a relative location as provider-backed would have inverted that whenever the process's
+     * working directory happens to be {@code ofbiz.home}, which in a deployment it is.</li>
+     * </ul>
+     *
+     * @param store the provider serving this operation, or {@code null} for database storage
+     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
+     * @param file the resolved location
+     * @return the provider key, or {@code null} when this location is not provider-backed
+     * @throws GeneralException if the provider refuses to derive a key from the location
+     */
+    private static String providerKey(ContentStore store, String dataResourceTypeId, File file)
+            throws GeneralException {
+        if (store == null || !file.isAbsolute() || "CONTEXT_FILE".equals(dataResourceTypeId)
+                || "CONTEXT_FILE_BIN".equals(dataResourceTypeId)) {
+            return null;
+        }
+        String relative = deploymentRelativePath(file);
+        return relative == null ? null : ContentStoreFactory.storeKey(store, relative);
+    }
+
+    /**
+     * What a location resolution does about content that is not on this instance's disk.
+     *
+     * <p>A parameter rather than a flag because the answer is no longer always the same, and because the two
+     * callers that need a different answer need it for different reasons: a streamed read is about to ask the
+     * provider and does not need a local file at all, while {@link #getContentFile} owes its caller a real
+     * {@code File} and can reconstruct one. Asked at the exact point each branch would report absence, so every
+     * branch keeps its own pre-existing message and its own pre-existing check order - which matters, because
+     * {@code LOCAL_FILE} tests presence before it tests absoluteness and that decides which exception a
+     * relative, absent location raises.
+     */
+    private interface PresencePolicy {
+        /**
+         * Decides whether a location holding nothing on this disk is the final answer.
+         *
+         * @param file the resolved location, which holds nothing
+         * @return true when the caller should report absence
+         * @throws GeneralException if establishing the answer refuses the location
+         */
+        boolean absenceIsFinal(File file) throws GeneralException;
+    }
+
+    /** Absence on this disk is the answer, which is what every caller needed before this seam existed. */
+    private static final PresencePolicy ABSENCE_IS_FINAL = file -> true;
+
+    /** Absence on this disk is not yet the answer, because the caller is about to ask the provider. */
+    private static final PresencePolicy ASK_THE_PROVIDER = file -> false;
 
     /**
      * Resolves a file-backed {@code DataResource} location to the one local file it names, applying every
@@ -915,23 +1155,22 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * @param objectInfo the {@code DataResource.objectInfo} location
      * @param contextRoot the webapp context root, required by the {@code CONTEXT_FILE} types and otherwise
      *     ignored
-     * @param requireLocalPresence whether a location holding nothing locally is final. True for every caller
-     *     that needs the local file itself, which is all of them unless a provider holds the content; false
-     *     only for a read that has already established a provider is configured and is about to ask it, where
-     *     absence on this disk is not yet an answer
+     * @param presence what to do about a location holding nothing on this instance's disk. Asked at the exact
+     *     point the branch would report absence, so the branch keeps its own message and its own order, and so a
+     *     policy that can supply the content has the resolved location in hand when it is asked
      * @return the resolved location, or {@code null} for a type that is not file backed, exactly as
      *     {@link #getContentFile} has always returned for one
      * @throws GeneralException if the location is refused - a relative {@code LOCAL_FILE}, or a location outside
      *     an allow list or the context root, or an empty context root
-     * @throws FileNotFoundException if the location holds nothing and {@code requireLocalPresence} is set
+     * @throws FileNotFoundException if the location holds nothing and the policy says absence is final
      */
     private static File resolveContentLocation(String dataResourceTypeId, String objectInfo, String contextRoot,
-            boolean requireLocalPresence) throws GeneralException, FileNotFoundException {
+            PresencePolicy presence) throws GeneralException, FileNotFoundException {
         File file = null;
 
         if ("LOCAL_FILE".equals(dataResourceTypeId) || "LOCAL_FILE_BIN".equals(dataResourceTypeId)) {
             file = FileUtil.getFile(objectInfo);
-            if (!file.exists() && requireLocalPresence) {
+            if (!file.exists() && presence.absenceIsFinal(file)) {
                 throw new FileNotFoundException("No file found: " + (objectInfo));
             }
             if (!file.isAbsolute()) {
@@ -959,7 +1198,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 sep = "/";
             }
             file = FileUtil.getFile(prefix + sep + objectInfo);
-            if (!file.exists() && requireLocalPresence) {
+            if (!file.exists() && presence.absenceIsFinal(file)) {
                 throw new FileNotFoundException("No file found: " + (prefix + sep + objectInfo));
             }
             SecurityUtil.checkOfbizFileAllowList(file);
@@ -974,7 +1213,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
             file = FileUtil.getFile(contextRoot + sep + objectInfo);
             checkContextFileBoundary(file, contextRoot);
-            if (!file.exists() && requireLocalPresence) {
+            if (!file.exists() && presence.absenceIsFinal(file)) {
                 throw new FileNotFoundException("No file found: " + (contextRoot + sep + objectInfo));
             }
         }
@@ -1018,7 +1257,36 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             maxFiles = 250;
         }
 
-        return getDataResourceContentUploadPath(initialPath, maxFiles, absolute);
+        String uploadPath = getDataResourceContentUploadPath(initialPath, maxFiles, absolute);
+        // The second of the resolution seams the plan names (plan sections 0.4.1 and 0.6.3), and the one that
+        // catches an UPLOAD. It has to be here rather than at getContentFile, because the service that actually
+        // writes an uploaded file - createFileMethod, reached through createAnonFile - resolves its own File from
+        // the objectInfo it was given and never calls this class at all. The one thing every upload does pass
+        // through is this method: DataServicesScript asks for the directory, composes objectInfo from it, and
+        // hands the write to that service. So what is registered here is a write-through over the DIRECTORY, and
+        // whatever file appears in it by the time the transaction commits is what gets published. That is what
+        // makes the plan's upload story true of an object store as well - an upload is published as it is
+        // written - without a business service having to know that a store exists.
+        //
+        // Inert unless an object store is configured, exactly as the other seam is.
+        try {
+            ContentStore store = ContentStoreFactory.getContentStore(delegator);
+            if (ContentStoreFactory.publicationRequired(store) && UtilValidate.isNotEmpty(uploadPath)) {
+                File directory = FileUtil.getFile(absolute ? uploadPath : deploymentHome() + uploadPath);
+                if (deploymentRelativePath(directory) != null) {
+                    registerWriteThrough(store, directory, () -> scanDirectory(directory), delegator);
+                }
+            }
+        } catch (GeneralException e) {
+            // Reported, not propagated: the frozen signature of this method declares nothing to throw, and it is
+            // called while a service is composing a location rather than while content is being written. A store
+            // that cannot be resolved is a deployment fault an operator has to see, and it must not turn resolving
+            // an upload directory into a failure - the upload still lands on this instance, and the read seams
+            // still refuse or fall back according to content.store.local.fallback.
+            Debug.logError(e, "The configured content store could not be resolved while an upload directory was"
+                    + " being prepared, so content written into it will not be published to the store", MODULE);
+        }
+        return uploadPath;
     }
 
     public static String getDataResourceContentUploadPath(String initialPath, double maxFiles) {
@@ -1500,10 +1768,10 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     }
 
     public static void renderFile(String dataResourceTypeId, String objectInfo, String rootDir, Appendable out) throws GeneralException, IOException {
-        // A caller of this frozen signature brings no resource identity, and identity is what a storage key is
-        // derived from, so there is nothing to read through a provider and this reads locally exactly as it
-        // always has. The overload below is the seam, and only the render path that holds the DataResource can
-        // reach it.
+        // A caller of this frozen signature brings neither the delegator nor the resource, and that pair of
+        // nulls is what marks a call as coming from it: storeForResource selects no provider for it, so this
+        // reads locally exactly as it always has. The overload below is the seam, and only the render path that
+        // holds the DataResource can reach it.
         renderFile(dataResourceTypeId, objectInfo, rootDir, out, null, null);
     }
 
@@ -1543,9 +1811,9 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * @param objectInfo the {@code DataResource.objectInfo} location
      * @param rootDir the webapp context root, used by the {@code CONTEXT_FILE} branch
      * @param out the output to render into
-     * @param delegator the delegator the resource was read through, carrying the tenant scope a provider key
-     *     needs; null from the frozen public signature, which then never consults a provider
-     * @param dataResourceId the immutable identifier of the resource; null as above
+     * @param delegator the delegator the provider and its tunables are resolved against; null from the frozen
+     *     public signature, which then never consults a provider
+     * @param dataResourceId the identifier of the resource being rendered; null as above
      * @throws GeneralException if the location is refused, or a configured provider cannot be reached or holds
      *     nothing for the resource
      * @throws IOException if the content cannot be read or the output cannot be written
@@ -1570,7 +1838,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
             }
             SecurityUtil.checkLocalFileAllowList(file);
-            if (renderThrough(store, delegator, dataResourceId, file, out, absent)) {
+            if (renderThrough(store, delegator, dataResourceTypeId, file, out, absent)) {
                 return;
             }
             if (absent) {
@@ -1600,7 +1868,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
             }
             SecurityUtil.checkOfbizFileAllowList(file);
-            if (renderThrough(store, delegator, dataResourceId, file, out, absent)) {
+            if (renderThrough(store, delegator, dataResourceTypeId, file, out, absent)) {
                 return;
             }
             if (absent) {
@@ -1724,13 +1992,14 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 // no provider configured the store is null, presence is required exactly as before, and the two
                 // statements after this are the pre-existing local read.
                 ContentStore store = storeForResource(dataResource.getDelegator(), dataResourceId);
-                File file = resolveContentLocation(dataResourceTypeId, objectInfo, contextRoot, store == null);
+                File file = resolveContentLocation(dataResourceTypeId, objectInfo, contextRoot,
+                        store == null ? ABSENCE_IS_FINAL : ASK_THE_PROVIDER);
                 if (file == null) {
                     throw new GeneralException("The dataResourceTypeId [" + dataResourceTypeId + "] names no file"
                             + " location; cannot stream");
                 }
-                Map<String, Object> streamed = streamThrough(store, dataResource.getDelegator(), dataResourceId,
-                        file, !file.exists());
+                Map<String, Object> streamed = streamThrough(store, dataResource.getDelegator(),
+                        dataResourceTypeId, file, !file.exists());
                 if (streamed != null) {
                     return streamed;
                 }
@@ -1766,13 +2035,80 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         throw new GeneralException("The dataResourceTypeId [" + dataResourceTypeId + "] is not supported in getDataResourceStream");
     }
 
+    /**
+     * Reads a {@code DataResource}'s whole content into a buffer.
+     *
+     * <p>Two things are true of this method that were not true of the streams it used to read, and both come from
+     * the same change: the stream it is handed may now be a response from a content-storage provider rather than
+     * a file on this disk.
+     *
+     * <ul>
+     * <li><strong>The stream is closed, on every path.</strong> A provider's stream holds a pooled connection, so
+     * a stream left open by an exception is a connection this instance never gets back - and enough of them stop
+     * the instance reading content at all (CWE-404/CWE-459). A local file stream was leaked here too; closing it
+     * is a plain improvement with no behaviour to change.</li>
+     * <li><strong>Provider content is bounded by {@code content.store.max.object.size}.</strong> That ceiling is
+     * the deployment's statement of how much content a single whole read may hold in the heap of one instance, and
+     * this method is a whole read by definition. It is applied to CONTENT SERVED BY A PROVIDER and to nothing
+     * else, which is exactly the reach of the change: a local file and a database column are read here precisely
+     * as they were before, so no deployment can find content it could read yesterday refused today. A provider's
+     * stream is recognised by its type, {@link ContentStore.ContentStream}, which is also what carries the length
+     * the store declared - so the refusal happens before a byte is transferred rather than after the heap has
+     * already been filled. Content too large to hold whole is served by
+     * {@link #getDataResourceStream}, which streams it and applies no ceiling at all.</li>
+     * </ul>
+     *
+     * @param delegator the delegator the resource is read through
+     * @param dataResourceId the immutable identifier of the resource
+     * @param https whether a relative URL resource resolves over https
+     * @param webSiteId the web site a relative URL resource resolves against
+     * @param locale the locale a relative URL resource resolves in
+     * @param rootDir the webapp context root, required by the {@code CONTEXT_FILE} types
+     * @return the whole content
+     * @throws IOException if the content cannot be read
+     * @throws GeneralException if the resource cannot be resolved, or provider content exceeds the ceiling
+     */
     public static ByteBuffer getContentAsByteBuffer(Delegator delegator, String dataResourceId, String https, String webSiteId, Locale locale,
                                                     String rootDir) throws IOException, GeneralException {
         GenericValue dataResource = EntityQuery.use(delegator).from("DataResource").where("dataResourceId", dataResourceId).queryOne();
         Map<String, Object> resourceData = DataResourceWorker.getDataResourceStream(dataResource, https, webSiteId, locale, rootDir, false);
-        InputStream stream = (InputStream) resourceData.get("stream");
-        ByteBuffer byteBuffer = ByteBuffer.wrap(IOUtils.toByteArray(stream));
-        return byteBuffer;
+        try (InputStream stream = (InputStream) resourceData.get("stream")) {
+            if (!(stream instanceof ContentStore.ContentStream served)) {
+                return ByteBuffer.wrap(IOUtils.toByteArray(stream));
+            }
+            long limit = ContentStoreFactory.maxObjectSize(delegator);
+            if (served.length() > limit) {
+                throw tooLargeToRead(dataResourceId, served.length(), limit);
+            }
+            // Bounded again as it is read, because the length above is what the store DECLARED and a store that
+            // understates it must not be able to make this allocate more than the ceiling allows.
+            byte[] read = stream.readNBytes((int) limit);
+            if (stream.read() != -1) {
+                throw tooLargeToRead(dataResourceId, limit + 1, limit);
+            }
+            return ByteBuffer.wrap(read);
+        }
+    }
+
+    /**
+     * Reports provider content that cannot be read whole because it exceeds the configured ceiling.
+     *
+     * <p>Names the resource, the size and the setting that governs it, and nothing about where the deployment
+     * keeps its content: this reaches the caller of a service and, through it, an end user (CWE-200). The storage
+     * key is in the log, under the same reference, wherever the provider itself reported one.
+     *
+     * @param dataResourceId the immutable identifier of the resource
+     * @param length how large the content is, as far as it is known
+     * @param limit the ceiling it exceeds
+     * @return the exception to throw
+     */
+    private static GeneralException tooLargeToRead(String dataResourceId, long length, long limit) {
+        Debug.logError("Content store refusal: the content of DataResource [" + dataResourceId + "] is " + length
+                + " bytes, over the " + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of " + limit
+                + "; content this large has to be streamed rather than read whole", MODULE);
+        return new GeneralException("The content of DataResource [" + dataResourceId + "] is larger than the "
+                + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of " + limit + " bytes, which is the"
+                + " most one read may hold. Raise that ceiling, or read this content as a stream.");
     }
 
     @Override
@@ -1784,233 +2120,373 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     // ---------------------------------------------------------------------------------------------------------
     // Content store seam support
     //
-    // The helpers the seams above and the publication seam below delegate through. Two seams read - renderFile
-    // copies content to an output, and getDataResourceStream hands a consumer a stream - and one writes:
-    // publishToContentStore places content a service has just written where every instance can read it. Each
-    // helper reports "nothing to do" when no provider is configured, so the committed default, DataResource
-    // database storage with file-backed resources on the local filesystem, reaches none of it. All
-    // object-storage behaviour itself lives in the store package; nothing here knows which provider is active
-    // and nothing here touches a provider SDK.
+    // The helpers the three seams the plan names delegate through (plan sections 0.2.1, 0.4.1 and 0.6.3). Two of
+    // the seams read - renderFile copies content to an output and getDataResourceStream hands a consumer a
+    // stream - and two resolve a location that is about to be written: getContentFile resolves a file and
+    // getDataResourceContentUploadPath resolves the upload directory. Every helper reports "nothing to do" when
+    // no provider is configured, so the committed default - DataResource database storage with file-backed
+    // resources on the local filesystem - reaches none of it. All object-storage behaviour itself lives in the
+    // store package; nothing here knows which provider is active and nothing here touches a provider SDK.
     //
-    // Where the write path is seamed, and why here. The services that create file-backed content resolve their
-    // own target and write the bytes themselves: createFile builds a File from the objectInfo it computed and
-    // writes to it, and createBinaryFile and updateBinaryFile take the File that getContentFile returns and
-    // open their own FileOutputStream on it. None of them can hand its bytes to a provider on its own without
-    // learning which provider is active, which is exactly the knowledge the plan confines to this seam and the
-    // store package (plan sections 0.2.1 and 0.6.3). So each of them calls publishToContentStore once its write
-    // has succeeded, and every decision - whether a provider is configured, whether it holds content apart from
-    // the deployment's own tree, which key the content belongs under, and what bound applies - is taken here.
-    // That is what makes the plan's upload story true of an object store as well: an upload is published as it
-    // is written, so the round trip the plan requires of a configured store holds in both directions (plan
-    // sections 0.1.1 goal 3 and 0.7.3). In filesystem mode publication is a no-op, because the provider's tree
-    // is the deployment's own tree and the write has already landed in it by construction; in database mode
-    // nothing is asked of a provider at all.
-    // The seams are four, and together they are what makes an instance replaceable: renderFile and
-    // getDataResourceStream read content through a provider, and storeContent and removeStoredContent place it
-    // there and take it away again. The write pair is what the object-storage objective needs, because an
-    // upload that lands on the instance that accepted it is durable local state by definition: another instance
-    // cannot serve it, and replacing the instance loses it. The registered content services hold the bytes, so
-    // they call storeContent from where they would otherwise have opened a FileOutputStream - a call, not a
-    // change of contract: no service signature, no service definition and no entity field moves, and when the
-    // call answers false, which is what the committed default answers, the local write below it is the one that
-    // was always performed.
+    // WHY THE WRITE IS SEAMED AT A RESOLUTION METHOD, AND PUBLISHED AT COMMIT.
     //
-    // Publishing and the metadata transaction. A published object and the DataResource row describing it have
-    // to agree, and they are written to different places, so the publish is bound to the transaction that
-    // records the row: registerPublishRollback asks the transaction manager to remove the object again if that
-    // transaction rolls back. This is what makes an upload all-or-nothing across the two stores, and it is the
-    // production path on which ContentStore.delete is exercised. It is registered only for a provider that
-    // holds content off the instance, because the filesystem provider's tree IS the deployment's own tree,
-    // where a rolled-back write has always left its file behind and parity means it still does.
+    // The services that write file-backed content resolve a location and then write to it themselves:
+    // createFile computes an objectInfo and opens its own FileOutputStream, and createBinaryFile and
+    // updateBinaryFile take the File getContentFile returns and open one on that. They are business services,
+    // which the plan places out of scope, so none of them can be asked to hand its bytes anywhere; and the only
+    // thing they all pass through is the resolution. So the resolution is where the seam goes.
+    //
+    // A resolution happens BEFORE the bytes are written, which is exactly what makes publishing from it correct
+    // rather than awkward. What is registered at resolution time is a write-through: a note of the location, and
+    // of what was there when it was resolved. At commit, whatever is on disk THEN is what gets published. That
+    // ordering is what answers, by construction rather than by care, every way the earlier design could go
+    // wrong:
+    //
+    //   * The bytes published are the bytes the deployment's own validation accepted. createBinaryFileMethod
+    //     writes the caller's array and then calls SecuredUpload.isValidFile; createFileMethod copies a
+    //     validated temporary file over the target. Publishing the caller's array at write time therefore
+    //     published bytes that validation had not seen - and, where a sanitiser rewrote the file, bytes that had
+    //     been deliberately replaced. Publishing what is on disk at commit cannot: a rejected upload returns a
+    //     service error, the transaction rolls back, and nothing is published at all.
+    //   * Nothing is visible in the store before the row that describes it commits, because nothing is written
+    //     to the store before then.
+    //   * There is no rollback path that removes anything, so no rollback can destroy content that was already
+    //     there. The earlier design published immediately and registered a delete to undo it, which deleted the
+    //     one stable key the content lives under - taking with it the PREVIOUS version, which the failed
+    //     transaction never owned, and any concurrent write that had committed in between.
+    //   * A write that never happened publishes nothing: the file is compared against what was there when it
+    //     was resolved, so a read that merely dereferenced the File leaves the store untouched.
+    //   * A write that REMOVED the content publishes a delete, which is what gives ContentStore.delete a
+    //     production caller and keeps the store from serving content the deployment has discarded.
+    //
+    // In filesystem mode none of this runs: that provider's tree IS the deployment's own tree, so the write has
+    // already landed in the provider by construction. In database mode there is no provider at all.
     // ---------------------------------------------------------------------------------------------------------
 
     /**
-     * Publishes content a caller has just written at a file-backed location to the configured content storage
-     * provider, so that every instance of a deployment can read it and not only the one that received it.
+     * Registers everything a resolved, provider-backed target holds to be brought into step with the content
+     * store when the transaction that resolved it commits, and reports whether it was registered.
      *
-     * <p>This is the file-oriented form of the write half of the storage seam (plan sections 0.1.1 goal 3,
-     * 0.4.1 and 0.7.3), for a caller that has content at a location rather than in hand: it publishes what is
-     * on disk. The registered content services hold their bytes, so they publish through
-     * {@link #storeContent}, which is the same seam expressed for a caller that has not written anything yet;
-     * both take every provider decision on the caller's behalf so that no service has to know which provider
-     * is active, both derive the key through {@link ContentStoreFactory#storeKey}, and both bind the publish
-     * to the transaction that records the row. This form is what an ingest, a migration or a caller outside
-     * the content services uses.
+     * <p>Called from the two resolution seams the plan names: {@link #getContentFile}, whose target is one file,
+     * and {@link #getDataResourceContentUploadPath}, whose target is the upload directory a file is about to be
+     * written into. Both reduce to the same thing - a set of locations and what each of them held at resolution
+     * time - so both are served by one synchronisation.
      *
-     * <p><strong>Inert unless an object store is configured.</strong> In database mode there is no provider and
-     * nothing is asked of one. In filesystem mode the provider's tree is the deployment's own tree, so the write
-     * the caller has just performed already landed in the provider and handing the same bytes over again would
-     * only rewrite the file it wrote; {@link ContentStoreFactory#publicationRequired} is what says so. Only an
-     * identity-keyed provider - a store that holds content apart from every instance - is published to.
+     * <p>It is deliberately silent about whether the caller is going to write. A read that only dereferences the
+     * {@code File} leaves the location as it found it, and the comparison made at commit then publishes nothing.
+     * That is what lets one seam serve both directions without having to know which one it is serving.
      *
-     * <p><strong>The bytes published are the bytes on disk.</strong> They are read back from the location the
-     * caller wrote, so what the store holds is what the deployment's own validation accepted and what a local
-     * read would return, rather than a second copy of a buffer that may have been transformed on its way to the
-     * file. The read is bounded by {@code content.store.max.object.size}, the same ceiling a whole read is
-     * bounded by, because content the store could hold but no consumer could then be served in one piece would
-     * only look published (CWE-400).
+     * <p><strong>The transaction is confirmed, not assumed.</strong> {@code TransactionUtil} silently does
+     * nothing when asked to register a synchronisation while no transaction is active, so code that registered
+     * and then relied on having done so would have had its work quietly dropped. The status decides:
      *
-     * <p><strong>A failure is a failure of the write.</strong> Nothing is caught here: a caller that cannot
-     * publish its content reports an error and lets its transaction roll back, so a {@code DataResource} row is
-     * never committed for content the rest of the fleet cannot read. That is the whole point of publishing
-     * inside the write rather than out of band afterwards.
+     * <ul>
+     * <li><strong>Active.</strong> Registered. The store is brought into step after the commit that records the
+     * row.</li>
+     * <li><strong>No transaction.</strong> Nothing is registered: there is nothing to bind to, and no later
+     * moment at which the bytes would be known to be complete. Every write path that reaches here runs inside a
+     * service and therefore inside a transaction, so a resolution outside one is a read. Reported once per
+     * target, so a deployment that does write outside a transaction can see why its content stayed local,
+     * without a line per read.</li>
+     * <li><strong>Marked for rollback, rolling back, or any other state.</strong> Nothing is registered. The
+     * transaction is already doomed, so nothing it produces may reach the store.</li>
+     * </ul>
      *
-     * <p><strong>Content outside the deployment's own tree is not published.</strong> An absolute
-     * {@code LOCAL_FILE} elsewhere on the host is state an operator placed deliberately, no storage key can be
-     * derived for it, and the read seams read it from where it is; publication reports it and leaves it there,
-     * exactly as a read would.
+     * <p>It never throws for a state it will not register in, because this sits on the READ path as much as the
+     * write path and a read must not begin to fail over the state of a transaction it does not use.
      *
-     * @param delegator the delegator the content was written through, carrying the tenant scope; required when a
-     *     provider that has to be published to is configured
-     * @param dataResourceId the immutable identifier of the resource the content belongs to; required for the
-     *     same reason, because it is what the storage key is derived from
-     * @param file the location the caller has finished writing, or {@code null} when it wrote nothing
-     * @throws GeneralException if a provider that has to be published to is configured but the resource identity
-     *     it keys content by is missing, if the provider refuses the key, or if the content is larger than one
-     *     read may hold
-     * @throws IOException if the content cannot be read back from the location, or the provider cannot store it
+     * @param store the provider serving this operation; never null and always one that holds content off the
+     *     instance
+     * @param target the file or directory being resolved
+     * @param scan how to read what the target holds, run once now and again at completion
+     * @param delegator the delegator the ceiling is resolved through; may be null
+     * @return {@code true} when the work was registered against an active transaction
      */
-    public static void publishToContentStore(Delegator delegator, String dataResourceId, File file)
-            throws GeneralException, IOException {
-        publishContentFile(delegator, dataResourceId, file);
-    }
-
-    /**
-     * Publishes content a caller has just written, and reports whether the configured provider took it.
-     *
-     * <p>The same seam as {@link #publishToContentStore}, in the form a caller that wants to know uses: it
-     * answers {@code false} for every configuration in which there is nothing to publish - database mode,
-     * where the bytes are in the row; a path-keyed provider, whose tree IS the deployment's own tree, so the
-     * write already landed in it; and a location outside that tree, which no key can be derived for - and
-     * {@code true} only when an object now holds the content. There is one implementation, so the two forms
-     * cannot diverge.
-     *
-     * @param delegator the delegator the content was written through, carrying the tenant scope
-     * @param dataResourceId the immutable identifier of the resource the content belongs to
-     * @param file the location the caller has finished writing, or {@code null} when it wrote nothing
-     * @return {@code true} when the content was published to a provider that holds it off this instance
-     * @throws GeneralException if a provider that has to be published to is configured but the resource
-     *     identity it keys content by is missing, if the provider refuses the key, or if the content is
-     *     larger than one read may hold
-     * @throws IOException if the content cannot be read back from the location, or the provider cannot store it
-     */
-    public static boolean publishContentFile(Delegator delegator, String dataResourceId, File file)
-            throws GeneralException, IOException {
-        if (file == null) {
+    private static boolean registerWriteThrough(ContentStore store, File target,
+            Supplier<Map<File, Snapshot>> scan, Delegator delegator) {
+        int status;
+        try {
+            status = TransactionUtil.getStatus();
+        } catch (GenericTransactionException e) {
+            Debug.logWarning(e, "Content written below [" + target.getName() + "] cannot be published to the"
+                    + " content store, because the status of the transaction it was resolved in could not be"
+                    + " established", MODULE);
             return false;
         }
-        ContentStore store = ContentStoreFactory.getContentStore(delegator);
-        if (!ContentStoreFactory.publicationRequired(store)) {
+        String identity = target.getAbsolutePath();
+        if (status != Status.STATUS_ACTIVE) {
+            reportUnboundResolution(identity, status);
             return false;
         }
-        if (delegator == null || UtilValidate.isEmpty(dataResourceId)) {
-            throw new GeneralException("Content written for a file-backed resource cannot be published to the"
-                    + " configured content store, because the resource identity the store keys content by was not"
-                    + " supplied with it");
+        if (!PENDING_WRITE_THROUGHS.get().add(identity)) {
+            // Already registered in this transaction. Two resolutions of one target - a service that resolves
+            // and then re-resolves, or two services inside one transaction - are one piece of work, and it is
+            // the state at commit that decides what that work is, so the first registration covers the second.
+            return true;
         }
-        String relative = deploymentRelativePath(file);
-        if (relative == null) {
-            Debug.logWarning("The content of DataResource [" + dataResourceId + "] was written outside this"
-                    + " deployment's own tree, so it is not published to the content store and only this instance"
-                    + " can read it", MODULE);
+        try {
+            TransactionUtil.registerSynchronization(new ContentWriteThrough(store, identity, scan, scan.get(),
+                    delegator));
+        } catch (GenericTransactionException e) {
+            PENDING_WRITE_THROUGHS.get().remove(identity);
+            Debug.logWarning(e, "Content written below [" + target.getName() + "] cannot be published to the"
+                    + " content store, because the publish could not be registered with the transaction that"
+                    + " resolved it", MODULE);
             return false;
         }
-        String key = ContentStoreFactory.storeKey(store, delegator, dataResourceId, relative);
-        // Bound to the metadata transaction exactly as storeContent binds its own publish, and for the same
-        // reason: the object and the DataResource row describing it are written to two places, only one of
-        // which is transactional, so a transaction that does not commit has to take the object with it.
-        // Registered BEFORE the object exists, so no published object is ever without its undo.
-        registerPublishRollback(store, key, dataResourceId);
-        store.put(key, contentToPublish(delegator, dataResourceId, file));
-        Debug.logInfo("Published the content of DataResource [" + dataResourceId + "] to the content store under ["
-                + key + "]", MODULE);
         return true;
     }
 
     /**
-     * Removes content a caller has just abandoned from the configured provider, and reports whether the
-     * provider held it.
+     * Reports a resolution that cannot be bound to a transaction, once per target.
      *
-     * <p>The withdrawal half of {@link #publishContentFile}, and answered by the same rules: nothing is
-     * withdrawn in database mode, from a path-keyed provider - whose file the deployment's own delete path
-     * owns - or for a location outside the deployment's tree. Idempotent by the provider contract, so
-     * withdrawing content that is not there succeeds.
+     * <p>Once per target rather than once per resolution, because the same location is resolved on every read of
+     * the resource and the report says nothing new the second time. Bounded, so that a deployment with a great
+     * many such locations cannot fill its log with them.
      *
-     * @param delegator the delegator the content was written through, carrying the tenant scope
-     * @param dataResourceId the immutable identifier of the resource the content belongs to
-     * @param file the location whose content is being withdrawn, or {@code null} when there is none
-     * @return {@code true} when the provider no longer holds the content, {@code false} when no provider
-     *     held it at all
-     * @throws GeneralException if the resource identity is missing or the provider refuses the key
-     * @throws IOException if the provider cannot be modified
+     * @param identity the absolute path of the target that will not be published
+     * @param status the transaction status that prevents it
      */
-    public static boolean withdrawContentFile(Delegator delegator, String dataResourceId, File file)
-            throws GeneralException, IOException {
-        if (file == null) {
-            return false;
+    private static void reportUnboundResolution(String identity, int status) {
+        if (REPORTED_UNBOUND_TARGETS.size() >= REPORTED_TARGET_LIMIT || !REPORTED_UNBOUND_TARGETS.add(identity)) {
+            return;
         }
-        ContentStore store = ContentStoreFactory.getContentStore(delegator);
-        if (!ContentStoreFactory.publicationRequired(store)) {
-            return false;
+        if (status == Status.STATUS_NO_TRANSACTION) {
+            Debug.logInfo("A content location was resolved outside a transaction, so a write to it cannot be"
+                    + " published to the content store and only this instance would be able to read it. Reads"
+                    + " are unaffected. A service always runs inside a transaction, so this is expected for a"
+                    + " read and a defect only for a write.", MODULE);
+            return;
         }
-        if (delegator == null || UtilValidate.isEmpty(dataResourceId)) {
-            throw new GeneralException("Content written for a file-backed resource cannot be withdrawn from the"
-                    + " configured content store, because the resource identity the store keys content by was not"
-                    + " supplied with it");
-        }
-        String relative = deploymentRelativePath(file);
-        if (relative == null) {
-            return false;
-        }
-        store.delete(ContentStoreFactory.storeKey(store, delegator, dataResourceId, relative));
-        return true;
+        Debug.logWarning("A content location was resolved in a transaction whose status is [" + status + "] rather"
+                + " than active, so nothing written through it will be published to the content store", MODULE);
     }
 
     /**
-     * Reads back the content that is about to be published, refusing content larger than the configured ceiling.
+     * Records what a single location holds, so that what happened to it can be told at commit.
      *
-     * <p>Bounded twice, as every whole read in this refactor is: once from the size the filesystem reports, and
-     * again as the content is read, because the location is one the deployment writes to and the size that was
-     * measured can be stale by the time it is read.
+     * <p>Three facts, because no one of them is enough alone: whether the location existed at all, how many bytes
+     * it held, and when it was last modified. A rewrite that happens to produce content of the same length is
+     * caught by the timestamp, and one that lands inside a single timestamp tick is caught by the length. The
+     * timestamp is read through {@link Files} rather than {@link File#lastModified()} because the former carries
+     * the filesystem's own resolution - nanoseconds on every mainstream Unix filesystem - while the latter
+     * truncates it to milliseconds, which a write can comfortably finish inside.
      *
-     * @param delegator the delegator the bound is resolved through
-     * @param dataResourceId the immutable identifier of the resource, for the refusal
-     * @param file the location the caller has finished writing
-     * @return the content to hand to the provider
-     * @throws GeneralException if the content is larger than one read may hold
-     * @throws IOException if it cannot be read
+     * @param existed whether anything was at the location
+     * @param length how many bytes it held
+     * @param modifiedAt when it was last modified, in nanoseconds, or -1 when nothing was there
      */
-    private static byte[] contentToPublish(Delegator delegator, String dataResourceId, File file)
-            throws GeneralException, IOException {
-        long limit = ContentStoreFactory.maxObjectSize(delegator);
-        if (file.length() > limit) {
-            throw tooLargeToPublish(dataResourceId, limit);
-        }
-        try (InputStream content = Files.newInputStream(file.toPath(), StandardOpenOption.READ)) {
-            byte[] read = content.readNBytes((int) limit);
-            if (content.read() != -1) {
-                throw tooLargeToPublish(dataResourceId, limit);
+    private record Snapshot(boolean existed, long length, long modifiedAt) {
+
+        /** What an absent location looks like. */
+        private static final Snapshot ABSENT = new Snapshot(false, 0L, -1L);
+
+        /**
+         * Records what a location holds now.
+         *
+         * @param file the location to look at
+         * @return the snapshot, which reports the location absent when it cannot be read at all
+         */
+        private static Snapshot of(File file) {
+            try {
+                BasicFileAttributes attributes = Files.readAttributes(file.toPath(), BasicFileAttributes.class);
+                if (!attributes.isRegularFile()) {
+                    return ABSENT;
+                }
+                return new Snapshot(true, attributes.size(), attributes.lastModifiedTime().to(TimeUnit.NANOSECONDS));
+            } catch (IOException | RuntimeException absent) {
+                return ABSENT;
             }
-            return read;
         }
     }
 
     /**
-     * Reports content that cannot be published because it exceeds the configured whole-read ceiling.
+     * Reads what one file holds, as the one-entry map a write-through compares.
      *
-     * <p>Names the resource, the ceiling and the setting that governs it, and deliberately not the location the
-     * content was written to: this message reaches the caller of a service and, through it, an end user
-     * (CWE-200). The location is already in the caller's own log.
-     *
-     * @param dataResourceId the immutable identifier of the resource
-     * @param limit the ceiling that was exceeded
-     * @return the exception to throw
+     * @param file the location
+     * @return a single-entry map, whose value reports absence when nothing is there
      */
-    private static GeneralException tooLargeToPublish(String dataResourceId, long limit) {
-        return new GeneralException("The content of DataResource [" + dataResourceId + "] is larger than the "
-                + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of " + limit + " bytes, which is the"
-                + " most one read may hold, so it cannot be published to the content store. Raise that ceiling"
-                + " to store content this large.");
+    private static Map<File, Snapshot> scanFile(File file) {
+        return Map.of(file, Snapshot.of(file));
+    }
+
+    /**
+     * Reads what every file directly inside a directory holds, as the map a write-through compares.
+     *
+     * <p>Direct children only, and regular files only: an upload lands as a file in the directory the upload
+     * path named, and descending further would make one upload's commit responsible for every file the
+     * deployment has ever placed below that tree.
+     *
+     * @param directory the directory
+     * @return what each file in it holds, empty when the directory cannot be read
+     */
+    private static Map<File, Snapshot> scanDirectory(File directory) {
+        File[] children = directory.listFiles();
+        if (children == null) {
+            return Map.of();
+        }
+        Map<File, Snapshot> held = new LinkedHashMap<>();
+        for (File child : children) {
+            Snapshot snapshot = Snapshot.of(child);
+            if (snapshot.existed()) {
+                held.put(child, snapshot);
+            }
+        }
+        return held;
+    }
+
+    /**
+     * Brings the content store into step with what a resolved target holds, once the transaction that resolved it
+     * has committed.
+     *
+     * <p>One instance per target per transaction. Every decision comes from the difference between what the
+     * target held when it was resolved and what it holds at completion:
+     *
+     * <ul>
+     * <li><strong>Unchanged.</strong> Nothing happens. This is every read.</li>
+     * <li><strong>Content is there and differs, or is new.</strong> It is published, streamed from the file so
+     * that content of a size an uploader chose is never held in this JVM's heap.</li>
+     * <li><strong>Content was there and is gone.</strong> Its key is removed, so the store does not go on serving
+     * content the deployment has discarded. This is the production caller of
+     * {@link ContentStore#delete(String)}.</li>
+     * </ul>
+     *
+     * <p>The ceiling is applied in {@link #beforeCompletion()}, where refusing still means something: the
+     * transaction is marked for rollback, so a row is never committed for content the store could hold but no
+     * instance could afterwards read in one piece. Applied after the commit it could only have logged a complaint
+     * about a row that was already there.
+     *
+     * <p>A failure after the commit is reported and swallowed, because there is nothing left to fail: the row is
+     * committed, and an exception escaping a completion callback suppresses whatever cleanup follows it. The
+     * report says what could not be done so that an operator can finish it by hand.
+     */
+    private static final class ContentWriteThrough implements Synchronization {
+
+        private final ContentStore store;
+        private final String identity;
+        private final Supplier<Map<File, Snapshot>> scan;
+        private final Map<File, Snapshot> before;
+        private final Delegator delegator;
+
+        /**
+         * Binds one target's content to the completion of the transaction that resolved it.
+         *
+         * @param store the provider to bring into step
+         * @param identity the absolute path of the target, which is what the registration is deduplicated by
+         * @param scan how to read what the target holds
+         * @param before what it held when it was resolved
+         * @param delegator the delegator the ceiling is resolved through; may be null
+         */
+        private ContentWriteThrough(ContentStore store, String identity, Supplier<Map<File, Snapshot>> scan,
+                Map<File, Snapshot> before, Delegator delegator) {
+            this.store = store;
+            this.identity = identity;
+            this.scan = scan;
+            this.before = before;
+            this.delegator = delegator;
+        }
+
+        @Override
+        public void beforeCompletion() {
+            long limit = ContentStoreFactory.maxObjectSize(delegator);
+            for (Map.Entry<File, Snapshot> now : scan.get().entrySet()) {
+                Snapshot state = now.getValue();
+                if (!state.existed() || state.equals(before.get(now.getKey())) || state.length() <= limit) {
+                    continue;
+                }
+                refuseOversizedContent(state.length(), limit);
+                return;
+            }
+        }
+
+        /**
+         * Marks the transaction for rollback rather than committing a row for content that cannot be published.
+         *
+         * @param length how large the content is
+         * @param limit the ceiling it exceeds
+         */
+        private void refuseOversizedContent(long length, long limit) {
+            Debug.logError("Content store refusal: content written below [" + identity + "] is " + length
+                    + " bytes, over the " + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of " + limit
+                    + "; the transaction is rolled back rather than recording content the store may hold but no"
+                    + " instance could read whole. Raise that ceiling to store content this large.", MODULE);
+            try {
+                TransactionUtil.setRollbackOnly("Content larger than "
+                        + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " cannot be published to the content"
+                        + " store", null);
+            } catch (GenericTransactionException e) {
+                Debug.logError(e, "The transaction recording oversized content could not be marked for rollback,"
+                        + " so the row may commit without the content being published", MODULE);
+            }
+        }
+
+        @Override
+        public void afterCompletion(int status) {
+            PENDING_WRITE_THROUGHS.get().remove(identity);
+            if (status != Status.STATUS_COMMITTED) {
+                // Nothing was written to the store, and nothing is removed from it. A transaction that did not
+                // commit leaves the store exactly as it was - including whatever version of this content was
+                // already there, and any write another transaction committed in the meantime.
+                return;
+            }
+            Map<File, Snapshot> now = scan.get();
+            for (Map.Entry<File, Snapshot> entry : now.entrySet()) {
+                if (!entry.getValue().equals(before.get(entry.getKey()))) {
+                    bringIntoStep(entry.getKey(), entry.getValue());
+                }
+            }
+            for (Map.Entry<File, Snapshot> entry : before.entrySet()) {
+                if (entry.getValue().existed() && !now.containsKey(entry.getKey())) {
+                    bringIntoStep(entry.getKey(), Snapshot.ABSENT);
+                }
+            }
+        }
+
+        /**
+         * Publishes or removes one location's content, reporting rather than propagating a failure.
+         *
+         * @param file the location
+         * @param state what it holds now
+         */
+        private void bringIntoStep(File file, Snapshot state) {
+            String key = null;
+            try {
+                String relative = deploymentRelativePath(file);
+                if (relative == null) {
+                    // Outside the deployment's own tree, so no key describes it and the read seams read it from
+                    // where it is. Nothing to publish and nothing to remove.
+                    return;
+                }
+                key = ContentStoreFactory.storeKey(store, relative);
+                if (state.existed()) {
+                    publish(key, file, state.length());
+                } else {
+                    store.delete(key);
+                    Debug.logInfo("Content was removed by a committed transaction, so it was removed from the"
+                            + " content store under [" + key + "] as well", MODULE);
+                }
+            } catch (GeneralException | IOException | RuntimeException e) {
+                Debug.logError(e, "The transaction recording content committed, but the content store could not be"
+                        + " brought into step with it under [" + key + "]. The store and this deployment's own"
+                        + " tree now disagree about this content, and it should be published by hand.", MODULE);
+            }
+        }
+
+        /**
+         * Streams one location's content to the store.
+         *
+         * @param key the storage key
+         * @param file the location
+         * @param length how many bytes it holds
+         * @throws GeneralException if the provider refuses the key or the length
+         * @throws IOException if the content cannot be read or stored
+         */
+        private void publish(String key, File file, long length) throws GeneralException, IOException {
+            try (InputStream content = Files.newInputStream(file.toPath(), StandardOpenOption.READ)) {
+                store.put(key, content, length);
+            }
+            Debug.logInfo("Published " + length + " bytes to the content store under [" + key + "]", MODULE);
+        }
     }
 
     /**
@@ -2020,15 +2496,16 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * sees the same provider even if the configuration is changed while it runs, and so one operation can never
      * be served half from one provider and half from another.
      *
-     * <p>Both parts of the resource's identity are required, because identity is what a storage key is derived
-     * from: without them there is no key to read or write and the only correct answer is the local one. That is
-     * what makes the frozen four-argument {@link #renderFile} signature behave exactly as it did before this
-     * work.
+     * <p>A caller that brings neither a delegator nor a resource gets no provider. Not because no key could be
+     * derived for it - a key comes from the location, which every caller has - but because that pair of nulls is
+     * what the frozen four-argument {@link #renderFile} signature passes, and that signature has to behave
+     * exactly as it did before this work. Every read that does reach a provider therefore comes from the render
+     * path or the stream path, both of which hold the {@code DataResource} they are reading.
      *
-     * @param delegator the delegator the resource was read or written through, carrying the tenant scope
-     * @param dataResourceId the immutable identifier of the resource
+     * @param delegator the delegator the provider and its tunables are resolved against
+     * @param dataResourceId the identifier of the resource being read
      * @return the active provider, or {@code null} when content is held in the {@code DataResource} database
-     *     columns - the committed default - or when the caller brought no resource identity
+     *     columns - the committed default - or when the caller is the frozen delegator-less signature
      * @throws GeneralException if a provider is selected but its configuration is incomplete or unusable, which
      *     is reported rather than hidden because quietly reading local files would mask a broken deployment
      */
@@ -2038,274 +2515,6 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             return null;
         }
         return ContentStoreFactory.getContentStore(delegator);
-    }
-
-    /**
-     * Reports whether a configured provider holds the content of a file-backed location, and is therefore where
-     * a write to it has to go.
-     *
-     * <p>Asked by a content service before it writes, so that it can prepare the bytes the way the provider
-     * needs them - validated on a staged copy rather than on a file in the deployment tree - and so that a
-     * deployment with no provider configured takes exactly the local path it always took. It resolves the
-     * location through the same authorisation the read paths use and derives the same key, so "the provider
-     * holds this" means the identical thing to both halves of the seam.
-     *
-     * @param delegator the delegator the resource is written through, carrying the tenant scope
-     * @param dataResourceId the immutable identifier of the resource
-     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
-     * @param objectInfo the {@code DataResource.objectInfo} location
-     * @param contextRoot the webapp context root, required by the {@code CONTEXT_FILE} types
-     * @return {@code true} when a provider holds this location's content
-     * @throws GeneralException if the location is refused, or a provider is selected but unusable
-     */
-    public static boolean contentStoreHolds(Delegator delegator, String dataResourceId, String dataResourceTypeId,
-            String objectInfo, String contextRoot) throws GeneralException {
-        return storeKeyFor(delegator, dataResourceId, dataResourceTypeId, objectInfo, contextRoot) != null;
-    }
-
-    /**
-     * Resolves the location a write is aimed at, requiring it to exist locally only when no provider holds the
-     * content.
-     *
-     * <p>{@link #getContentFile} is a read resolution and treats an absent location as final, which is right
-     * for every caller that needs the local file itself. A write to a provider-backed resource does not: the
-     * bytes are going to the provider, and the local location exists only to be authorised and to name the key.
-     * Every authorisation {@code getContentFile} applies is applied here, through the same code, so a location
-     * an allow list or a context root forbids is refused for a write exactly as it is for a read.
-     *
-     * @param delegator the delegator the resource is written through
-     * @param dataResourceId the immutable identifier of the resource
-     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
-     * @param objectInfo the {@code DataResource.objectInfo} location
-     * @param contextRoot the webapp context root, required by the {@code CONTEXT_FILE} types
-     * @return the resolved location, or {@code null} for a type that is not file backed
-     * @throws GeneralException if the location is refused, or a provider is selected but unusable
-     * @throws FileNotFoundException if the location holds nothing and no provider holds the content either,
-     *     which is the pre-existing behaviour of {@link #getContentFile} for exactly that case
-     */
-    public static File getContentWriteFile(Delegator delegator, String dataResourceId, String dataResourceTypeId,
-            String objectInfo, String contextRoot) throws GeneralException, FileNotFoundException {
-        ContentStore store = storeForResource(delegator, dataResourceId);
-        return resolveContentLocation(dataResourceTypeId, objectInfo, contextRoot, store == null);
-    }
-
-    /**
-     * Stores content for a file-backed {@code DataResource} in the configured provider.
-     *
-     * <p>The write half of the seam. It is what keeps an upload off the instance that accepted it: the bytes go
-     * to the provider every instance of the deployment reaches, under the key both read seams derive for the
-     * same resource, so the content is servable by any instance and survives the one that received it.
-     *
-     * <p>Answers {@code false} without touching anything when no provider holds this location's content -
-     * database storage, which is the committed default, and any location outside the deployment tree - and the
-     * caller then performs the local write it has always performed. That is the whole of the backward
-     * compatibility: an unconfigured deployment reaches the {@code false} return and nothing else here.
-     *
-     * <p>Bound to the metadata transaction. When the provider holds content off this instance, a rollback
-     * synchronisation is registered so that a transaction which records no {@code DataResource} row leaves no
-     * object behind either. Registration failure is a refusal rather than a warning: an object published
-     * without that binding is one nothing will ever remove.
-     *
-     * @param delegator the delegator the resource is written through, carrying the tenant scope
-     * @param dataResourceId the immutable identifier of the resource
-     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
-     * @param objectInfo the {@code DataResource.objectInfo} location
-     * @param contextRoot the webapp context root, required by the {@code CONTEXT_FILE} types
-     * @param content the complete content to store; never null, and may be empty
-     * @return {@code true} when the provider now holds the content, {@code false} when the caller must perform
-     *     its own local write
-     * @throws GeneralException if the location is refused, the provider is unusable, the content is null, or
-     *     the publish could not be bound to the transaction that records the metadata
-     * @throws IOException if the provider cannot be written to
-     */
-    public static boolean storeContent(Delegator delegator, String dataResourceId, String dataResourceTypeId,
-            String objectInfo, String contextRoot, byte[] content) throws GeneralException, IOException {
-        if (content == null) {
-            throw new GeneralException("Cannot store null content for dataResourceId [" + dataResourceId + "]");
-        }
-        ContentStore store = storeForResource(delegator, dataResourceId);
-        String key = storeKeyFor(store, delegator, dataResourceId, dataResourceTypeId, objectInfo, contextRoot);
-        if (key == null) {
-            return false;
-        }
-        // Registered BEFORE the object exists, deliberately. Registering afterwards would leave a window in
-        // which a published object had no undo, and a registration that fails after the publish would leave one
-        // permanently: this way a transaction manager that cannot accept the synchronisation costs the upload
-        // rather than orphaning an object in the bucket.
-        registerPublishRollback(store, key, dataResourceId);
-        store.put(key, content);
-        Debug.logInfo("Published " + content.length + " bytes of content for dataResourceId [" + dataResourceId
-                + "] to the configured content store", MODULE);
-        return true;
-    }
-
-    /**
-     * Removes the content a file-backed {@code DataResource} holds in the configured provider.
-     *
-     * <p>The removal half of the seam, and idempotent by the provider's contract: removing content that is not
-     * there succeeds. Answers {@code false} without touching anything when no provider holds this location's
-     * content, so a caller that also has a local file to remove keeps doing exactly that.
-     *
-     * @param delegator the delegator the resource is written through, carrying the tenant scope
-     * @param dataResourceId the immutable identifier of the resource
-     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
-     * @param objectInfo the {@code DataResource.objectInfo} location
-     * @param contextRoot the webapp context root, required by the {@code CONTEXT_FILE} types
-     * @return {@code true} when the provider no longer holds the content, {@code false} when no provider holds
-     *     it at all
-     * @throws GeneralException if the location is refused or the provider is unusable
-     * @throws IOException if the provider cannot be modified
-     */
-    public static boolean removeStoredContent(Delegator delegator, String dataResourceId,
-            String dataResourceTypeId, String objectInfo, String contextRoot)
-            throws GeneralException, IOException {
-        ContentStore store = storeForResource(delegator, dataResourceId);
-        String key = storeKeyFor(store, delegator, dataResourceId, dataResourceTypeId, objectInfo, contextRoot);
-        if (key == null) {
-            return false;
-        }
-        store.delete(key);
-        return true;
-    }
-
-    /**
-     * Derives the provider key for a file-backed location, resolving the provider first.
-     *
-     * @param delegator the delegator the resource is read or written through
-     * @param dataResourceId the immutable identifier of the resource
-     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
-     * @param objectInfo the {@code DataResource.objectInfo} location
-     * @param contextRoot the webapp context root, required by the {@code CONTEXT_FILE} types
-     * @return the provider key, or {@code null} when no provider holds this location's content
-     * @throws GeneralException if the location is refused or the provider is unusable
-     */
-    private static String storeKeyFor(Delegator delegator, String dataResourceId, String dataResourceTypeId,
-            String objectInfo, String contextRoot) throws GeneralException {
-        return storeKeyFor(storeForResource(delegator, dataResourceId), delegator, dataResourceId,
-                dataResourceTypeId, objectInfo, contextRoot);
-    }
-
-    /**
-     * Derives the provider key for a file-backed location through an already resolved provider.
-     *
-     * <p>The location is resolved and authorised before any key exists, through the same code
-     * {@link #getContentFile} uses, so a location an operator has forbidden costs no provider request; and the
-     * key itself comes from {@link #readKey}, the one derivation both read seams use, so a resource written
-     * under this key is a resource they read back.
-     *
-     * @param store the resolved provider, or {@code null} for database storage
-     * @param delegator the delegator the resource is read or written through
-     * @param dataResourceId the immutable identifier of the resource
-     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}
-     * @param objectInfo the {@code DataResource.objectInfo} location
-     * @param contextRoot the webapp context root, required by the {@code CONTEXT_FILE} types
-     * @return the provider key, or {@code null} when no provider holds this location's content
-     * @throws GeneralException if the location is refused or the provider is unusable
-     */
-    private static String storeKeyFor(ContentStore store, Delegator delegator, String dataResourceId,
-            String dataResourceTypeId, String objectInfo, String contextRoot) throws GeneralException {
-        if (store == null || UtilValidate.isEmpty(objectInfo)) {
-            return null;
-        }
-        File file;
-        try {
-            file = resolveContentLocation(dataResourceTypeId, objectInfo, contextRoot, false);
-        } catch (FileNotFoundException absent) {
-            // Cannot happen with requireLocalPresence false, and is reported rather than swallowed if the
-            // resolution ever changes: silently answering "no provider holds this" would send content local.
-            throw new GeneralException("The location [" + objectInfo + "] of dataResourceId [" + dataResourceId
-                    + "] could not be resolved", absent);
-        }
-        return file == null ? null : readKey(store, delegator, dataResourceId, file);
-    }
-
-    /**
-     * Binds a publish to the transaction that records the metadata describing it.
-     *
-     * <p>An object store and the {@code DataResource} row are two stores, and only one of them is transactional.
-     * Without this, a service that published an upload and then failed - a permission check, an ECA, a
-     * constraint, anything after the bytes were sent - would leave an object in the bucket that no row refers
-     * to: content nobody can reach and nothing will remove, accumulating on every retry. So the removal is
-     * registered as a rollback action of the current transaction, which is the same mechanism the entity engine
-     * uses for its own after-transaction work.
-     *
-     * <p>Only for a provider that holds content off this instance. The filesystem provider's storage tree is
-     * the deployment's own tree, and a rolled-back local write has always left its file behind; removing it now
-     * would be a behaviour change in the one mode whose whole purpose is to behave as it always did.
-     *
-     * <p>No transaction, no registration, and that is correct rather than a gap:
-     * {@code TransactionUtil.registerSynchronization} does nothing when no transaction is active, which is a
-     * caller that is not recording a row either.
-     *
-     * @param store the provider the content is being published to, never null
-     * @param key the key the content is published under
-     * @param dataResourceId the resource being published, for the diagnostic
-     * @throws GeneralException if the synchronisation cannot be registered, which is refused rather than
-     *     ignored because an unbound publish is an object nothing will ever remove
-     */
-    private static void registerPublishRollback(ContentStore store, String key, String dataResourceId)
-            throws GeneralException {
-        if (!ContentStoreFactory.holdsContentOffInstance(store)) {
-            return;
-        }
-        try {
-            TransactionUtil.registerSynchronization(new Synchronization() {
-                @Override
-                public void beforeCompletion() {
-                    // Nothing: the object is already published, and this exists only to undo it.
-                }
-
-                @Override
-                public void afterCompletion(int status) {
-                    if (status == Status.STATUS_COMMITTED) {
-                        return;
-                    }
-                    try {
-                        store.delete(key);
-                        Debug.logInfo("The transaction recording dataResourceId [" + dataResourceId + "] did not"
-                                + " commit, so the content published for it was removed from the content store",
-                                MODULE);
-                    } catch (GeneralException | IOException e) {
-                        // Reported and swallowed: this runs after the transaction has completed, where there is
-                        // nothing left to fail. What is left behind is an unreferenced object, which the message
-                        // names so that it can be removed - either by hand or by the store's own lifecycle rules.
-                        Debug.logError(e, "The transaction recording dataResourceId [" + dataResourceId + "] did"
-                                + " not commit and the content published for it could not be removed from the"
-                                + " content store. It is unreferenced and should be removed.", MODULE);
-                    }
-                }
-            });
-        } catch (GenericTransactionException e) {
-            throw new GeneralException("The content for dataResourceId [" + dataResourceId + "] was not published,"
-                    + " because the removal that undoes it if this transaction rolls back could not be"
-                    + " registered", e);
-        }
-    }
-
-    /**
-     * Derives the key the active provider holds a resolved location's content under.
-     *
-     * <p>The derivation itself belongs to {@link ContentStoreFactory#storeKey}, which knows what the active
-     * provider is keyed by: immutable identity for an object store, the {@code ofbiz.home}-relative path for a
-     * path-keyed provider. What is decided here is the prior question of whether the provider can hold this
-     * content at all. A location outside {@code ofbiz.home} is host-local state an operator placed deliberately,
-     * so it has no place in a provider and is read from where it is.
-     *
-     * @param store the provider serving this operation, never null
-     * @param delegator the delegator the resource was read through
-     * @param dataResourceId the immutable identifier of the resource
-     * @param file the resolved, already authorised location
-     * @return the provider key, or {@code null} when the location lies outside {@code ofbiz.home} and is
-     *     therefore not provider-backed content
-     * @throws GeneralException if the provider refuses to derive a key from this resource's identity
-     */
-    private static String readKey(ContentStore store, Delegator delegator, String dataResourceId, File file)
-            throws GeneralException {
-        String relative = deploymentRelativePath(file);
-        if (relative == null) {
-            return null;
-        }
-        return ContentStoreFactory.storeKey(store, delegator, dataResourceId, relative);
     }
 
     /**
@@ -2357,8 +2566,9 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * full and nothing is written to local disk, which is what the pre-refactor local read also did.
      *
      * @param store the provider serving this operation, or {@code null} for database storage
-     * @param delegator the delegator the resource was read through
-     * @param dataResourceId the immutable identifier of the resource
+     * @param delegator the delegator the fallback setting is resolved through
+     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}, which decides whether this resource
+     *     is provider-backed at all
      * @param file the resolved, already authorised location
      * @param out the output to render into
      * @param absentLocally whether the location holds nothing on this instance's disk
@@ -2368,12 +2578,9 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      *     a local copy may not answer in its place
      * @throws IOException if the content cannot be read or the output cannot be written
      */
-    private static boolean renderThrough(ContentStore store, Delegator delegator, String dataResourceId, File file,
-            Appendable out, boolean absentLocally) throws GeneralException, IOException {
-        if (store == null) {
-            return false;
-        }
-        String key = readKey(store, delegator, dataResourceId, file);
+    private static boolean renderThrough(ContentStore store, Delegator delegator, String dataResourceTypeId,
+            File file, Appendable out, boolean absentLocally) throws GeneralException, IOException {
+        String key = providerKey(store, dataResourceTypeId, file);
         if (key == null) {
             return false;
         }
@@ -2406,8 +2613,9 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * which hands over a {@code FileInputStream}.
      *
      * @param store the provider serving this operation, or {@code null} for database storage
-     * @param delegator the delegator the resource was read through
-     * @param dataResourceId the immutable identifier of the resource
+     * @param delegator the delegator the fallback setting is resolved through
+     * @param dataResourceTypeId the {@code DataResource.dataResourceTypeId}, which decides whether this resource
+     *     is provider-backed at all
      * @param file the resolved, already authorised location
      * @param absentLocally whether the location holds nothing on this instance's disk
      * @return the {@code stream} and {@code length} pair {@link #getDataResourceStream} returns, or {@code null}
@@ -2416,12 +2624,9 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      *     local copy may not answer in its place
      * @throws IOException if the content cannot be opened
      */
-    private static Map<String, Object> streamThrough(ContentStore store, Delegator delegator, String dataResourceId,
-            File file, boolean absentLocally) throws GeneralException, IOException {
-        if (store == null) {
-            return null;
-        }
-        String key = readKey(store, delegator, dataResourceId, file);
+    private static Map<String, Object> streamThrough(ContentStore store, Delegator delegator,
+            String dataResourceTypeId, File file, boolean absentLocally) throws GeneralException, IOException {
+        String key = providerKey(store, dataResourceTypeId, file);
         if (key == null) {
             return null;
         }
@@ -2448,8 +2653,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * decision arises, and the caller reports absence exactly as it always has.</li>
      * <li><strong>Nothing in the provider but a local copy exists, with {@code
      * content.store.local.fallback} at its committed default.</strong> The local copy answers. Content written
-     * since the provider was configured is published to it as it is written, so this case is content that
-     * predates the provider - shipped content, or an upload made before it was switched on - and refusing it
+     * since the provider was configured is published to it by the transaction that writes it, so this case is
+     * content that predates the provider - shipped content, or an upload made before it was switched on - and refusing it
      * would make selecting a provider stop a deployment serving content it served the day before. It is
      * reported once per resource rather than once per read, because the report is about a resource that has yet
      * to be migrated and repeating it on every render says nothing new.</li>
@@ -2460,10 +2665,18 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * instance. It is refused.</li>
      * </ul>
      *
+     * <p><strong>The refusal says nothing about where the content lives.</strong> A storage key is this
+     * deployment's own layout - the {@code ofbiz.home}-relative path of the content, under whatever prefix the
+     * bucket is organised by - and this refusal travels back through the content-rendering path, where it can
+     * reach a rendered page. So the key goes to the log, beside an opaque reference, and the message carries the
+     * reference and the setting an operator would change (CWE-200). The provider's own absence report is not
+     * attached either, for the same reason: {@code GeneralException.getMessage()} appends the message of any cause
+     * it is given, so attaching it would put the path straight back into the text.
+     *
      * @param key the provider key that holds nothing
      * @param absentLocally whether the location holds nothing on this instance's disk either
      * @param delegator the delegator the fallback setting is resolved through
-     * @param absent the provider's report of absence, kept as the cause and for verbose logging
+     * @param absent the provider's report of absence, kept for the log
      * @throws GeneralException when a local copy exists but may not answer for the provider
      */
     private static void refuseUnlessLocalCopyMayAnswer(String key, boolean absentLocally, Delegator delegator,
@@ -2474,17 +2687,21 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             return;
         }
         if (!ContentStoreFactory.localFallbackEnabled(delegator)) {
-            throw new GeneralException("The configured content store holds no content under [" + key + "] while a"
-                    + " local copy of it exists. The store is the authority for this content, so the local copy"
-                    + " is not served in its place. Place the content in the store, or set"
+            String reference = UUID.randomUUID().toString();
+            Debug.logError(absent, "Content store refusal [" + reference + "]: the store holds no content under ["
+                    + key + "] while a local copy of it exists, and content.store.local.fallback is false, so the"
+                    + " local copy is not served in its place. Place the content in the store, or set"
                     + " content.store.local.fallback=true to allow local copies to answer while content is"
-                    + " migrated into it.", absent);
+                    + " migrated into it.", MODULE);
+            throw new GeneralException("The requested content is not available from this deployment's content"
+                    + " store, and content.store.local.fallback does not allow a local copy to answer for it."
+                    + " Reference [" + reference + "].");
         }
         if (REPORTED_FALLBACK_KEYS.size() < REPORTED_FALLBACK_KEY_LIMIT && REPORTED_FALLBACK_KEYS.add(key)) {
             Debug.logWarning(absent, "The configured content store holds nothing under [" + key + "], so the"
                     + " local copy answers for it because content.store.local.fallback allows it. Content"
-                    + " written since the store was configured is published to it as it is written, so this"
-                    + " content predates the store and belongs copied into it.", MODULE);
+                    + " written since the store was configured is published to it by the transaction that"
+                    + " writes it, so this content predates the store and belongs copied into it.", MODULE);
             return;
         }
         Debug.logVerbose(absent, "The configured content store holds nothing under [" + key + "], so the local"

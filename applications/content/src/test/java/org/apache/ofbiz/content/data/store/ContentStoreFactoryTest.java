@@ -46,7 +46,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Base64;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -55,6 +55,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -65,6 +66,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
+import java.util.zip.CRC32;
 
 import javax.imageio.ImageIO;
 import javax.transaction.Status;
@@ -102,6 +104,7 @@ import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.http.AbortableInputStream;
 import software.amazon.awssdk.regions.Region;
@@ -126,7 +129,6 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -142,8 +144,10 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Answers.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.withSettings;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -237,6 +241,9 @@ public final class ContentStoreFactoryTest {
     private static final String PROPERTY_S3_ATTEMPT_TIMEOUT = "content.store.s3.attempt.timeout.millis";
     private static final String PROPERTY_S3_MAX_RETRIES = "content.store.s3.max.retries";
 
+    /** The deadline a whole streamed response body is bound by. */
+    private static final String PROPERTY_S3_STREAM_TIMEOUT = "content.store.s3.stream.total.timeout.millis";
+
     /** Every key this test writes, and therefore every key it has to put back. */
     private static final String[] MUTATED_PROPERTIES = {
         PROPERTY_PROVIDER,
@@ -252,6 +259,13 @@ public final class ContentStoreFactoryTest {
         PROPERTY_S3_API_TIMEOUT,
         PROPERTY_S3_ATTEMPT_TIMEOUT,
         PROPERTY_S3_MAX_RETRIES,
+        PROPERTY_S3_STREAM_TIMEOUT,
+        // The plaintext-endpoint permission belongs here as much as any other, and for a stronger reason
+        // than tidiness: setPropertyValueInMemory lasts for the life of the JVM, so a test that turned it
+        // on and did not put it back left every LATER test in this JVM permitted to send its credentials
+        // to a plaintext endpoint. A suite that relaxes a security control for its own convenience and
+        // then forgets to restore it stops being able to prove that the control works.
+        PROPERTY_S3_INSECURE_ENDPOINT,
     };
 
     private static final String PROVIDER_DATABASE = "database";
@@ -601,6 +615,16 @@ public final class ContentStoreFactoryTest {
         // The other half of the matrix, and the half that would break every real deployment if the
         // canonicalisation were too eager: an ordinary address written in an alternate form is not a
         // metadata address and must be accepted. 127.0.0.1 as one decimal number is 2130706433.
+        //
+        // The plaintext permission is granted here EXPLICITLY, and only here, because this case isolates
+        // the metadata-address policy from the transport policy: several of the addresses below are
+        // plaintext and not on this host, which the transport policy refuses on its own account, and
+        // asserting them without saying so would be asserting two policies at once and passing only while
+        // some other test happened to have relaxed one of them. That the transport policy REFUSES such an
+        // endpoint unless it is permitted is proved by
+        // aPlaintextEndpointIsRefusedUnlessItIsOnThisHostOrExplicitlyPermitted, and the restore hook puts
+        // this value back so no later test inherits it.
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_INSECURE_ENDPOINT, "true");
         String[] ordinaryEndpoints = {"http://127.0.0.1:9000/", "http://2130706433:9000/",
                 "http://0x7f000001:9000/", "http://[::1]:9000/", "https://10.0.0.7:9000/",
                 "http://169.253.169.254/", "http://169.255.169.254/"};
@@ -813,9 +837,10 @@ public final class ContentStoreFactoryTest {
         // The cause is the second route the store's own words could travel, and the easier one to
         // overlook: anything that logs a caught IOException with its stack trace, or reads
         // getCause().getMessage(), republishes whatever the SDK quoted - and an SDK message can quote the
-        // request it was building, endpoint and signed headers included. So the failure crosses no
-        // boundary at all; what identifies it goes to the log, sanitised, beside the reference above.
-        assertNull(thrown.getCause(), "no SDK failure may be attached to the report: " + thrown);
+        // request it was building, endpoint and signed headers included. So the SDK failure itself crosses
+        // no boundary; a sanitised stand-in does, so that the report is still something a caller can
+        // branch on. See assertSanitisedCause.
+        assertSanitisedCause(thrown);
     }
 
     @Test
@@ -1097,31 +1122,27 @@ public final class ContentStoreFactoryTest {
         S3Client client = mock(S3Client.class);
         ContentStore store = new S3ContentStore(client, BUCKET);
 
-        // A bucket is one namespace shared by every instance and, in a multi-tenant deployment, by
-        // every tenant, so this provider accepts only the scoped identity key and refuses everything
-        // else where it is named rather than sending it to a store that would honour it. The list is
-        // the ways a key can fail to be that: absent, empty, absolute, a traversal, a bare upload
-        // path that two tenants could both record, the right shape under the wrong namespace, too few
-        // or too many segments, and an empty segment. The last five are the right shape in every
-        // respect but one character, and are refused for a second reason: a key travels to the store
-        // inside the request line and its headers, so one carrying a NUL or a line break could alter
-        // what is sent on this deployment's behalf rather than merely name the wrong object.
+        // A key here is the content's ofbiz.home-relative path, the same key the filesystem provider uses, and
+        // it is refused where it is named rather than sent to a store that would honour it. The list is the ways
+        // a path can fail to be one: absent, empty, absolute, a traversal, a bare relative component, an empty
+        // component and a trailing separator. The last five are usable paths in every respect but one character,
+        // and are refused for a second reason: a key travels to the store inside the request line and its
+        // headers, so one carrying a NUL or a line break could alter what is sent on this deployment's behalf
+        // rather than merely name the wrong object.
         String[] unusable = {
             null,
             "",
-            "/dataresource/default/10000",
-            "dataresource/../../etc/passwd",
-            "runtime/uploads/party/logo.png",
-            "other/default/10000",
-            "dataresource/10000",
-            "dataresource/default/10000/original",
-            "dataresource//10000",
-            "dataresource/default/",
-            "dataresource/default/100\u000000",
-            "dataresource/default/10\t000",
-            "dataresource/default/10000\n",
-            "dataresource/default/100\u007f00",
-            "dataresource/default/100\u001b00",
+            "/runtime/uploads/party/logo.png",
+            "runtime/../../etc/passwd",
+            "runtime/./uploads/logo.png",
+            "..",
+            "runtime//uploads/logo.png",
+            "runtime/uploads/",
+            "runtime/uploads/logo\u0000.png",
+            "runtime/uploads/lo\tgo.png",
+            "runtime/uploads/logo.png\n",
+            "runtime/uploads/logo\u007f.png",
+            "runtime/uploads/logo\u001b.png",
         };
         for (String key : unusable) {
             // All five operations are asked, not only the two that are cheapest to call: they share
@@ -1314,57 +1335,6 @@ public final class ContentStoreFactoryTest {
             assertEquals(DEFAULT_MAX_OBJECT_SIZE, ContentStoreFactory.maxObjectSize(null), "[" + unusable + "] must"
                     + " leave the committed default in force");
         }
-    }
-
-    @Test
-    public void theObjectStoreKeyIsDerivedFromTenantScopeAndTheImmutableIdentifier() throws Exception {
-        ContentStore objectStore = new S3ContentStore(mock(S3Client.class), BUCKET);
-
-        // Only these two getters are consulted, which is why a stand-in delegator is the right stub
-        // here: the derivation is about identity, and nothing else about a delegator takes part in it.
-        Delegator base = mock(Delegator.class);
-        when(base.getDelegatorBaseName()).thenReturn("default");
-        when(base.getDelegatorTenantId()).thenReturn("");
-        assertEquals("dataresource/default/10000", ContentStoreFactory.storeKey(objectStore, base, "10000",
-                "runtime/uploads/party/logo.png"), "the recorded path must take no part in an object-store key");
-
-        Delegator tenant = mock(Delegator.class);
-        when(tenant.getDelegatorBaseName()).thenReturn("default");
-        when(tenant.getDelegatorTenantId()).thenReturn("DEMO1");
-        assertEquals("dataresource/default~DEMO1/10000", ContentStoreFactory.storeKey(objectStore, tenant, "10000",
-                null), "a tenant must be scoped inside the base delegator it belongs to");
-
-        // The same identifier under two tenancies must not be one key: that is the whole point.
-        assertNotEquals(ContentStoreFactory.storeKey(objectStore, base, "10000", null),
-                ContentStoreFactory.storeKey(objectStore, tenant, "10000", null),
-                "two tenancies must never derive one key");
-    }
-
-    @Test
-    public void aPathKeyedProviderKeepsTheLocationTheDeploymentAlreadyUses() throws Exception {
-        ContentStore filesystem = new FileSystemContentStore(null);
-
-        // Filesystem mode is the compatibility mode: the key is the location the content already
-        // occupies, so a DataResource under runtime/uploads is read from where it already is.
-        assertEquals("runtime/uploads/party/logo.png", ContentStoreFactory.storeKey(filesystem, null, "10000",
-                "runtime/uploads/party/logo.png"), "a path-keyed provider must be keyed by that path");
-    }
-
-    @Test
-    public void aKeyIsRefusedRatherThanDerivedFromSomethingUnusable() throws Exception {
-        ContentStore objectStore = new S3ContentStore(mock(S3Client.class), BUCKET);
-        Delegator base = mock(Delegator.class);
-        when(base.getDelegatorBaseName()).thenReturn("default");
-        when(base.getDelegatorTenantId()).thenReturn("");
-
-        assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(null, base, "10000", "a/b"),
-                "database mode has no storage key, so asking for one is a mistake worth reporting");
-        assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(objectStore, null, "10000", null),
-                "an object-store key cannot be derived without the tenant scope");
-        assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(objectStore, base, "", null),
-                "an empty identifier names nothing and cannot be encoded into something that does");
-        assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(objectStore, base, null, null),
-                "an absent identifier must be refused rather than encoded");
     }
 
     @Test
@@ -1613,9 +1583,9 @@ public final class ContentStoreFactoryTest {
             overlongKey,
         };
         for (String key : unusable) {
-            GeneralException refused = assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(
-                    filesystem, null, "10000", key), "minting must refuse [" + key + "], because every provider"
-                            + " refuses it");
+            Executable minting = () -> ContentStoreFactory.storeKey(filesystem, key);
+            GeneralException refused = assertThrows(GeneralException.class, minting, "minting must refuse ["
+                    + key + "], because every provider refuses it");
             assertNotNull(refused.getMessage(), "a refusal must say which rule was broken");
             // The same value, offered straight to the contract every provider validates against. Both have
             // to refuse it; a value only one of them refuses is exactly the divergence this guards against.
@@ -1629,7 +1599,7 @@ public final class ContentStoreFactoryTest {
         for (String key : new String[] {"a", "runtime/uploads/party/logo.png", atComponentLimit,
                 "runtime/uploads/" + atComponentLimit, "name with spaces.png", "colon:in:a:posix:name",
                 "unicode/ünïcödé.png"}) {
-            assertEquals(key, ContentStoreFactory.storeKey(filesystem, null, "10000", key),
+            assertEquals(key, ContentStoreFactory.storeKey(filesystem, key),
                     "[" + key + "] is inside every limit and must be minted unchanged");
             assertDoesNotThrow(() -> ContentStore.requireUsableKey(key),
                     "the shared grammar must accept [" + key + "] too");
@@ -1685,12 +1655,12 @@ public final class ContentStoreFactoryTest {
                 "the fixture must be exactly at the limit, or this pair asserts nothing");
         assertEquals(ContentStore.MAX_KEY_LENGTH_BYTES + 1, keyOver.getBytes(StandardCharsets.UTF_8).length,
                 "the fixture must be exactly one byte over the limit");
-        assertEquals(keyAt, ContentStoreFactory.storeKey(filesystem, null, "10000", keyAt),
+        assertEquals(keyAt, ContentStoreFactory.storeKey(filesystem, keyAt),
                 "a key of exactly " + ContentStore.MAX_KEY_LENGTH_BYTES + " bytes must be minted unchanged:"
                         + " refusing it would make an existing deployment's longest keys unusable");
         assertDoesNotThrow(() -> ContentStore.requireUsableKey(keyAt),
                 "the shared grammar must accept a key of exactly " + ContentStore.MAX_KEY_LENGTH_BYTES + " bytes");
-        assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(filesystem, null, "10000", keyOver),
+        assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(filesystem, keyOver),
                 "a key one byte over the total limit must be refused when it is minted");
         assertThrows(GeneralException.class, () -> ContentStore.requireUsableKey(keyOver),
                 "the shared grammar must refuse a key one byte over the total limit");
@@ -1724,12 +1694,12 @@ public final class ContentStoreFactoryTest {
                 what + ": the refused fixture must be over the limit");
         String acceptedKey = "runtime/uploads/" + accepted;
         String refusedKey = "runtime/uploads/" + refused;
-        assertEquals(acceptedKey, ContentStoreFactory.storeKey(store, null, "10000", acceptedKey),
+        assertEquals(acceptedKey, ContentStoreFactory.storeKey(store, acceptedKey),
                 what + " of exactly " + ContentStore.MAX_KEY_COMPONENT_LENGTH_BYTES + " bytes must be minted"
                         + " unchanged: refusing it would make an existing deployment's keys unusable");
         assertDoesNotThrow(() -> ContentStore.requireUsableKey(acceptedKey),
                 what + " at the limit must be accepted by the shared grammar too");
-        assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(store, null, "10000", refusedKey),
+        assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(store, refusedKey),
                 what + " over the limit must be refused when it is minted");
         assertThrows(GeneralException.class, () -> ContentStore.requireUsableKey(refusedKey),
                 what + " over the limit must be refused by the shared grammar too");
@@ -1972,6 +1942,13 @@ public final class ContentStoreFactoryTest {
      * refusal that left the staging entry would leave content in the tree under no key at all, which nothing
      * would ever read, delete or account for.
      *
+     * <p>The TYPE is asserted, not just the refusal: a length that does not match its stream is the caller's
+     * own mistake, so {@link ContentStore#put(String, java.io.InputStream, long)} reports it as
+     * {@link GeneralException} - the exception every operation of the contract uses for a request it will not
+     * carry out - rather than as an {@link IOException}, which the contract reserves for the storage failing.
+     * A caller that retries on {@code IOException} and reports {@code GeneralException} would otherwise retry
+     * a request that cannot ever succeed.
+     *
      * @param home a per-test temporary directory standing in for the storage root
      * @throws Exception if the provider cannot be exercised
      */
@@ -1983,8 +1960,9 @@ public final class ContentStoreFactoryTest {
         Path directory = Files.createDirectories(home.resolve("runtime/uploads/party"));
 
         Executable declaresMoreThanItHolds = () -> store.put(key, new ByteArrayInputStream(PAYLOAD), PAYLOAD.length + 8L);
-        IOException short0 = assertThrows(IOException.class, declaresMoreThanItHolds,
-                "a stream that ends before the length it declared must be refused, not stored truncated");
+        GeneralException short0 = assertThrows(GeneralException.class, declaresMoreThanItHolds,
+                "a stream that ends before the length it declared must be refused as the caller error it is,"
+                        + " not stored truncated and not reported as the storage failing");
         assertTrue(short0.getMessage().contains("bytes before"), "the refusal must say the stream ended early: ["
                 + short0.getMessage() + "]");
         assertFalse(store.exists(key), "a refused write must store nothing at all");
@@ -1992,8 +1970,9 @@ public final class ContentStoreFactoryTest {
                 + " in the tree under no key would never be read, deleted or accounted for");
 
         Executable declaresLessThanItHolds = () -> store.put(key, new ByteArrayInputStream(PAYLOAD), PAYLOAD.length - 1L);
-        IOException long0 = assertThrows(IOException.class, declaresLessThanItHolds,
-                "a stream that holds more than the length it declared must be refused, not stored short");
+        GeneralException long0 = assertThrows(GeneralException.class, declaresLessThanItHolds,
+                "a stream that holds more than the length it declared must be refused as the caller error it is,"
+                        + " not stored short and not reported as the storage failing");
         assertTrue(long0.getMessage().contains("holds more than"), "the refusal must say the stream was longer: ["
                 + long0.getMessage() + "]");
         assertFalse(store.exists(key), "a refused write must store nothing at all");
@@ -2004,6 +1983,60 @@ public final class ContentStoreFactoryTest {
         assertArrayEquals(PAYLOAD, store.get(key), "a correct write after a refused one must succeed");
         assertEquals(List.of("mismatch.bin"), namesIn(directory), "and must leave exactly the content, with no"
                 + " staging entry beside it");
+    }
+
+    /**
+     * A rewrite whose stream does not hold what it declared leaves the content the deployment already had.
+     *
+     * <p>This is the exact defect the staging rewrite exists to remove, and the case a mismatch test written
+     * against a NEW key cannot reach. The provider used to open the existing file for rewriting - truncating it -
+     * and only then discover that the stream was short or long, so a failed write destroyed the previous version
+     * and left either a partial file or one padded to a length nothing had sent. The content was gone, the
+     * refusal named a caller error, and there was nothing left to fall back to.
+     *
+     * <p>Both directions are driven against an EXISTING key, and three things are asserted after each: the
+     * previous content is byte-for-byte intact, no staging entry is left beside it, and the file is the SAME file
+     * - its identity is unchanged, so the deployment's own inode, links and permissions were never replaced.
+     *
+     * @param home a per-test temporary directory standing in for the storage root
+     * @throws Exception if the provider cannot be exercised
+     */
+    @Test
+    public void aMismatchedRewriteLeavesTheContentTheDeploymentAlreadyHad(@TempDir Path home) throws Exception {
+        FileSystemContentStore store = filesystemStoreRootedAt(home);
+        String key = "runtime/uploads/party/existing.bin";
+        Path directory = Files.createDirectories(home.resolve("runtime/uploads/party"));
+        byte[] established = "the version this deployment already had".getBytes(StandardCharsets.UTF_8);
+        store.put(key, new ByteArrayInputStream(established), established.length);
+        Path content = directory.resolve("existing.bin");
+        Object identity = Files.readAttributes(content, BasicFileAttributes.class).fileKey();
+
+        Executable declaresMoreThanItHolds = () ->
+                store.put(key, new ByteArrayInputStream(PAYLOAD), PAYLOAD.length + 8L);
+        assertThrows(GeneralException.class, declaresMoreThanItHolds, "a stream ending before the length it"
+                + " declared must be refused");
+        assertArrayEquals(established, store.get(key), "the content the deployment already had must survive a"
+                + " refused rewrite: validating after truncating is what destroyed it");
+        assertEquals(List.of("existing.bin"), namesIn(directory), "and no staging entry may be left beside it");
+        assertEquals(identity, Files.readAttributes(content, BasicFileAttributes.class).fileKey(), "and it must"
+                + " still be the same file, so nothing about it - inode, links, permissions - was replaced");
+
+        Executable declaresLessThanItHolds = () ->
+                store.put(key, new ByteArrayInputStream(PAYLOAD), PAYLOAD.length - 1L);
+        assertThrows(GeneralException.class, declaresLessThanItHolds, "a stream holding more than the length it"
+                + " declared must be refused");
+        assertArrayEquals(established, store.get(key), "a longer-than-declared stream must not leave the file"
+                + " holding the declared prefix of it either");
+        assertEquals(List.of("existing.bin"), namesIn(directory), "and still no staging entry");
+        assertEquals(identity, Files.readAttributes(content, BasicFileAttributes.class).fileKey(), "and still"
+                + " the same file");
+
+        // A correct rewrite still replaces the content in place, so the refusals above left nothing that
+        // poisons the next write.
+        store.put(key, new ByteArrayInputStream(PAYLOAD), PAYLOAD.length);
+        assertArrayEquals(PAYLOAD, store.get(key), "a correct rewrite after a refused one must take effect");
+        assertEquals(identity, Files.readAttributes(content, BasicFileAttributes.class).fileKey(), "and must"
+                + " still rewrite the deployment's own file rather than replace it");
     }
 
     /**
@@ -2070,10 +2103,14 @@ public final class ContentStoreFactoryTest {
      * here, because a later change to publish every write through the staging entry would look like a
      * strengthening and would quietly break the promise.
      *
-     * <p>The cost of the decision is asserted too, in the same place, so it is recorded rather than implied: a
-     * reader that arrives during the rewrite sees a prefix. That is the guarantee the content already had -
-     * the {@code DataResource} upload path writes in place as well - and it is why the concurrency assertion
-     * below distinguishes a prefix of a written value from content that was never written.
+     * <p>What in-place does NOT mean is asserted in the same place, because that is the half a later change
+     * could quietly get wrong in either direction. The source is consumed into a private staging entry first,
+     * and the file the deployment had is opened only once that staged copy is complete, so a reader arriving
+     * while the write is still reading its source sees the WHOLE OLD value - not a prefix of the new one, and
+     * never a mixture. Transferring the caller's stream straight into the live file, which is what this did,
+     * meant a source that turned out to be unusable had already destroyed the stored content; the staging
+     * entry present beside the content during the window is the visible evidence of the fix, and it is
+     * asserted here so that removing it would fail rather than pass quietly.
      *
      * @param home a per-test temporary directory standing in for the storage root
      * @throws Exception if the provider cannot be exercised
@@ -2102,18 +2139,18 @@ public final class ContentStoreFactoryTest {
             assertTrue(source.reachedHalfway(CONCURRENT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
                     "the rewrite must reach the middle of its payload, or the window under test never opened");
 
-            // The documented cost: the key stays visible and holds a prefix of the new value while it is
-            // being written. Asserted, not tolerated, so the decision cannot be reversed by accident.
+            // The key stays visible throughout, and what it holds while the source is still being read is
+            // the whole OLD value: the live file is not opened until the staged copy is complete.
             assertTrue(store.exists(key), "an in-place rewrite must leave the key visible throughout");
-            byte[] midWrite = store.get(key);
-            assertTrue(midWrite.length < second.length, "the mid-rewrite read must see less than the whole new"
-                    + " value, or the window was missed");
-            for (byte seen : midWrite) {
-                assertEquals((byte) 'B', seen, "an in-place rewrite must leave a prefix of the new value, never"
-                        + " a mixture of the old and the new");
-            }
-            assertEquals(List.of("inplace.bin"), namesIn(target.getParent()), "an in-place rewrite must not"
-                    + " stage anything: the file the deployment already had is the one being written");
+            assertArrayEquals(first, store.get(key), "a reader arriving while the write is still consuming its"
+                    + " source must see the whole value that was stored, because a source that turns out to be"
+                    + " unusable must not have destroyed it");
+            List<String> during = namesIn(target.getParent());
+            assertTrue(during.contains("inplace.bin"), "the content must stay in place while it is being"
+                    + " replaced: " + during);
+            assertEquals(2, during.size(), "the replacement must be staged beside the content rather than"
+                    + " transferred into it, so exactly one staging entry must be present during the window: "
+                    + during);
 
             source.release();
             written.get(CONCURRENT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -2263,12 +2300,16 @@ public final class ContentStoreFactoryTest {
      * may survive: content in the tree under no key is content that would never be read, deleted or accounted
      * for.
      *
-     * <p>A prefix is admitted rather than refused here because an existing file is rewritten in place by
-     * design; {@link #anInPlaceRewriteKeepsTheFileTheDeploymentAlreadyHad} asserts that decision directly, and
-     * {@link #aStagedWriteIsInvisibleAtItsKeyUntilItIsComplete} asserts the whole-or-nothing guarantee on the
-     * path that makes it. A read refused by the {@code content.store.max.object.size} ceiling is admitted for
-     * the same reason: a reader holding the file open across repeated in-place rewrites can be handed the same
-     * region more than once, and the ceiling is exactly what keeps that bounded.
+     * <p>A prefix, or a mixture of two written values, is admitted rather than refused here because an
+     * existing file is rewritten in place by design; {@link #anInPlaceRewriteKeepsTheFileTheDeploymentAlreadyHad}
+     * asserts that decision directly, and {@link #aStagedWriteIsInvisibleAtItsKeyUntilItIsComplete} asserts the
+     * whole-or-nothing guarantee on the path that makes it. Absence is admitted too, because a delete can win.
+     * NOTHING ELSE is: a contended read must not be refused, and in particular must not be refused by the
+     * {@code content.store.max.object.size} ceiling, which content of 48 and 64 KiB cannot reach. That is
+     * asserted rather than tolerated because it used to happen: the whole-object read probed for one byte
+     * beyond what it had read even when it had stopped at end of file well short of the ceiling, so an
+     * ordinary overwrite arriving in that instant was reported to the caller as content too large to read -
+     * a refusal an operator could not act on, appearing at random under load and in roughly half of these runs.
      *
      * @param home a per-test temporary directory standing in for the storage root
      * @throws Exception if the provider cannot be exercised
@@ -2316,21 +2357,10 @@ public final class ContentStoreFactoryTest {
                                         }
                                     }
                                 } catch (FileNotFoundException deletedMeanwhile) {
-                                    // A delete won the race. Absence is a legitimate answer here.
+                                    // A delete won the race. Absence is the one legitimate refusal here, and
+                                    // every other IOException - the ceiling included - reaches the catch below
+                                    // and is recorded as the unexplained failure it would be.
                                     assertNotNull(deletedMeanwhile.getMessage(), "absence must be explained");
-                                } catch (IOException refusedByTheCeiling) {
-                                    // The other legitimate answer, and the reason the ceiling exists. A reader
-                                    // holding this file open while writers truncate and rewrite it in place can
-                                    // be handed more bytes than the file ever held at once: each truncate resets
-                                    // the offset a writer fills from while the reader's own offset stays where
-                                    // it was, so the same region is served again. The ceiling bounds that, and
-                                    // refusing the read is the correct outcome - so it is admitted, but only
-                                    // when the refusal is that one.
-                                    if (refusedByTheCeiling.getMessage() == null
-                                            || !refusedByTheCeiling.getMessage().contains(
-                                                    PROPERTY_MAX_OBJECT_SIZE)) {
-                                        failures.add(refusedByTheCeiling);
-                                    }
                                 }
                             }
                             }
@@ -2559,6 +2589,60 @@ public final class ContentStoreFactoryTest {
     }
 
     /**
+     * The two classes of setting are exactly what the factory says they are: every DYNAMIC setting is absent
+     * from the construction-bound set, every other {@code content.store.*} setting is present in it, and
+     * changing a dynamic one therefore cannot produce a "restart to apply" report.
+     *
+     * <p>This is the property the reload semantics rest on, and conflating the two classes was the defect: one
+     * fingerprint covered every {@code content.store.*} value and one warning said every one of them waited for
+     * a restart, while {@code content.store.max.object.size} and {@code content.store.local.fallback} are read
+     * on every use and so were already in force. A deployment acting on that warning would have restarted a
+     * fleet for a change that had already applied, and - worse in the other direction - would have been told
+     * nothing at all about the settings that genuinely do wait.
+     *
+     * <p>Asserted against the SHIPPED resource rather than a fixture, so that a setting added to
+     * {@code content.properties} is classified by this test the moment it is shipped: a new setting lands in
+     * the construction-bound set unless it is declared dynamic, which is the fail-safe direction.
+     *
+     * @throws Exception if the resource cannot be read
+     */
+    @Test
+    public void theDynamicSettingsAreExcludedFromTheConstructionBoundSetAndEveryOtherOneIsIncluded()
+            throws Exception {
+        Properties committed = new Properties();
+        try (InputStream bytes = Files.newInputStream(committedContentProperties())) {
+            committed.load(bytes);
+        }
+        SortedSet<String> constructionBound = ContentStoreFactory.constructionBoundProperties();
+
+        // The dynamic set is not empty, so the assertions below are not vacuously true.
+        assertEquals(Set.of(PROPERTY_MAX_OBJECT_SIZE, PROPERTY_LOCAL_FALLBACK), ContentStoreFactory.DYNAMIC_PROPERTIES,
+                "the settings read on every use are the read ceiling and the local fallback, and adding another"
+                        + " one has to be a deliberate change to this assertion as well");
+
+        for (String dynamic : ContentStoreFactory.DYNAMIC_PROPERTIES) {
+            assertTrue(committed.containsKey(dynamic), "a setting declared dynamic must actually be shipped: ["
+                    + dynamic + "]");
+            assertFalse(constructionBound.contains(dynamic), "a setting read on every use must be absent from the"
+                    + " construction-bound set, or a change to it would be reported as needing a restart it does"
+                    + " not need: [" + dynamic + "]");
+        }
+
+        // The selector is covered even though a deployment may not declare it at all.
+        assertTrue(constructionBound.contains(PROPERTY_PROVIDER), "the provider selector is construction-bound"
+                + " whether or not the shipped file declares it");
+
+        for (String name : committed.stringPropertyNames()) {
+            if (!name.startsWith("content.store.") || ContentStoreFactory.DYNAMIC_PROPERTIES.contains(name)) {
+                continue;
+            }
+            assertTrue(constructionBound.contains(name), "every shipped content.store.* setting that is not"
+                    + " declared dynamic is sealed into a provider when it is built and must be covered by the"
+                    + " construction-bound set: [" + name + "]");
+        }
+    }
+
+    /**
      * The committed deadlines, retry cap, read ceiling and tail defaults are the values an untouched provider
      * applies, read from the shipped file rather than from a value a test wrote.
      *
@@ -2738,8 +2822,9 @@ public final class ContentStoreFactoryTest {
         // And the SDK failure itself crosses no boundary, not even as the cause: anything that logs a caught
         // IOException with its stack trace, or reads getCause().getMessage(), would republish whatever the SDK
         // quoted - and an SDK message can quote the request it was building, endpoint and signed headers
-        // included. What identifies the failure is in the log beside the reference above, sanitised.
-        assertNull(reported.getCause(), "no SDK failure may be attached to the report: " + reported);
+        // included. What crosses is the sanitised stand-in, which is what keeps the report inspectable
+        // without making it disclosing. See assertSanitisedCause.
+        assertSanitisedCause(reported);
     }
 
     @Test
@@ -2883,9 +2968,13 @@ public final class ContentStoreFactoryTest {
      * The table therefore carries both, together with the allow-list refusal of each family, the empty context
      * root, and a location that escapes the context root.
      *
-     * <p>An object store is configured throughout and is never stubbed, so a refusal that reached it first
-     * would fail the row: a location an operator has forbidden must cost no provider request, or a caller
-     * becomes an oracle for whether forbidden content exists.
+     * <p>An object store is configured throughout, and for every REFUSAL it is never stubbed and never touched:
+     * a location an operator has forbidden must cost no provider request, or a caller becomes an oracle for
+     * whether forbidden content exists. The one row that is not a refusal of the location - an {@code OFBIZ_FILE}
+     * inside the tree that simply holds nothing - is the opposite case and asserts the opposite thing: the store
+     * MUST be asked, because content published by another instance leaves nothing on this one\'s disk, and only
+     * once the store has answered "nothing here either" is absence the answer. It gets a store that reports
+     * absence the way a real one does.
      *
      * @param type the {@code dataResourceTypeId} under test
      * @param form which refusal the row exercises
@@ -2915,7 +3004,10 @@ public final class ContentStoreFactoryTest {
     public void eachTypesRefusalsKeepTheOrderTheyHaveAlwaysHad(String type, String form, String expected,
             String fragment, @TempDir Path home, @TempDir Path elsewhere) throws Exception {
         System.setProperty("ofbiz.home", home.toString());
-        S3Client untouched = mock(S3Client.class);
+        // The store is consulted only for a location that is inside the deployment tree and merely absent; every
+        // other row is a refusal of the location itself, which must never reach a provider.
+        boolean storeMayBeAsked = "ofbiz-absent".equals(form);
+        S3Client untouched = storeMayBeAsked ? inMemoryObjectStore(new ConcurrentHashMap<>()) : mock(S3Client.class);
         installObjectStoreClient(untouched);
         Files.createDirectories(home.resolve("runtime/uploads"));
         Path context = Files.createDirectories(home.resolve("webapp"));
@@ -2961,7 +3053,11 @@ public final class ContentStoreFactoryTest {
         // catches both, which is why the exact class is asserted rather than a common supertype.
         assertEquals(refusal, thrown.getClass(), "the exact exception class is part of the contract, because"
                 + " the two are distinguished by callers that treat absence differently from refusal");
-        verifyNoInteractions(untouched);
+        if (storeMayBeAsked) {
+            verify(untouched).getObject(any(GetObjectRequest.class));
+        } else {
+            verifyNoInteractions(untouched);
+        }
     }
 
     /**
@@ -2998,7 +3094,10 @@ public final class ContentStoreFactoryTest {
         Path local = locationFor(family, home, "rendered.txt");
         Files.writeString(local, "the local copy");
         Map<String, byte[]> objects = new ConcurrentHashMap<>();
-        objects.put("dataresource/default/10000", "the provider's copy".getBytes(StandardCharsets.UTF_8));
+        // Under the key the seam derives, which is the content's own ofbiz.home-relative path - the same key the
+        // filesystem provider uses, so one row means one piece of content whichever provider is configured.
+        objects.put(home.relativize(local).toString().replace('\\', '/'),
+                "the provider's copy".getBytes(StandardCharsets.UTF_8));
         if (PROVIDER_S3.equals(storage)) {
             installObjectStoreClient(inMemoryObjectStore(objects));
         } else {
@@ -3011,134 +3110,6 @@ public final class ContentStoreFactoryTest {
 
         assertEquals("provider".equals(servedBy) ? "the provider's copy" : "the local copy", rendered,
                 type + " under " + storage + " storage must be served from the " + servedBy + " copy");
-    }
-
-    /**
-     * The update service of the {@code createFile}/{@code updateFile} family publishes the content it accepted.
-     *
-     * <p>Four services write files, in two families: the {@code dataResource}-taking pair
-     * ({@code createBinaryFile}, {@code updateBinaryFile}) and the {@code objectInfo}-taking pair
-     * ({@code createFile}, {@code updateFile}). They are separate methods with separate validation and they
-     * reach the seam from different places, so a seam wired into one is not wired into the other by
-     * implication. The create half of this family is asserted above; this is the update half, whose content
-     * would otherwise be readable only by the instance that received it.
-     *
-     * <p>Driven through the {@code binData} branch. The sibling {@code textData} branch cannot be driven from a
-     * test at all: it validates through {@code SecuredUpload.isValidFile(..., "Text", ...)}, which calls
-     * {@code Imaging.guessFormat} on the file and lets its {@code IllegalArgumentException} escape for anything
-     * that is not a recognised image format - so every plain-text upload throws before the seam is reached.
-     * That is upstream behaviour in {@code framework/security}, unmodified by this work and outside its scope,
-     * and it is reported rather than worked around here. It does not weaken this assertion: the seam sits ahead
-     * of the whole write-and-validate block and is common to both branches of the method, which is what lets it
-     * hand the bytes over instead of writing them.
-     *
-     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
-     * @throws Exception if the service cannot be invoked
-     */
-    @Test
-    public void theUpdateHalfOfTheObjectInfoFamilyPublishesTheContentItAccepted(@TempDir Path home)
-            throws Exception {
-        System.setProperty("ofbiz.home", home.toString());
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Files.write(uploads.resolve("updated.png"), new byte[0]);
-        RecordedObjectStore store = recordingObjectStoreClient();
-        Delegator delegator = seamDelegator("default", null);
-
-        Map<String, Object> result = DataServices.updateFileMethod(dispatchContextFor(delegator),
-                UtilMisc.toMap("dataResourceTypeId", "OFBIZ_FILE_BIN", "objectInfo",
-                        "/runtime/uploads/updated.png", "dataResourceId", "10010", "binData",
-                        ByteBuffer.wrap(smallPng()), "locale", Locale.ENGLISH));
-
-        assertFalse(ServiceUtil.isError(result), "the service must succeed: " + ServiceUtil.getErrorMessage(result));
-        assertArrayEquals(smallPng(), store.contentOf("dataresource/default/10010"),
-                "the replacement must reach the object store, or an update stays readable only by the instance"
-                        + " that received it");
-        // As in the create half: the publish replaces the local write rather than following it, so the file that
-        // stood at the location the objectInfo names is left as it was and every instance reads the replacement
-        // from the store. A read prefers the provider, so the superseded local copy can answer nothing.
-        assertEquals(0, Files.size(uploads.resolve("updated.png")),
-                "and the location the objectInfo names must not also be written, or each instance would hold its"
-                        + " own copy of the resource again");
-    }
-
-    /**
-     * A publish already made is withdrawn when a later write in the same transaction cannot be published.
-     *
-     * <p>The partial failure, which is the case a compensation exists for and the one a single-write test
-     * cannot reach. Two rows are written inside one transaction; the store accepts the first and refuses the
-     * second, so the second service fails, the transaction rolls back, and the first row is gone. Its object
-     * must go with it - otherwise the store accumulates content addressed by an identifier no row uses, which
-     * nothing will ever read, delete or account for.
-     *
-     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
-     * @throws Exception if the services cannot be invoked
-     */
-    @Test
-    public void aPublishAlreadyMadeIsWithdrawnWhenALaterWriteInTheSameTransactionCannotBe(@TempDir Path home)
-            throws Exception {
-        System.setProperty("ofbiz.home", home.toString());
-        Files.createDirectories(home.resolve("runtime/uploads"));
-        Map<String, byte[]> objects = new ConcurrentHashMap<>();
-        List<String> removed = Collections.synchronizedList(new ArrayList<>());
-        AtomicInteger writes = new AtomicInteger();
-        S3Client acceptsOnlyTheFirst = mock(S3Client.class);
-        when(acceptsOnlyTheFirst.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
-                .thenAnswer(call -> {
-                    if (writes.incrementAndGet() > 1) {
-                        throw S3Exception.builder().statusCode(HTTP_SERVER_ERROR)
-                                .message("the store refused the second write").build();
-                    }
-                    PutObjectRequest request = call.getArgument(0);
-                    RequestBody body = call.getArgument(1);
-                    try (InputStream bytes = body.contentStreamProvider().newStream()) {
-                        objects.put(request.key(), bytes.readAllBytes());
-                    }
-                    return PutObjectResponse.builder().build();
-                });
-        when(acceptsOnlyTheFirst.deleteObject(any(DeleteObjectRequest.class))).thenAnswer(call -> {
-            String key = ((DeleteObjectRequest) call.getArgument(0)).key();
-            removed.add(key);
-            objects.remove(key);
-            return DeleteObjectResponse.builder().build();
-        });
-        installObjectStoreClient(acceptsOnlyTheFirst);
-        Delegator delegator = seamDelegator("default", null);
-
-        boolean begun = TransactionUtil.begin();
-        try {
-            Map<String, Object> accepted = DataServices.createFileMethod(dispatchContextFor(delegator),
-                    UtilMisc.toMap("dataResourceTypeId", "OFBIZ_FILE_BIN", "objectInfo",
-                            "/runtime/uploads/first.png", "dataResourceId", "10011", "binData",
-                            ByteBuffer.wrap(smallPng()), "locale", Locale.ENGLISH));
-            assertFalse(ServiceUtil.isError(accepted), "the first write must succeed for this case to exist: "
-                    + ServiceUtil.getErrorMessage(accepted));
-            assertTrue(objects.containsKey("dataresource/default/10011"), "the first write must have reached the"
-                    + " store, and the store holds " + objects.keySet());
-
-            Map<String, Object> refused = DataServices.createFileMethod(dispatchContextFor(delegator),
-                    UtilMisc.toMap("dataResourceTypeId", "OFBIZ_FILE_BIN", "objectInfo",
-                            "/runtime/uploads/second.png", "dataResourceId", "10012", "binData",
-                            ByteBuffer.wrap(smallPng()), "locale", Locale.ENGLISH));
-            assertTrue(ServiceUtil.isError(refused), "a write the store will not accept must fail the service,"
-                    + " which is what rolls the transaction back");
-        } finally {
-            TransactionUtil.rollback(begun, "the second write failed, so the test rolls this back as the"
-                    + " service framework would", null);
-        }
-
-        assertTrue(removed.contains("dataresource/default/10011"), "the object published by the write that"
-                + " succeeded must be withdrawn when the transaction it belonged to rolls back, and these were"
-                + " withdrawn: " + removed);
-        // The refused write's key is withdrawn as well, and that is the compensation working rather than a
-        // surplus removal: the undo is registered BEFORE the object is published, deliberately, so that no
-        // published object can exist without one. A removal for content that was never stored is a no-op by the
-        // provider's contract - removing what is not there succeeds - so the ordering costs an idempotent call
-        // and closes the window in which a publish would have had no undo at all.
-        assertTrue(removed.size() <= 2, "only the two keys this transaction wrote under may be withdrawn: "
-                + removed);
-        assertFalse(objects.containsKey("dataresource/default/10011"), "and must no longer be in the store");
-        assertFalse(objects.containsKey("dataresource/default/10012"), "while the write that was refused must"
-                + " have stored nothing in the first place");
     }
 
     /**
@@ -3208,34 +3179,6 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
-    public void aFileCreatedThroughTheServiceIsPublishedToTheObjectStore(@TempDir Path home) throws Exception {
-        // The caller-level write path, at the boundary the services actually write through: createFileMethod
-        // resolves the location, writes the content, validates it as an upload, and the seam then publishes it.
-        // What is asserted is the object: an instance replaced after this call is answered from the store, so
-        // the content is not lost with the instance that received it.
-        System.setProperty("ofbiz.home", home.toString());
-        Files.createDirectories(home.resolve("runtime/uploads"));
-        RecordedObjectStore store = recordingObjectStoreClient();
-        Delegator delegator = seamDelegator("default", null);
-
-        Map<String, Object> result = DataServices.createFileMethod(dispatchContextFor(delegator),
-                UtilMisc.toMap("dataResourceTypeId", "OFBIZ_FILE_BIN", "objectInfo",
-                        "/runtime/uploads/created.png", "dataResourceId", "10000", "binData",
-                        ByteBuffer.wrap(smallPng()), "locale", Locale.ENGLISH));
-
-        assertFalse(ServiceUtil.isError(result), "the service must succeed: " + ServiceUtil.getErrorMessage(result));
-        assertArrayEquals(smallPng(), store.contentOf("dataresource/default/10000"),
-                "the bytes the service accepted must reach the object store under the resource's identity key");
-        // The bytes go to the store INSTEAD of onto this instance's disk, which is the whole objective: the
-        // service returns as soon as the publish succeeds, so no durable local copy is left to be lost with the
-        // instance that received it. The upload validation still ran - on a staged copy, removed either way -
-        // so what the store holds is content the local path would also have accepted, unmodified.
-        assertFalse(Files.exists(home.resolve("runtime/uploads/created.png")),
-                "and must not also be written to this instance, which would be exactly the durable local state"
-                        + " the object store exists to remove");
-    }
-
-    @Test
     public void contentTheUploadValidationRefusesIsNeverPublished(@TempDir Path home) throws Exception {
         // Publishing happens AFTER the upload validation, which is the whole reason the seam sits where it
         // does: content a service is about to refuse must never reach a store every instance reads.
@@ -3250,156 +3193,6 @@ public final class ContentStoreFactoryTest {
 
         assertTrue(ServiceUtil.isError(result), "an upload the validation refuses must not report success");
         verify(store.client(), never()).putObject(any(PutObjectRequest.class), any(RequestBody.class));
-    }
-
-    @Test
-    public void aBinaryUploadCreatedThroughTheServiceIsPublishedToTheObjectStore(@TempDir Path home)
-            throws Exception {
-        // The other upload family: createBinaryFileMethod takes the File getContentFile resolved and writes
-        // its own stream to it. A PNG rather than text, because this is the branch an image upload takes and
-        // the upload validation it performs is content-sensitive.
-        System.setProperty("ofbiz.home", home.toString());
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        RecordedObjectStore store = recordingObjectStoreClient();
-        Delegator delegator = seamDelegator("default", null);
-
-        Map<String, Object> result = DataServices.createBinaryFileMethod(dispatchContextFor(delegator),
-                UtilMisc.toMap("dataResource", fileResource("OFBIZ_FILE_BIN", "/runtime/uploads/upload.png",
-                        "10001", delegator), "imageData", smallPng(), "locale", Locale.ENGLISH));
-
-        assertFalse(ServiceUtil.isError(result), "the service must succeed: " + ServiceUtil.getErrorMessage(result));
-        assertArrayEquals(smallPng(), store.contentOf("dataresource/default/10001"),
-                "an uploaded binary must reach the object store rather than staying on this instance");
-        // No local file is created, and none had to exist for the write to be resolved: this family resolves its
-        // target as a WRITE target, which authorises the location exactly as a read does but does not require it
-        // to hold anything when a provider holds the content.
-        assertFalse(Files.exists(uploads.resolve("upload.png")),
-                "and must leave nothing durable on the instance that accepted it");
-    }
-
-    @Test
-    public void aBinaryUploadUpdatedThroughTheServiceReplacesTheObjectItPublished(@TempDir Path home)
-            throws Exception {
-        System.setProperty("ofbiz.home", home.toString());
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Files.write(uploads.resolve("replaced.png"), new byte[0]);
-        RecordedObjectStore store = recordingObjectStoreClient();
-        Delegator delegator = seamDelegator("default", null);
-
-        Map<String, Object> result = DataServices.updateBinaryFileMethod(dispatchContextFor(delegator),
-                UtilMisc.toMap("dataResource", fileResource("OFBIZ_FILE_BIN", "/runtime/uploads/replaced.png",
-                        "10002", delegator), "imageData", smallPng(), "locale", Locale.ENGLISH));
-
-        assertFalse(ServiceUtil.isError(result), "the service must succeed: " + ServiceUtil.getErrorMessage(result));
-        assertArrayEquals(smallPng(), store.contentOf("dataresource/default/10002"),
-                "an update must replace the object every other instance reads");
-        assertEquals(0, Files.size(uploads.resolve("replaced.png")),
-                "and must not write the instance's own copy alongside it, which a later read would have to choose"
-                        + " between");
-    }
-
-    @Test
-    public void aServiceWriteIsRefusedWhenTheObjectStoreCannotAcceptIt(@TempDir Path home) throws Exception {
-        // Fail closed. A DataResource row whose content only this instance holds is exactly the state the
-        // object-store objective removes, so a publish that cannot happen fails the service instead of
-        // being logged and forgotten.
-        System.setProperty("ofbiz.home", home.toString());
-        Files.createDirectories(home.resolve("runtime/uploads"));
-        S3Client failing = mock(S3Client.class);
-        when(failing.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
-                .thenThrow(S3Exception.builder().statusCode(HTTP_SERVER_ERROR).message("refused").build());
-        installObjectStoreClient(failing);
-
-        Map<String, Object> result = DataServices.createFileMethod(dispatchContextFor(seamDelegator("default", null)),
-                UtilMisc.toMap("dataResourceTypeId", "OFBIZ_FILE_BIN", "objectInfo",
-                        "/runtime/uploads/refused.png", "dataResourceId", "10003", "binData",
-                        ByteBuffer.wrap(smallPng()), "locale", Locale.ENGLISH));
-
-        assertTrue(ServiceUtil.isError(result), "a write that cannot be published must not report success");
-    }
-
-    @Test
-    public void publishingIsANoOpWhenContentIsHeldInTheDatabase(@TempDir Path home) throws Exception {
-        // The committed default reaches none of the write seam, which is what keeps an unconfigured
-        // deployment byte-for-byte as it was. Asserted through the seam's own report rather than through a
-        // store, because in this configuration there is no store to observe.
-        System.setProperty("ofbiz.home", home.toString());
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Path written = uploads.resolve("database-mode.txt");
-        Files.writeString(written, "content the database holds");
-        configureProvider(PROVIDER_DATABASE);
-        ContentStoreFactory.clearCache();
-
-        assertFalse(DataResourceWorker.publishContentFile(seamDelegator("default", null), "10000",
-                written.toFile()), "database mode must publish nothing");
-        assertFalse(DataResourceWorker.withdrawContentFile(seamDelegator("default", null), "10000",
-                written.toFile()), "database mode must withdraw nothing");
-    }
-
-    @Test
-    public void publishingIsANoOpForAPathKeyedProviderBecauseTheWriteAlreadyLandedThere(@TempDir Path home)
-            throws Exception {
-        // The filesystem provider's tree IS the deployment's tree, so the service's own write already put the
-        // bytes where the provider keeps them. Re-writing them would replace the very file the deployment's
-        // upload path manages, which is the behaviour this provider exists to preserve.
-        System.setProperty("ofbiz.home", home.toString());
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Path written = uploads.resolve("already-there.txt");
-        Files.writeString(written, "content the write already placed");
-        configureProvider(PROVIDER_FILESYSTEM);
-        ContentStoreFactory.clearCache();
-        Map<String, String> before = snapshotOf(home);
-
-        assertFalse(DataResourceWorker.publishContentFile(seamDelegator("default", null), "10000",
-                written.toFile()), "a path-keyed provider must publish nothing, because the write reached it");
-        assertEquals(before, snapshotOf(home), "publishing to a path-keyed provider must not touch the tree");
-    }
-
-    @Test
-    public void publishedContentIsWithdrawnWhenTheTransactionThatRecordedItRollsBack(@TempDir Path home)
-            throws Exception {
-        // A publish is not transactional - an object store knows nothing of the caller's transaction - so the
-        // seam compensates. Without this a failed create would leave an object addressable by an identifier
-        // no row uses.
-        System.setProperty("ofbiz.home", home.toString());
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Path written = uploads.resolve("rolled-back.txt");
-        Files.writeString(written, "content whose row never commits");
-        RecordedObjectStore store = recordingObjectStoreClient();
-        Delegator delegator = seamDelegator("default", null);
-
-        boolean begun = TransactionUtil.begin();
-        try {
-            assertTrue(DataResourceWorker.publishContentFile(delegator, "10004", written.toFile()),
-                    "the object store must accept the publish for this test to mean anything");
-            assertArrayEquals(Files.readAllBytes(written), store.contentOf("dataresource/default/10004"),
-                    "the publish must reach the store before the transaction is decided");
-        } finally {
-            TransactionUtil.rollback(begun, "the test rolls this transaction back deliberately", null);
-        }
-
-        assertEquals(List.of("dataresource/default/10004"), store.removedKeys(),
-                "the object published inside a transaction that rolled back must be removed again");
-    }
-
-    @Test
-    public void publishedContentSurvivesACommittedTransaction(@TempDir Path home) throws Exception {
-        // The other half of the compensation, and the half that would silently destroy content if the
-        // condition were inverted: a committed row must keep its object.
-        System.setProperty("ofbiz.home", home.toString());
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Path written = uploads.resolve("committed.txt");
-        Files.writeString(written, "content whose row commits");
-        RecordedObjectStore store = recordingObjectStoreClient();
-
-        boolean begun = TransactionUtil.begin();
-        assertTrue(DataResourceWorker.publishContentFile(seamDelegator("default", null), "10005",
-                written.toFile()), "the object store must accept the publish for this test to mean anything");
-        TransactionUtil.commit(begun);
-
-        assertEquals(List.of(), store.removedKeys(), "a committed row must keep the object it refers to");
-        assertArrayEquals(Files.readAllBytes(written), store.contentOf("dataresource/default/10005"),
-                "the object a committed row refers to must still hold the content that was published");
     }
 
     @Test
@@ -3809,6 +3602,13 @@ public final class ContentStoreFactoryTest {
         // not public, so http exposes both to anything on the network path. A warning was no defence: the
         // credentials travelled in clear text either way. Three cases, and the middle one is the point.
         installOfflineObjectStoreConfiguration();
+        // Asserted rather than assumed: this case only means anything while the permission is off, and the
+        // permission is a JVM-wide in-memory value any earlier test could have turned on. Reading it back
+        // here is what makes the refusal below evidence about the provider instead of evidence about which
+        // test ran first.
+        assertEquals("false", UtilProperties.getPropertyValue(RESOURCE, PROPERTY_S3_INSECURE_ENDPOINT),
+                "every configuration this suite installs states the strict posture explicitly, so a plaintext"
+                        + " endpoint must be refused on its own account here");
         configureEndpoint("http://" + UNREACHED_HOST + ":9000");
         GeneralException refusal = refusalOf(PROVIDER_S3);
         assertTrue(refusal.getMessage().contains(PROPERTY_S3_INSECURE_ENDPOINT), "the refusal must name the"
@@ -4034,91 +3834,6 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
-    public void anyIdentifierTheFrozenSchemaPermitsIsEncodedRatherThanRefused() throws Exception {
-        // The finding this proves: the derivation used to accept only [A-Za-z0-9._-] in an identifier, but
-        // DataResource.dataResourceId and Tenant.tenantId are entity fields of the id type and the entity
-        // model is frozen - createDataResource accepts an identifier a caller supplies, and OFBiz's own
-        // identifier validation permits characters beyond that set. Refusing such a row tightened the schema
-        // and the service contract from underneath and made perfectly valid content unaddressable. So an
-        // identifier is transformed, never refused for what it contains.
-        ContentStore objectStore = new S3ContentStore(mock(S3Client.class), BUCKET);
-        Delegator base = mock(Delegator.class);
-        when(base.getDelegatorBaseName()).thenReturn("default");
-        when(base.getDelegatorTenantId()).thenReturn("");
-
-        String[] awkward = {"10000/original", "10 000", "10000#1", "10000%2f", "..", ".", "b64-QUJD",
-            "id\u00e9e", "\u4f01\u696d-1", "a+b", "a=b", "a?b", "a&b", "10000\\1", "~1", ":1", };
-        Map<String, String> derived = new LinkedHashMap<>();
-        for (String identifier : awkward) {
-            String key = ContentStoreFactory.storeKey(objectStore, base, identifier, null);
-            String segment = key.substring("dataresource/default/".length());
-
-            assertTrue(segment.startsWith("b64-"), "[" + printable(identifier) + "] must be encoded rather than"
-                    + " passed through, was: " + segment);
-            assertEquals(identifier, new String(Base64.getUrlDecoder().decode(segment.substring("b64-".length())),
-                    StandardCharsets.UTF_8), "the encoding must be reversible, so an operator or a migration"
-                    + " can recover the identifier a key names");
-            assertDoesNotThrow(() -> objectStore.exists(key), "an encoded key must satisfy the shared grammar"
-                    + " and the object store's own scoping rule, so it must not be refused at the boundary");
-            assertFalse(derived.containsKey(segment), "the encoding must be injective: [" + segment + "] was"
-                    + " already derived from [" + printable(derived.get(segment)) + "]");
-            derived.put(segment, identifier);
-        }
-
-        // An ordinary identifier keeps the readable key it always had, which is what keeps the encoding from
-        // changing where existing content is addressed.
-        assertEquals("dataresource/default/10000", ContentStoreFactory.storeKey(objectStore, base, "10000", null),
-                "an identifier already made of accepted characters must not be encoded");
-        assertTrue(ContentStoreFactory.verbatimSegment("10000"), "an ordinary identifier must be usable as it is");
-        assertFalse(ContentStoreFactory.verbatimSegment("b64-QUJD"), "a value that could be mistaken for an"
-                + " encoded segment must itself be encoded, or two identifiers would name one object");
-    }
-
-    @Test
-    public void aTenancyThatCarriesAnythingUnusualIsScopedRatherThanRefused() throws Exception {
-        ContentStore objectStore = new S3ContentStore(mock(S3Client.class), BUCKET);
-        Delegator crossable = mock(Delegator.class);
-        when(crossable.getDelegatorBaseName()).thenReturn("default");
-        when(crossable.getDelegatorTenantId()).thenReturn("a/b");
-
-        String key = ContentStoreFactory.storeKey(objectStore, crossable, "10000", null);
-
-        // Encoded, so it cannot be widened into two segments - which is what would have let one tenancy
-        // address another's content - and still separated from the base delegator by the one character
-        // neither form of a segment can contain.
-        assertEquals(3, key.split("/", -1).length, "a tenancy carrying a separator must stay one segment: " + key);
-        assertTrue(key.startsWith("dataresource/default~b64-"), "the tenancy must be scoped inside its base"
-                + " delegator and encoded: " + key);
-        assertNotEquals(key, ContentStoreFactory.storeKey(objectStore, crossable, "10000/original", null),
-                "two identifiers under one tenancy must never derive one key");
-    }
-
-    @Test
-    public void theComponentLimitIsAppliedToTheEncodedFormRatherThanToTheIdentifier() throws Exception {
-        // The limit exists because the ENCODED segment is what a store receives, so that is what has to fit.
-        // Applying it to the identifier instead would refuse a value that encodes perfectly well, and would
-        // let one through whose encoding does not fit.
-        ContentStore objectStore = new S3ContentStore(mock(S3Client.class), BUCKET);
-        Delegator base = mock(Delegator.class);
-        when(base.getDelegatorBaseName()).thenReturn("default");
-        when(base.getDelegatorTenantId()).thenReturn("");
-
-        // Base64 costs four characters for every three bytes, so this is the longest identifier that still
-        // encodes inside one component, and one byte more is the shortest that does not.
-        int longestEncodable = ContentStoreFactory.MAX_KEY_COMPONENT_LENGTH_BYTES - "b64-".length();
-        String fits = "\u00e9".repeat(longestEncodable / 4 * 3 / 2);
-        String doesNot = "\u00e9".repeat(ContentStoreFactory.MAX_KEY_COMPONENT_LENGTH_BYTES);
-
-        assertDoesNotThrow(() -> ContentStoreFactory.storeKey(objectStore, base, fits, null),
-                "an identifier whose encoded form fits in one component must be accepted");
-        GeneralException refused = assertThrows(GeneralException.class, () -> ContentStoreFactory.storeKey(
-                objectStore, base, doesNot, null), "an identifier whose encoded form does not fit must be"
-                + " refused");
-        assertTrue(refused.getMessage().contains("encodes to"), "the refusal must name the encoded length"
-                + " rather than blame a character: " + refused.getMessage());
-    }
-
-    @Test
     public void aConfigurationChangeBehindTheProviderNameIsReportedAndNotAppliedInPlace() throws Exception {
         ContentStore first = storeConfiguredAs(PROVIDER_S3);
         assertSame(first, ContentStoreFactory.getContentStore(), "one configuration must be resolved once");
@@ -4136,157 +3851,6 @@ public final class ContentStoreFactoryTest {
                 + " provider in service");
         assertEquals(BUCKET, bucketOf(first), "the provider in service must still hold the bucket it was built"
                 + " from");
-    }
-
-    @Test
-    public void theWorkerPublishesContentToTheConfiguredProviderAndReadsItBack(@TempDir Path home) throws Exception {
-        System.setProperty("ofbiz.home", home.toString());
-        configureProvider(PROVIDER_FILESYSTEM);
-        Files.createDirectories(home.resolve("runtime/uploads"));
-        Delegator delegator = seamDelegator("default", null);
-        byte[] uploaded = "the bytes a user uploaded".getBytes(StandardCharsets.UTF_8);
-
-        assertTrue(DataResourceWorker.contentStoreHolds(delegator, "10000", "OFBIZ_FILE",
-                "/runtime/uploads/published.txt", null), "a configured provider must hold a deployment location");
-        assertTrue(DataResourceWorker.storeContent(delegator, "10000", "OFBIZ_FILE",
-                "/runtime/uploads/published.txt", null, uploaded), "the provider must accept the content, so the"
-                + " caller performs no local write of its own");
-
-        // Read back through the read seam, which derives its key independently: this is the round trip the
-        // objective is stated in - content written by one instance is servable by any instance.
-        assertEquals("the bytes a user uploaded", renderedThroughSeam("OFBIZ_FILE",
-                "/runtime/uploads/published.txt", null, delegator, "10000"), "content published through the"
-                + " seam must be readable through it");
-
-        assertTrue(DataResourceWorker.removeStoredContent(delegator, "10000", "OFBIZ_FILE",
-                "/runtime/uploads/published.txt", null), "the provider must accept the removal");
-        assertThrows(FileNotFoundException.class, () -> renderedThroughSeam("OFBIZ_FILE",
-                "/runtime/uploads/published.txt", null, delegator, "10000"), "removed content must be gone");
-    }
-
-    @Test
-    public void theWorkerWritesNothingToAProviderWhenContentIsHeldInTheDatabase(@TempDir Path home)
-            throws Exception {
-        // The committed default, and the whole of the backward compatibility: the seam answers "nothing to do"
-        // and the service performs exactly the local write it always performed.
-        System.setProperty("ofbiz.home", home.toString());
-        configureProvider(PROVIDER_DATABASE);
-        Delegator delegator = seamDelegator("default", null);
-
-        assertFalse(DataResourceWorker.contentStoreHolds(delegator, "10000", "OFBIZ_FILE",
-                "/runtime/uploads/local.txt", null), "database storage must hold no location");
-        assertFalse(DataResourceWorker.storeContent(delegator, "10000", "OFBIZ_FILE",
-                "/runtime/uploads/local.txt", null, "never published".getBytes(StandardCharsets.UTF_8)),
-                "database storage must leave the write to the caller");
-        assertFalse(DataResourceWorker.removeStoredContent(delegator, "10000", "OFBIZ_FILE",
-                "/runtime/uploads/local.txt", null), "database storage must leave the removal to the caller");
-        assertFalse(Files.exists(home.resolve("runtime/uploads/local.txt")), "the seam must not write the file"
-                + " itself when it declines: that is the caller's own local write");
-    }
-
-    @Test
-    public void aLocationOutsideTheDeploymentIsNeverPublished(@TempDir Path home, @TempDir Path webapp)
-            throws Exception {
-        // Host-local state, whether an operator placed it or a webapp owns it. It is read from where it is, so
-        // it is written where it is too: publishing it would move a file the deployment does not own into the
-        // storage every instance shares, and reading it back would then depend on which instance answered.
-        System.setProperty("ofbiz.home", home.toString());
-        configureProvider(PROVIDER_FILESYSTEM);
-        Delegator delegator = seamDelegator("default", null);
-
-        // A CONTEXT_FILE under a context root outside the deployment: authorised, and still not provider-backed.
-        Files.writeString(webapp.resolve("static.txt"), "part of the webapp");
-        assertFalse(DataResourceWorker.contentStoreHolds(delegator, "10000", "CONTEXT_FILE", "/static.txt",
-                webapp.toString()), "a location outside the deployment is not provider-backed");
-        assertFalse(DataResourceWorker.storeContent(delegator, "10000", "CONTEXT_FILE", "/static.txt",
-                webapp.toString(), "never published".getBytes(StandardCharsets.UTF_8)), "the caller must keep"
-                + " writing a location outside the deployment itself");
-        assertEquals("part of the webapp", Files.readString(webapp.resolve("static.txt")), "the seam must not"
-                + " have touched the file it declined");
-
-        // And a location the allow list forbids is refused before any provider is asked at all, so a write can
-        // no more be used as an existence oracle for forbidden content than a read can.
-        Path outside = Files.createTempFile("outside-the-deployment", ".txt");
-        try {
-            Files.writeString(outside, "placed by an operator");
-            GeneralException refused = assertThrows(GeneralException.class, () ->
-                    DataResourceWorker.contentStoreHolds(delegator, "10000", "LOCAL_FILE", outside.toString(),
-                            null));
-            assertTrue(refused.getMessage().contains("not within an allowed directory"), "the refusal must come"
-                    + " from the allow list: [" + refused.getMessage() + "]");
-        } finally {
-            Files.deleteIfExists(outside);
-        }
-    }
-
-    @Test
-    public void aWriteTargetIsResolvedWithoutRequiringTheFileToExistWhenAProviderHoldsIt(@TempDir Path home)
-            throws Exception {
-        // getContentFile treats an absent location as final, which is right for a read and wrong for a create:
-        // in object-store mode the local file legitimately never exists, and requiring it would make the
-        // registered binary-file services unable to create content at all.
-        System.setProperty("ofbiz.home", home.toString());
-        Files.createDirectories(home.resolve("runtime/uploads"));
-        Delegator delegator = seamDelegator("default", null);
-
-        configureProvider(PROVIDER_FILESYSTEM);
-        assertNotNull(DataResourceWorker.getContentWriteFile(delegator, "10000", "OFBIZ_FILE",
-                "/runtime/uploads/not-yet-there.bin", null), "a write target must resolve before it exists");
-
-        // With no provider, absence is final exactly as it always was, including the same exception. The
-        // resolution is cleared because it is immutable once established: a provider already in service is
-        // returned unchanged for the life of the JVM, so re-reading the property is not what a deployment does
-        // to change backends - it restarts, which is what clearCache stands in for here.
-        configureProvider(PROVIDER_DATABASE);
-        ContentStoreFactory.clearCache();
-        assertThrows(FileNotFoundException.class, () -> DataResourceWorker.getContentWriteFile(delegator, "10000",
-                "OFBIZ_FILE", "/runtime/uploads/not-yet-there.bin", null), "database storage must report an"
-                + " absent write target exactly as getContentFile always has");
-
-        // And authorisation is applied to a write target as strictly as to a read location.
-        configureProvider(PROVIDER_FILESYSTEM);
-        ContentStoreFactory.clearCache();
-        Path outside = Files.createTempFile("outside-the-deployment", ".txt");
-        try {
-            GeneralException refused = assertThrows(GeneralException.class, () ->
-                    DataResourceWorker.getContentWriteFile(delegator, "10000", "LOCAL_FILE", outside.toString(),
-                            null));
-            assertTrue(refused.getMessage().contains("not within an allowed directory"), "a write target must be"
-                    + " refused by the allow list: [" + refused.getMessage() + "]");
-        } finally {
-            Files.deleteIfExists(outside);
-        }
-    }
-
-    @Test
-    public void aPublishIsRemovedAgainWhenTheTransactionRecordingItDoesNotCommit() throws Exception {
-        // Content in an object store and the DataResource row describing it are two stores, and only one of them
-        // is transactional. Without this binding every failed upload would leave an object nothing refers to and
-        // nothing removes, accumulating on every retry.
-        RecordingContentStore store = new RecordingContentStore();
-        assertTrue(ContentStoreFactory.holdsContentOffInstance(store), "a provider that is not the filesystem one"
-                + " holds content off the instance and must therefore be bound to the transaction");
-
-        Synchronization registered = registeredPublishRollback(store, KEY);
-        assertNotNull(registered, "a publish to an off-instance provider must register its own undo");
-
-        registered.afterCompletion(Status.STATUS_COMMITTED);
-        assertEquals(List.of(), store.deleted, "a committed transaction must leave the published content alone");
-
-        registered.afterCompletion(Status.STATUS_ROLLEDBACK);
-        assertEquals(List.of(KEY), store.deleted, "a rolled-back transaction must remove the content it"
-                + " published");
-    }
-
-    @Test
-    public void aPublishToTheDeploymentsOwnTreeIsNotBoundToTheTransaction() throws Exception {
-        // The filesystem provider's storage tree IS the deployment's own content tree, where a rolled-back write
-        // has always left its file behind. Removing it now would be a behaviour change in the one mode whose
-        // whole purpose is to behave as it always did.
-        assertFalse(ContentStoreFactory.holdsContentOffInstance(new FileSystemContentStore(null)),
-                "the filesystem provider holds content on the instance");
-        assertNull(registeredPublishRollback(new FileSystemContentStore(null), "runtime/uploads/local.txt"),
-                "a write into the deployment's own tree must register no undo");
     }
 
     @Test
@@ -4356,105 +3920,6 @@ public final class ContentStoreFactoryTest {
                 "a write into the deployment's own tree is already in the filesystem provider");
         assertTrue(ContentStoreFactory.publicationRequired(storeConfiguredAs(PROVIDER_S3)),
                 "content written locally is invisible to the fleet until it is published to the object store");
-    }
-
-    @Test
-    public void publishingIsInertUnlessAnObjectStoreIsConfigured(@TempDir Path home) throws Exception {
-        System.setProperty("ofbiz.home", home.toString());
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Path written = uploads.resolve("just-written.txt");
-        Files.writeString(written, "the bytes a service just wrote");
-        Delegator delegator = seamDelegator("default", null);
-
-        // Database mode: nothing is asked of any provider, and the write is left exactly as it was.
-        configureProvider(PROVIDER_DATABASE);
-        Map<String, String> before = snapshotOf(home);
-        assertDoesNotThrow(() -> DataResourceWorker.publishToContentStore(delegator, "10000", written.toFile()),
-                "publication must be a no-op when content is held in the database");
-        assertEquals(before, snapshotOf(home), "publication in database mode must touch nothing at all");
-
-        // Filesystem mode: the provider's tree is this tree, so publication must not rewrite, move or duplicate
-        // the file the caller just wrote.
-        configureProvider(PROVIDER_FILESYSTEM);
-        assertDoesNotThrow(() -> DataResourceWorker.publishToContentStore(delegator, "10000", written.toFile()),
-                "publication must be a no-op when the provider's tree is the deployment's own tree");
-        assertEquals(before, snapshotOf(home), "publication in filesystem mode must leave the local write alone");
-        assertEquals("the bytes a service just wrote", Files.readString(written), "the content must be untouched");
-
-        // And a caller that wrote nothing publishes nothing, whatever is configured. The offline object-store
-        // fixture is in force here, so any request at all would fail this assertion rather than pass it quietly.
-        configureProvider(PROVIDER_S3);
-        assertDoesNotThrow(() -> DataResourceWorker.publishToContentStore(delegator, "10000", null),
-                "there is nothing to publish when no file was written");
-    }
-
-    @Test
-    public void publicationIsAttemptedRatherThanSkippedOnceAnObjectStoreIsConfigured(@TempDir Path home)
-            throws Exception {
-        // The defect this guards against is silence: an upload that reports success while the store stays empty.
-        // The configured endpoint refuses every connection, so a publication that is actually attempted fails
-        // loudly and a publication that is quietly skipped passes - which is why the assertion is that it throws.
-        System.setProperty("ofbiz.home", home.toString());
-        configureProvider(PROVIDER_S3);
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Path written = Files.writeString(uploads.resolve("unreachable-store.txt"), "bytes bound for the store");
-
-        assertThrows(IOException.class, () -> DataResourceWorker.publishToContentStore(seamDelegator("default",
-                null), "10000", written.toFile()), "an object store that cannot be reached must fail the write"
-                + " rather than let it report success with nothing stored");
-    }
-
-    @Test
-    public void publicationRefusesToGuessWhatItCannotDerive(@TempDir Path home) throws Exception {
-        System.setProperty("ofbiz.home", home.toString());
-        configureProvider(PROVIDER_S3);
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Path written = Files.writeString(uploads.resolve("identity.txt"), "content with nothing to key it by");
-
-        // Identity is what an object-store key is derived from. Publishing without it would have to invent a key,
-        // and an invented key is content nothing can find again.
-        assertThrows(GeneralException.class, () -> DataResourceWorker.publishToContentStore(seamDelegator("default",
-                null), null, written.toFile()), "publication must refuse rather than invent an identity");
-        assertThrows(GeneralException.class, () -> DataResourceWorker.publishToContentStore(null, "10000",
-                written.toFile()), "publication must refuse rather than invent a tenant scope");
-
-        // A location outside the deployment's own tree is host-local state an operator placed deliberately - the
-        // read seams read it where it is, and publication leaves it there rather than failing a write over it.
-        Path elsewhere = Files.createTempDirectory("blitzy-adhoc-outside-home");
-        try {
-            Path outside = Files.writeString(elsewhere.resolve("host-local.txt"), "not part of the deployment");
-            assertDoesNotThrow(() -> DataResourceWorker.publishToContentStore(seamDelegator("default", null),
-                    "10000", outside.toFile()), "content outside the deployment tree is not provider-backed and"
-                    + " must not fail the write that produced it");
-        } finally {
-            try (Stream<Path> entries = Files.walk(elsewhere)) {
-                entries.sorted(java.util.Comparator.reverseOrder()).forEach(path -> path.toFile().delete());
-            }
-        }
-    }
-
-    @Test
-    public void publicationRefusesContentLargerThanOneReadMayHold(@TempDir Path home) throws Exception {
-        // Publishing content no consumer could then be served in one piece would only look published, so the
-        // whole-read ceiling bounds publication too. Refused before a request is made, which is why the
-        // unreachable endpoint of the offline fixture never comes into it.
-        System.setProperty("ofbiz.home", home.toString());
-        configureProvider(PROVIDER_S3);
-        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_MAX_OBJECT_SIZE, "1024");
-        Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
-        Path written = Files.write(uploads.resolve("too-large.bin"), new byte[4096]);
-
-        GeneralException refused = assertThrows(GeneralException.class, () ->
-                DataResourceWorker.publishToContentStore(seamDelegator("default", null), "10000",
-                        written.toFile()), "content over the ceiling must be refused rather than published");
-        assertTrue(refused.getMessage().contains(PROPERTY_MAX_OBJECT_SIZE), "the refusal must name the setting"
-                + " that governs it: [" + refused.getMessage() + "]");
-        // The refusal reaches the caller of a service and, through it, an end user, so it names the resource and
-        // the ceiling and not where this deployment keeps its content (CWE-200).
-        assertFalse(refused.getMessage().contains("too-large.bin"), "the refusal must not disclose the content"
-                + " path: [" + refused.getMessage() + "]");
-        assertFalse(refused.getMessage().contains(home.toString()), "the refusal must not disclose the"
-                + " deployment root: [" + refused.getMessage() + "]");
     }
 
     @Test
@@ -4577,34 +4042,601 @@ public final class ContentStoreFactoryTest {
         public void delete(String key) {
             deleted.add(key);
         }
+
+        @Override
+        public boolean holdsContentOffInstance() {
+            return true;
+        }
     }
 
     /**
-     * Invokes the seam's rollback registration and returns the synchronisation it registered, if any.
+     * Content written through the resolution seam reaches the store when, and only when, the transaction that
+     * resolved it commits.
      *
-     * @param store the provider the publish was made to
-     * @param key the key the content was published under
-     * @return the registered synchronisation, or null when the seam registered none
-     * @throws Exception if the registration itself failed, which is a refusal the caller asserts on
+     * <p>The two halves are one test because they are one decision, and getting either of them wrong is a
+     * different kind of corruption. Publishing at write time - which is what this did - put bytes in the store
+     * that the deployment's own validation had not yet seen, and made a rollback responsible for removing them
+     * again: that removal deleted the one stable key the content lives under, taking the PREVIOUS version with it,
+     * which the failed transaction never owned. Publishing at commit cannot do either: nothing reaches the store
+     * until the row that describes it is committed, and a transaction that does not commit leaves the store
+     * exactly as it found it, including whatever was already under that key.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
      */
-    private static Synchronization registeredPublishRollback(ContentStore store, String key) throws Exception {
-        Method registration = DataResourceWorker.class.getDeclaredMethod("registerPublishRollback",
-                ContentStore.class, String.class, String.class);
-        registration.setAccessible(true);
-        List<Synchronization> registered = new ArrayList<>();
-        try (MockedStatic<TransactionUtil> transactions = mockStatic(TransactionUtil.class)) {
-            transactions.when(() -> TransactionUtil.registerSynchronization(any(Synchronization.class)))
-                    .thenAnswer(invocation -> {
-                        registered.add(invocation.getArgument(0));
-                        return null;
-                    });
-            try {
-                registration.invoke(null, store, key, "10000");
-            } catch (InvocationTargetException reflected) {
-                throw (Exception) reflected.getCause();
+    @Test
+    public void contentReachesTheStoreOnCommitAndNeverOnRollback(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        Map<String, byte[]> objects = new ConcurrentHashMap<>();
+        byte[] previous = "the version that was already published".getBytes(StandardCharsets.UTF_8);
+        objects.put("runtime/uploads/target.bin", previous);
+        installObjectStoreClient(inMemoryObjectStore(objects));
+        Path target = Files.createDirectories(home.resolve("runtime/uploads")).resolve("target.bin");
+        Files.write(target, "the copy this instance already had".getBytes(StandardCharsets.UTF_8));
+
+        // ROLLBACK first, so that what the commit case proves cannot be an artefact of the order.
+        Synchronization rolledBack = writeThroughFor(() -> {
+            File resolved = DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/target.bin", null);
+            Files.write(resolved.toPath(), "bytes a doomed transaction wrote".getBytes(StandardCharsets.UTF_8));
+        });
+        assertNotNull(rolledBack, "a provider-backed resolution inside an active transaction must register a"
+                + " write-through, or nothing would ever be published");
+        rolledBack.afterCompletion(Status.STATUS_ROLLEDBACK);
+        assertArrayEquals(previous, objects.get("runtime/uploads/target.bin"), "a transaction that did not commit"
+                + " must leave the store exactly as it was, including the version that was already published:"
+                + " deleting the stable key would destroy content the failed transaction never owned");
+
+        // COMMIT, with the bytes that are on disk at that moment.
+        byte[] written = "the bytes on disk when the transaction committed".getBytes(StandardCharsets.UTF_8);
+        Synchronization committed = writeThroughFor(() -> {
+            File resolved = DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/target.bin", null);
+            Files.write(resolved.toPath(), written);
+        });
+        assertNotNull(committed, "the second resolution must register too");
+        committed.beforeCompletion();
+        committed.afterCompletion(Status.STATUS_COMMITTED);
+        assertArrayEquals(written, objects.get("runtime/uploads/target.bin"), "a committed transaction must"
+                + " publish what was on disk when it committed, under the content's own path key");
+    }
+
+    /**
+     * A resolution that only reads publishes nothing, which is what lets one seam serve both directions.
+     *
+     * <p>{@code getContentFile} resolves a read location as often as a write target - {@code ContentWorker} and
+     * the report templates dereference the {@code File} - so a seam that published whatever it resolved would
+     * re-upload content on every read, and would overwrite a newer object in the store with this instance's older
+     * local copy. Comparing the location against what it held when it was resolved is what prevents both.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void aResolutionThatOnlyReadsPublishesNothing(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        Map<String, byte[]> objects = new ConcurrentHashMap<>();
+        byte[] newerInTheStore = "the newer copy another instance published".getBytes(StandardCharsets.UTF_8);
+        objects.put("runtime/uploads/read.bin", newerInTheStore);
+        installObjectStoreClient(inMemoryObjectStore(objects));
+        Path local = Files.createDirectories(home.resolve("runtime/uploads")).resolve("read.bin");
+        Files.write(local, "this instance's older local copy".getBytes(StandardCharsets.UTF_8));
+
+        Synchronization readOnly = writeThroughFor(() ->
+                assertNotNull(DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/read.bin", null),
+                        "the frozen contract is a non-null File"));
+        assertNotNull(readOnly, "the registration itself is not conditional on writing: what is published is");
+        readOnly.beforeCompletion();
+        readOnly.afterCompletion(Status.STATUS_COMMITTED);
+
+        assertArrayEquals(newerInTheStore, objects.get("runtime/uploads/read.bin"), "a resolution that wrote"
+                + " nothing must publish nothing: republishing the local copy would overwrite a newer object with"
+                + " an older one");
+    }
+
+    /**
+     * Content a committed transaction removed is removed from the store as well.
+     *
+     * <p>This is the production caller of {@link ContentStore#delete(String)}, and the reason the store cannot go
+     * on serving content the deployment has discarded: without it, an object outlives the file it mirrors and
+     * every instance except the one that performed the removal keeps serving it.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void contentRemovedByACommittedTransactionIsRemovedFromTheStore(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        Map<String, byte[]> objects = new ConcurrentHashMap<>();
+        objects.put("runtime/uploads/discarded.bin", PAYLOAD);
+        installObjectStoreClient(inMemoryObjectStore(objects));
+        Path local = Files.createDirectories(home.resolve("runtime/uploads")).resolve("discarded.bin");
+        Files.write(local, PAYLOAD);
+
+        Synchronization removal = writeThroughFor(() -> {
+            File resolved = DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/discarded.bin", null);
+            Files.delete(resolved.toPath());
+        });
+        assertNotNull(removal, "the resolution must register, or a removal could never be mirrored");
+        removal.beforeCompletion();
+        removal.afterCompletion(Status.STATUS_COMMITTED);
+
+        assertFalse(objects.containsKey("runtime/uploads/discarded.bin"), "content removed by a committed"
+                + " transaction must be removed from the store, or the store keeps serving what the deployment"
+                + " discarded");
+    }
+
+    /**
+     * A resolution in a transaction that is not active registers nothing, rather than believing it has.
+     *
+     * <p>{@code TransactionUtil.registerSynchronization} silently does nothing when no transaction is active, so
+     * code that registered and then relied on having done so would have had its work dropped without a word. Both
+     * states are asserted: no transaction at all, which is what a read outside a service looks like, and a
+     * transaction already marked for rollback, which is doomed and must produce nothing.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void aResolutionOutsideAnActiveTransactionRegistersNothing(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        Map<String, byte[]> objects = new ConcurrentHashMap<>();
+        installObjectStoreClient(inMemoryObjectStore(objects));
+        Path local = Files.createDirectories(home.resolve("runtime/uploads")).resolve("unbound.bin");
+        Files.write(local, PAYLOAD);
+
+        for (int status : new int[] {Status.STATUS_NO_TRANSACTION, Status.STATUS_MARKED_ROLLBACK,
+                Status.STATUS_ROLLING_BACK, Status.STATUS_UNKNOWN}) {
+            List<Synchronization> registered = new ArrayList<>();
+            try (MockedStatic<TransactionUtil> transactions = mockStatic(TransactionUtil.class,
+                    withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
+                transactions.when(TransactionUtil::getStatus).thenReturn(status);
+                transactions.when(() -> TransactionUtil.registerSynchronization(any(Synchronization.class)))
+                        .thenAnswer(call -> registered.add(call.getArgument(0)));
+                File resolved = DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/unbound.bin",
+                        null);
+                assertNotNull(resolved, "the frozen contract still has to be honoured in every transaction state");
+                Files.write(resolved.toPath(), "written with nothing to bind to".getBytes(StandardCharsets.UTF_8));
             }
+            assertEquals(List.of(), registered, "status [" + status + "] is not active, so nothing may be"
+                    + " registered against it");
+            assertEquals(Map.of(), objects, "status [" + status + "] must publish nothing at all");
+        }
+    }
+
+    /**
+     * Content too large to be read back in one piece rolls the transaction back rather than being committed.
+     *
+     * <p>The ceiling is the deployment's statement of how much content one whole read may hold, and it is applied
+     * BEFORE the commit for a reason: content the store could hold but no instance could afterwards read whole
+     * would only look published, and after the commit there is nothing left to do about it but complain. Refusing
+     * before it means the row and the object stay in step.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void contentTooLargeToPublishRollsTheTransactionBackBeforeItCommits(@TempDir Path home)
+            throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_MAX_OBJECT_SIZE, "1024");
+        Map<String, byte[]> objects = new ConcurrentHashMap<>();
+        installObjectStoreClient(inMemoryObjectStore(objects));
+        Path local = Files.createDirectories(home.resolve("runtime/uploads")).resolve("oversized.bin");
+        Files.write(local, new byte[8]);
+
+        List<String> rolledBack = new ArrayList<>();
+        List<Synchronization> registered = new ArrayList<>();
+        try (MockedStatic<TransactionUtil> transactions = mockStatic(TransactionUtil.class,
+                withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
+            transactions.when(TransactionUtil::getStatus).thenReturn(Status.STATUS_ACTIVE);
+            transactions.when(() -> TransactionUtil.registerSynchronization(any(Synchronization.class)))
+                    .thenAnswer(call -> registered.add(call.getArgument(0)));
+            transactions.when(() -> TransactionUtil.setRollbackOnly(anyString(), any()))
+                    .thenAnswer(call -> rolledBack.add(call.getArgument(0)));
+            File resolved = DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/oversized.bin", null);
+            Files.write(resolved.toPath(), new byte[4096]);
+            assertEquals(1, registered.size(), "the resolution must have registered");
+            registered.get(0).beforeCompletion();
+        }
+
+        assertEquals(1, rolledBack.size(), "oversized content must roll the transaction back before it commits,"
+                + " rather than committing a row for content no instance could read whole: " + rolledBack);
+        assertTrue(rolledBack.get(0).contains(PROPERTY_MAX_OBJECT_SIZE), "the rollback must name the setting that"
+                + " governs it: " + rolledBack.get(0));
+        assertEquals(Map.of(), objects, "nothing may have been published");
+    }
+
+    /**
+     * A location this instance holds no copy of is reconstructed from the store, so a caller that needs a
+     * {@code File} still gets one.
+     *
+     * <p>The frozen contract of {@code getContentFile} is a non-null {@code File} that exists, and content
+     * published by another instance leaves nothing on this one's disk - which is the state every instance except
+     * the one that received the upload is in. A seam that only ever looked at local disk therefore failed on
+     * every other instance.
+     *
+     * <p>It is reconstructed AT ITS OWN PATH rather than into a temporary file, and that is the whole point: the
+     * caller may be about to write to it, and a temporary file would have taken that write with it. The parent
+     * directories are created too, because the instance that received the upload created them and this one never
+     * did.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void aLocationThisInstanceHasNoCopyOfIsReconstructedFromTheStore(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        byte[] published = "published by another instance".getBytes(StandardCharsets.UTF_8);
+        Map<String, byte[]> objects = new ConcurrentHashMap<>();
+        objects.put("runtime/uploads/00002/reconstructed.bin", published);
+        installObjectStoreClient(inMemoryObjectStore(objects));
+        Path expected = home.resolve("runtime/uploads/00002/reconstructed.bin");
+        assertFalse(Files.exists(expected.getParent()), "the directory must be missing, or this asserts nothing");
+
+        File resolved = DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/00002/reconstructed.bin",
+                null);
+
+        assertNotNull(resolved, "the frozen contract is a non-null File");
+        assertTrue(resolved.exists(), "the File a caller is handed has to exist: every caller either reads it or"
+                + " writes to it, and both need a real path");
+        assertEquals(expected.toFile().getCanonicalPath(), resolved.getCanonicalPath(), "the content must be"
+                + " reconstructed at the location the row names, not at a temporary path a write would be lost to");
+        assertArrayEquals(published, Files.readAllBytes(resolved.toPath()), "the reconstruction must be what the"
+                + " store holds");
+        // And a write to it lands where the write-through will find it, which is what a temporary file could not
+        // have offered.
+        Files.write(resolved.toPath(), PAYLOAD);
+        assertArrayEquals(PAYLOAD, Files.readAllBytes(expected), "a write through the reconstructed File must"
+                + " reach the location the row names");
+    }
+
+    /**
+     * A {@code CONTEXT_FILE} is neither published to the store nor read through it.
+     *
+     * <p>Its content is a webapp's own static files, which ship inside the container image: every instance already
+     * has an identical copy, so there is no durable local state to externalise - and making them provider-backed
+     * would instead mean every instance's static files had to be uploaded before it could serve them. The render
+     * path has always read them locally, so a write path that gave them provider keys would have had the same
+     * resource written to one place and read from another, which is the inconsistency this asserts against.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void aContextFileIsNeitherPublishedNorReadThroughTheStore(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        S3Client untouched = mock(S3Client.class);
+        installObjectStoreClient(untouched);
+        Path context = Files.createDirectories(home.resolve("webapp"));
+        Files.write(context.resolve("static.bin"), PAYLOAD);
+
+        List<Synchronization> registered = new ArrayList<>();
+        try (MockedStatic<TransactionUtil> transactions = mockStatic(TransactionUtil.class,
+                withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
+            transactions.when(TransactionUtil::getStatus).thenReturn(Status.STATUS_ACTIVE);
+            transactions.when(() -> TransactionUtil.registerSynchronization(any(Synchronization.class)))
+                    .thenAnswer(call -> registered.add(call.getArgument(0)));
+            File resolved = DataResourceWorker.getContentFile("CONTEXT_FILE", "/static.bin", context.toString());
+            assertNotNull(resolved, "a context file still resolves to the file it always resolved to");
+            Files.write(resolved.toPath(), "rewritten in place".getBytes(StandardCharsets.UTF_8));
+        }
+
+        assertEquals(List.of(), registered, "a context file must register no write-through: it is not"
+                + " provider-backed in either direction");
+        verifyNoInteractions(untouched);
+        // And the read direction agrees, which is the half that was already local-only.
+        assertEquals("rewritten in place", renderedThroughSeam("CONTEXT_FILE", "/static.bin", context.toString(),
+                seamDelegator("default", null), "10000"), "a context file must be rendered from the local copy");
+        verifyNoInteractions(untouched);
+    }
+
+    /**
+     * A file written into a resolved upload directory is published, which is the only way an upload can be.
+     *
+     * <p>The service that writes an uploaded file resolves its own {@code File} from the {@code objectInfo} it was
+     * given and never calls this class, so there is no file resolution to seam. What every upload does pass
+     * through is the upload DIRECTORY: the script asks for it, composes {@code objectInfo} from it, and hands the
+     * write to that service. So the directory is what the write-through watches, and whatever file has appeared in
+     * it by the time the transaction commits is what gets published.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void aFileWrittenIntoAResolvedUploadDirectoryIsPublished(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        Map<String, byte[]> objects = new ConcurrentHashMap<>();
+        installObjectStoreClient(inMemoryObjectStore(objects));
+        // The upload root, which the deployment's own installation creates: getDataResourceContentUploadPath
+        // creates only the numbered subdirectory below it, with a single-level mkdir.
+        Files.createDirectories(home.resolve("runtime/uploads"));
+        byte[] uploaded = "the bytes an upload wrote".getBytes(StandardCharsets.UTF_8);
+
+        Synchronization upload = writeThroughFor(() -> {
+            String directory = DataResourceWorker.getDataResourceContentUploadPath(seamDelegator("default", null),
+                    true);
+            assertNotNull(directory, "the upload path is what an objectInfo is composed from");
+            Files.write(Paths.get(directory).resolve("10000.png"), uploaded);
+        });
+
+        assertNotNull(upload, "resolving an upload directory inside an active transaction must register a"
+                + " write-through, or an upload could never be published");
+        upload.beforeCompletion();
+        upload.afterCompletion(Status.STATUS_COMMITTED);
+
+        assertEquals(1, objects.size(), "exactly the uploaded file must have been published: " + objects.keySet());
+        String key = objects.keySet().iterator().next();
+        assertTrue(key.endsWith("/10000.png"), "the key must be the upload's own path: " + key);
+        assertArrayEquals(uploaded, objects.get(key), "the published bytes must be the bytes the upload wrote");
+    }
+
+    /**
+     * The bytes the upload validation left behind are the bytes published, not the bytes the caller submitted.
+     *
+     * <p>This is the property the whole write path was arranged around, and the one that is easiest to lose.
+     * {@code createFileMethod} writes the submitted array to a TEMPORARY file, hands that file to
+     * {@code SecuredUpload}, which decodes the image and REWRITES it - stripping every metadata chunk with it -
+     * and only then copies the rewritten file onto the destination. So the destination holds post-validation
+     * content and the submitted array does not. Publishing from the array would put content the deployment's own
+     * sanitiser rejected into a store every instance reads, and it would do so silently, because the local copy
+     * would still be the clean one. Publishing at commit, from the FILE, is what makes that impossible.
+     *
+     * <p>The fixture carries a marker inside a PNG {@code tEXt} chunk so that the assertion cannot be vacuous:
+     * the submitted bytes and the published bytes are asserted to DIFFER, and the marker is asserted absent from
+     * what reached the store. A test whose input survived sanitising unchanged would prove nothing.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void theBytesTheUploadSanitiserLeftBehindAreTheOnesPublished(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        Files.createDirectories(home.resolve("runtime/uploads"));
+        RecordedObjectStore store = recordingObjectStoreClient();
+        String marker = "BLITZY-METADATA-THAT-MUST-NOT-SURVIVE";
+        byte[] submitted = pngCarryingMetadata(marker);
+        assertTrue(new String(submitted, StandardCharsets.ISO_8859_1).contains(marker), "the fixture must"
+                + " actually carry the marker, or this case cannot tell the two copies apart");
+        Path[] written = new Path[1];
+
+        Synchronization upload = writeThroughFor(() -> {
+            String directory = DataResourceWorker.getDataResourceContentUploadPath(seamDelegator("default", null),
+                    true);
+            String relative = home.relativize(Paths.get(directory)).toString().replace(File.separatorChar, '/');
+            written[0] = Paths.get(directory).resolve("10008.png");
+            Map<String, Object> result = DataServices.createFileMethod(
+                    dispatchContextFor(seamDelegator("default", null)),
+                    UtilMisc.toMap("dataResourceTypeId", "OFBIZ_FILE_BIN", "objectInfo",
+                            "/" + relative + "/10008.png", "dataResourceId", "10008", "binData",
+                            ByteBuffer.wrap(submitted), "locale", Locale.ENGLISH));
+            assertFalse(ServiceUtil.isError(result), "a valid image upload must be accepted: " + result);
+        });
+
+        assertNotNull(upload, "the upload directory resolution must register the publish");
+        upload.beforeCompletion();
+        upload.afterCompletion(Status.STATUS_COMMITTED);
+
+        assertEquals(1, store.publishedKeys().size(), "exactly the uploaded file must be published: "
+                + store.publishedKeys());
+        String key = store.publishedKeys().iterator().next();
+        byte[] published = store.contentOf(key);
+        byte[] onDisk = Files.readAllBytes(written[0]);
+        assertArrayEquals(onDisk, published, "what is published must be exactly what the validation left on"
+                + " disk, because that file is the post-validation content and the submitted array is not");
+        assertFalse(Arrays.equals(submitted, published), "the sanitiser rewrote the file, so publishing the"
+                + " submitted array would be publishing content this deployment refused - if these are equal"
+                + " the fixture no longer exercises the sanitiser and the case proves nothing");
+        assertFalse(new String(published, StandardCharsets.ISO_8859_1).contains(marker), "the metadata the"
+                + " sanitiser stripped must not reach the store");
+    }
+
+    /**
+     * An upload of nothing is published rather than left where only one instance can see it.
+     *
+     * <p>Zero bytes is a legitimate outcome - a cleared attachment, an empty export - and it is the case a
+     * publication decision made on "is there anything to send" gets wrong: the file EXISTS, the row that names
+     * it commits, and every instance except this one would then find nothing behind it. What decides is whether
+     * the location changed, not whether it holds anything, so an empty file is published exactly like any other
+     * and reads back as the zero-length content the contract promises.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void anEmptyUploadIsPublishedRatherThanLeftOnlyOnTheInstance(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        Files.createDirectories(home.resolve("runtime/uploads"));
+        RecordedObjectStore store = recordingObjectStoreClient();
+        Path[] written = new Path[1];
+
+        Synchronization upload = writeThroughFor(() -> {
+            String directory = DataResourceWorker.getDataResourceContentUploadPath(seamDelegator("default", null),
+                    true);
+            written[0] = Files.createFile(Paths.get(directory).resolve("10009.bin"));
+        });
+
+        assertNotNull(upload, "the upload directory resolution must register the publish");
+        upload.beforeCompletion();
+        upload.afterCompletion(Status.STATUS_COMMITTED);
+
+        assertEquals(1, store.publishedKeys().size(), "an empty upload must be published like any other: "
+                + store.publishedKeys());
+        assertArrayEquals(new byte[0], store.contentOf(store.publishedKeys().iterator().next()),
+                "the published object must be the zero-length content the file holds");
+        assertTrue(Files.exists(written[0]), "publishing must not disturb the file it published");
+        assertTrue(store.removedKeys().isEmpty(), "an empty file is content, not an absence, so nothing may be"
+                + " removed from the store for it: " + store.removedKeys());
+    }
+
+    /**
+     * Removing only the metadata leaves the stored object exactly where filesystem mode leaves the file.
+     *
+     * <p>{@code removeDataResource} is declared {@code engine="entity-auto" invoke="delete"}: it deletes the row
+     * and nothing else, so a deployment on local files keeps the file on disk afterwards. An object store has to
+     * behave the same way, because AAP 0.7.1 requires every webapp and every service to behave identically
+     * before and after this work - a provider that deleted the object on a row removal would make the object
+     * store LOSE content that filesystem mode keeps, and no service asked it to.
+     *
+     * <p>What is mirrored is the removal of the CONTENT, which is the case
+     * {@link #contentRemovedByACommittedTransactionIsRemovedFromTheStore} covers. The two together are the whole
+     * of the delete policy: the store follows the file, and nothing else.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void removingOnlyTheMetadataLeavesTheStoredObjectExactlyAsFilesystemModeDoes(@TempDir Path home)
+            throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        RecordedObjectStore store = recordingObjectStoreClient();
+        Path local = Files.createDirectories(home.resolve("runtime/uploads")).resolve("kept.bin");
+        Files.writeString(local, "the version this deployment held before the write below");
+
+        // The store is seeded by a committed write-through rather than by planting an object in the fixture, so
+        // what it holds got there the way a deployment's content really does: resolved inside a transaction,
+        // written, and published when that transaction committed.
+        Synchronization seeding = writeThroughFor(() -> {
+            assertNotNull(DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/kept.bin", null),
+                    "the resolution must answer with the local file");
+            Files.write(local, PAYLOAD);
+        });
+        assertNotNull(seeding, "the resolution must register");
+        seeding.beforeCompletion();
+        seeding.afterCompletion(Status.STATUS_COMMITTED);
+        assertArrayEquals(PAYLOAD, store.contentOf("runtime/uploads/kept.bin"), "the store must hold the"
+                + " content before the removal under test, or the case cannot show it survives");
+
+        // The row is deleted; the file is not. That is exactly what the entity-auto service does.
+        Synchronization metadataOnly = writeThroughFor(() ->
+                DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/kept.bin", null));
+        assertNotNull(metadataOnly, "the resolution must register");
+        metadataOnly.beforeCompletion();
+        metadataOnly.afterCompletion(Status.STATUS_COMMITTED);
+
+        assertTrue(store.removedKeys().isEmpty(), "a metadata-only removal must remove nothing from the store,"
+                + " because filesystem mode keeps the file: " + store.removedKeys());
+        assertArrayEquals(PAYLOAD, store.contentOf("runtime/uploads/kept.bin"), "the object must survive a"
+                + " removal of the row that named it, exactly as the local file does");
+        assertTrue(Files.exists(local), "the local file must survive too, which is what makes the two agree");
+    }
+
+    /**
+     * No completion status other than {@code STATUS_COMMITTED} touches the store, whatever the transaction
+     * manager reports.
+     *
+     * <p>{@code afterCompletion} is called with the status the transaction reached, and a synchronisation that
+     * acted on anything except a commit would act for a transaction whose row was never recorded. Marked for
+     * rollback, rolling back, prepared, unknown - each of them means the row is not there, or not there yet, and
+     * publishing content for a row that does not exist is how a store comes to hold objects nothing references
+     * and to have had a stable key deleted by a transaction that never owned it.
+     *
+     * <p>Every status in the specification is driven except the one that publishes, and the store is asserted
+     * untouched after each - both the version it already held and the fact that nothing was removed. The write
+     * is real: the file on disk differs from the object throughout, so a synchronisation that acted on any of
+     * these statuses would be visible immediately.
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void noCompletionStatusOtherThanCommittedTouchesTheStore(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        RecordedObjectStore store = recordingObjectStoreClient();
+        Path target = Files.createDirectories(home.resolve("runtime/uploads")).resolve("doomed.bin");
+        Files.writeString(target, "the copy this instance already had");
+
+        Synchronization pending = writeThroughFor(() -> {
+            File resolved = DataResourceWorker.getContentFile("OFBIZ_FILE", "/runtime/uploads/doomed.bin", null);
+            Files.write(resolved.toPath(), PAYLOAD);
+        });
+        assertNotNull(pending, "the resolution must register, or this case would prove only that nothing was"
+                + " listening");
+        pending.beforeCompletion();
+
+        int[] everyStatusButACommit = {Status.STATUS_ACTIVE, Status.STATUS_MARKED_ROLLBACK,
+                Status.STATUS_PREPARED, Status.STATUS_ROLLEDBACK, Status.STATUS_UNKNOWN,
+                Status.STATUS_NO_TRANSACTION, Status.STATUS_PREPARING, Status.STATUS_COMMITTING,
+                Status.STATUS_ROLLING_BACK, };
+        for (int status : everyStatusButACommit) {
+            pending.afterCompletion(status);
+
+            assertTrue(store.publishedKeys().isEmpty(), "completion status [" + status + "] is not a commit, so"
+                    + " nothing may be published for it: " + store.publishedKeys());
+            assertTrue(store.removedKeys().isEmpty(), "completion status [" + status + "] is not a commit, so"
+                    + " nothing may be removed either - deleting the stable key would destroy content this"
+                    + " transaction never owned: " + store.removedKeys());
+        }
+        assertArrayEquals(PAYLOAD, Files.readAllBytes(target), "the local write itself is untouched by any of"
+                + " this, which is what makes the store the only thing being asserted about");
+    }
+
+    /**
+     * The strict-fallback refusal names no storage key, because it reaches whoever asked for the content.
+     *
+     * <p>A storage key is this deployment's own layout - the {@code ofbiz.home}-relative path of the content,
+     * under whatever prefix the bucket is organised by - and this refusal travels back through the
+     * content-rendering path, where it can reach a rendered page. So the key goes to the log beside an opaque
+     * reference, and the message carries the reference and the setting an operator would change (CWE-200).
+     *
+     * @param home a per-test temporary directory standing in for {@code ofbiz.home}
+     * @throws Exception if the seam cannot be exercised
+     */
+    @Test
+    public void theStrictFallbackRefusalNamesNoStorageKey(@TempDir Path home) throws Exception {
+        System.setProperty("ofbiz.home", home.toString());
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_LOCAL_FALLBACK, "false");
+        installObjectStoreClient(inMemoryObjectStore(new ConcurrentHashMap<>()));
+        Path local = Files.createDirectories(home.resolve("runtime/uploads")).resolve("only-local.bin");
+        Files.writeString(local, "a copy only this instance has");
+
+        GeneralException refused = assertThrows(GeneralException.class, () -> renderedThroughSeam("OFBIZ_FILE",
+                "/runtime/uploads/only-local.bin", null, seamDelegator("default", null), "10000"),
+                "with the strict posture the store is the authority, so a local copy must not answer for it");
+
+        for (String disclosure : new String[] {"runtime/uploads/only-local.bin", "only-local.bin",
+                home.toString()}) {
+            assertFalse(refused.getMessage().contains(disclosure), "the refusal reaches whoever asked for the"
+                    + " content, so it must not disclose [" + disclosure + "]: " + refused.getMessage());
+        }
+        assertTrue(refused.getMessage().contains("Reference ["), "the refusal must carry the opaque reference that"
+                + " joins it to the log line explaining it: " + refused.getMessage());
+        assertTrue(refused.getMessage().contains(PROPERTY_LOCAL_FALLBACK), "the refusal must name the setting an"
+                + " operator would change: " + refused.getMessage());
+    }
+
+    /**
+     * Runs a seam call inside a transaction that reports itself active, and returns the write-through it
+     * registered.
+     *
+     * <p>A real transaction manager is not available to a unit test, and it is not what is under test: what is
+     * under test is which synchronisation the seam registers and what that synchronisation then does at each
+     * completion status. Substituting {@code TransactionUtil} makes both observable, and driving the returned
+     * synchronisation directly is what lets one test assert the commit and the rollback outcomes of the same
+     * resolution.
+     *
+     * @param seam the seam call to make, and the write it should perform
+     * @return the registered write-through, or null when the seam registered none
+     * @throws Exception if the seam call itself fails
+     */
+    private static Synchronization writeThroughFor(ThrowingRunnable seam) throws Exception {
+        List<Synchronization> registered = new ArrayList<>();
+        try (MockedStatic<TransactionUtil> transactions = mockStatic(TransactionUtil.class,
+                withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
+            transactions.when(TransactionUtil::getStatus).thenReturn(Status.STATUS_ACTIVE);
+            transactions.when(() -> TransactionUtil.registerSynchronization(any(Synchronization.class)))
+                    .thenAnswer(call -> registered.add(call.getArgument(0)));
+            seam.run();
         }
         return registered.isEmpty() ? null : registered.get(0);
+    }
+
+    /** A seam call that may fail, so a test body can be handed to {@link #writeThroughFor}. */
+    private interface ThrowingRunnable {
+        /**
+         * Makes the seam call.
+         *
+         * @throws Exception if it fails
+         */
+        void run() throws Exception;
     }
 
     /**
@@ -4789,6 +4821,13 @@ public final class ContentStoreFactoryTest {
         UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_ACCESS_KEY_ID, ACCESS_KEY_ID);
         UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_SECRET_ACCESS_KEY, SECRET_ACCESS_KEY);
         UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_PATH_STYLE, "true");
+        // STATED, not inherited. Every configuration this suite installs is a strict one, so a test that
+        // needs the plaintext permission has to ask for it in its own body and every other test is proved
+        // against the posture a deployment actually runs. Left to whatever the JVM happened to hold, a test
+        // asserting that a plaintext endpoint is REFUSED would pass or fail according to which test ran
+        // before it - and the committed default is this value, so stating it changes nothing but the
+        // suite's independence from its own execution order.
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_INSECURE_ENDPOINT, "false");
     }
 
     /**
@@ -4962,12 +5001,53 @@ public final class ContentStoreFactoryTest {
     private static void assertStoreFailure(IOException thrown) {
         assertFalse(thrown instanceof FileNotFoundException, "a store failure must not be reported as an"
                 + " absence: " + thrown);
-        // Identified by its reference rather than by a nested SDK failure: the report reaches whoever asked
-        // for the content, so the store's own words - which can quote the request it was building - stay in
-        // the log, sanitised, beside this reference.
+        // Identified by its reference rather than by the store's own words: the report reaches whoever asked
+        // for the content, so what the store said - which can quote the request it was building - stays in
+        // the log beside this reference, sanitised.
         assertTrue(thrown.getMessage().contains("Reference ["), "a store failure must carry the opaque"
                 + " reference that joins it to the log line explaining it: " + thrown);
-        assertNull(thrown.getCause(), "no SDK failure may be attached to a store failure: " + thrown);
+        assertSanitisedCause(thrown);
+    }
+
+    /**
+     * Asserts that a translated failure carries a cause that can be inspected and cannot leak.
+     *
+     * <p>Both halves matter and they pull against each other, which is why they are asserted in one place.
+     * Attaching the SDK failure itself would republish whatever it quoted - an SDK message can quote the
+     * request it was building, endpoint and signed headers included - through anything that logs a caught
+     * {@code IOException} with its stack trace or reads {@code getCause().getMessage()}. Attaching NOTHING,
+     * which is what this did, left a caller with fixed English text and an opaque reference as its only
+     * diagnostics: there was no way to tell an expired deadline from {@code AccessDenied}, so no way to
+     * decide whether retrying could ever help or which alert to raise.
+     *
+     * <p>So the cause is a sanitised stand-in: it carries the type and the service fields as data, carries
+     * no stack trace of its own - it is built where the translation happens, not where the failure did -
+     * and quotes none of the SDK's message, cause or suppressed failures.
+     *
+     * @param thrown the translated exception
+     */
+    private static void assertSanitisedCause(Throwable thrown) {
+        Throwable cause = thrown.getCause();
+        assertNotNull(cause, "a translated failure must carry a cause an inspecting caller can branch on,"
+                + " because fixed text and an opaque reference are not diagnostics: " + thrown);
+        assertFalse(cause instanceof SdkException, "the cause must not be an SDK type, or no SDK type would"
+                + " have been kept out of the contract after all: " + cause.getClass().getName());
+        assertTrue(cause instanceof S3ContentStore.RedactedStoreCause, "the cause must be the sanitised"
+                + " stand-in rather than anything of the SDK's: " + cause.getClass().getName());
+        S3ContentStore.RedactedStoreCause redacted = (S3ContentStore.RedactedStoreCause) cause;
+        assertNull(redacted.getCause(), "the sanitised cause must carry no cause of its own, or the SDK"
+                + " failure would be one dereference further down the same chain");
+        assertEquals(0, redacted.getSuppressed().length, "the sanitised cause must suppress nothing");
+        assertEquals(0, redacted.getStackTrace().length, "the sanitised cause must carry no stack trace: it"
+                + " is built where the translation happens, not where the failure did, so a trace of its own"
+                + " would describe the translator and mislead");
+        assertNotNull(redacted.getMessage(), "the sanitised cause must describe the failure by type");
+        assertTrue(redacted.getMessage().contains(redacted.failureType()), "the message and the fields must"
+                + " agree: [" + redacted.getMessage() + "] vs [" + redacted.failureType() + "]");
+        for (String secret : new String[] {BUCKET, KEY}) {
+            assertFalse(redacted.getMessage().contains(secret), "the sanitised cause must disclose neither"
+                    + " the bucket nor the key: [" + redacted.getMessage() + "]");
+        }
     }
 
     /**
@@ -5084,6 +5164,182 @@ public final class ContentStoreFactoryTest {
      * Write-seam fixtures
      */
 
+    @Test
+    public void aStreamedWriteToTheObjectStoreIsHeldToTheLengthItDeclared() throws Exception {
+        // The object-store half of the same contract the filesystem provider is held to, and the one where
+        // getting it wrong was silent: the SDK frames a PutObject from the declared length, writes exactly
+        // that many bytes and never looks at the rest, so a stream holding MORE than it declared was stored
+        // TRUNCATED and stored successfully. Nothing anywhere reported it and a later read returned content
+        // that looked complete. The recording client below writes the body exactly as the SDK does - the
+        // declared number of bytes and no more - so what is asserted is the real interaction and not a
+        // stand-in for it.
+        List<byte[]> sent = new ArrayList<>();
+        S3Client client = clientWritingPutBodiesLikeTheSdk(sent);
+        ContentStore store = new S3ContentStore(client, OFFLINE_BUCKET);
+
+        Executable declaresLessThanItHolds = () -> store.put(KEY, new ByteArrayInputStream(PAYLOAD),
+                PAYLOAD.length - 1L);
+        GeneralException tooLong = assertThrows(GeneralException.class, declaresLessThanItHolds,
+                "a stream holding more than the length it declared must be refused rather than stored"
+                        + " truncated");
+        assertTrue(tooLong.getMessage().contains("holds more than"), "the refusal must say the stream was"
+                + " longer than it declared: [" + tooLong.getMessage() + "]");
+
+        Executable declaresMoreThanItHolds = () -> store.put(KEY, new ByteArrayInputStream(PAYLOAD),
+                PAYLOAD.length + 8L);
+        GeneralException tooShort = assertThrows(GeneralException.class, declaresMoreThanItHolds,
+                "a stream ending before the length it declared must be refused as the caller error it is,"
+                        + " not reported as the store failing");
+        assertTrue(tooShort.getMessage().contains("bytes before"), "the refusal must say the stream ended"
+                + " early: [" + tooShort.getMessage() + "]");
+
+        assertEquals(List.of(), sent, "a refused write must leave nothing stored: neither mismatch may have"
+                + " completed a request");
+
+        // And the check is transparent to a stream that does agree with its length - including the look-ahead,
+        // which must not eat the last byte of a correct write.
+        store.put(KEY, new ByteArrayInputStream(PAYLOAD), PAYLOAD.length);
+        assertEquals(1, sent.size(), "a correct write must reach the store exactly once");
+        assertArrayEquals(PAYLOAD, sent.get(0), "a correct write must arrive whole and unaltered");
+    }
+
+    @Test
+    public void aClientThatCannotBeClosedStillReleasesTheCredentialProviderItOwns() throws Exception {
+        // Two owned resources, closed in one try: a client whose own close threw took the credential
+        // provider's release with it. That release is not optional - the default chain keeps an HTTP client
+        // of its own for instance metadata, and only the instance that built the chain can close it - so
+        // skipping it leaks that client's pool and threads for the life of the JVM, at exactly the moment
+        // something was already going wrong.
+        RecordedSdk sdk = new RecordedSdk();
+        sdk.failTheCloseWith(new IllegalStateException("the SDK client cannot be closed"));
+        S3ContentStore.installSdkConstructionForTesting(sdk);
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_BUCKET, "configured-bucket");
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_REGION, "us-east-1");
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_ENDPOINT, "");
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_KEY_PREFIX, "");
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_ACCESS_KEY_ID, "");
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_SECRET_ACCESS_KEY, "");
+        S3ContentStore store = new S3ContentStore((Delegator) null);
+        assertNotNull(sdk.lastDefaultChain(), "no configured credential pair must build the default chain,"
+                + " or this test asserts nothing about releasing one");
+
+        // Reported, never propagated: close runs while a provider is being replaced or while the JVM is
+        // stopping, and neither has anywhere to report a failure to.
+        assertDoesNotThrow(store::close, "a close that cannot release the client must still return");
+
+        assertTrue(sdk.lastDefaultChain().isClosed(), "the credential provider this provider built must be"
+                + " released even when closing the client fails, because nothing else can ever reach it");
+    }
+
+    @Test
+    public void aBodyThatFailsWhileItIsBeingReadIsTranslatedLikeEveryOtherStoreFailure() throws Exception {
+        // Translation used to stop at the moment openStream returned. After it the caller held the SDK's own
+        // response stream, so a reset connection or a truncated body arrived as whatever the SDK or the HTTP
+        // client chose to say - uncorrelated and unredacted, on the path whose whole purpose is to render
+        // content into a response.
+        AtomicBoolean aborted = new AtomicBoolean(false);
+        S3Client client = mock(S3Client.class);
+        when(client.getObject(any(GetObjectRequest.class))).thenReturn(bodyFailingAfter(
+                "https://store.example.internal/" + OFFLINE_BUCKET + "/secret-layout", aborted));
+        ContentStore store = new S3ContentStore(client, OFFLINE_BUCKET);
+
+        ContentStore.ContentStream body = store.openStream(KEY);
+        IOException reported = assertThrows(IOException.class, body::read,
+                "a body that fails mid-read must be reported through the contract, not through the SDK");
+
+        assertFalse(reported instanceof FileNotFoundException, "a failure to read a body that was found is"
+                + " not an absence: " + reported);
+        assertTrue(reported.getMessage().contains("Reference ["), "the report must carry the opaque reference"
+                + " that joins it to the log line explaining it: " + reported.getMessage());
+        for (String disclosure : new String[] {"store.example.internal", OFFLINE_BUCKET, "secret-layout", KEY}) {
+            assertFalse(reported.getMessage().contains(disclosure), "the report reaches whoever asked for the"
+                    + " content, so it must not disclose [" + disclosure + "]: " + reported.getMessage());
+        }
+        assertTrue(aborted.get(), "a failed body must be ABORTED rather than closed: closing a partly-read"
+                + " response drains the remainder of the object off the wire, which is the transfer a"
+                + " refusal exists to avoid");
+    }
+
+    @Test
+    public void aBodyStillBeingReadAfterItsDeadlineIsAbandonedRatherThanWaitedOn() throws Exception {
+        // The SDK's api-call and attempt deadlines stop at the moment the body is handed over, and what it
+        // bounds after that is INACTIVITY: a store answering each read just inside the socket timeout never
+        // trips it and holds a request thread, a connection and a pool slot for as long as it likes. This is
+        // the deadline over the WHOLE body that closes that, so "any size" does not also mean "any duration".
+        UtilProperties.setPropertyValueInMemory(RESOURCE, PROPERTY_S3_STREAM_TIMEOUT, "1000");
+        AtomicBoolean aborted = new AtomicBoolean(false);
+        S3Client client = mock(S3Client.class);
+        when(client.getObject(any(GetObjectRequest.class))).thenReturn(new ResponseInputStream<>(
+                GetObjectResponse.builder().contentLength((long) PAYLOAD.length).build(),
+                AbortableInputStream.create(new ByteArrayInputStream(PAYLOAD), () -> aborted.set(true))));
+        ContentStore store = new S3ContentStore(client, OFFLINE_BUCKET);
+
+        ContentStore.ContentStream body = store.openStream(KEY);
+        assertTrue(body.read() >= 0, "the body must serve content before its deadline");
+        Thread.sleep(1100L);
+
+        IOException refused = assertThrows(IOException.class, body::read,
+                "a body still being read after its deadline must be refused rather than served");
+        assertTrue(refused.getMessage().contains("Reference ["), "the refusal must carry the opaque reference"
+                + " that joins it to the log line explaining it: " + refused.getMessage());
+        assertFalse(refused.getMessage().contains(PROPERTY_S3_STREAM_TIMEOUT), "the refusal reaches whoever"
+                + " asked for the content, so the setting that governs it belongs in the log: "
+                + refused.getMessage());
+        assertTrue(aborted.get(), "an overrun body must be abandoned rather than drained");
+        // And it stays refused: a caller that keeps reading must not be handed the rest of a partial object
+        // as though nothing had happened.
+        assertThrows(IOException.class, body::read, "an abandoned body must stay abandoned");
+    }
+
+    /**
+     * Builds a client that writes a {@code PutObject} body exactly as the SDK writes one, recording what
+     * arrived.
+     *
+     * <p>Faithful in the one respect that matters here: the SDK frames the request from the DECLARED length
+     * and writes that many bytes from the body, never more. A mock that ignored the body entirely could not
+     * tell a stream that agreed with its length from one that did not, and a mock that drained the body to
+     * its end would be testing something the SDK never does. An {@link IOException} raised while the body is
+     * being written is reported the way the SDK reports one, as an {@link SdkClientException}, because that
+     * is what the provider has to recognise.
+     *
+     * @param sent collects the body of every request that completed
+     * @return the client to issue requests through
+     */
+    private static S3Client clientWritingPutBodiesLikeTheSdk(List<byte[]> sent) {
+        S3Client client = mock(S3Client.class);
+        when(client.putObject(any(PutObjectRequest.class), any(RequestBody.class))).thenAnswer(call -> {
+            RequestBody body = call.getArgument(1);
+            long declared = body.optionalContentLength().orElse(0L);
+            try (InputStream content = body.contentStreamProvider().newStream()) {
+                sent.add(content.readNBytes((int) declared));
+            } catch (IOException e) {
+                throw SdkClientException.create("Unable to execute HTTP request", e);
+            }
+            return PutObjectResponse.builder().build();
+        });
+        return client;
+    }
+
+    /**
+     * Builds a response whose body fails as soon as it is read, quoting deployment layout in the way an SDK
+     * or HTTP-client failure does.
+     *
+     * @param quoted what the failure's own message discloses, which must not reach the caller
+     * @param aborted set when the response is abandoned rather than closed
+     * @return an SDK response stream that fails on first read
+     */
+    private static ResponseInputStream<GetObjectResponse> bodyFailingAfter(String quoted, AtomicBoolean aborted) {
+        InputStream failing = new InputStream() {
+            @Override
+            public int read() throws IOException {
+                throw new IOException("Connection reset while reading " + quoted);
+            }
+        };
+        return new ResponseInputStream<>(
+                GetObjectResponse.builder().contentLength(1024L).build(),
+                AbortableInputStream.create(failing, () -> aborted.set(true)));
+    }
+
     /**
      * Installs an object-store provider whose SDK client is the supplied mock, so the whole provider - key
      * derivation, prefixing, request building and failure translation - runs for real with no network, no
@@ -5115,6 +5371,7 @@ public final class ContentStoreFactoryTest {
         private ClosableCredentials lastDefaultChain;
         private AwsCredentialsProvider credentialsGiven;
         private RuntimeException buildFailure;
+        private RuntimeException closeFailure;
 
         @Override
         public S3ClientBuilder clientBuilder() {
@@ -5127,6 +5384,9 @@ public final class ContentStoreFactoryTest {
                 when(builder.build()).thenReturn(client);
             } else {
                 when(builder.build()).thenThrow(buildFailure);
+            }
+            if (closeFailure != null) {
+                doThrow(closeFailure).when(client).close();
             }
             return builder;
         }
@@ -5146,6 +5406,15 @@ public final class ContentStoreFactoryTest {
          */
         private void failTheBuildWith(RuntimeException failure) {
             buildFailure = failure;
+        }
+
+        /**
+         * Makes the substituted client refuse to close, the way a client with a failing resource does.
+         *
+         * @param failure what the close throws
+         */
+        private void failTheCloseWith(RuntimeException failure) {
+            closeFailure = failure;
         }
 
         /**
@@ -5425,6 +5694,15 @@ public final class ContentStoreFactoryTest {
         private List<String> removedKeys() {
             return removed;
         }
+
+        /**
+         * Returns every key this store was asked to hold, in the order it was asked.
+         *
+         * @return the published keys
+         */
+        private Set<String> publishedKeys() {
+            return held.keySet();
+        }
     }
 
     /**
@@ -5448,6 +5726,45 @@ public final class ContentStoreFactoryTest {
      *
      * @return the encoded image
      * @throws IOException if the image cannot be encoded, which no platform this runs on does
+     */
+    private static byte[] pngCarryingMetadata(String marker) throws IOException {
+        byte[] png = smallPng();
+        // The IEND chunk is the last twelve bytes of every PNG: a zero length, the type, and its CRC. A tEXt
+        // chunk spliced in front of it is a well formed PNG that carries the marker in its metadata, which is
+        // precisely what the upload sanitiser exists to strip - so it is what tells a published copy that came
+        // from the sanitised FILE apart from one that came from the submitted array.
+        byte[] data = ("Comment\u0000" + marker).getBytes(StandardCharsets.ISO_8859_1);
+        CRC32 crc = new CRC32();
+        crc.update("tEXt".getBytes(StandardCharsets.US_ASCII));
+        crc.update(data);
+        ByteArrayOutputStream chunk = new ByteArrayOutputStream();
+        chunk.write(fourBytes(data.length));
+        chunk.write("tEXt".getBytes(StandardCharsets.US_ASCII));
+        chunk.write(data);
+        chunk.write(fourBytes(crc.getValue()));
+
+        ByteArrayOutputStream carrying = new ByteArrayOutputStream();
+        carrying.write(png, 0, png.length - 12);
+        carrying.write(chunk.toByteArray());
+        carrying.write(png, png.length - 12, 12);
+        return carrying.toByteArray();
+    }
+
+    /**
+     * Encodes a value as the four big-endian bytes a PNG chunk header and CRC are written with.
+     *
+     * @param value the value to encode
+     * @return the four bytes, most significant first
+     */
+    private static byte[] fourBytes(long value) {
+        return new byte[] {(byte) (value >>> 24), (byte) (value >>> 16), (byte) (value >>> 8), (byte) value};
+    }
+
+    /**
+     * A minimal, valid PNG, encoded by the platform so that the upload validation accepts it.
+     *
+     * @return the encoded image
+     * @throws IOException if the platform cannot encode a PNG
      */
     private static byte[] smallPng() throws IOException {
         BufferedImage image = new BufferedImage(8, 8, BufferedImage.TYPE_INT_RGB);

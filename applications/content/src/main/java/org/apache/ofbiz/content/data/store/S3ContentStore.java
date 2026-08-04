@@ -19,6 +19,7 @@
 package org.apache.ofbiz.content.data.store;
 
 import java.io.FileNotFoundException;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
@@ -81,16 +82,16 @@ import software.amazon.awssdk.utils.SdkAutoCloseable;
  * implicit default, so which identity a deployment authenticates as is a decision this code records
  * rather than one that follows from what the SDK happens to do.
  *
- * <p><strong>Keys are scoped, and an unscoped key is refused.</strong> A bucket is one flat
- * namespace that every instance and, in a multi-tenant deployment, every tenant shares. This
- * provider therefore accepts only the identity-derived key {@link ContentStoreFactory} mints -
- * {@code dataresource/<scope>/<dataResourceId>}, three segments, the first of them
- * {@value ContentStoreFactory#IDENTITY_KEY_NAMESPACE} - and refuses anything else before a request
- * is issued. That refusal is what makes the scoping worth something: were a bare path accepted, two
- * tenants recording the same path would address one object, and a recorded path would decide which
- * object a read returns. {@code content.store.s3.key.prefix} is prepended to every key, so one
- * bucket can hold several deployments; the prefix separates deployments and the key's own scope
- * segment separates tenants.
+ * <p><strong>A key here is the same key the filesystem provider uses.</strong> It is the content's
+ * {@code ofbiz.home}-relative path, minted once by {@link ContentStoreFactory#storeKey} and refused
+ * here unless it satisfies the grammar every provider shares - no control character, no absolute path,
+ * no drive prefix, no {@code .} or {@code ..} component. One key shape for both providers is what lets
+ * a deployment copy its existing tree into a bucket and have every {@code DataResource} row keep
+ * naming the same content, which is the migration the {@code content.store.local.fallback} window
+ * exists for; a second key shape would instead have made one row mean different content depending on
+ * which provider was configured. A bucket is one flat namespace that every instance shares, so
+ * {@code content.store.s3.key.prefix} is prepended to every key: that is what separates two
+ * deployments sharing a bucket, exactly as separate trees separate them on a filesystem.
  *
  * <p><strong>Deadlines and retries are the deployment's decision.</strong>
  * {@code content.store.s3.api.timeout.millis} bounds a whole storage call including its retries,
@@ -101,6 +102,13 @@ import software.amazon.awssdk.utils.SdkAutoCloseable;
  * down costs a bounded wait and then a reported failure. The SDK's standard retry mode keeps its own
  * retry-capacity throttle on top of the cap, which is what stops every request retrying at once
  * while a store is failing.
+ *
+ * <p>Those three stop where the CALL stops, which is the moment {@code openStream} hands a body over,
+ * so {@code content.store.s3.stream.total.timeout.millis} bounds the body itself - the whole of it,
+ * from that moment until its last byte. The SDK's own remaining bound there is a socket read timeout,
+ * which measures INACTIVITY: a store answering each read just inside it never trips it and holds a
+ * request thread and a pooled connection for as long as it likes. A body that overruns its deadline is
+ * aborted and the read refused. See {@code ServedBody}.
  *
  * <p><strong>Endpoint safety.</strong> Every object request carries this deployment's credential,
  * so the endpoint is validated before a client is built: it must be an absolute {@code http} or
@@ -140,15 +148,31 @@ import software.amazon.awssdk.utils.SdkAutoCloseable;
  * else - not the bucket, not the object key, not the store's own message - because it can reach a
  * rendered page. The bucket, the key and the redacted status, error code and request id go to the
  * log under the same reference, so an operator joins the two without the message having disclosed
- * where this deployment keeps its content or what it calls it. The SDK failure is retained as the
- * cause for anything that inspects it.
+ * where this deployment keeps its content or what it calls it. The SDK failure itself is not attached;
+ * a {@link S3ContentStore.RedactedStoreCause} carrying only its type, status, error code and request id
+ * is, so that code which inspects a cause has something to branch on and nothing to republish.
  *
- * <p><strong>A whole-object read is bounded.</strong> {@code get} refuses content larger than
- * {@link ContentStoreFactory#maxObjectSize}, checking the declared length first and then the bytes
- * actually delivered, so neither an oversized object nor a store that understates its size can
- * exhaust the heap of the instance reading it. A refused or failed read aborts the connection rather
- * than draining it, so refusing costs no bandwidth. {@code openStream} is unbounded by design and is
- * what content of a size an uploader chose is served through.
+ * <p>That applies to a body being read as much as to the request that opened it. Every {@code read},
+ * {@code skip} and {@code close} of a returned body is translated by the same rules, because the body
+ * is read on the path that renders content into a response and the SDK's own report of a reset
+ * connection or a truncated body is as capable of quoting the endpoint as any other.
+ *
+ * <p><strong>A whole-object read is bounded in size; a streamed one is bounded in time.</strong>
+ * {@code get} refuses content larger than {@link ContentStoreFactory#maxObjectSize}, checking the
+ * declared length first and then the bytes actually delivered, so neither an oversized object nor a
+ * store that understates its size can exhaust the heap of the instance reading it. A refused or failed
+ * read aborts the connection rather than draining it, so refusing costs no bandwidth.
+ * {@code openStream} is deliberately unbounded in SIZE - it is what content of a size an uploader chose
+ * is served through - and bounded in TIME by the streamed-body deadline above, so "any size" does not
+ * also mean "any duration".
+ *
+ * <p><strong>A declared length is held to.</strong> {@code put(String, InputStream, long)} frames its
+ * request from the length it was given, which is what keeps the content out of this JVM's heap, and the
+ * stream is checked against that length as it is sent: a stream that ends early, and a stream that
+ * holds more than it declared, are both refused as the caller errors they are - a
+ * {@link GeneralException}, the same as the filesystem provider raises - before the request body is
+ * complete, so nothing is stored either way. Without that check the SDK sent the first {@code length}
+ * bytes and ignored the rest, and a longer stream was stored silently truncated.
  *
  * <p>Thread safe: {@code S3Client} is thread safe, and everything else the instance holds - the
  * bucket, the key prefix and the credential provider - is immutable and set once in the constructor.
@@ -171,6 +195,12 @@ public final class S3ContentStore implements ContentStore {
     /** The number of retries allowed after a failed first attempt. */
     private static final String MAX_RETRIES_PROPERTY = "content.store.s3.max.retries";
 
+    /**
+     * How long a streamed response body may take in total, from the moment it is handed to a caller
+     * until the moment its last byte is read.
+     */
+    private static final String STREAM_TIMEOUT_PROPERTY = "content.store.s3.stream.total.timeout.millis";
+
     /** The committed whole-call deadline, in milliseconds. */
     private static final long DEFAULT_API_TIMEOUT = 30000L;
 
@@ -192,8 +222,28 @@ public final class S3ContentStore implements ContentStore {
     /** The largest retry cap accepted. */
     private static final long MAXIMUM_MAX_RETRIES = 10L;
 
-    /** The number of segments an object key carries: the namespace, the scope and the identifier. */
-    private static final int KEY_SEGMENT_COUNT = 3;
+    /**
+     * The committed streamed-body deadline: one hour.
+     *
+     * <p>Generous rather than tight, because it bounds content of a size an uploader chose being read by
+     * a consumer whose speed nothing here controls: an hour serves the
+     * {@code content.store.max.object.size} default of 10 MiB at under 25 kbit/s, so no transfer a
+     * deployment would call healthy comes near it. What it removes is the UNBOUNDED case - a body that
+     * yields a byte every few minutes and holds a request thread and a pooled connection for as long as
+     * the peer cares to.
+     */
+    private static final long DEFAULT_STREAM_TIMEOUT = 3600000L;
+
+    /** The shortest streamed-body deadline accepted: one second. */
+    private static final long MINIMUM_STREAM_TIMEOUT = 1000L;
+
+    /**
+     * The longest streamed-body deadline accepted: one day.
+     *
+     * <p>There is deliberately no value meaning "no deadline". An unbounded body is the condition this
+     * setting exists to remove, so the setting cannot be used to restore it.
+     */
+    private static final long MAXIMUM_STREAM_TIMEOUT = 86400000L;
 
     /**
      * The one error code that means the key holds nothing.
@@ -400,6 +450,7 @@ public final class S3ContentStore implements ContentStore {
     private final S3Client s3Client;
     private final String bucket;
     private final String keyPrefix;
+    private final long streamTimeoutMillis;
     private final AwsCredentialsProvider credentialsProvider;
 
     /** The delegator every {@code content.store.*} value is read through; null reads the file alone. */
@@ -517,6 +568,7 @@ public final class S3ContentStore implements ContentStore {
         }
         this.bucket = configuredBucket;
         this.keyPrefix = prefix;
+        this.streamTimeoutMillis = streamTimeout(delegator);
         this.credentialsProvider = credentials;
         this.delegator = delegator;
         Debug.logInfo("Content storage provider s3 initialised with endpoint-override ["
@@ -561,6 +613,23 @@ public final class S3ContentStore implements ContentStore {
     }
 
     /**
+     * Reads the deadline a streamed response body is bound by.
+     *
+     * <p>Read once, in the constructor, because it belongs with the two deadlines the client itself is
+     * built with rather than with the settings that are read afresh on every operation - see
+     * {@link ContentStoreFactory#DYNAMIC_PROPERTIES}. Read through
+     * {@link ContentStoreFactory#boundedLong}, so an unusable value is reported once and the committed
+     * default applies rather than the deadline silently becoming "none".
+     *
+     * @param delegator the delegator the setting is read through; may be null
+     * @return the deadline in milliseconds, always inside the accepted bounds
+     */
+    private static long streamTimeout(Delegator delegator) {
+        return ContentStoreFactory.boundedLong(STREAM_TIMEOUT_PROPERTY, delegator, DEFAULT_STREAM_TIMEOUT,
+                MINIMUM_STREAM_TIMEOUT, MAXIMUM_STREAM_TIMEOUT);
+    }
+
+    /**
      * Validates the configured key prefix and normalises it to either "" or something ending in "/".
      *
      * @param configured the configured prefix, which may be blank
@@ -591,9 +660,9 @@ public final class S3ContentStore implements ContentStore {
             }
         }
         String prefix = trimmed + "/";
-        if (prefix.getBytes(StandardCharsets.UTF_8).length >= ContentStoreFactory.MAX_KEY_LENGTH_BYTES) {
+        if (prefix.getBytes(StandardCharsets.UTF_8).length >= ContentStore.MAX_KEY_LENGTH_BYTES) {
             throw new GeneralException(KEY_PREFIX_PROPERTY + " is " + prefix.length() + " characters, which leaves no"
-                    + " room for a key inside the " + ContentStoreFactory.MAX_KEY_LENGTH_BYTES + " byte limit");
+                    + " room for a key inside the " + ContentStore.MAX_KEY_LENGTH_BYTES + " byte limit");
         }
         return prefix;
     }
@@ -641,6 +710,7 @@ public final class S3ContentStore implements ContentStore {
         this.s3Client = s3Client;
         this.bucket = bucket;
         this.keyPrefix = validatedKeyPrefix(property(KEY_PREFIX_PROPERTY, delegator));
+        this.streamTimeoutMillis = streamTimeout(delegator);
         // No credential provider of its own: the client was supplied already built, so there is
         // nothing here that this instance is responsible for releasing.
         this.credentialsProvider = null;
@@ -659,22 +729,49 @@ public final class S3ContentStore implements ContentStore {
      *
      * <p>Idempotent as far as this provider is concerned: the SDK's own {@code close} tolerates being
      * called more than once, and the factory closes a displaced provider exactly once in any case.
+     *
+     * <p><strong>Each owned resource is released independently.</strong> There are two of them - the
+     * client and, when this instance built it, the credential provider - and they used to be closed
+     * inside one {@code try}, so a client whose own close threw took the credential provider's release
+     * with it. That release is not optional: the default credential chain keeps an HTTP client of its
+     * own for instance metadata, and only the instance that built the chain can close it, so skipping it
+     * leaks that client's connection pool and threads for the life of the JVM - and the moment it was
+     * skipped is exactly the moment something was already going wrong. Each is now attempted in its own
+     * {@code try}, with the provider's release in a {@code finally}, so neither outcome can hide or
+     * prevent the other.
      */
     void close() {
         try {
             s3Client.close();
-            // Closed after the client and only when this instance built it: the default chain keeps a
-            // client of its own for instance metadata, and the SDK closes only what it created itself.
-            if (credentialsProvider != null) {
-                closeQuietly(credentialsProvider);
-            }
         } catch (RuntimeException e) {
-            // Reported and swallowed deliberately: this runs while a provider is being replaced or
-            // while the JVM is stopping, and neither has anywhere to report a failure to. Letting it
-            // out of the shutdown hook would suppress the rest of the cleanup.
-            Debug.logWarning("The S3 content store client could not be closed cleanly: "
-                    + e.getClass().getName(), MODULE);
+            reportUncleanClose("client", e);
+        } finally {
+            if (credentialsProvider != null) {
+                try {
+                    closeQuietly(credentialsProvider);
+                } catch (RuntimeException e) {
+                    reportUncleanClose("credential provider", e);
+                }
+            }
         }
+    }
+
+    /**
+     * Reports a resource that could not be released, without letting the report stop the rest of the
+     * cleanup.
+     *
+     * <p>Reported and swallowed deliberately: this runs while a provider is being replaced or while the
+     * JVM is stopping, and neither has anywhere to report a failure to. Letting it out would suppress
+     * whatever cleanup has not happened yet. Described by type alone, for the reason
+     * {@link #storeFailure} gives - handing the failure to {@code Debug} would write its message and
+     * stack trace, which is the one route that bypasses redaction.
+     *
+     * @param what the resource that could not be released
+     * @param cause the failure to describe
+     */
+    private static void reportUncleanClose(String what, RuntimeException cause) {
+        Debug.logWarning("The S3 content store " + what + " could not be closed cleanly: " + redacted(cause),
+                MODULE);
     }
 
     @Override
@@ -698,7 +795,183 @@ public final class S3ContentStore implements ContentStore {
         // was given and streams the body, so the content is never held in this JVM's heap in full - which
         // is the whole reason this overload exists. The stream is deliberately NOT closed here; the
         // contract leaves it with the caller, which is what lets a caller go on using its own source.
-        putObject(key, RequestBody.fromInputStream(content, length));
+        //
+        // Wrapped, because framing the request from the declared length is exactly what makes a stream
+        // that disagrees with it dangerous: the SDK sends the first `length` bytes and never looks at the
+        // rest, so a longer stream was stored SILENTLY TRUNCATED - complete as far as any later read
+        // could tell. The wrapper refuses that before the body is complete, so the request fails and the
+        // stored object is left as it was. See ExactLengthBody.
+        ExactLengthBody body = new ExactLengthBody(content, length, key);
+        try {
+            putObject(key, RequestBody.fromInputStream(body, length));
+        } catch (GeneralException | IOException | RuntimeException failed) {
+            // The mismatch is recorded on the wrapper as well as thrown, because what reaches here is
+            // whatever the SDK made of an IOException raised while it was writing the body - it may be
+            // wrapped, and it is translated by putObject into the contract's own IOException, which
+            // deliberately carries no SDK detail. The flag is the one reliable signal, and it changes only
+            // the type of the report: a length that does not match its stream is the CALLER'S mistake, and
+            // this contract reports that as GeneralException in both directions and in both providers.
+            IOException mismatch = body.mismatch();
+            if (mismatch != null) {
+                throw new GeneralException(mismatch.getMessage(), mismatch);
+            }
+            throw failed;
+        }
+        // A completed request whose body was short or long is not reachable - the SDK cannot frame a
+        // request from a length the body did not satisfy - but the flag is checked rather than assumed,
+        // because assuming it would make silent truncation the failure mode again if it ever were.
+        IOException mismatch = body.mismatch();
+        if (mismatch != null) {
+            throw new GeneralException(mismatch.getMessage(), mismatch);
+        }
+    }
+
+    /**
+     * The request body for {@link #put(String, InputStream, long)}, which holds the caller's stream to
+     * the length it was declared with.
+     *
+     * <p><strong>Why this is needed at all.</strong> The SDK frames a {@code PutObject} from the length
+     * it is given: it writes exactly that many bytes from the stream and never asks for another. A stream
+     * holding MORE than it declared was therefore stored truncated, and stored successfully - no error
+     * anywhere, and a later read returning content that looks complete. A stream holding LESS raised
+     * whatever the HTTP client made of an unfillable body, which arrived as a storage failure rather than
+     * as the caller error it is.
+     *
+     * <p><strong>How the long case is caught before it can be stored.</strong> The check cannot wait
+     * until the request is finished, because by then the truncated object exists and undoing it would
+     * mean deleting or rewriting content this provider was not asked to change. So the extra byte is
+     * looked for at the last possible moment that is still too early to matter: on the read that WOULD
+     * complete the body. If the source has another byte, that read throws instead of returning, the SDK
+     * is left with an incomplete body, the request fails and nothing is stored. If it does not, the final
+     * bytes are handed over and the request completes exactly as before.
+     *
+     * <p>One byte of the caller's stream is consumed by that look-ahead. It is inconsequential: the only
+     * case in which a byte is found is the case that is refused anyway.
+     *
+     * <p>{@code mark} and {@code reset} are honoured, including for the counters, because the SDK resets
+     * a mark-supporting stream to retry a failed attempt; without that a retry would be reported as a
+     * stream that ended early. {@code close} is left to {@link FilterInputStream}, which closes the
+     * source exactly as handing the source over unwrapped did.
+     */
+    private static final class ExactLengthBody extends FilterInputStream {
+
+        private final long declared;
+        private final String key;
+        private long delivered;
+        private boolean lookedAhead;
+        private long markedDelivered;
+        private boolean markedLookedAhead;
+        private IOException mismatch;
+
+        /**
+         * Holds a stream to a declared length.
+         *
+         * @param source the caller's stream, which this does not own
+         * @param declared the exact number of bytes the caller said it holds
+         * @param key the key being written, named in a refusal
+         */
+        ExactLengthBody(InputStream source, long declared, String key) {
+            super(source);
+            this.declared = declared;
+            this.key = key;
+        }
+
+        /**
+         * Reports the mismatch this body refused, if it refused one.
+         *
+         * @return the refusal, or {@code null} when the stream held exactly what it declared
+         */
+        private IOException mismatch() {
+            return mismatch;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int produced = read(one, 0, 1);
+            return produced < 0 ? -1 : one[0] & 0xff;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int wanted) throws IOException {
+            if (wanted == 0) {
+                return 0;
+            }
+            if (delivered >= declared) {
+                // The body is already complete. Reached when the declared length is zero, and when the
+                // client reads again to observe the end of the stream.
+                refuseIfLonger();
+                return -1;
+            }
+            int room = (int) Math.min(wanted, declared - delivered);
+            int produced = in.read(buffer, offset, room);
+            if (produced < 0) {
+                throw record(new IOException("The content stream for [" + key + "] ended "
+                        + (declared - delivered) + " bytes before the " + declared + " bytes it declared, so"
+                        + " nothing was stored"));
+            }
+            delivered += produced;
+            if (delivered >= declared) {
+                // Before returning, so that a refusal leaves the body incomplete and the request fails.
+                refuseIfLonger();
+            }
+            return produced;
+        }
+
+        /**
+         * Looks once for a byte beyond the declared length and refuses the write if there is one.
+         *
+         * @throws IOException if the source holds more than it declared
+         */
+        private void refuseIfLonger() throws IOException {
+            if (lookedAhead) {
+                return;
+            }
+            lookedAhead = true;
+            if (in.read() != -1) {
+                throw record(new IOException("The content stream for [" + key + "] holds more than the "
+                        + declared + " bytes it declared, so nothing was stored"));
+            }
+        }
+
+        /**
+         * Records a refusal so that the caller can recognise it whatever the SDK does with it.
+         *
+         * @param refusal the refusal being thrown
+         * @return the same refusal, to be thrown by the caller
+         */
+        private IOException record(IOException refusal) {
+            if (mismatch == null) {
+                mismatch = refusal;
+            }
+            return refusal;
+        }
+
+        @Override
+        public synchronized void mark(int readLimit) {
+            in.mark(readLimit);
+            markedDelivered = delivered;
+            markedLookedAhead = lookedAhead;
+        }
+
+        @Override
+        public synchronized void reset() throws IOException {
+            in.reset();
+            delivered = markedDelivered;
+            lookedAhead = markedLookedAhead;
+            // The refusal is NOT cleared: a stream that disagreed with its length still disagrees with it,
+            // and the retry is only reading the same source again.
+        }
+
+        @Override
+        public int available() throws IOException {
+            return (int) Math.min(in.available(), declared - delivered);
+        }
+
+        @Override
+        public long skip(long count) throws IOException {
+            return in.skip(Math.min(count, declared - delivered));
+        }
     }
 
     /**
@@ -779,7 +1052,224 @@ public final class S3ContentStore implements ContentStore {
         // The response is aborted rather than closed if the length cannot be established at all,
         // because a response left open would hold a connection from the pool for good.
         long declared = declaredLength(content, objectKey);
-        return new ContentStream(content, declared);
+        // Wrapped a second time, by ServedBody, for the two things that were true of the raw response and
+        // must not be: an IOException raised while the body was being read reached the caller with whatever
+        // the SDK put in it, bypassing the translation every other failure of this provider goes through;
+        // and the body had no total deadline, so a peer trickling bytes held a request thread and a pooled
+        // connection for as long as it liked.
+        return new ContentStream(new ServedBody(content, objectKey, streamTimeoutMillis), declared);
+    }
+
+    /**
+     * The response body a caller is handed, which translates every failure and will not be read forever.
+     *
+     * <p><strong>Translation.</strong> Everything this provider throws is fixed text plus an opaque
+     * reference, with the bucket, the key and the sanitised diagnostic logged under that reference - and
+     * that used to stop at the moment {@code openStream} returned. After it, the caller held the SDK's own
+     * {@code ResponseInputStream}: a connection reset, a truncated body or a failure to close raised
+     * whatever the SDK or the HTTP client chose to say, uncorrelated and unredacted, on a path whose whole
+     * purpose is to render content into a response. Every {@code read}, {@code skip} and {@code close}
+     * here therefore goes through {@link #storeFailure}, which is what the request half of the same
+     * operation has always done.
+     *
+     * <p><strong>Deadline.</strong> One deadline over the WHOLE body, fixed when the body is handed over,
+     * rather than a per-read timeout. The SDK's socket and attempt timeouts bound how long one read may
+     * block; neither bounds how long a peer may keep a body open by answering each read just before its
+     * timeout expires. That is the shape a slow-drip response takes, and it costs a request thread and a
+     * pooled connection for its duration. The deadline is checked before each operation and at the moment
+     * an operation returns, so a body that has overrun is refused rather than being allowed one more read.
+     *
+     * <p>An overrun and a failure both {@code abort()} the response rather than closing it: closing a
+     * partly-read response drains the remainder of the object off the wire, which is the transfer a
+     * refusal exists to avoid. Afterwards the body is exhausted for good - a caller that keeps reading
+     * gets the same refusal rather than a partial object that looks complete.
+     */
+    private final class ServedBody extends InputStream {
+
+        private final ResponseInputStream<GetObjectResponse> response;
+        private final String objectKey;
+        private final long deadlineNanos;
+        private IOException terminated;
+        private boolean closed;
+
+        /**
+         * Wraps an open response body.
+         *
+         * @param response the open response, positioned at its first byte
+         * @param objectKey the prefixed object key, for the log rather than for a thrown message
+         * @param timeoutMillis how long the whole body may take
+         */
+        ServedBody(ResponseInputStream<GetObjectResponse> response, String objectKey, long timeoutMillis) {
+            this.response = response;
+            this.objectKey = objectKey;
+            this.deadlineNanos = System.nanoTime() + Duration.ofMillis(timeoutMillis).toNanos();
+        }
+
+        @Override
+        public int read() throws IOException {
+            requireUsable();
+            int produced = (int) translating("read", () -> response.read());
+            requireUsable();
+            return produced;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int wanted) throws IOException {
+            requireUsable();
+            int produced = (int) translating("read", () -> response.read(buffer, offset, wanted));
+            requireUsable();
+            return produced;
+        }
+
+        @Override
+        public long skip(long count) throws IOException {
+            requireUsable();
+            long skipped = translating("read", () -> response.skip(count));
+            requireUsable();
+            return skipped;
+        }
+
+        @Override
+        public int available() throws IOException {
+            requireUsable();
+            return (int) translating("read", () -> (long) response.available());
+        }
+
+        /**
+         * Releases the response, once, reporting a failure to do so the way every other failure of this
+         * provider is reported.
+         *
+         * @throws IOException if the response could not be released
+         */
+        @Override
+        public void close() throws IOException {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            if (terminated != null) {
+                // Already released by the refusal that ended this body. Closing it again would be the drain
+                // that aborting existed to avoid, and a caller closing a body it was refused from is doing
+                // the right thing rather than something to report.
+                return;
+            }
+            translating("close", () -> {
+                response.close();
+                return 0L;
+            });
+        }
+
+        /**
+         * Refuses any further use of a body that has ended, and ends one that has outlived its deadline.
+         *
+         * <p>Called before each operation and again when it returns. Before, so a body that is finished
+         * stays finished and one already past its deadline is not given another read; after, because an
+         * operation can itself be what carries the body past the deadline, and a read that returns bytes
+         * from beyond it would be the overrun this exists to stop.
+         *
+         * <p>Once ended, the SAME refusal is reported to every later call. It has to be: aborting an SDK
+         * response does not necessarily make its underlying stream unreadable, so a body allowed to carry
+         * on after a refusal could keep serving bytes - and a caller that ignored one refusal would then
+         * assemble a partial object that looks complete.
+         *
+         * @throws IOException if this body has ended, or has now outlived its deadline
+         */
+        private void requireUsable() throws IOException {
+            if (terminated != null) {
+                // A new instance carrying the same text, so the reference an operator can act on is the
+                // same one while the stack trace still describes the call that was refused.
+                throw new IOException(terminated.getMessage());
+            }
+            if (System.nanoTime() - deadlineNanos < 0L) {
+                return;
+            }
+            String reference = reference();
+            Debug.logError("Content store refusal [" + reference + "]: the response for object [" + objectKey
+                    + "] in bucket [" + bucket + "] was still being read after the " + STREAM_TIMEOUT_PROPERTY
+                    + " deadline of " + streamTimeoutMillis + " milliseconds, so it was abandoned rather than"
+                    + " allowed to hold a request thread and a pooled connection indefinitely", MODULE);
+            throw terminate(new IOException("The requested content took longer to transfer than this instance"
+                    + " allows. Reference [" + reference + "]."));
+        }
+
+        /**
+         * Performs one operation on the response, translating an SDK or IO failure into the contract's
+         * own report.
+         *
+         * @param operation what was being attempted, for the diagnostic
+         * @param body the operation to perform
+         * @return whatever the operation returned
+         * @throws IOException if the operation failed
+         */
+        private long translating(String operation, BodyOperation body) throws IOException {
+            try {
+                return body.perform();
+            } catch (SdkException e) {
+                throw terminate(storeFailure(operation, objectKey, e));
+            } catch (IOException e) {
+                throw terminate(bodyFailure(operation, objectKey, e));
+            }
+        }
+
+        /**
+         * Ends this body: abandons the response and records the refusal every later call reports.
+         *
+         * <p>Abandoned rather than closed, because closing a partly-read response drains the remainder of
+         * the object off the wire, which is the transfer a refusal exists to avoid. A failure to abandon it
+         * is reported and swallowed, so it cannot replace the failure being reported.
+         *
+         * @param refusal the refusal that ended this body
+         * @return the same refusal, to be thrown by the caller
+         */
+        private IOException terminate(IOException refusal) {
+            if (terminated == null) {
+                terminated = refusal;
+                try {
+                    response.abort();
+                } catch (RuntimeException e) {
+                    reportUncleanClose("response body", e);
+                }
+            }
+            return refusal;
+        }
+    }
+
+    /**
+     * One operation on a response body, so that {@code read}, {@code skip}, {@code available} and
+     * {@code close} are all translated by the same code.
+     */
+    private interface BodyOperation {
+        /**
+         * Performs the operation.
+         *
+         * @return the operation's own result, widened so one signature covers all four
+         * @throws IOException if it fails
+         */
+        long perform() throws IOException;
+    }
+
+    /**
+     * Translates a failure raised while a response body was being read into the contract's failure,
+     * without disclosing where this deployment keeps its content.
+     *
+     * <p>The same rules as {@link #storeFailure}: fixed text plus an opaque reference outward, and the
+     * bucket, the key and a sanitised description of the failure logged under that reference. Separate
+     * from it only because what arrives here is an {@link IOException} - a reset connection, a body that
+     * ended early - rather than an {@link SdkException}, and an {@code IOException}'s own message is as
+     * capable of quoting the endpoint as an SDK one is.
+     *
+     * @param operation what was being attempted, for the diagnostic
+     * @param objectKey the key the response is for
+     * @param cause the failure raised while reading
+     * @return the exception to throw
+     */
+    private IOException bodyFailure(String operation, String objectKey, IOException cause) {
+        String reference = reference();
+        Debug.logError("Content store failure [" + reference + "]: could not " + operation + " the response for"
+                + " object [" + objectKey + "] in bucket [" + bucket + "]; failure ["
+                + cause.getClass().getSimpleName() + "]", MODULE);
+        return new IOException("The content store could not " + operation + " the requested content."
+                + " Reference [" + reference + "].");
     }
 
     /**
@@ -904,6 +1394,20 @@ public final class S3ContentStore implements ContentStore {
     }
 
     /**
+     * Reports that this provider DOES hold content off the instance.
+     *
+     * <p>A bucket is a namespace outside every instance, so content that exists only on one instance's
+     * disk is content the rest of the fleet cannot read: it has to be published here before an instance
+     * can be treated as replaceable, which is the whole purpose of this provider.
+     *
+     * @return {@code true}, always
+     */
+    @Override
+    public boolean holdsContentOffInstance() {
+        return true;
+    }
+
+    /**
      * Reads a response into an array without letting it exceed the configured ceiling.
      *
      * <p>Checked twice, because either check alone is insufficient. The declared length is checked
@@ -955,46 +1459,34 @@ public final class S3ContentStore implements ContentStore {
      * Validates a storage key and places it under the configured prefix.
      *
      * <p>The grammar every provider shares is applied first, through
-     * {@link ContentStoreFactory#requireUsableKey(String)}, so that this provider refuses exactly the
-     * keys the filesystem provider refuses and content migrated between the two keeps every key it
-     * had.
+     * {@link ContentStore#requireUsableKey(String)}, so that this provider refuses exactly the keys the
+     * filesystem provider refuses - a control character, an absolute path, a Windows drive prefix, an
+     * empty component and any {@code .} or {@code ..} component - and content copied between the two
+     * therefore keeps every key it had. That last property is not incidental: it is what lets a
+     * deployment migrate its existing tree into a bucket during the window
+     * {@code content.store.local.fallback} exists to cover.
      *
-     * <p>The scoping is enforced here and not only where the key is minted, because this class is
-     * reachable without coming through {@link ContentStoreFactory} and a bucket is a namespace every
-     * instance and every tenant shares. Only the three-segment identity key is accepted:
-     * {@value ContentStoreFactory#IDENTITY_KEY_NAMESPACE}, then the tenant scope, then the
-     * {@code dataResourceId}. A bare path is refused rather than stored, which is what keeps a
-     * recorded {@code objectInfo} value from deciding which object a read returns and keeps two
-     * tenants that recorded the same path from addressing one object.
+     * <p>The prefix is then applied and the WHOLE result is bounded again, because the shared grammar
+     * bounded the key the caller supplied and it is the prefixed key a store receives. Nothing else is
+     * required of the key here: what a key means is decided once, by
+     * {@link ContentStoreFactory#storeKey}, and a second opinion at this boundary is exactly how the two
+     * providers would come to disagree about which object a {@code DataResource} row names.
      *
      * @param key the provider-relative storage key
      * @return the object key to name in a request, prefix included
-     * @throws GeneralException if the key breaks the shared key grammar, is not the scoped identity
-     *     key this provider accepts, or exceeds the object-key length limit once the prefix is applied
+     * @throws GeneralException if the key breaks the shared key grammar, or exceeds the object-key
+     *     length limit once the prefix is applied
      */
     private String objectKey(String key) throws GeneralException {
-        // The grammar every provider shares first, from its one implementation, so that this provider
-        // refuses exactly what the filesystem provider refuses and content migrated between the two keeps
-        // every key it had. What follows is what this provider alone requires of a key.
-        ContentStoreFactory.requireUsableKey(key);
-        String[] segments = key.split("/", -1);
-        boolean scoped = segments.length == KEY_SEGMENT_COUNT
-                && ContentStoreFactory.IDENTITY_KEY_NAMESPACE.equals(segments[0])
-                && UtilValidate.isNotEmpty(segments[1]) && UtilValidate.isNotEmpty(segments[2])
-                && !"..".equals(segments[1]) && !"..".equals(segments[2])
-                && !".".equals(segments[1]) && !".".equals(segments[2]);
-        if (!scoped) {
-            throw new GeneralException("The object store accepts only a tenant-scoped content key of the form "
-                    + ContentStoreFactory.IDENTITY_KEY_NAMESPACE + "/<scope>/<dataResourceId>, and [" + key
-                    + "] is not one; an unscoped key would share one object between tenants");
+        ContentStore.requireUsableKey(key);
+        String prefixed = keyPrefix + key;
+        int length = prefixed.getBytes(StandardCharsets.UTF_8).length;
+        if (length > ContentStore.MAX_KEY_LENGTH_BYTES) {
+            throw new GeneralException("The content store key [" + key + "] occupies " + length + " bytes once the"
+                    + " configured key prefix is applied, over the " + ContentStore.MAX_KEY_LENGTH_BYTES
+                    + " bytes an object key may occupy");
         }
-        String objectKey = keyPrefix + key;
-        int length = objectKey.getBytes(StandardCharsets.UTF_8).length;
-        if (length > ContentStoreFactory.MAX_KEY_LENGTH_BYTES) {
-            throw new GeneralException("A content store key must be at most " + ContentStoreFactory.MAX_KEY_LENGTH_BYTES
-                    + " bytes once the configured prefix is applied, and this one is " + length);
-        }
-        return objectKey;
+        return prefixed;
     }
 
     /**
@@ -1566,11 +2058,11 @@ public final class S3ContentStore implements ContentStore {
      * prefixed object key are deployment layout, so they go to the log rather than into an exception
      * that a rendered page could show.
      *
-     * <p>The SDK failure itself is neither logged nor attached, for the reason given on
+     * <p>The SDK failure itself never crosses the boundary, for the reason given on
      * {@link #storeFailure}: its message can quote the request that produced it, and an absence report
-     * travels back through the content-rendering path. Its sanitised description goes to the log with
-     * the object key, which is all an operator needs to tell "nothing stored" apart from "asked the
-     * wrong bucket".
+     * travels back through the content-rendering path. What is attached instead is a
+     * {@link RedactedStoreCause} - the same sanitised description that goes to the log - so that code
+     * which inspects a cause has something to inspect and nothing to leak.
      *
      * @param key the key as the caller supplied it
      * @param objectKey the prefixed object key that holds nothing, for the log
@@ -1580,7 +2072,10 @@ public final class S3ContentStore implements ContentStore {
     private FileNotFoundException absent(String key, String objectKey, SdkException cause) {
         Debug.logVerbose("The S3 content store holds no content under object [" + objectKey + "] in bucket ["
                 + bucket + "]: " + redacted(cause), MODULE);
-        return new FileNotFoundException("No content is stored under [" + key + "]");
+        FileNotFoundException absent = new FileNotFoundException("No content is stored under [" + key + "]");
+        // initCause because FileNotFoundException declares no constructor that takes one.
+        absent.initCause(new RedactedStoreCause(cause));
+        return absent;
     }
 
     /**
@@ -1593,15 +2088,21 @@ public final class S3ContentStore implements ContentStore {
      * sanitised type, status, error code and request id, so an operator joins the report an end user
      * quotes to the failure that produced it.
      *
-     * <p><strong>The SDK failure crosses no boundary at all.</strong> It is not attached as the cause
-     * and it is not handed to {@code Debug} in any form, not even behind the verbose switch. Two
-     * separate paths made that necessary. Attaching it meant the value travelled with the exception:
-     * anything that logs a caught {@code IOException} with its stack trace, or reads
-     * {@code getCause().getMessage()}, republishes whatever the SDK quoted - and an SDK message can
-     * quote the request it was building, endpoint and signed headers included. Logging the object
-     * itself did the same thing directly, because {@code Debug} writes the message and the whole stack
-     * trace, which is the one route that bypasses the sanitising below. What is kept is exactly what
-     * identifies a failure without describing it: the type, and the service fields where there are any.
+     * <p><strong>The SDK failure itself crosses no boundary.</strong> It is not attached and it is not
+     * handed to {@code Debug} in any form, not even behind the verbose switch, because both routes
+     * republish whatever the SDK quoted: an SDK message can quote the request it was building, endpoint
+     * and signed headers included, and {@code Debug} given the object writes its message and its whole
+     * stack trace, which is the one route that bypasses the sanitising below.
+     *
+     * <p><strong>A sanitised stand-in IS attached, though.</strong> Detaching the cause outright also
+     * removed every programmatic diagnostic: a caller that wanted to distinguish an expired deadline
+     * from {@code AccessDenied} - to decide whether retrying could ever help, or to raise the right
+     * alert - had only fixed English text and an opaque reference to work from, in an exception whose
+     * cause chain was empty. {@link RedactedStoreCause} closes that gap without reopening the first
+     * one: it carries the type, status, error code and request id as fields and as its message, carries
+     * no stack trace, no suppression and no cause of its own, and quotes nothing of the SDK's own
+     * message. Logging it, or reading {@code getCause().getMessage()}, therefore yields exactly what
+     * the log line under the same reference already says.
      *
      * @param operation what was being attempted, for the diagnostic
      * @param objectKey the key the request named
@@ -1613,7 +2114,96 @@ public final class S3ContentStore implements ContentStore {
         Debug.logError("Content store failure [" + reference + "]: could not " + operation + " object [" + objectKey
                 + "] in bucket [" + bucket + "]; " + redacted(cause), MODULE);
         return new IOException("The content store could not " + operation + " the requested content."
-                + " Reference [" + reference + "].");
+                + " Reference [" + reference + "].", new RedactedStoreCause(cause));
+    }
+
+    /**
+     * The only description of an SDK failure that is allowed to travel with a translated exception.
+     *
+     * <p>It exists so that the outward message can stay fixed text plus a reference while an inspecting
+     * caller still gets something to branch on. Everything it holds comes from {@link #redacted}, which
+     * uses only the fields that IDENTIFY a failure - the type, and for a service failure the HTTP
+     * status, the error code and the request id - and never the SDK's own message, cause or stack.
+     *
+     * <p>Deliberately stack-less, suppression-less and cause-less: it is constructed at the point of
+     * translation rather than where the failure happened, so a stack trace of its own would describe the
+     * translator and mislead, and any cause it carried would be the SDK failure this class exists to
+     * keep out of the chain.
+     *
+     * <p>Nested here rather than given a file of its own because it is a detail of this provider's error
+     * contract and the plan isolates the object-store code to this package.
+     */
+    static final class RedactedStoreCause extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        /** The simple type name of the failure that was translated, always present. */
+        private final String failureType;
+
+        /** The HTTP status a service failure reported, or -1 for a client-side failure. */
+        private final int statusCode;
+
+        /** The service error code, or an empty string when there was none. */
+        private final String errorCode;
+
+        /** The service request id, or an empty string when there was none. */
+        private final String requestId;
+
+        /**
+         * Describes a failure using only the fields that identify it.
+         *
+         * @param cause the failure to describe, an SDK one or one the client builder raised
+         */
+        RedactedStoreCause(RuntimeException cause) {
+            // No cause, no suppression, no stack trace: see the class comment.
+            super(redacted(cause), null, false, false);
+            this.failureType = cause.getClass().getSimpleName();
+            this.statusCode = cause instanceof SdkServiceException service ? service.statusCode() : -1;
+            String code = cause instanceof S3Exception s3 && s3.awsErrorDetails() != null
+                    ? s3.awsErrorDetails().errorCode()
+                    : null;
+            this.errorCode = code == null ? "" : code;
+            String id = cause instanceof SdkServiceException service && service.requestId() != null
+                    ? service.requestId()
+                    : null;
+            this.requestId = id == null ? "" : id;
+        }
+
+        /**
+         * Reports the simple type name of the failure that was translated.
+         *
+         * @return the type name, never null
+         */
+        public String failureType() {
+            return failureType;
+        }
+
+        /**
+         * Reports the HTTP status a service failure carried.
+         *
+         * @return the status, or -1 when the failure was client-side and carried none
+         */
+        public int statusCode() {
+            return statusCode;
+        }
+
+        /**
+         * Reports the service error code the failure carried.
+         *
+         * @return the error code, or an empty string when there was none
+         */
+        public String errorCode() {
+            return errorCode;
+        }
+
+        /**
+         * Reports the service request id the failure carried.
+         *
+         * @return the request id, or an empty string when there was none
+         */
+        public String requestId() {
+            return requestId;
+        }
     }
 
     /**

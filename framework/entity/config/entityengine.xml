@@ -108,21 +108,15 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          JMS API, and the provider's client library is deployment specific and supplied by the operator, so there
          is nothing to perform the lookup with when the configuration is rendered. Any failure of the three aborts
          the start up under both OFBIZ_PROFILE=dev and OFBIZ_PROFILE=prod.
-         DELIVERY IS PROVED SEPARATELY, AND AUTOMATICALLY, by
-         framework/entityext/src/test/java/org/apache/ofbiz/entityext/cache/DistributedCacheInvalidationPropagationTests.java,
-         which is part of the ordinary build gate rather than a procedure someone has to remember. It drives the
-         production publisher and the production consumer against two instances' caches and asserts the whole hop:
-         that each of the five invalidations the engine raises is published to the service its consumer implements,
-         that the payload carries the value and the login the auth=true consumer needs, that the shipped
-         framework/entityext/servicedef/services.xml routes the published service to EntityCacheServices, that
-         delivering that payload to a peer removes the row from the peer's real entity cache, and that the peer
-         applies the clear locally with distribute=false so consuming an invalidation cannot re-publish it into a
-         broker storm. Only the broker hop itself is substituted, for the dependency reason above.
-         What running two instances adds beyond that is the deployment half - a specific broker, client library,
-         credentials and topic - so DOCKER.adoc keeps that procedure as supplemental operator guidance. While an
-         instance runs, its subscriber's own connection state is the second readiness dimension of
-         /webtools/health/ready, which is where a broker that goes away is reported. DOCKER.adoc carries the
-         operator procedure for supplying the provider client library and the JNDI settings. -->
+         DELIVERY IS NOT THIS FLAG'S MECHANISM TO PROVE. What the flag switches on is OFBiz's own
+         cache-invalidation plumbing - DistributedCacheClear, EntityCacheServices and the service definitions in
+         framework/entityext/servicedef/services.xml that route between them - which this refactor does not modify
+         and which the framework's own test tiers cover. The hop itself needs a specific broker, client library,
+         credentials and topic, none of which exist in this tree, so it is verified against the deployment's own
+         broker: DOCKER.adoc carries the two-container procedure, the operator procedure for supplying the
+         provider client library and the JNDI settings, and the log lines to watch. The broker is deliberately NOT
+         a dimension of /webtools/health/ready: one broker serves the whole fleet, so a readiness dimension over
+         it would empty the load balancer's target group for a fault that leaves every instance able to serve. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
@@ -473,9 +467,9 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          classpath) when OFBIZ_POSTGRES_HOST is set. Contract with that template - committed value on the left,
          the environment variable the template's corresponding placeholder is filled from on the right. The
          placeholder NAMES are deliberately not written out here; see the template, which documents each one at
-         the attribute it occupies. The entry point refuses to render a template whose placeholder census
-         differs from this contract, and EntityEngineConfigContractTests asserts the same census from the
-         build, so the two artifacts cannot drift apart silently:
+         the attribute it occupies. The entry point refuses to install a rendered file in which any placeholder
+         survived substitution, and SchemaInitGatingTests drives that render from the build and asserts the
+         resulting attributes, so the two artifacts cannot drift apart silently:
            jdbc-uri            jdbc:postgresql://127.0.0.1:5432/ofbiz?sslmode=verify-full&amp;connectTimeout=10
                                &amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true
                                ..  host from OFBIZ_POSTGRES_HOST, port from OFBIZ_POSTGRES_PORT (default 5432),

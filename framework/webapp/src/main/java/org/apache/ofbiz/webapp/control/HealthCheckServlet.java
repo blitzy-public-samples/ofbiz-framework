@@ -22,7 +22,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -41,20 +40,12 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpSession;
 
-import org.apache.ofbiz.base.config.GenericConfigException;
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.UtilValidate;
 import org.apache.ofbiz.entity.Delegator;
 import org.apache.ofbiz.entity.DelegatorFactory;
 import org.apache.ofbiz.entity.GenericEntityException;
 import org.apache.ofbiz.entity.condition.EntityCondition;
-import org.apache.ofbiz.service.LocalDispatcher;
-import org.apache.ofbiz.service.ServiceContainer;
-import org.apache.ofbiz.service.config.ServiceConfigUtil;
-import org.apache.ofbiz.service.config.model.JmsService;
-import org.apache.ofbiz.service.config.model.Server;
-import org.apache.ofbiz.service.jms.GenericMessageListener;
-import org.apache.ofbiz.service.jms.JmsListenerFactory;
 
 /**
  * HealthCheckServlet.java - Liveness and readiness probes for load-balancer target-group checks.
@@ -80,9 +71,10 @@ import org.apache.ofbiz.service.jms.JmsListenerFactory;
  *     so this class reads no part of the body.</li>
  * </ul>
  *
- * <p>Readiness measures two dimensions, in this order:
+ * <p>Readiness measures exactly one dimension - the one the Agent Action Plan specifies for this
+ * endpoint, delegator and datasource connectivity:
  *
- * <ol>
+ * <ul>
  * <li><em>Datasource.</em> The {@code SequenceValueItem} count must COMPLETE. Its result is not
  *     examined: completing the statement is what proves the datasource is reachable, the pool can
  *     hand out a connection, the credentials are accepted and the table is present and readable, and
@@ -93,12 +85,18 @@ import org.apache.ofbiz.service.jms.JmsListenerFactory;
  *     {@code CommonPingDatasourceInvalidCount} for a zero count and applying that here would hold a
  *     correctly provisioned fleet out of service. Only a lookup or query that FAILS is not-ready;
  *     see {@link #runReadinessCheck}.</li>
- * <li><em>Cache coherence.</em> When - and only when - this instance's delegator has distributed
- *     cache clear enabled, the entity-cache invalidation transport must have a connected subscriber,
- *     which is why a single-node deployment is unaffected by it; see {@link #isCacheTransportReady}
- *     for why an instance without that transport must be taken out of service rather than left
- *     serving.</li>
- * </ol>
+ * </ul>
+ *
+ * <p><strong>Nothing else is measured, deliberately.</strong> Readiness is the delegator and its
+ * datasource, and nothing about the entity-cache invalidation transport takes part in it. Observing
+ * that transport would mean reading {@code AbstractJmsListener.isConnected}, a plain non-volatile
+ * field whose writes carry no publication guarantee this class could establish from the read side - so
+ * a probe could report a disconnected instance as ready indefinitely, which is a worse answer than not
+ * asking the question. Making that field visible would mean changing the service engine's JMS
+ * internals, which are frozen. Cache coherence is instead configured and verified where it belongs: the
+ * container entry point refuses to start an instance whose delegator has distributed cache clear
+ * enabled without a transport configured for it, so the state this probe would have reported cannot be
+ * reached by a running instance in the first place.
  *
  * <p>Exactly one readiness check runs at a time and its verdict is shared: an overlapping probe is
  * answered from that check or from the most recent verdict rather than by starting a second one. A
@@ -118,12 +116,13 @@ import org.apache.ofbiz.service.jms.JmsListenerFactory;
  *
  * <h2>How the probes are reached anonymously</h2>
  *
- * <p>This class is registered ONCE, as a servlet mapped to the two exact probe paths. That mapping is
- * the contract: it is what makes the container resolve those two paths to this component rather than to
- * its own default servlet, and it keeps the probes off {@code /control/*} and therefore outside the
- * OFBTOOLS and WEBTOOLS base permissions. Routing a probe past the webapp's ordinary filters is a
- * separate responsibility and lives in a separate class, {@link HealthProbeFilter}; this one performs no
- * login, no permission check, no session access and no service-engine invocation.
+ * <p>This class is registered ONCE, as a servlet mapped to the two exact probe paths, and the two paths
+ * are added to {@code ControlFilter}'s {@code allowedPaths} so that the filter admits them without a
+ * login - the same two-edit registration the webtools descriptor already uses for {@code /ping.txt}.
+ * That mapping is the contract: it is what makes the container resolve those two paths to this component
+ * rather than to its own default servlet, and it keeps the probes off {@code /control/*} and therefore
+ * outside the OFBTOOLS and WEBTOOLS base permissions. This class performs no login, no permission check
+ * and no service-engine invocation.
  *
  * <p><strong>Why the delegator is resolved here rather than read from the context.</strong>
  * {@code ContextFilter}, when {@code general.properties} enables multitenant mode, selects a tenant from
@@ -131,47 +130,38 @@ import org.apache.ofbiz.service.jms.JmsListenerFactory;
  * {@code ServletContext} delegator, security and dispatcher attributes with that tenant's - one request
  * mutating state every later request in the webapp inherits. A readiness verdict read from those
  * attributes would therefore describe whichever tenancy asked last rather than this instance. Resolving
- * the delegator from the webapp's declared {@code entityDelegatorName} removes that misreport, and it
- * does so whether or not a deployment also installs {@link HealthProbeFilter}: the two halves are
- * independent on purpose, because a webapp may register this servlet on its own.
+ * the delegator from the webapp's declared {@code entityDelegatorName} context-param removes that
+ * misreport: a context-param is deployment-descriptor configuration and no request can change it.
  *
  * <p>A spelling under {@code /health/} that is not exactly one of the two probe paths is not mapped to
  * this servlet at all and is answered by the container as any other unmapped path is.
- * {@link #isProbePath} remains the single definition of what a probe path is, for this class, for
- * {@link HealthProbeFilter} and for any Tomcat valve that has to recognise one earlier still.
+ * {@link #isProbePath} is the single definition of what a probe path is.
  *
- * <p><strong>A probe does not run the webapp's ordinary filter chain.</strong> {@link HealthProbeFilter}
- * is mapped first, on the two exact probe paths, and forwards to this servlet by name; a named dispatch
- * is not filtered by a url-pattern mapping, so {@code ControlFilter}, {@code CacheFilter},
- * {@code ContextFilter} and {@code SameSiteFilter} do not run for a probe. That is what gives the three
- * properties below, each of which was previously a consequence to be lived with rather than a guarantee.
+ * <p><strong>A probe runs the webapp's ordinary filter chain, exactly as {@code /ping.txt} does.</strong>
+ * That is the registration the Agent Action Plan prescribes - a {@code servlet}/{@code servlet-mapping}
+ * pair plus an {@code allowedPaths} entry - and it leaves the webapp's filter chain and its ordering
+ * completely unchanged. Three consequences follow, and each is handled here rather than by adding a
+ * filter of this component's own:
  *
  * <ol>
- * <li><strong>No session and no session cookie.</strong> {@code ControlFilter} and {@code ContextFilter}
- * both call {@code getSession()} unconditionally, {@code ControlFilter} before it consults its
- * allow-list, so behind them every probe created an {@code HttpSession} and made the container emit a
- * session cookie for it - several times a minute per instance, for a caller that returns no session and
- * follows no cookie. Bypassing them means none is created. As a second line of defence, for a webapp
- * that registers this servlet without that filter, {@link #discardAnySessionMintedForThisProbe}
- * invalidates a session this request created and suppresses its cookie, so the guarantee holds however
- * this servlet is wired up.</li>
- * <li><strong>No request body is parsed.</strong> {@code ControlFilter} calls
- * {@code UtilHttp.getParameterMap} and {@code ContextFilter} calls
- * {@code WebAppUtil.setAttributesFromRequestBody}, so behind them a body arriving on a probe path was
- * already parsed before the {@code 400} below could refuse it. Bypassing them means the header-only
- * decision this class makes is now what the deployment does too. Bounding a probe body at the load
- * balancer and at the connector remains worthwhile, as the container documentation says.</li>
- * <li><strong>No anonymous prefix grant.</strong> Reaching this servlet through the ordinary chain needs
- * an entry in {@code ControlFilter}'s {@code allowedPaths}, which is matched with {@code startsWith};
- * the only concise entry is {@code /health}, and it grants anonymous chain access to every
- * {@code /health*} spelling - {@code /healthz/live} among them - none of which is a probe. Because
- * probes are answered before {@code ControlFilter} is reached, that entry is gone: admission is exactly
- * the two paths {@link #isProbePath} names, and any other spelling is treated like any other
- * unauthenticated request to the webapp.</li>
+ * <li><strong>A session may be minted by the chain.</strong> {@code ControlFilter} and
+ * {@code ContextFilter} both call {@code getSession()} unconditionally, {@code ControlFilter} before it
+ * consults its allow-list, which is equally true of every anonymous path the descriptor already admits.
+ * {@link #discardAnySessionMintedForThisProbe} therefore invalidates a session this request created and
+ * suppresses its cookie, so a probe leaves no session behind however this servlet is wired up.</li>
+ * <li><strong>The chain may parse a request body before this class refuses one.</strong>
+ * {@code ControlFilter} calls {@code UtilHttp.getParameterMap} and {@code ContextFilter} calls
+ * {@code WebAppUtil.setAttributesFromRequestBody}. The header-only {@code 400} below is still this
+ * class's own decision and reads nothing itself; bounding a probe body at the load balancer and at the
+ * connector remains worthwhile, as the container documentation says.</li>
+ * <li><strong>The {@code allowedPaths} entries are the two EXACT probe paths</strong> -
+ * {@code /health/live} and {@code /health/ready} - and never the {@code /health} prefix.
+ * {@code allowedPaths} is matched with {@code startsWith}, so a single {@code /health} entry would admit
+ * every {@code /health*} spelling to the chain anonymously. With the exact entries, the only near misses
+ * admitted are longer spellings of those two paths, and no {@code servlet-mapping} answers any of them:
+ * the container replies {@code 404} from its default servlet, so nothing is reachable that was not
+ * reachable before.</li>
  * </ol>
- *
- * <p>All three are the accepted cost of the two-edit servlet registration the Agent Action Plan
- * prescribes, which leaves the webapp's filter chain and its ordering exactly as they were.
  *
  * <p>Every field is a private constant or a thread-safe counter, so the single instance the container
  * creates is safe to serve concurrently, and the class is inert until a webapp deployment descriptor
@@ -224,18 +214,17 @@ public class HealthCheckServlet extends HttpServlet {
     // runReadinessCheck for why counting rows was both the wrong question and an unbounded one.
     private static final String READINESS_ENTITY = "SequenceValueItem";
 
-    // The webapp's declared delegator and dispatcher names, read from its own context-params.
+    // The webapp's declared delegator name, read from its own context-param.
     //
-    // NOT the ServletContext "delegator" and "dispatcher" ATTRIBUTES, which is what this class used to
-    // read. Those attributes are mutable: ContextFilter replaces all three of delegator, security and
-    // dispatcher on the ServletContext whenever a multitenant request selects a tenant from the Host
-    // header or from a userTenantId parameter, so an object read from them belongs to whichever tenancy
-    // asked last and an anonymous caller could steer a probe at a tenant database of its choosing. A
-    // context-param is deployment-descriptor configuration and no request can change it, so resolving
-    // from the declared NAME binds every probe to the same base delegator - this instance's own
-    // datasource - for the life of the deployment. See baseDelegator and probeDispatcher.
+    // NOT the ServletContext "delegator" ATTRIBUTE, which is what this class used to read. That
+    // attribute is mutable: ContextFilter replaces all three of delegator, security and dispatcher on
+    // the ServletContext whenever a multitenant request selects a tenant from the Host header or from a
+    // userTenantId parameter, so an object read from it belongs to whichever tenancy asked last and an
+    // anonymous caller could steer a probe at a tenant database of its choosing. A context-param is
+    // deployment-descriptor configuration and no request can change it, so resolving from the declared
+    // NAME binds every probe to the same base delegator - this instance's own datasource - for the life
+    // of the deployment. See baseDelegator.
     private static final String DELEGATOR_NAME_PARAMETER = "entityDelegatorName";
-    private static final String DISPATCHER_NAME_PARAMETER = "localDispatcherName";
 
     // The predicate that makes the connectivity query bounded. It is a raw where clause rather than a
     // field comparison because it must not name a column: the entity's own definition is free to change,
@@ -246,34 +235,17 @@ public class HealthCheckServlet extends HttpServlet {
     // answers, not how much data it has.
     private static final EntityCondition READINESS_BOUND = EntityCondition.makeConditionWhere("1=0");
 
-    // The jms-service the distributed cache clear services are declared against. It is the location
-    // attribute of the distributedClearCacheLine service definitions, so it is the name
-    // JmsServiceEngine looks up when an entity write publishes an invalidation, and therefore the only
-    // transport whose state says anything about this instance's fitness to be a coherent fleet member.
-    private static final String CACHE_TRANSPORT_SERVICE = "serviceMessenger";
-
-    // The one send-mode under which JmsServiceEngine.serverList yields servers to publish to. "none"
-    // yields an empty list and every other value is refused by the engine, so this is exactly the
-    // configuration in which a publish can succeed.
-    private static final String SEND_MODE_ALL = "all";
-
-    // ServletContext attribute the delegator is published under. ContextFilter.init() populates it
-    // when the webapp is deployed and WebAppUtil.getDelegator both reads and refreshes it, so
-    // reading it first lets a probe observe an already-built delegator instead of asking for one.
-    private static final String DELEGATOR_ATTRIBUTE = "delegator";
-
     // Fixed response bodies. Hand-built literals only: no JSON library is pulled in, and no
     // internal detail can ever leak into a body that has no variable part. Every rejection - an
     // unknown path, a refused method, a refused body - shares BODY_UNKNOWN, because a probe client
     // acts on the status code and telling an anonymous caller which rule it broke serves no purpose.
     //
-    // The not-ready document carries the status and nothing else, for the same reason. Readiness is
-    // measured across more than one dimension - the datasource and, when the delegator requires it,
-    // the entity-cache invalidation transport - so a body that named the datasource would be an
-    // outright FALSE claim on every 503 raised by the other dimension. It is spelled separately from
-    // BODY_UNKNOWN even though the two documents are identical, because they answer different
-    // questions: this one reports a measured verdict, that one reports a refused request, and neither
-    // may start tracking the other's wording by accident.
+    // The not-ready document carries the status and nothing else, for the same reason. A 503 is raised
+    // by the datasource dimension AND by the probe's own shedding and deadline paths, which say nothing
+    // about the datasource at all, so a body that named the datasource would be an outright false claim
+    // on some of them. It is spelled separately from BODY_UNKNOWN even though the two documents are
+    // identical, because they answer different questions: this one reports a measured verdict, that one
+    // reports a refused request, and neither may start tracking the other's wording by accident.
     private static final String BODY_LIVE_UP = "{\"status\":\"UP\"}";
     private static final String BODY_UNKNOWN = "{\"status\":\"DOWN\"}";
     private static final String BODY_READY_UP = "{\"status\":\"UP\",\"database\":\"UP\"}";
@@ -324,9 +296,6 @@ public class HealthCheckServlet extends HttpServlet {
     // measurement slow, typically an exhausted connection pool or a stalled network path, rather than
     // to restore a datasource that has reported a failure.
     private static final String EVENT_READINESS_CHECK_TIMEOUT = "HEALTH-READINESS-CHECK-TIMEOUT";
-    // The one code that says the DATASOURCE is fine: it answered, and it is the fleet-coherence
-    // dependency that is missing.
-    private static final String EVENT_READINESS_CACHE_TRANSPORT_UNAVAILABLE = "HEALTH-READINESS-CACHE-TRANSPORT-UNAVAILABLE";
 
     // Rate limit for those events. An outage makes every probe of every load-balancer target fail at
     // the polling interval, so one line per minute per JVM is emitted per code, and the occurrences
@@ -351,8 +320,6 @@ public class HealthCheckServlet extends HttpServlet {
     private static final AtomicLong READINESS_WAITERS_LOG_SUPPRESSED = new AtomicLong(0L);
     private static final AtomicLong READINESS_TIMEOUT_LOG_LAST_AT = new AtomicLong(unclaimedWindow());
     private static final AtomicLong READINESS_TIMEOUT_LOG_SUPPRESSED = new AtomicLong(0L);
-    private static final AtomicLong READINESS_TRANSPORT_LOG_LAST_AT = new AtomicLong(unclaimedWindow());
-    private static final AtomicLong READINESS_TRANSPORT_LOG_SUPPRESSED = new AtomicLong(0L);
 
     // Window that throttles how often a probe may ask the delegator factory for a delegator, using
     // the same interval as the log above. It is reopened immediately by a resolution that succeeds, so
@@ -581,15 +548,15 @@ public class HealthCheckServlet extends HttpServlet {
     /*
      * Leaves no session behind, whatever ran in front of this servlet.
      *
-     * In the deployment this project configures, HealthProbeFilter answers a probe before any
-     * session-creating filter runs, so there is nothing here to discard and this method does nothing.
-     * It exists because this servlet is registerable from any webapp's descriptor, and a webapp that
-     * registers it WITHOUT that filter puts it behind ControlFilter and ContextFilter, both of which
-     * call getSession() unconditionally. A probe arrives several times a minute per instance from a
-     * caller that returns no session and follows no cookie, so a session created for one is never
-     * reused: it is retained until it expires on its own, and it makes the container emit a session
-     * cookie that a cookie-sticky load balancer would happily pin traffic with. Neither belongs on a
-     * health endpoint, so this endpoint refuses to own one however it was wired up.
+     * A probe runs the webapp's ordinary filter chain - that is the registration the Agent Action Plan
+     * prescribes, and it leaves the chain and its ordering untouched - so ControlFilter and ContextFilter
+     * both reach it, and both call getSession() unconditionally, ControlFilter before it even consults
+     * its allow-list. A probe arrives several times a minute per instance from a caller that returns no
+     * session and follows no cookie, so a session created for one is never reused: it would be retained
+     * until it expired on its own, and it would make the container emit a session cookie that a
+     * cookie-sticky load balancer would happily pin traffic with. Neither belongs on a health endpoint,
+     * so this endpoint discards the one minted for it rather than adding a filter of its own to the
+     * chain - which is what keeps the guarantee independent of how the servlet is wired up.
      *
      * Only a session this request created is discarded - isNew() - so a probe that arrives carrying
      * somebody's session cookie, which a browser or a misdirected client can do, leaves that session
@@ -974,10 +941,8 @@ public class HealthCheckServlet extends HttpServlet {
      * for the statement and for what each part of it is chosen to prove and to avoid. Nothing about the
      * contents of the database is inspected, and the cost per probe does not grow with the data.
      *
-     * The cache-coherence dimension follows, because the delegator the first dimension resolves is
-     * what says whether the second applies at all, and because an instance that cannot reach its
-     * datasource has the more urgent problem and must not be reported under the transport's event
-     * code. See isCacheTransportReady.
+     * There is no second dimension. See the class documentation for why the entity-cache invalidation
+     * transport is deliberately not observed here, and where that property is established instead.
      *
      * The check is strictly read-only - no DDL, no writes, no cache mutation and no explicit
      * transaction management - which is what allows a serving instance to run without DDL privileges,
@@ -1003,14 +968,6 @@ public class HealthCheckServlet extends HttpServlet {
             // read off the result: any successful execution IS connectivity, which is the semantic the
             // whole dimension turns on. Failure lands in the catch below, under one event code.
             datasourceAnswers(delegator);
-            // Second dimension. The datasource has answered, so what remains is whether this instance
-            // is fit to be one member of a coherent fleet - see isCacheTransportReady, which is inert
-            // unless this delegator requires distributed cache clear.
-            if (!isCacheTransportReady(context, delegator)) {
-                logRateLimitedWarning(EVENT_READINESS_CACHE_TRANSPORT_UNAVAILABLE, READINESS_TRANSPORT_LOG_LAST_AT,
-                        READINESS_TRANSPORT_LOG_SUPPRESSED);
-                return false;
-            }
             return true;
         } catch (GenericEntityException | RuntimeException failure) {
             // Every remaining failure mode - an unreachable datasource, an exhausted connection pool,
@@ -1060,246 +1017,6 @@ public class HealthCheckServlet extends HttpServlet {
     private static void datasourceAnswers(Delegator delegator) throws GenericEntityException {
         delegator.getEntityHelper(READINESS_ENTITY).findCountByCondition(delegator,
                 delegator.getModelReader().getModelEntity(READINESS_ENTITY), READINESS_BOUND, null, null);
-    }
-
-    /*
-     * Reports whether this instance is fit to serve as one member of a cache-coherent fleet.
-     *
-     * When a delegator has distributed cache clear enabled, every entity write it performs calls
-     * EntityCacheServices, which dispatches the distributedClearCacheLine services asynchronously.
-     * Those services are declared engine="jms" location="serviceMessenger" and none of them declares
-     * require-new-transaction, so ServiceDispatcher.runAsync does not suspend the caller's transaction.
-     * If no jms-service named serviceMessenger is active, JmsServiceEngine.run dereferences a null
-     * service element; runAsync catches the throwable and calls TransactionUtil.rollback, which -
-     * because it did not begin the transaction - marks the CALLER's transaction rollback-only.
-     * EntityCacheServices catches only GenericServiceException and logs it, and cannot undo that mark.
-     * So an instance in that state does not merely serve stale caches: it rolls back the very writes it
-     * was asked to perform, once per write, with a stack trace each time. Nothing in the write path
-     * fails loudly enough to stop it, which is why the load balancer has to be the thing that stops it,
-     * by being told this instance is not ready.
-     *
-     * The dimension is inert unless the fleet needs it. Delegator.useDistributedCacheClear() is the
-     * per-delegator distributed-cache-clear-enabled attribute, read straight off the already-parsed
-     * delegator configuration: no I/O, no logging and nothing to throw. It is false in the committed
-     * configuration, so a single-node or local H2 deployment does not enter the rest of this method and
-     * its readiness verdict is what it was before this dimension existed.
-     *
-     * The dispatcher comes from probeDispatcher, which resolves it for the BASE delegator under the name
-     * the webapp declares rather than reading the mutable ServletContext attribute - ContextFilter
-     * replaces that attribute for a tenant, and the listener factory this dimension measures is the one
-     * this instance's own service engine owns. The lookup is the pair ContextFilter.init() already
-     * registered, so it is a cache hit and not a construction. Its JmsListenerFactory - a plain field
-     * read on ServiceDispatcher, null when service.properties disables JMS - holds the subscribers, and
-     * getJMSListeners() hands back a copy of that map, so reading it costs no lock and no network call.
-     * isConnected() is a plain field read on each listener. The whole dimension is an in-process
-     * observation: it adds no socket and no broker round trip to a check that is already bounded.
-     *
-     * ONLY the listeners of the serviceMessenger jms-service are looked at, by key, and every one of them
-     * has to be connected - see subscriberConnected. Iterating the whole listener map, which this
-     * method used to do, measured the wrong thing in both directions: an unrelated connected listener made
-     * a missing serviceMessenger look healthy, and an unrelated broken one took an instance out of service
-     * whose cache invalidation was working.
-     * BOTH HALVES OF THE TRANSPORT ARE CHECKED, AND ONLY serviceMessenger'S HALVES.
-     *
-     * The PUBLISHER half is the one an entity write actually uses, and it is pure configuration:
-     * JmsServiceEngine looks the jms-service up BY NAME through
-     * ServiceConfigUtil.getServiceEngine().getJmsServiceByName(location) and then asks serverList for
-     * the servers to send to, which returns nothing at all when send-mode is "none" and throws for any
-     * value other than "none" or "all". So a serviceMessenger that is absent, declares no server, or
-     * declares a send-mode that yields no server is a publisher that cannot publish - the exact state
-     * that produces the rollback described above - and it is reported as not ready. The service
-     * configuration is parsed once at start-up and handed out as immutable model objects, so reading it
-     * here is thread-safe by publication and costs no I/O.
-     *
-     * The SUBSCRIBER half is the listener for that same jms-service and NOT, as this once did, every
-     * listener in the factory's map. Iterating them all made readiness depend on transports that have
-     * nothing to do with cache coherence: an unrelated queue listener that could not connect held the
-     * whole instance out of the target group, and an unrelated CONNECTED listener could equally have
-     * masked a serviceMessenger that was down had the loop been an any-match. The listener key is
-     * rebuilt exactly as JmsListenerFactory.loadListeners builds it - a StringBuilder accumulated over
-     * the service's servers, appending jndi-server-name, jndi-name and topic-queue for each server that
-     * declares listen="true" - so the lookup finds the very object that service's subscriber was stored
-     * under. That accumulation across servers is a quirk of the factory rather than a design; it is
-     * reproduced rather than corrected because the factory is engine internals the refactoring plan
-     * freezes (plan section 0.7.2), and reproducing it is what makes the key match.
-     *
-     * THE STATUS IS READ WITH A HAPPENS-BEFORE EDGE. AbstractJmsListener.isConnected is a plain,
-     * non-volatile boolean, so reading it from this thread carries no visibility guarantee of its own -
-     * a probe could observe a stale value indefinitely. The read is therefore performed while holding
-     * the listener's own monitor. That is not decoration: both concrete listeners set the flag true
-     * inside their synchronized load(), so the true is published by that monitor's release, and
-     * AbstractJmsListener.onException sets it false and then loops calling refresh(), which calls the
-     * same synchronized load() - so every write to the flag is followed by a release of this monitor in
-     * the writing thread, and acquiring it here gives a genuine happens-before edge to the latest
-     * write. The flag itself is left exactly as it is, in a file the plan freezes.
-     *
-     * Acquiring that monitor can block while a listener is inside load(), which does a JNDI lookup and
-     * a broker connect. That is bounded and correct rather than a hazard: the readiness check already
-     * runs on its own thread under its own deadline and excess probes are shed, so a probe that blocks
-     * on a reconnecting subscriber is reported not ready by that deadline - which is the true verdict
-     * for an instance whose cache transport is mid-reconnect.
-     *
-     * What the connected flag proves is more than a TCP probe of the broker would. It is set only after
-     * the JNDI initial context is built, the connection factory and the topic are looked up, a
-     * connection and a session are created, a subscriber is registered and the connection is started, so
-     * a connected subscriber indicates the broker was reachable, the credentials were ACCEPTED and the
-     * topic resolved - the same prerequisites, on the same broker and the same credentials, that the
-     * sending half needs. That is where authorization readiness comes from: it is observed, not assumed.
-     * It is also self-healing in both directions and needs no state of its own - a listener that could
-     * not connect is already in the map reporting false, and onException flips it back the moment the
-     * broker drops and returns it to true by itself when the broker comes back, with no restart and no
-     * operator action.
-     *
-     * The method is fail-closed, including during start-up. An unresolvable dispatcher, a null listener
-     * factory, an unreadable service configuration, an absent serviceMessenger, a service that cannot
-     * publish, a subscriber map that has not been populated yet and a listener that reports itself
-     * disconnected all read as NOT ready. Two of those are ordinary start-up states and both hold traffic
-     * off: the listener factory's loader thread has not completed its first pass yet, and the
-     * configuration declares the service without a listening server. Both are transient by construction -
-     * the loader retries, and the entry point refuses to start an instance with the flag set and no
-     * transport configured.
-     *
-     * The result is not logged here; the caller emits the one rate-limited event code, so a broker
-     * outage across a whole fleet costs one line per minute per JVM rather than one per probe.
-     *
-     * WHAT THIS DIMENSION IS, AND WHAT PROVES THE REST. This observes one instance's subscriber state:
-     * that this instance is attached to the transport and would therefore receive an invalidation. It is
-     * a liveness property of the connection, checked continuously while the instance runs, and it is the
-     * right thing for a readiness probe to check - a probe must be cheap and local, so it cannot publish
-     * a test message and wait for a peer to acknowledge it, and an endpoint that did would make every
-     * probe a distributed operation.
-     *
-     * That an invalidation actually propagates - published by one instance, routed to the consuming
-     * service, and applied to a peer's cache - is a property of the code on both ends of the hop, so it
-     * is proved once, automatically, rather than continuously: see
-     * framework/entityext/src/test/java/org/apache/ofbiz/entityext/cache/DistributedCacheInvalidationPropagationTests.java,
-     * which drives the production publisher and the production consumer against two instances' caches
-     * and fails the build if any of the five invalidation kinds stops reaching a peer. The two are
-     * complementary and neither substitutes for the other: that test cannot know whether this instance's
-     * broker is up, and this dimension cannot know whether the code on the far side still applies what
-     * arrives.
-     */
-    private static boolean isCacheTransportReady(ServletContext context, Delegator delegator) {
-        if (!delegator.useDistributedCacheClear()) {
-            return true;
-        }
-        JmsService cacheTransport = cacheTransportConfiguration();
-        if (cacheTransport == null || !publisherCanSend(cacheTransport)) {
-            return false;
-        }
-        LocalDispatcher dispatcher = probeDispatcher(context);
-        if (dispatcher == null) {
-            return false;
-        }
-        JmsListenerFactory listenerFactory = dispatcher.getJMSListeneFactory();
-        if (listenerFactory == null) {
-            return false;
-        }
-        Map<String, GenericMessageListener> subscribers = listenerFactory.getJMSListeners();
-        if (subscribers == null) {
-            return false;
-        }
-        return subscriberConnected(cacheTransport, subscribers);
-    }
-
-    /*
-     * Returns the jms-service the distributed cache clear services are declared against, or null when
-     * the service configuration cannot be read or does not declare it.
-     *
-     * Fail-closed on a configuration error rather than propagating one: this runs inside a probe whose
-     * only vocabulary is ready or not ready, and a configuration that cannot be read is not a fleet
-     * member that may be trusted with a write.
-     */
-    private static JmsService cacheTransportConfiguration() {
-        try {
-            return ServiceConfigUtil.getServiceEngine().getJmsServiceByName(CACHE_TRANSPORT_SERVICE);
-        } catch (GenericConfigException | RuntimeException unreadable) {
-            return null;
-        }
-    }
-
-    /*
-     * Reports whether a write on this instance would find somewhere to publish its invalidation.
-     *
-     * Mirrors JmsServiceEngine.serverList: send-mode "none" yields no server, "all" yields every
-     * declared server, and any other value is refused by the engine itself. A service with no server
-     * declared is equally unable to publish.
-     */
-    private static boolean publisherCanSend(JmsService cacheTransport) {
-        if (!SEND_MODE_ALL.equals(cacheTransport.getSendMode())) {
-            return false;
-        }
-        List<Server> servers = cacheTransport.getServers();
-        return servers != null && !servers.isEmpty();
-    }
-
-    /*
-     * Reports whether the subscriber belonging to the given jms-service is present and connected.
-     *
-     * The key is rebuilt the way JmsListenerFactory.loadListeners builds it, accumulation quirk
-     * included, so the lookup finds that service's own listener rather than any other. Every listening
-     * server the service declares must have a connected subscriber: they are alternative brokers for
-     * one topic, and one of them being down means invalidations this instance publishes are not seen by
-     * the fleet member subscribed to it.
-     *
-     * The status read holds the listener's monitor, which is what makes it visible - see
-     * isCacheTransportReady for why that edge exists and why it is the read side that establishes it.
-     */
-    private static boolean subscriberConnected(JmsService cacheTransport,
-            Map<String, GenericMessageListener> subscribers) {
-        List<Server> servers = cacheTransport.getServers();
-        StringBuilder serverKey = new StringBuilder();
-        boolean anyListening = false;
-        for (Server server : servers) {
-            if (!server.getListen()) {
-                continue;
-            }
-            anyListening = true;
-            serverKey.append(server.getJndiServerName()).append(":");
-            serverKey.append(server.getJndiName()).append(":");
-            serverKey.append(server.getTopicQueue());
-            GenericMessageListener subscriber = subscribers.get(serverKey.toString());
-            if (subscriber == null) {
-                return false;
-            }
-            synchronized (subscriber) {
-                if (!subscriber.isConnected()) {
-                    return false;
-                }
-            }
-        }
-        return anyListening;
-    }
-
-    /*
-     * The dispatcher the cache-transport check observes, resolved for the BASE delegator rather than read
-     * from the ServletContext.
-     *
-     * The attribute cannot be trusted for this: ContextFilter replaces the ServletContext dispatcher
-     * whenever a multitenant request selects a tenant, so the object published there belongs to whichever
-     * tenancy asked last. The listener factory this method wants is the one the instance's own service
-     * engine owns, so the dispatcher is looked up under the name the webapp declares, bound to the base
-     * delegator - the same pair ContextFilter.init() registered when the webapp was deployed, so this is a
-     * cache hit rather than a construction in every running deployment.
-     *
-     * Null when the webapp declares no dispatcher name, when the base delegator cannot be resolved, or
-     * when the lookup fails, all of which the caller reads as "this instance has not finished coming up",
-     * which for a readiness probe is the truth.
-     */
-    private static LocalDispatcher probeDispatcher(ServletContext context) {
-        Delegator base = baseDelegator(context);
-        if (base == null) {
-            return null;
-        }
-        String dispatcherName = context.getInitParameter(DISPATCHER_NAME_PARAMETER);
-        if (UtilValidate.isEmpty(dispatcherName)) {
-            return null;
-        }
-        try {
-            return ServiceContainer.getLocalDispatcher(dispatcherName, base);
-        } catch (RuntimeException unavailable) {
-            return null;
-        }
     }
 
     /*
@@ -1501,8 +1218,6 @@ public class HealthCheckServlet extends HttpServlet {
         flushSuppressed(EVENT_READINESS_SHED, READINESS_SHED_LOG_LAST_AT, READINESS_SHED_LOG_SUPPRESSED);
         flushSuppressed(EVENT_READINESS_WAITERS_FULL, READINESS_WAITERS_LOG_LAST_AT, READINESS_WAITERS_LOG_SUPPRESSED);
         flushSuppressed(EVENT_READINESS_CHECK_TIMEOUT, READINESS_TIMEOUT_LOG_LAST_AT, READINESS_TIMEOUT_LOG_SUPPRESSED);
-        flushSuppressed(EVENT_READINESS_CACHE_TRANSPORT_UNAVAILABLE, READINESS_TRANSPORT_LOG_LAST_AT,
-                READINESS_TRANSPORT_LOG_SUPPRESSED);
     }
 
     private static void flushSuppressed(String eventCode, AtomicLong window, AtomicLong suppressed) {

@@ -93,24 +93,6 @@ public class ContextFilter implements Filter {
         HttpServletRequest httpRequest = (HttpServletRequest) request;
         HttpServletResponse httpResponse = (HttpServletResponse) response;
 
-        // A load-balancer health probe passes straight through, before anything below runs. Everything
-        // this filter does to a request is either state a probe must not create or work a probe must not
-        // pay for: it CREATES A SESSION to hold webSiteId, it PARSES THE REQUEST BODY through
-        // WebAppUtil.setAttributesFromRequestBody, and under multitenancy it resolves a tenant delegator
-        // from the server name and stores it in that session. A probe polled every few seconds by an
-        // unauthenticated caller would mint per-instance state each time, which is the opposite of what a
-        // freely replaceable instance may do, and liveness would stop being answerable independently of
-        // how far this webapp has come up.
-        //
-        // HealthCheckServlet needs none of it: it reads the delegator and the dispatcher from the
-        // ServletContext attributes, which this filter's init() published at deployment time, and never
-        // from the request attributes set below. The paths come from the servlet itself, so this
-        // exemption cannot drift from what it answers, and it matches the two of them exactly.
-        if (HealthCheckServlet.isProbePath(pathWithinWebapp(httpRequest))) {
-            chain.doFilter(request, httpResponse);
-            return;
-        }
-
         // ----- Servlet Object Setup -----
 
         // set the ServletContext in the request for future use
@@ -204,30 +186,6 @@ public class ContextFilter implements Filter {
 
         // we're done checking; continue on
         chain.doFilter(request, httpResponse);
-    }
-
-    /**
-     * Returns the requested path with the webapp's mount point removed.
-     *
-     * <p>Used only to recognise a health probe, and computed from the request URI alone so that it runs
-     * before this filter touches the session, the request body or the tenant machinery. The container
-     * has already normalised and decoded the URI and stripped any path parameters by the time a filter
-     * sees it, so no {@code ../} traversal, {@code %2e} escape or {@code ;jsessionid} suffix can reach
-     * the exact comparison the probe test performs.
-     *
-     * @param httpRequest the request being filtered
-     * @return the path within the webapp, or the whole URI when it does not start with the context path
-     */
-    private static String pathWithinWebapp(HttpServletRequest httpRequest) {
-        String uri = httpRequest.getRequestURI();
-        if (uri == null) {
-            return "";
-        }
-        String context = httpRequest.getContextPath();
-        if (context != null && !context.isEmpty() && uri.startsWith(context)) {
-            return uri.substring(context.length());
-        }
-        return uri;
     }
 
     @Override

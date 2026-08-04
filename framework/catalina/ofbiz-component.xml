@@ -148,13 +148,14 @@ under the License.
                  session for a probe before any context saw it - including for a probe path addressed to a
                  context that neither maps nor allow-lists it - and would rewrite a domain-widened session
                  cookie onto a response no probe client reads.
-                 The exemption is one of two layers, and together they are what makes a probe session-free end
-                 to end: inside the webapp, HealthProbeFilter is mapped first on the two exact probe paths and
-                 forwards to HealthCheckServlet by name, and a named dispatch is not filtered by a url-pattern
-                 mapping, so ControlFilter and ContextFilter - both of which call getSession() unconditionally
-                 - do not run for a probe either. The servlet additionally discards any session it still finds
-                 was created for the probe, so the guarantee survives a webapp that registers the servlet
-                 without the filter.
+                 Inside a webapp the probe is served by HealthCheckServlet through an ordinary servlet
+                 mapping, so the webapp's own filter chain still runs in front of it - and ControlFilter and
+                 ContextFilter both call getSession() unconditionally, so a session IS created there. The
+                 servlet therefore discards a session that was created for the probe, and suppresses the
+                 session cookie on its response, which is what keeps a probe from accumulating sessions
+                 whatever chain a webapp registers it behind. This valve's exemption is the layer above that:
+                 it keeps the ENGINE-scope valve from widening a session cookie's domain for a probe, on a
+                 path no context may even map.
                  The paths this valve exempts are the servlet's own published HealthCheckServlet.isProbePath
                  contract, not a copy of the literals, so the exemption cannot drift from what the endpoint
                  serves. -->

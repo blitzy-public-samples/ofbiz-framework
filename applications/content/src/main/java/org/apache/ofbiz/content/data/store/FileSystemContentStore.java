@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.channels.Channels;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.CopyOption;
 import java.nio.file.DirectoryStream;
@@ -45,6 +46,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
@@ -96,9 +98,11 @@ import org.apache.ofbiz.entity.Delegator;
  *
  * <p><strong>Links are never followed.</strong> Every descent and every open passes
  * {@code NOFOLLOW_LINKS}, so neither an ancestor nor the final component can be a link, and anything
- * that is not a regular file - a symbolic link, a directory, a device - is refused. A directory this
- * provider is told already exists is re-read after the fact rather than assumed, so an entry planted
- * while a concurrent write was creating its parents is refused instead of written through.
+ * that is not a regular file - a symbolic link, a directory, a device - is refused. Creating a missing
+ * level of the tree is the one operation the JDK offers no descriptor-relative form of, so it is done by
+ * path and then the created directory is proved, by file identity, to be the entry the open parent holds
+ * under that name - an ancestor exchanged while a key was being reached is refused rather than written
+ * through. See {@link #createLevel}.
  *
  * <p>A platform whose {@link java.nio.file.FileSystem} does not hand out a
  * {@link SecureDirectoryStream} - which is a documented optional capability - cannot offer
@@ -108,18 +112,21 @@ import org.apache.ofbiz.entity.Delegator;
  * protection the platform can actually provide. Every mainstream Unix filesystem supplies a secure
  * stream.
  *
- * <p><strong>A new file is created privately; an existing file is written in place.</strong> When
- * nothing is stored under a key yet, content is written to a temporary file created
- * {@code rw-------} in the destination's own directory and then moved onto the destination
- * atomically, so the content appears complete or not at all and is private from the instant it
- * exists. When a regular file is already there, it is truncated and rewritten in place instead: in
- * this provider the storage tree *is* the deployment's existing content tree, and replacing the file
- * would give it a new inode, a new modification time and this provider's permissions rather than the
- * ones the deployment's own upload path produced. Preserving that lifecycle is what the plan
- * requires of filesystem mode (plan section 0.6.3), and it is the same in-place rewrite the
- * {@code DataResource} services perform, so an in-place write is not a weaker guarantee than
- * content already has - it is the guarantee it already has. Directories this provider creates are
- * created {@code rwx------}.
+ * <p><strong>Every write is staged first, and only then does it touch anything stored.</strong>
+ * Content is always written to a temporary file created {@code rw-------} in the destination's own
+ * directory, so it is private from the instant it exists and so a source that turns out to be unusable -
+ * a stream that does not hold the length it declared, a read that fails part way - is refused with the
+ * stored content untouched. What happens to that staged copy then depends on what is already there: with
+ * nothing stored under the key it is MOVED onto the destination, one rename, so the content appears
+ * complete or not at all; with a regular file already stored it is copied onto that file IN PLACE. The
+ * in-place rewrite is deliberate - in this provider the storage tree *is* the deployment's existing
+ * content tree, and replacing the file would give it a new inode, a new modification time and this
+ * provider's permissions rather than the ones the deployment's own upload path produced. Preserving that
+ * lifecycle is what the plan requires of filesystem mode (plan section 0.6.3), and it is the same
+ * in-place rewrite the {@code DataResource} services perform, so it is not a weaker guarantee than
+ * content already has - it is the guarantee it already has. What staging adds is that the bytes copied
+ * in are complete before the live file is opened at all. Directories this provider creates are created
+ * {@code rwx------}.
  *
  * <p><strong>Privacy fails closed.</strong> On a filesystem that cannot express POSIX permissions
  * the owner-only mode is applied through the platform's own access flags and then verified; if it
@@ -245,114 +252,247 @@ public final class FileSystemContentStore implements ContentStore {
         if (length < 0L) {
             throw new GeneralException("Cannot store " + length + " bytes for content store key [" + key + "]");
         }
-        store(key, out -> copyExactly(content, out, length, key));
+        try {
+            store(key, out -> copyExactly(content, out, length, key));
+        } catch (ExactLengthMismatch mismatch) {
+            // Normalised to the type the contract declares. A stream that does not hold exactly the length
+            // it was declared with is the CALLER'S mistake, not the store failing, and every operation of
+            // this contract tells the two apart - so it must not arrive as an IOException. Nothing was
+            // stored: the mismatch is established while writing the STAGING entry, which store() then
+            // removes, so a live file at this key is exactly what it was.
+            throw new GeneralException(mismatch.getMessage(), mismatch);
+        }
     }
 
     /**
      * Writes a payload to the one path a key names, whichever source the payload comes from.
      *
      * <p>The two {@code put} overloads differ only in where their bytes come from, so the decision
-     * between rewriting an existing file and publishing a new one is made once, here. Rewriting is
-     * deliberate for a file that is already there: see the class documentation for why keeping that
-     * file's inode, modification time and permissions matters more here than an atomic swap would.
-     * A file that is not there yet is staged beside its target and moved into place, so a concurrent
-     * reader never observes a partially written new file. A file that was there when it was looked at
-     * and gone by the time it was opened is published as a new one, so a concurrent delete of the same
-     * key cannot turn a write that was asked for into a failure.
+     * between rewriting an existing file and publishing a new one is made once, here.
+     *
+     * <p><strong>The payload is always written to a private staging entry FIRST, and the live file is
+     * only touched once that staged copy is complete.</strong> This is what makes the exact-length
+     * contract safe: a stream that turns out not to hold exactly the length it declared is refused
+     * while the staging entry is being written, so a live file at this key is left exactly as it was.
+     * Truncating the live file and transferring into it - which is what this did - destroyed the stored
+     * content before the source was known to be usable, so a short or long stream left the key holding
+     * partial content that read back as complete. It also let a concurrent reader holding the file open
+     * be served the same region twice, because each truncate reset the offset a writer filled from
+     * while the reader's own offset stayed where it was.
+     *
+     * <p>How the staged copy then becomes the stored content depends on what is already there:
+     * <ul>
+     * <li>Nothing there: the staging entry is MOVED onto the target - one rename, so a concurrent
+     * reader never observes a partially written new file.</li>
+     * <li>A regular file there: that file is rewritten IN PLACE from the staged copy. Rewriting rather
+     * than renaming over is deliberate - see the class documentation for why this provider preserves the
+     * file's inode, modification time and permissions - and it is now a copy from a complete local file
+     * rather than a transfer from a caller's stream, so the only thing a concurrent reader can still see
+     * is a mixture of the old and the new bytes of a successful replacement, exactly as the
+     * pre-refactor local write behaved.</li>
+     * <li>A file that was there when it was looked at and gone by the time it was opened: the staged
+     * copy is moved into place instead, so a concurrent delete cannot turn a write that was asked for
+     * into a failure.</li>
+     * </ul>
      *
      * @param key the provider-relative storage key
      * @param payload the content to write
-     * @throws GeneralException if the key is unusable or something that is not a regular file occupies
-     *     the target
+     * @throws GeneralException if the key is unusable, something that is not a regular file occupies
+     *     the target, or owner-only permissions cannot be established for the staging entry
      * @throws IOException if the content cannot be written
      */
     private void store(String key, Payload payload) throws GeneralException, IOException {
         try (Location location = locate(key, true)) {
             BasicFileAttributes existing = location.attributesOrNull();
-            if (existing != null) {
-                if (!existing.isRegularFile()) {
-                    throw new GeneralException("The filesystem content store refuses to write ["
-                            + relative(location.target) + "] because something that is not a regular file already"
-                            + " occupies it");
-                }
-                // The open decides, not the check above. Between the two, a concurrent delete of the same
-                // key can remove the file, and a rewrite opened without CREATE then finds nothing there;
-                // reporting that as a failure would refuse a write that was asked for, where the upload
-                // path this provider stands in for - a plain create-or-truncate open - would have stored
-                // the content. So an open that finds the file gone publishes a new one instead.
-                interleaveBeforeOpen();
-                OutputStream rewrite;
-                try {
-                    rewrite = location.openForRewrite();
-                } catch (NoSuchFileException removedMeanwhile) {
-                    rewrite = null;
-                }
-                if (rewrite != null) {
-                    try (OutputStream out = rewrite) {
-                        payload.writeTo(out);
+            if (existing != null && !existing.isRegularFile()) {
+                throw new GeneralException("The filesystem content store refuses to write ["
+                        + relative(location.target) + "] because something that is not a regular file already"
+                        + " occupies it");
+            }
+            Staged staged = stage(location, payload);
+            boolean consumed = false;
+            try {
+                if (existing != null) {
+                    // The open decides, not the check above. Between the two, a concurrent delete of the same
+                    // key can remove the file, and a rewrite opened without CREATE then finds nothing there;
+                    // reporting that as a failure would refuse a write that was asked for, where the upload
+                    // path this provider stands in for - a plain create-or-truncate open - would have stored
+                    // the content. So an open that finds the file gone promotes the staged copy instead.
+                    interleaveBeforeOpen();
+                    if (rewriteFromStaged(location, staged)) {
+                        consumed = true;
+                        return;
                     }
-                    return;
+                }
+                promote(location, staged);
+                consumed = true;
+            } finally {
+                if (!consumed) {
+                    discard(location, staged);
                 }
             }
-            publishNewFile(location, payload);
         }
     }
 
     /**
-     * Writes content that is not there yet to a private staging entry beside its destination and then
-     * moves it onto the destination.
+     * Writes the whole payload to a private staging entry beside its destination, and reports where.
      *
-     * <p>Staged and moved rather than created and written, so a concurrent reader never observes a
-     * partially written new file, and created {@code rw-------} so it is private from the instant it
-     * exists rather than from the instant the write finishes. Both the staging entry and the move are
-     * relative to the directory the location holds open, so neither can be redirected by an exchange
-     * of an ancestor.
+     * <p>Staged before anything live is touched, and created {@code rw-------} so the content is private
+     * from the instant it exists rather than from the instant the write finishes. A payload that fails
+     * part way - a stream that does not hold the length it declared, a source that cannot be read - is
+     * refused HERE, with the staging entry removed and the stored content untouched.
      *
-     * @param location the located destination, open on its own directory
+     * @param location the located destination, whose own directory the entry is created in
      * @param payload the content to write
+     * @return the staged copy
      * @throws GeneralException if owner-only permissions cannot be established
-     * @throws IOException if the content cannot be written or moved into place
+     * @throws IOException if the content cannot be produced or written
      */
-    private void publishNewFile(Location location, Payload payload) throws GeneralException, IOException {
-        if (location.directory == null) {
-            Path parent = location.target.getParent();
-            Path staging = createStagingFile(parent == null ? root : parent);
-            try {
-                try (OutputStream out = Files.newOutputStream(staging, StandardOpenOption.WRITE,
-                        StandardOpenOption.TRUNCATE_EXISTING)) {
-                    payload.writeTo(out);
-                }
-                move(staging, location.target);
-                staging = null;
-            } finally {
-                if (staging != null) {
-                    Files.deleteIfExists(staging);
-                }
-            }
-            return;
-        }
-        Path staging = createStagingEntry(location);
-        boolean published = false;
+    private Staged stage(Location location, Payload payload) throws GeneralException, IOException {
+        Staged staged = createStaging(location);
+        boolean written = false;
         try {
-            try (OutputStream out = Channels.newOutputStream(location.directory.newByteChannel(staging,
-                    Set.of(StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING,
-                            LinkOption.NOFOLLOW_LINKS)))) {
+            try (OutputStream out = staged.openForWrite(location)) {
                 payload.writeTo(out);
             }
-            // Directory-relative, and within one directory, so it is the atomic rename the contract
-            // promises rather than a copy that could be observed half done.
-            location.directory.move(staging, location.directory, location.name);
-            published = true;
+            written = true;
+            return staged;
         } finally {
-            if (!published) {
-                try {
-                    location.directory.deleteFile(staging);
-                } catch (IOException | RuntimeException e) {
-                    Debug.logWarning("A filesystem content store staging entry could not be removed after a failed"
-                            + " write below [" + relative(location.target) + "]: " + e.getClass().getName(), MODULE);
-                }
+            if (!written) {
+                discard(location, staged);
             }
         }
+    }
+
+    /**
+     * Rewrites the file already stored at a location from a completed staged copy, in place.
+     *
+     * @param location the located destination, open on its own directory
+     * @param staged the completed staged copy
+     * @return true when the live file was rewritten, false when it had been removed meanwhile and the
+     *     caller should promote the staged copy instead
+     * @throws IOException if the rewrite fails for any other reason
+     */
+    private boolean rewriteFromStaged(Location location, Staged staged) throws IOException {
+        OutputStream rewrite;
+        try {
+            rewrite = location.openForRewrite();
+        } catch (NoSuchFileException removedMeanwhile) {
+            return false;
+        }
+        try (OutputStream out = rewrite; InputStream from = staged.openForRead(location)) {
+            from.transferTo(out);
+        }
+        discard(location, staged);
+        return true;
+    }
+
+    /**
+     * A completed, private staging entry the stored content is produced from.
+     *
+     * <p>One name for the two forms a staging entry can take, so {@link #store} decides once what to do
+     * with it rather than branching on the platform at every step. In the ordinary case it is a
+     * single-component name inside the directory the location holds open, and every operation on it is
+     * descriptor-relative; in the documented no-{@link SecureDirectoryStream} fallback it is an absolute
+     * path beside the destination, where the ancestor walk has already been performed.
+     *
+     * @param name the single-component staging name, when the entry is descriptor-relative
+     * @param path the absolute staging path, when the platform offers no secure directory stream
+     */
+    private record Staged(Path name, Path path) {
+
+        /**
+         * Opens the staging entry for writing, truncating it.
+         *
+         * @param location the destination this entry was created beside
+         * @return the stream to write to, which the caller closes
+         * @throws IOException if it cannot be opened
+         */
+        private OutputStream openForWrite(Location location) throws IOException {
+            if (path != null) {
+                return Files.newOutputStream(path, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+            }
+            return Channels.newOutputStream(location.directory.newByteChannel(name,
+                    Set.of(StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING,
+                            LinkOption.NOFOLLOW_LINKS)));
+        }
+
+        /**
+         * Opens the completed staging entry for reading, so its bytes can be copied onto a live file.
+         *
+         * @param location the destination this entry was created beside
+         * @return the stream to read from, which the caller closes
+         * @throws IOException if it cannot be opened
+         */
+        private InputStream openForRead(Location location) throws IOException {
+            if (path != null) {
+                return Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS);
+            }
+            return Channels.newInputStream(location.directory.newByteChannel(name,
+                    Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)));
+        }
+    }
+
+    /**
+     * Creates the private staging entry a write is produced through, beside its destination.
+     *
+     * <p>Beside the destination rather than in a temporary directory, so the move onto the destination
+     * stays within one filesystem and can be a rename. Created {@code rw-------} so the content is
+     * private from the instant it exists.
+     *
+     * @param location the located destination
+     * @return the created, empty staging entry
+     * @throws GeneralException if owner-only permissions cannot be established
+     * @throws IOException if it cannot be created
+     */
+    private Staged createStaging(Location location) throws GeneralException, IOException {
+        if (location.directory == null) {
+            Path parent = location.target.getParent();
+            return new Staged(null, createStagingFile(parent == null ? root : parent));
+        }
+        return new Staged(createStagingEntry(location), null);
+    }
+
+    /**
+     * Removes a staging entry, reporting rather than propagating a failure to do so.
+     *
+     * <p>Reported and swallowed because it is always the cleanup half of an operation that has already
+     * decided its own outcome: turning a failure to remove a temporary file into the reported result
+     * would hide either the refusal that is being propagated or a write that actually succeeded.
+     *
+     * @param location the destination the entry was created beside
+     * @param staged the entry to remove
+     */
+    private void discard(Location location, Staged staged) {
+        try {
+            if (staged.path() != null) {
+                Files.deleteIfExists(staged.path());
+            } else {
+                location.directory.deleteFile(staged.name());
+            }
+        } catch (IOException | RuntimeException e) {
+            Debug.logWarning("A filesystem content store staging entry beside [" + relative(location.target)
+                    + "] could not be removed: " + e.getClass().getName(), MODULE);
+        }
+    }
+
+    /**
+     * Moves a completed staged copy onto a destination that holds nothing.
+     *
+     * <p>One rename, within one directory, so a concurrent reader never observes a partially written new
+     * file. Both the staging entry and the move are relative to the directory the location holds open,
+     * so neither can be redirected by an exchange of an ancestor.
+     *
+     * @param location the located destination, open on its own directory
+     * @param staged the completed staged copy
+     * @throws IOException if it cannot be moved into place
+     */
+    private void promote(Location location, Staged staged) throws IOException {
+        if (staged.path() != null) {
+            move(staged.path(), location.target);
+            return;
+        }
+        location.directory.move(staged.name(), location.directory, location.name);
     }
 
     /**
@@ -382,7 +522,22 @@ public final class FileSystemContentStore implements ContentStore {
                 Debug.logVerbose(collision, "A content store staging name was already taken; trying another",
                         MODULE);
             } catch (UnsupportedOperationException notPosix) {
-                return createStagingEntryWithoutPosix(location, candidate);
+                // REFUSED, not worked around. Making the entry private after the fact needs a path, and the
+                // only path available here is location.target.resolveSibling(candidate) - an ABSOLUTE path,
+                // resolved after the secure descent established confinement through descriptors. Applying a
+                // permission change through it re-opens the confinement question the descent had already
+                // settled: an ancestor exchanged for a link in between would send the change somewhere
+                // outside this provider's root. A SecureDirectoryStream offers no descriptor-relative
+                // permission change, so there is no confined way to do it and the operation fails closed
+                // instead. Unreachable on every mainstream filesystem, which supports POSIX permissions and
+                // takes the branch above; a platform that supplies a SecureDirectoryStream and yet refuses
+                // POSIX permissions gets a clear refusal rather than a private document written with
+                // whatever the platform default happens to be.
+                throw new GeneralException("The filesystem content store refuses to write below ["
+                        + relative(location.target) + "] because this filesystem supports descriptor-relative"
+                        + " operations but not POSIX permissions, so a staging entry cannot be created private"
+                        + " to the OFBiz user without a path-based permission change that would leave the"
+                        + " confinement this provider guarantees", notPosix);
             }
         }
         throw new IOException("The filesystem content store could not create a staging entry below ["
@@ -390,41 +545,24 @@ public final class FileSystemContentStore implements ContentStore {
     }
 
     /**
-     * Creates the staging entry on a filesystem that cannot express POSIX permissions, applying and
-     * verifying owner-only access through the platform's own flags instead.
+     * A stream that did not hold exactly the number of bytes it was declared with.
      *
-     * <p>Reachable only where a platform supplies a {@link SecureDirectoryStream} and yet refuses
-     * POSIX permissions, which no mainstream filesystem does. It is written out rather than left to
-     * chance because the alternative is a staging entry created with whatever the platform default
-     * happens to be, holding content that can be a private document.
+     * <p>An {@link IOException} subtype only because {@link Payload#writeTo} can throw nothing else -
+     * it is what a producer is allowed to signal. {@link #put(String, InputStream, long)} catches it and
+     * rethrows it as the {@link GeneralException} the contract declares, because a length that does not
+     * match its stream is the CALLER'S mistake rather than the store failing, and the contract tells
+     * those two apart.
      *
-     * @param location the located destination, whose directory the entry is created in
-     * @param candidate the staging name to create
-     * @return the staging name
-     * @throws GeneralException if owner-only access cannot be established
-     * @throws IOException if it cannot be created
+     * <p>Raised while the STAGING entry is being written, so stored content is untouched: content that
+     * was not there stays absent, and content that was there is exactly what it was.
      */
-    private Path createStagingEntryWithoutPosix(Location location, Path candidate)
-            throws GeneralException, IOException {
-        location.directory.newByteChannel(candidate,
-                Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)).close();
-        boolean restricted = false;
-        try {
-            restrictToOwner(location.target.resolveSibling(candidate), "content");
-            restricted = true;
-        } finally {
-            if (!restricted) {
-                // Created with the platform default and could not be made private, so it is removed
-                // rather than left behind readable while the refusal propagates.
-                try {
-                    location.directory.deleteFile(candidate);
-                } catch (IOException | RuntimeException e) {
-                    Debug.logWarning("A content store staging entry that could not be made private could not be"
-                            + " removed either: " + e.getClass().getName(), MODULE);
-                }
-            }
+    private static final class ExactLengthMismatch extends IOException {
+
+        private static final long serialVersionUID = 1L;
+
+        ExactLengthMismatch(String message) {
+            super(message);
         }
-        return candidate;
     }
 
     /**
@@ -432,16 +570,16 @@ public final class FileSystemContentStore implements ContentStore {
      *
      * <p>A length that does not match the stream is a caller error rather than something to work
      * around, and both directions matter: a short stream would store truncated content under a key
-     * that reads back as complete, and a long one would silently drop the rest. Refusing before the
-     * content is published - the caller's target is a staging file or an already-validated rewrite -
-     * is what keeps a mismatch from becoming stored content.
+     * that reads back as complete, and a long one would silently drop the rest. It is refused into a
+     * STAGING entry, before anything live has been touched - see {@link #store} - so a mismatch never
+     * becomes stored content and never destroys content that was already stored.
      *
      * @param content the stream to read from; not closed here, because it belongs to the caller
      * @param out the destination to write to
      * @param length the exact number of bytes to transfer
      * @param key the key being written, named in a refusal
-     * @throws IOException if the transfer fails, or if the stream does not hold exactly {@code length}
-     *     bytes
+     * @throws ExactLengthMismatch if the stream does not hold exactly {@code length} bytes
+     * @throws IOException if the transfer itself fails
      */
     private static void copyExactly(InputStream content, OutputStream out, long length, String key)
             throws IOException {
@@ -451,14 +589,17 @@ public final class FileSystemContentStore implements ContentStore {
             int wanted = (int) Math.min(buffer.length, remaining);
             int read = content.read(buffer, 0, wanted);
             if (read < 0) {
-                throw new IOException("The content stream for [" + key + "] ended " + remaining + " bytes before"
-                        + " the " + length + " bytes it declared, so nothing was stored");
+                throw new ExactLengthMismatch("The content stream for [" + key + "] ended " + remaining
+                        + " bytes before the " + length + " bytes it declared, so nothing was stored");
             }
             out.write(buffer, 0, read);
             remaining -= read;
         }
+        // One byte of lookahead, which is the only way to tell a stream that held exactly the declared
+        // length from one holding more. It consumes a byte of the caller's stream, which is
+        // inconsequential: the only case in which it finds one is the case that is refused anyway.
         if (content.read() != -1) {
-            throw new IOException("The content stream for [" + key + "] holds more than the " + length
+            throw new ExactLengthMismatch("The content stream for [" + key + "] holds more than the " + length
                     + " bytes it declared, so nothing was stored");
         }
     }
@@ -486,7 +627,14 @@ public final class FileSystemContentStore implements ContentStore {
             // file can be appended to between that measurement and this read.
             try (InputStream content = location.openForRead()) {
                 byte[] read = content.readNBytes((int) limit);
-                if (content.read() != -1) {
+                // The ceiling is exceeded only if the read actually FILLED it and there is still more to
+                // come. Probing for a further byte after a read that stopped short of the ceiling asks a
+                // different question than it appears to: readNBytes stops at end of file, and in a shared
+                // tree the file can be rewritten in place between that end and this probe, so a byte
+                // appearing at the old end means the content CHANGED, not that it is too large. Refusing on
+                // that made an ordinary concurrent overwrite of a 48 KiB file look like a breach of a 10 MiB
+                // ceiling - a refusal an operator could not act on, arriving at random under load.
+                if (read.length >= limit && content.read() != -1) {
                     throw oversized(location.target, "more than " + limit, limit);
                 }
                 return read;
@@ -505,15 +653,30 @@ public final class FileSystemContentStore implements ContentStore {
         Location location = locate(key, false);
         boolean handedOver = false;
         try {
-            BasicFileAttributes attributes = location.requireRegularFile();
-            // Deliberately unbounded, and opened NOFOLLOW so the name cannot have become a link: this is
-            // the operation content of a size an uploader chose is served through, and it never holds
-            // that content in the heap in full.
+            // Established first, so a directory or a device under this key is refused as such rather than
+            // opened, and so absence is reported the way the contract requires.
+            location.requireRegularFile();
+            // ONE channel, opened NOFOLLOW so the name cannot have become a link, with the length taken
+            // from THAT channel.
             //
-            // The length comes from the attributes that established this is a regular file, so the
-            // length reported and the file opened are the same measurement rather than two.
-            ContentStream stream = new ContentStream(closing(location.openForRead(), location),
-                    attributes.size());
+            // The length used to come from the attributes read a moment earlier, which describe the file
+            // that was there when they were read rather than the file this open returned: between the two a
+            // concurrent writer can replace or extend the content, and the caller would then hold a stream
+            // over one object carrying the length of another - so an HTTP response would declare a
+            // Content-Length it cannot satisfy, or would truncate what it sends. SeekableByteChannel.size()
+            // is a property of the OPEN channel, so the number reported and the bytes delivered are the same
+            // object by construction, and stay so for the life of the stream.
+            //
+            // Deliberately unbounded: this is the operation content of a size an uploader chose is served
+            // through, and it never holds that content in the heap in full.
+            SeekableByteChannel channel = location.openChannelForRead();
+            ContentStream stream;
+            try {
+                stream = new ContentStream(closing(Channels.newInputStream(channel), location), channel.size());
+            } catch (IOException | RuntimeException failed) {
+                channel.close();
+                throw failed;
+            }
             handedOver = true;
             return stream;
         } catch (NoSuchFileException removedMeanwhile) {
@@ -577,6 +740,22 @@ public final class FileSystemContentStore implements ContentStore {
     }
 
     /**
+     * Reports that this provider does NOT hold content off the instance.
+     *
+     * <p>Its storage tree IS the deployment's own content tree, at the deployment's own paths, so a
+     * service that has written a file under {@code ofbiz.home} has by construction written it into this
+     * provider: publishing the same bytes again would only rewrite the file the service just wrote.
+     * Behaving exactly as the pre-refactor local filesystem behaved is the whole purpose of this
+     * provider.
+     *
+     * @return {@code false}, always
+     */
+    @Override
+    public boolean holdsContentOffInstance() {
+        return false;
+    }
+
+    /**
      * Resolves a storage key to the one path inside this provider's root that it names.
      *
      * <p>The shared key grammar first, then the lexical root test, then the on-disk confinement check:
@@ -594,7 +773,7 @@ public final class FileSystemContentStore implements ContentStore {
         // The grammar every provider shares, from its one implementation: empty, control characters, an
         // absolute path or a drive prefix, an empty or relative component, and the length bounds. What
         // follows is what this provider alone requires - that the key stay inside the tree it owns.
-        ContentStoreFactory.requireUsableKey(key);
+        ContentStore.requireUsableKey(key);
         Path resolved = root.resolve(key).normalize();
         if (!resolved.startsWith(root) || resolved.equals(root)) {
             throw new GeneralException("The content store key [" + key + "] resolves outside the storage root");
@@ -735,11 +914,9 @@ public final class FileSystemContentStore implements ContentStore {
      *
      * <p>Opened with {@code NOFOLLOW_LINKS} relative to the directory above, so a name that is a
      * symbolic link, or that is not a directory at all, cannot be descended into - whether it was
-     * always so or became so a moment ago. Creation is by path because
-     * {@link SecureDirectoryStream} offers no descriptor-relative create; that is sound because the
-     * created directory is not then used by name - it is opened by the same
-     * {@code NOFOLLOW_LINKS} descent as any other level, so a directory exchanged for a link between
-     * being created and being opened is refused here exactly as a planted link would be.
+     * always so or became so a moment ago. Creating a missing level is the one operation that cannot
+     * be performed relative to a descriptor, and {@link #createLevel} is what keeps that from
+     * weakening the guarantee.
      *
      * @param directory the directory to descend from
      * @param step the single name to descend into
@@ -770,7 +947,7 @@ public final class FileSystemContentStore implements ContentStore {
             throw refuseAncestor(target, step, "is a symbolic link or cannot be opened as a directory",
                     wrongKind);
         }
-        createDirectories(level);
+        createLevel(directory, step, level, target);
         try {
             return directory.newDirectoryStream(step, LinkOption.NOFOLLOW_LINKS);
         } catch (NoSuchFileException removedMeanwhile) {
@@ -904,8 +1081,9 @@ public final class FileSystemContentStore implements ContentStore {
         /**
          * Requires that the key holds a regular file, reporting absence the way the contract requires.
          *
-         * @return the attributes read while checking, so a caller needing the size does not read them
-         *     a second time and risk disagreeing with this check
+         * @return the attributes read while checking, for a caller that needs them; note that they
+         *     describe the file as it was when they were read, so a caller that hands a length to a
+         *     consumer must take it from the channel it opens instead - see {@link #openChannelForRead()}
          * @throws GeneralException if something that is not a regular file is stored here
          * @throws FileNotFoundException if nothing is stored here
          * @throws IOException if the attributes cannot be read
@@ -929,11 +1107,21 @@ public final class FileSystemContentStore implements ContentStore {
          * @throws IOException if it cannot be opened, including because it is no longer there
          */
         private InputStream openForRead() throws IOException {
+            return Channels.newInputStream(openChannelForRead());
+        }
+
+        /**
+         * Opens the content for reading as a CHANNEL, relative to the directory this location holds
+         * open, so that a caller needing the length can take it from the same object it will read.
+         *
+         * @return the open channel, which the caller closes
+         * @throws IOException if it cannot be opened, including because it is no longer there
+         */
+        private SeekableByteChannel openChannelForRead() throws IOException {
             if (directory == null) {
-                return Files.newInputStream(target, LinkOption.NOFOLLOW_LINKS);
+                return Files.newByteChannel(target, Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
             }
-            return Channels.newInputStream(directory.newByteChannel(name,
-                    Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)));
+            return directory.newByteChannel(name, Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
         }
 
         /**
@@ -1091,72 +1279,169 @@ public final class FileSystemContentStore implements ContentStore {
     }
 
     /**
-     * Creates a directory and any missing parent inside the storage root, owner-only.
+     * Creates the one missing level a descent is standing on, and proves it is the level the descent
+     * holds open before anything is written through it.
      *
-     * @param directory the directory to create
-     * @throws GeneralException if what already occupies the path is not a directory, or if owner-only
-     *     permissions cannot be established
-     * @throws IOException if it cannot be created
-     */
-    private void createDirectories(Path directory) throws GeneralException, IOException {
-        if (Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
-            return;
-        }
-        Path parent = directory.getParent();
-        if (parent != null && parent.startsWith(root) && !parent.equals(root)) {
-            createDirectories(parent);
-        }
-        try {
-            Files.createDirectory(directory, PosixFilePermissions.asFileAttribute(DIRECTORY_PERMISSIONS));
-        } catch (FileAlreadyExistsException raced) {
-            // Something is there now that was not there a moment ago. The expected cause is a
-            // concurrent upload creating the same directory, but "a directory appeared" is exactly
-            // what a planted link looks like too, so what appeared is re-read rather than assumed.
-            requireDirectory(directory, raced);
-        } catch (UnsupportedOperationException notPosix) {
-            createDirectoryWithoutPosix(directory);
-        }
-    }
-
-    /**
-     * Re-reads an entry that appeared while its parents were being created, and refuses it unless it
-     * is a real directory.
+     * <p>A directory is the one thing this provider cannot create relative to a descriptor:
+     * {@link SecureDirectoryStream} exposes no {@code mkdirat}, so the only way to make one is by
+     * absolute path - and an absolute path is resolved by NAME, re-opening the confinement question the
+     * descent had already settled with descriptors. If an ancestor were exchanged for a symbolic link
+     * after it was descended into, a path-based create would follow that link and make a directory
+     * somewhere OUTSIDE this provider's root. The re-open that follows would then refuse to descend, so
+     * no content was ever written there - but the mutation would already have happened, unreported.
      *
-     * @param directory the path that already exists
-     * @param raced the report that it already exists
-     * @throws GeneralException if it is a link or is not a directory
-     * @throws IOException if its attributes cannot be read
+     * <p>Two things narrow that to the point where it can be stated rather than hoped for:
+     * <ul>
+     *   <li>ONE level, never a chain. The caller walks the tree a level at a time with the parent
+     *       already open, so exactly one directory is ever missing here; creating parents recursively
+     *       would multiply by-path mutations for no reason.</li>
+     *   <li>IDENTITY, checked through the descriptor. The entry the path names and the entry the open
+     *       parent holds under the same name are compared by file identity, and anything other than
+     *       agreement is refused - so a create that landed outside the tree is reported rather than
+     *       silently tolerated.</li>
+     * </ul>
+     *
+     * @param parent the open directory this level is created below
+     * @param step the single name being created
+     * @param level the absolute path of that name, which is the only way to create it
+     * @param target the whole resolved path, named in a refusal
+     * @throws GeneralException if the level cannot be created privately, or cannot be shown to be the
+     *     one the descent holds open
+     * @throws IOException if it cannot be created for any other reason
      */
-    private void requireDirectory(Path directory, FileAlreadyExistsException raced)
+    private void createLevel(SecureDirectoryStream<Path> parent, Path step, Path level, Path target)
             throws GeneralException, IOException {
-        BasicFileAttributes attributes = readAttributes(directory);
-        if (attributes == null) {
-            // Created and removed again between the two calls. Nothing is there, so nothing can be
-            // written through it; the write below will report the missing directory itself.
-            Debug.logVerbose(raced, "The content store directory [" + relative(directory)
-                    + "] appeared and was removed again while it was being created", MODULE);
-            return;
+        try {
+            Files.createDirectory(level, PosixFilePermissions.asFileAttribute(DIRECTORY_PERMISSIONS));
+        } catch (FileAlreadyExistsException raced) {
+            // Something is there now that was not there a moment ago. The expected cause is a concurrent
+            // write creating the same level, which is ordinary rather than exceptional, so it is not a
+            // failure - but what appeared is not assumed to be a directory of this tree either. The
+            // identity check below, and the NOFOLLOW re-open the caller performs after it, decide that.
+            Debug.logVerbose(raced, "The content store level [" + step + "] on the way to [" + relative(target)
+                    + "] was created concurrently", MODULE);
+        } catch (UnsupportedOperationException notPosix) {
+            // REFUSED, not worked around, for the same reason a staging entry is - see
+            // createStagingEntry. Making the directory private after the fact needs a path-based
+            // permission change, which is exactly the confinement question this method exists to keep
+            // closed. Unreachable on every mainstream filesystem, all of which support POSIX permissions.
+            throw new GeneralException("The filesystem content store refuses to create the level [" + step
+                    + "] on the way to [" + relative(target) + "] because this filesystem supports"
+                    + " descriptor-relative operations but not POSIX permissions, so the directory cannot be"
+                    + " created private to the OFBiz user without a path-based permission change that would"
+                    + " leave the confinement this provider guarantees", notPosix);
         }
-        if (attributes.isSymbolicLink() || !attributes.isDirectory()) {
-            throw new GeneralException("The filesystem content store refuses to write below ["
-                    + relative(directory) + "] because " + (attributes.isSymbolicLink() ? "a symbolic link"
-                    : "something that is not a directory") + " appeared there while it was being created");
-        }
-        Debug.logVerbose(raced, "The content store directory [" + relative(directory)
-                + "] was created concurrently", MODULE);
+        requireCreatedLevelIsTheOpenOne(parent, step, level, target);
     }
 
     /**
-     * Creates a directory on a filesystem that cannot express POSIX permissions, applying and
-     * verifying owner-only access through the platform's own flags instead.
+     * Refuses a created level that is not the entry the open parent holds under the same name.
      *
-     * @param directory the directory to create
-     * @throws GeneralException if owner-only access cannot be established
-     * @throws IOException if it cannot be created
+     * <p>The two identities are read the two different ways the level can be reached: through the
+     * descriptor the descent holds, and by the absolute path the creation used. They agree in every
+     * ordinary case, including a concurrent create of the same directory, because both describe the same
+     * inode. They disagree only when the name resolved to something else - an ancestor exchanged for a
+     * link, so the created directory is outside this provider's root - which is the case that must not
+     * pass silently.
+     *
+     * @param parent the open directory the level was created below
+     * @param step the single name that was created
+     * @param level the absolute path it was created by
+     * @param target the whole resolved path, named in a refusal
+     * @throws GeneralException if the two do not describe the same entry, or if this filesystem cannot
+     *     report an identity to compare
+     * @throws IOException if the attributes cannot be read
      */
-    private void createDirectoryWithoutPosix(Path directory) throws GeneralException, IOException {
-        Files.createDirectories(directory);
-        restrictToOwner(directory, "directory");
+    private void requireCreatedLevelIsTheOpenOne(SecureDirectoryStream<Path> parent, Path step, Path level,
+            Path target) throws GeneralException, IOException {
+        Object throughDescriptor = identityThroughDescriptor(parent, step, target);
+        Object byPath = identityByPath(level, step, target);
+        if (throughDescriptor == null && byPath == null) {
+            // Created and removed again before either could be read. Nothing is there under either route,
+            // so there is nothing to refuse on confinement grounds; the caller's re-open reports the
+            // missing directory as what it is.
+            Debug.logVerbose("The content store level [" + step + "] on the way to [" + relative(target)
+                    + "] was removed as soon as it was created", MODULE);
+            return;
+        }
+        if (!Objects.equals(throughDescriptor, byPath)) {
+            throw new GeneralException("The filesystem content store refuses [" + relative(target)
+                    + "] because the directory created for the level [" + step + "] is not the entry that name"
+                    + " holds below the directory this descent has open, so an ancestor was exchanged while"
+                    + " this key was being reached and the created directory is outside this provider's"
+                    + " storage root; nothing was written and the stray directory was left in place to be"
+                    + " inspected");
+        }
+    }
+
+    /**
+     * Reads a level's file identity through the descriptor the descent holds open.
+     *
+     * @param parent the open directory
+     * @param step the single name to read
+     * @param target the whole resolved path, named in a refusal
+     * @return the identity, or {@code null} if nothing is there
+     * @throws GeneralException if this filesystem reports no identity
+     * @throws IOException if the attributes cannot be read
+     */
+    private Object identityThroughDescriptor(SecureDirectoryStream<Path> parent, Path step, Path target)
+            throws GeneralException, IOException {
+        try {
+            return requireIdentity(parent.getFileAttributeView(step, BasicFileAttributeView.class,
+                    LinkOption.NOFOLLOW_LINKS).readAttributes().fileKey(), step, target);
+        } catch (NoSuchFileException absent) {
+            Debug.logVerbose(absent, "The content store level [" + step + "] is not held by the directory open"
+                    + " on the way to [" + relative(target) + "]", MODULE);
+            return null;
+        }
+    }
+
+    /**
+     * Reads a level's file identity by the absolute path it was created with.
+     *
+     * @param level the absolute path
+     * @param step the single name it ends in, named in a refusal
+     * @param target the whole resolved path, named in a refusal
+     * @return the identity, or {@code null} if nothing is there
+     * @throws GeneralException if this filesystem reports no identity
+     * @throws IOException if the attributes cannot be read
+     */
+    private Object identityByPath(Path level, Path step, Path target) throws GeneralException, IOException {
+        try {
+            return requireIdentity(Files.readAttributes(level, BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS).fileKey(), step, target);
+        } catch (NoSuchFileException absent) {
+            Debug.logVerbose(absent, "The content store level [" + step + "] is not at the path it was created"
+                    + " by on the way to [" + relative(target) + "]", MODULE);
+            return null;
+        }
+    }
+
+    /**
+     * Requires that this filesystem reports an identity for an entry, so the two routes to a created
+     * level can be compared at all.
+     *
+     * <p>Fails closed rather than assuming agreement: without an identity the by-path creation cannot be
+     * shown to be the entry the descent holds, and this method exists precisely because that has to be
+     * shown. Unreachable on the platforms this branch runs on - a {@link SecureDirectoryStream} is
+     * supplied by the Unix provider, which reports a device-and-inode identity for every entry - so this
+     * refuses a hypothetical platform that offers descriptor-relative operations while withholding the
+     * one fact needed to verify them.
+     *
+     * @param key the identity read, possibly {@code null}
+     * @param step the single name it was read for
+     * @param target the whole resolved path, named in a refusal
+     * @return the identity, never {@code null}
+     * @throws GeneralException if there is none
+     */
+    private Object requireIdentity(Object key, Path step, Path target) throws GeneralException {
+        if (key == null) {
+            throw new GeneralException("The filesystem content store refuses [" + relative(target)
+                    + "] because this filesystem reports no file identity for the level [" + step + "], so a"
+                    + " directory it had to create by path cannot be shown to be the directory this descent"
+                    + " holds open, and the confinement this provider guarantees cannot be demonstrated");
+        }
+        return key;
     }
 
     /**

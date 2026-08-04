@@ -22,7 +22,6 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Locale;
 import java.util.Properties;
 import java.util.Set;
@@ -74,7 +73,6 @@ import org.apache.ofbiz.entity.util.EntityUtilProperties;
  * There are no aliases: {@code fs} and {@code local} are not accepted and are refused like any
  * other unrecognised value.
  *
- * <p><strong>One resolution per delegator scope, established once and then immutable.</strong> A
  * <p><strong>Deployment values come from the property file alone; only tunables may be overridden
  * from the database.</strong> The seven values that decide WHERE durable content is written and WHO
  * it is written as - the selector, the bucket, the region, the endpoint, the addressing style and
@@ -84,9 +82,28 @@ import org.apache.ofbiz.entity.util.EntityUtilProperties;
  * way to bypass that validation entirely: a row could point a production fleet at a plaintext
  * endpoint, at another bucket, or at another principal, in a change no start-up check ever sees and
  * with no atomicity across the seven. The documented non-secret tunables - the key prefix, the read
- * ceiling, the migration fallback, the two deadlines and the retry cap - keep honouring a
+ * ceiling, the migration fallback, the deadlines and the retry cap - keep honouring a
  * {@code SystemProperty} row, because they change how the configured store is used rather than
  * which store it is.
+ *
+ * <p><strong>WHEN a change takes effect: two classes of setting, and they behave differently.</strong>
+ * Conflating them was a defect in its own right, because one warning claimed that every
+ * {@code content.store.*} change waits for a restart while two of them in fact applied immediately.
+ *
+ * <ul>
+ * <li><em>Construction-bound</em> - {@link #constructionBoundProperties()}. Read once, when the
+ * provider for a scope is built: the selector, the bucket, the region, the endpoint, the addressing
+ * style, the plaintext-endpoint allowance, the two credentials, the key prefix, the two SDK deadlines,
+ * the response-body deadline and the retry cap. These are the ONLY settings the resolution fingerprint
+ * covers, and therefore the only ones a change to which is reported as "restart to apply". They are
+ * construction-bound because they are sealed into a client, its credential provider and its override
+ * configuration, none of which can be replaced under requests already holding it.</li>
+ * <li><em>Dynamic</em> - {@link #DYNAMIC_PROPERTIES}. Read on every use, so a change applies at once
+ * with no restart: {@code content.store.max.object.size} and {@code content.store.local.fallback}.
+ * Each is a number or a flag consulted by the operation that needs it; nothing is built from them.
+ * They are excluded from the fingerprint precisely so that changing one never produces a "restart to
+ * apply" line for a change that is already in force.</li>
+ * </ul>
  *
  * <p><strong>One resolution per delegator scope, keyed by the whole configuration.</strong> A
  * resolved provider is kept so that it is constructed once rather than once per request. What is
@@ -120,11 +137,15 @@ import org.apache.ofbiz.entity.util.EntityUtilProperties;
  * never been published, and whatever is still held when the JVM stops is closed by a shutdown hook.
  *
  * <p><strong>Storage keys are minted here.</strong> {@link #storeKey} is the one place a key is
- * derived, because the derivation depends on which provider is active and no caller should have to
- * know that: the filesystem provider is keyed by the {@code ofbiz.home}-relative path the
- * deployment already uses, while the object store is keyed by immutable identity - namespace,
- * tenant scope and {@code dataResourceId} - so that one bucket shared by several tenants cannot
- * serve one tenant's content to another. {@link #maxObjectSize} bounds what any single read may
+ * derived, so that no caller has to know how it is derived, and every provider is keyed the same
+ * way: by the {@code ofbiz.home}-relative path of the content. That path is the location the
+ * deployment already uses, and it is the one value both resolution seams always have. One
+ * derivation for every provider is what makes the providers interchangeable - content published
+ * through one can be read through another, so a deployment can move between them - and what keeps
+ * the filesystem provider's tree identical to the deployment's own tree. Keeping one deployment's
+ * content apart from another's inside a shared bucket is a deployment concern, served by
+ * {@code content.store.s3.key.prefix} rather than by the key derivation.
+ * {@link #maxObjectSize} bounds what any single read may
  * materialise, {@link #publicationRequired} says whether a local write still has to be handed to the
  * provider, and {@link #localFallbackEnabled} decides what a store miss means for a resource this
  * instance holds a file for.
@@ -148,16 +169,26 @@ public final class ContentStoreFactory {
     /** The value that selects {@link S3ContentStore}. */
     private static final String S3 = "s3";
 
-    /**
-     * The prefix every property this package reads shares, and therefore the set the resolution
-     * digest covers. Discovered from the resource rather than listed here, so a property added to
-     * {@code content.properties} is covered without this class having to be edited too.
-     */
+    /** The prefix every property this package reads shares. */
     private static final String STORE_PROPERTY_PREFIX = "content.store.";
 
     /**
-     * The ceiling on what a single read may materialise, and on what one publication may hand over,
-     * in bytes.
+     * The settings that are read on EVERY use, and therefore take effect without a restart.
+     *
+     * <p>Each is consulted by the operation that needs it - the read ceiling by a whole-object read and
+     * by the publication bound, the fallback flag by a store miss - and nothing is built from either, so
+     * a change to one is in force the moment it is made. They are excluded from
+     * {@link #fingerprint(Delegator)} for exactly that reason: including them would make a change that
+     * is ALREADY in force produce a "restart to apply" warning, which is the opposite of the truth.
+     *
+     * <p>Every other {@code content.store.*} setting is construction-bound; see
+     * {@link #constructionBoundProperties()}.
+     */
+    static final Set<String> DYNAMIC_PROPERTIES = Set.of(
+            "content.store.max.object.size",
+            "content.store.local.fallback");
+
+    /**
      * The values that decide where durable content is written and which principal writes it, and
      * which are therefore read from {@code content.properties} alone.
      *
@@ -216,48 +247,6 @@ public final class ContentStoreFactory {
 
     /** The largest ceiling accepted, which is what keeps a mistyped value from meaning "unbounded". */
     private static final long MAXIMUM_MAX_OBJECT_SIZE = 2147483639L;
-
-    /**
-     * The first segment of every object-store key, which is what makes an unscoped key recognisable.
-     *
-     * <p>Package-private because {@link S3ContentStore} refuses a key that does not begin with it:
-     * the segment is only worth anything if the boundary that receives the key insists on it, and
-     * both sides have to mean the same segment.
-     */
-    static final String IDENTITY_KEY_NAMESPACE = "dataresource";
-
-    /**
-     * The greatest length of a storage key, in bytes of its UTF-8 encoding.
-     *
-     * <p>1024 is the object-store limit on an object key. Applying it to every provider is what
-     * keeps a key portable between them: content stored while one provider was configured is
-     * addressable by the same key after a deployment changes provider.
-     *
-     * <p>Package-private, and here rather than on {@link ContentStore}, because it is a rule of the
-     * one validator below rather than a member of the five-operation contract an implementer has to
-     * satisfy.
-     */
-    static final int MAX_KEY_LENGTH_BYTES = 1024;
-
-    /**
-     * The greatest length of one key component, in bytes of its UTF-8 encoding.
-     *
-     * <p>255 is the file-name limit common filesystems impose. Applying it to every provider is the
-     * other half of key portability: a key an object store accepts as one long string has to remain
-     * writable as a path once a deployment changes to a path-keyed provider.
-     */
-    static final int MAX_KEY_COMPONENT_LENGTH_BYTES = 255;
-
-    /**
-     * The marker that opens an encoded key segment, and therefore the one prefix a segment may never
-     * carry verbatim.
-     *
-     * <p>{@code b64-} is itself made only of characters a segment may carry, so an encoded segment is
-     * as portable as a verbatim one. Forcing any value that begins with it into the encoded form is
-     * what makes the encoding injective: were a value spelled {@code b64-QUJD} allowed through
-     * verbatim it would name the same object as the encoding of {@code ABC}.
-     */
-    private static final String ENCODED_SEGMENT_PREFIX = "b64-";
 
     /** The scope key a resolution without a delegator is held under; no delegator is ever named this. */
     private static final String GLOBAL_SCOPE = "";
@@ -399,27 +388,6 @@ public final class ContentStoreFactory {
     }
 
     /**
-     * Reports whether a provider holds content somewhere other than this instance's own filesystem tree.
-     *
-     * <p>What this decides is whether a write to the provider has to be undone when the transaction that
-     * records the metadata rolls back. For a provider that holds content off the instance the answer is
-     * yes: the object and the {@code DataResource} row are in two stores, only one of which is
-     * transactional, so an unpaired object is content nothing refers to and nothing removes. For the
-     * filesystem provider the answer is no, because its storage tree IS the deployment's own content
-     * tree, where a rolled-back write has always left its file behind - and behaving as it always did is
-     * the whole point of that provider.
-     *
-     * <p>Answers {@code true} for any future provider that is neither of those, so a provider added
-     * later is bound to the transaction unless it is explicitly recognised as local.
-     *
-     * @param store the provider to describe; may be null, which is database storage
-     * @return {@code true} when the provider holds content off this instance
-     */
-    public static boolean holdsContentOffInstance(ContentStore store) {
-        return store != null && !(store instanceof FileSystemContentStore);
-    }
-
-    /**
      * Forgets every value already reported as unusable, so the next unusable value is reported again.
      *
      * <p>Package-private, and for the same reason as {@link #clearCache()}: this class deliberately
@@ -468,7 +436,7 @@ public final class ContentStoreFactory {
      * before the provider was configured, and anything an operator has yet to copy into the bucket
      * would otherwise stop serving the moment the provider is switched on, which is the functional
      * parity the plan requires of every new capability (plan sections 0.1.2 and 0.7.1). New content
-     * needs no such bridge, because an upload is published to the store as it is written.
+     * needs no such bridge, because content is published to the store by the transaction that writes it.
      *
      * <p>Setting it {@code false} is the strict, fail-closed mode: once a provider is configured,
      * content it does not hold is an error rather than a file only one fleet member can see. That is
@@ -505,76 +473,78 @@ public final class ContentStoreFactory {
      * Reports whether content written to the deployment's own tree still has to be handed to the
      * provider, or whether writing it locally has already placed it there.
      *
-     * <p>The answer follows from how a provider is keyed, which is why it is decided here beside
-     * {@link #storeKey} rather than at the write seam. A path-keyed provider is the deployment's own
-     * tree at the deployment's own paths, so a service that has just written a file under
-     * {@code ofbiz.home} has by construction written it into the provider and handing the same bytes
-     * over again would only rewrite the file it already wrote. An identity-keyed provider - the
-     * object store - is a namespace outside every instance, so content that is only on this
-     * instance's disk is content the rest of the fleet cannot read: it has to be published.
+     * <p>ONE predicate, and it asks the PROVIDER rather than testing its class. Two overlapping
+     * predicates used to answer this with two different {@code instanceof} tests - one calling every
+     * provider that was not the filesystem one remote, the other calling only the object store one that
+     * needed publication - so a provider added later would have been classified inconsistently by the
+     * two and the write seam could disagree with the rest of the package about the same provider. The
+     * capability now lives on {@link ContentStore#holdsContentOffInstance()}, where the provider that
+     * knows the answer states it.
      *
-     * <p>Database mode, which is {@code null}, requires no publication either: the bytes are held in
-     * the {@code DataResource} columns and are shared by every instance the moment the row commits.
+     * <p>Database mode, which is {@code null}, requires no publication: the bytes are held in the
+     * {@code DataResource} columns and are shared by every instance the moment the row commits.
      *
      * @param store the provider content was written under, or {@code null} for database mode
      * @return true only when the provider holds content apart from the deployment's own tree and a
      *     local write therefore has to be published to it
      */
     public static boolean publicationRequired(ContentStore store) {
-        return store instanceof S3ContentStore;
+        return store != null && store.holdsContentOffInstance();
     }
 
     /**
-     * Derives the storage key a {@code DataResource}'s content is held under by the active provider.
+     * Derives the storage key a {@code DataResource}'s content is held under, which is its
+     * {@code ofbiz.home}-relative path and is the same for every provider.
      *
-     * <p>The derivation is here, and not at the call site, because it depends on which provider is
-     * active:
+     * <p><strong>One key, every provider.</strong> The path a deployment already stores its content at
+     * IS the key: a {@code DataResource} whose content lives at {@code runtime/uploads/party/logo.png}
+     * is held under {@code runtime/uploads/party/logo.png} in filesystem mode and under the same string,
+     * beneath {@code content.store.s3.key.prefix}, in object-store mode. Three things follow from that,
+     * and each of them is why it is done this way:
      *
      * <ul>
-     * <li>The object store is keyed by immutable identity - {@code dataresource/<scope>/<id>} -
-     * where the scope is the delegator's base name, joined with {@code ~} and the tenant identifier
-     * when the delegator serves a tenant. Every part is put through {@link #segment}, which encodes
-     * any identifier that is not already made of characters a key may carry rather than refusing it,
-     * so an arbitrary but perfectly valid {@code dataResourceId} or {@code tenantId} is addressable
-     * and no part can introduce a separator - which is what keeps two tenancies from producing one
-     * scope. Nothing a {@code DataResource} row carries takes part in the key, so no recorded path can
-     * steer a read at another object, and one bucket shared by several tenants cannot serve one
-     * tenant's content to another. An object store is a flat namespace shared by every instance, which
-     * is exactly why the scope has to be in the key.</li>
-     * <li>Every other provider is keyed by {@code relativePath}, the {@code ofbiz.home}-relative
-     * path the deployment already stores its content at. This is what keeps filesystem mode
-     * behaving as it does today, which the plan freezes: a {@code DataResource} whose content lives
-     * under {@code runtime/uploads} is read from exactly where it already is.</li>
+     * <li><strong>Filesystem parity, which the plan freezes.</strong> Filesystem mode's storage tree IS
+     * the deployment's own content tree (plan section 0.6.3), so its key can only ever be the path. A
+     * second key shape for the object store would mean one {@code DataResource} row naming different
+     * content depending on which provider was configured, and would make content impossible to copy
+     * between the two - which is precisely what a deployment does during the migration window that
+     * {@code content.store.local.fallback} exists to cover.</li>
+     * <li><strong>The seams the plan names have a path, and not always an identity.</strong> The
+     * integration points are {@code DataResourceWorker}'s file-resolution methods (plan section 0.6.3).
+     * {@code getContentFile} carries no {@code dataResourceId} in its frozen signature, and
+     * {@code getDataResourceContentUploadPath} resolves the upload DIRECTORY before any
+     * {@code DataResource} row exists at all. An identity key cannot be derived at either, so it could
+     * not have been the key for the write path the plan requires.</li>
+     * <li><strong>The path is already confined, twice.</strong> A location reaches this method only
+     * after the resource type's own allow list has accepted it - {@code SecurityUtil}'s local and
+     * {@code ofbiz.home} lists - and only after it has been shown to lie inside {@code ofbiz.home}; the
+     * key grammar below then refuses a control character, an absolute path, a drive prefix and any
+     * {@code .} or {@code ..} component. A recorded {@code objectInfo} therefore cannot address content
+     * outside the tree the deployment's own configuration already allows it to address.</li>
      * </ul>
      *
-     * <p>The key returned always satisfies the grammar {@link ContentStore} documents, and each
-     * provider validates it again at its own boundary.
+     * <p><strong>What separates one deployment, or one tenant, from another</strong> is what separates
+     * them on the filesystem: the paths. Two deployments sharing one bucket are separated by
+     * {@code content.store.s3.key.prefix}; a tenant that must not share an upload tree is separated by
+     * its own {@code content.upload.path.prefix}, which is read per delegator. Scoping the object-store
+     * key by tenant while the filesystem key stayed unscoped would have made the two providers disagree
+     * about what a row means, which is the one thing this method exists to prevent.
      *
      * @param store the provider the key is for, as resolved by this factory; never null, because
      *     database mode holds content in the {@code DataResource} columns and has no key
-     * @param delegator the delegator the {@code DataResource} was read through, which carries the
-     *     tenant scope; required for an identity-keyed provider
-     * @param dataResourceId the immutable identifier of the {@code DataResource}; required for an
-     *     identity-keyed provider
-     * @param relativePath the {@code ofbiz.home}-relative path the content is stored at; required
-     *     for a path-keyed provider
+     * @param relativePath the {@code ofbiz.home}-relative path the content is stored at, with
+     *     {@code /} separators
      * @return the storage key, never blank
-     * @throws GeneralException if the provider is null, if what the provider's key is derived from is
-     *     missing or carries something a key may not, or if the derived key exceeds
-     *     {@link #MAX_KEY_LENGTH_BYTES}
+     * @throws GeneralException if the provider is null, if the path is missing or carries something a
+     *     key may not, or if the key exceeds {@link ContentStore#MAX_KEY_LENGTH_BYTES}
      */
-    public static String storeKey(ContentStore store, Delegator delegator, String dataResourceId,
-            String relativePath) throws GeneralException {
+    public static String storeKey(ContentStore store, String relativePath) throws GeneralException {
         if (store == null) {
             throw new GeneralException("A content storage key was asked for while content is held in the database,"
                     + " where there is no storage key");
         }
-        String key = store instanceof S3ContentStore
-                ? IDENTITY_KEY_NAMESPACE + "/" + scopeSegment(delegator) + "/" + segment("data resource id",
-                        dataResourceId)
-                : relativePath;
-        requireUsableKey(key);
-        return key;
+        ContentStore.requireUsableKey(relativePath);
+        return relativePath;
     }
 
     /**
@@ -635,12 +605,15 @@ public final class ContentStoreFactory {
      * Reports, once per scope, that the configuration changed after the provider was established.
      *
      * <p>Reported rather than acted on, because {@link #resolve} cannot know that the provider in
-     * service has been released by everything holding it. An operator who changes
-     * {@code content.store.*} on a running instance needs to be told that the change is not in force,
-     * and needs to be told once rather than on every read - so the first detection replaces the held
-     * record's fingerprint with the one now configured, which makes every later read compare equal and
-     * stay silent until the configuration changes again. The provider inside the record is never
-     * touched.
+     * service has been released by everything holding it. An operator who changes a construction-bound
+     * setting on a running instance needs to be told that the change is not in force, and needs to be
+     * told once rather than on every read - so the first detection replaces the held record's
+     * fingerprint with the one now configured, which makes every later read compare equal and stay
+     * silent until the configuration changes again. The provider inside the record is never touched.
+     *
+     * <p>Only a construction-bound change reaches here at all: {@link #fingerprint(Delegator)} covers
+     * exactly {@link #constructionBoundProperties()}, so changing {@link #DYNAMIC_PROPERTIES} produces
+     * no warning - correctly, because such a change is already in force.
      *
      * @param scope the delegator scope the resolution is held under, named in the report
      * @param held the resolution in service
@@ -652,10 +625,12 @@ public final class ContentStoreFactory {
         if (held.matches(selected, fingerprint) || !held.noteConfigurationChange(selected, fingerprint)) {
             return;
         }
-        Debug.logWarning("The content storage configuration of delegator scope [" + scope + "] has changed, but the ["
-                + held.provider() + "] provider resolved earlier stays in service: a provider owns the client and the"
-                + " open streams of requests already using it, so it cannot be replaced underneath them. Restart this"
-                + " instance for the new content.store.* configuration to take effect.", MODULE);
+        Debug.logWarning("A construction-bound part of the content storage configuration of delegator scope ["
+                + scope + "] has changed, but the [" + held.provider() + "] provider resolved earlier stays in"
+                + " service: a provider owns the client and the open streams of requests already using it, so it"
+                + " cannot be replaced underneath them. Restart this instance for the change to take effect. The"
+                + " settings read on every use - " + String.join(", ", new TreeSet<>(DYNAMIC_PROPERTIES))
+                + " - are NOT covered by this warning and are already in force.", MODULE);
     }
 
     /**
@@ -817,33 +792,53 @@ public final class ContentStoreFactory {
     }
 
     /**
-     * Digests every configuration value this package reads, so that a resolution can be recognised
-     * as belonging to the configuration in force rather than only to the provider name.
+     * The {@code content.store.*} settings a provider is BUILT from, and therefore the exact set a
+     * change to which needs a restart.
      *
-     * <p>The property set is discovered from the resource and filtered by
-     * {@link #STORE_PROPERTY_PREFIX} rather than listed in this class, so a setting added to
-     * {@code content.properties} is covered the moment it is shipped. What is kept is a digest and
-     * not the values: one of them is a secret access key, and there is no reason to hold a second,
-     * unclearable copy of it for the life of the JVM.
+     * <p>Discovered from the resource and filtered by {@link #STORE_PROPERTY_PREFIX}, minus
+     * {@link #DYNAMIC_PROPERTIES}, so a setting added to {@code content.properties} is covered the
+     * moment it is shipped without this class having to be edited - while the two settings that are
+     * genuinely read on every use stay out of it. The selector is added explicitly because it must be
+     * covered even in a deployment whose property file does not declare it at all.
      *
-     * @param delegator the delegator overrides are read through; may be null
-     * @return a hexadecimal SHA-256 digest of the configuration, never blank
-     * @throws GeneralException if SHA-256 is unavailable, which the platform requires it not to be
+     * <p>Package-private so the provider tests can assert the split itself rather than a
+     * re-implementation of it: that every dynamic setting is absent and every other one present is the
+     * property the reload semantics rest on.
+     *
+     * @return the construction-bound property names, sorted
      */
-    private static String fingerprint(Delegator delegator) throws GeneralException {
-        Properties committed = UtilProperties.getProperties(PROPERTY_RESOURCE);
+    static SortedSet<String> constructionBoundProperties() {
         SortedSet<String> names = new TreeSet<>();
-        // Sorted, so the digest depends on the configuration and not on iteration order. The selector
-        // is added explicitly because it must be covered even in a deployment whose property file
-        // does not declare it at all.
         names.add(PROVIDER_PROPERTY);
+        Properties committed = UtilProperties.getProperties(PROPERTY_RESOURCE);
         if (committed != null) {
             for (String name : committed.stringPropertyNames()) {
-                if (name.startsWith(STORE_PROPERTY_PREFIX)) {
+                if (name.startsWith(STORE_PROPERTY_PREFIX) && !DYNAMIC_PROPERTIES.contains(name)) {
                     names.add(name);
                 }
             }
         }
+        return names;
+    }
+
+    /**
+     * Digests every CONSTRUCTION-BOUND configuration value, so that a resolution can be recognised as
+     * belonging to the configuration its provider was built from rather than only to the provider name.
+     *
+     * <p>The dynamic settings are deliberately absent - see {@link #DYNAMIC_PROPERTIES}. Including them
+     * would make a change that already applies without a restart turn the fingerprint over and emit a
+     * "restart to apply" warning about a change that is in force, which is exactly the contradiction
+     * this split removes.
+     *
+     * <p>What is kept is a digest and not the values: one of them is a secret access key, and there is
+     * no reason to hold a second, unclearable copy of it for the life of the JVM.
+     *
+     * @param delegator the delegator overrides are read through; may be null
+     * @return a hexadecimal SHA-256 digest of the construction-bound configuration, never blank
+     * @throws GeneralException if SHA-256 is unavailable, which the platform requires it not to be
+     */
+    private static String fingerprint(Delegator delegator) throws GeneralException {
+        SortedSet<String> names = new TreeSet<>(constructionBoundProperties());
         StringBuilder joined = new StringBuilder();
         for (String name : names) {
             // Digested through the accessor each setting is really read with, so the digest describes the
@@ -877,176 +872,6 @@ public final class ContentStoreFactory {
         } catch (NoSuchAlgorithmException e) {
             throw new GeneralException("The content storage configuration cannot be resolved because SHA-256 is not"
                     + " available from this Java platform", e);
-        }
-    }
-
-    /**
-     * Derives the scope segment of an object-store key from the delegator's tenancy.
-     *
-     * <p>A tenant is qualified by the base delegator it belongs to, joined with {@code ~}. Neither
-     * form {@link #segment} can produce contains that character: the verbatim form accepts only
-     * {@code [A-Za-z0-9._-]}, and the encoded form is a marker made of those same characters followed
-     * by URL-safe base64, whose alphabet is {@code A-Za-z0-9-_}. So a value carrying a {@code ~} is
-     * encoded rather than passed through, two tenancies cannot produce the same segment, and a tenant
-     * whose identifier happens to equal a base delegator's name cannot read the content of the
-     * deployment that delegator serves.
-     *
-     * @param delegator the delegator the content was read through
-     * @return the scope segment, never blank
-     * @throws GeneralException if there is no delegator, or if the tenancy does not fit in one key
-     *     component once encoded
-     */
-    private static String scopeSegment(Delegator delegator) throws GeneralException {
-        if (delegator == null) {
-            throw new GeneralException("An object-store key cannot be derived without a delegator, because the"
-                    + " key's tenant scope is derived from it");
-        }
-        String base = segment("delegator base name", delegator.getDelegatorBaseName());
-        String tenantId = delegator.getDelegatorTenantId();
-        return UtilValidate.isEmpty(tenantId) ? base : base + "~" + segment("tenant id", tenantId);
-    }
-
-    /**
-     * Encodes one identifier into a key segment, reversibly, without restricting what the identifier
-     * may be.
-     *
-     * <p><strong>Why an encoding and not a check.</strong> The values that make up an identity key are
-     * {@code DataResource.dataResourceId} and {@code Tenant.tenantId}. Both are entity fields of the
-     * {@code id} type, and the entity model that declares them is frozen: it permits any string that
-     * fits, {@code createDataResource} accepts an identifier a caller supplies, and OFBiz's own
-     * identifier validation permits characters a storage key has to be careful with. Refusing such an
-     * identifier - which is what this method used to do - would tighten the schema and the service
-     * contract from underneath, and would make content that a perfectly valid row names simply
-     * unaddressable. So an identifier is never refused for what it contains; it is transformed into
-     * something a key may carry.
-     *
-     * <p><strong>The transformation.</strong> A value made only of {@code [A-Za-z0-9._-]}, that is
-     * neither {@code .} nor {@code ..} and that does not begin with {@value #ENCODED_SEGMENT_PREFIX},
-     * is used exactly as it is. That is what every ordinary OFBiz identifier looks like, so the keys a
-     * deployment sees are the readable ones it would have had anyway. Anything else becomes
-     * {@value #ENCODED_SEGMENT_PREFIX} followed by the RFC 4648 URL-safe base64 of the value's UTF-8
-     * bytes without padding - an alphabet of {@code A-Za-z0-9-_}, which is inside the accepted set, so
-     * an encoded segment is exactly as portable between an object store and a filesystem as a verbatim
-     * one. The transform is injective, and therefore reversible: the two forms are told apart by the
-     * marker, and a value that would have collided with an encoding is itself encoded rather than
-     * passed through. It is also stable - the same identifier always produces the same segment - which
-     * is what lets any instance of a fleet address content any other instance stored.
-     *
-     * <p><strong>The limit is applied afterwards.</strong> A key component is bounded by
-     * {@value #MAX_KEY_COMPONENT_LENGTH_BYTES} bytes, and it is the ENCODED segment that has to fit,
-     * because the encoded segment is what a store receives. Base64 costs four bytes for every three, so
-     * an {@code id} field - twenty characters - encodes to at most twenty-eight; the bound is reached
-     * only by an identifier far longer than the entity model can hold, and the refusal then names the
-     * encoded length rather than blaming a character.
-     *
-     * @param what what the segment is, named in a refusal so the mistake can be found
-     * @param value the identifier to encode
-     * @return the segment to place in the key, verbatim or encoded
-     * @throws GeneralException if the value is empty, or if its encoded form does not fit in one key
-     *     component
-     */
-    private static String segment(String what, String value) throws GeneralException {
-        if (UtilValidate.isEmpty(value)) {
-            throw new GeneralException("An object-store key cannot be derived because its " + what + " is empty");
-        }
-        String encoded = verbatimSegment(value) ? value
-                : ENCODED_SEGMENT_PREFIX + Base64.getUrlEncoder().withoutPadding()
-                        .encodeToString(value.getBytes(StandardCharsets.UTF_8));
-        int length = encoded.getBytes(StandardCharsets.UTF_8).length;
-        if (length > MAX_KEY_COMPONENT_LENGTH_BYTES) {
-            throw new GeneralException("An object-store key cannot be derived because its " + what + " encodes to "
-                    + length + " bytes, over the " + MAX_KEY_COMPONENT_LENGTH_BYTES
-                    + " bytes one key component may occupy");
-        }
-        return encoded;
-    }
-
-    /**
-     * Reports whether an identifier may be used as a key segment exactly as it is.
-     *
-     * <p>Package-private rather than private so that the provider tests can assert the boundary
-     * between the two forms directly, which is the property the encoding's injectivity rests on.
-     *
-     * @param value the identifier, never empty
-     * @return true when the value carries only accepted characters, names a resource rather than a
-     *     directory, and cannot be mistaken for an encoded segment
-     */
-    static boolean verbatimSegment(String value) {
-        if (".".equals(value) || "..".equals(value) || value.startsWith(ENCODED_SEGMENT_PREFIX)) {
-            return false;
-        }
-        for (int index = 0; index < value.length(); index++) {
-            char character = value.charAt(index);
-            boolean accepted = character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z'
-                    || character >= '0' && character <= '9' || character == '.' || character == '_'
-                    || character == '-';
-            if (!accepted) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Requires that a key satisfies the grammar {@link ContentStore} documents, so that every provider
-     * refuses exactly the same keys, in the same way, before it issues any request or touches any
-     * storage.
-     *
-     * <p>One implementation, used by this factory on every key it mints and by every provider at its
-     * own boundary - a provider is reachable without coming through here - because a key is only
-     * opaque if it means the same thing everywhere: a deployment that migrates content from one
-     * provider to another must not discover that a key one accepted is a key the next refuses. It is
-     * package-private for the same reason it is single: it is this package's rule, not a sixth
-     * operation an implementer of the contract could satisfy differently. It raises a
-     * {@link GeneralException} rather than an {@code IOException} because an unusable key is the
-     * caller's mistake, not the store's failure, and every caller of the contract distinguishes the
-     * two.
-     *
-     * <p>Refused, in this order: a null, empty or whitespace-only key; a control character anywhere,
-     * because a key travels to an object store inside the request line and its headers; a leading
-     * {@code /} or {@code \} or a Windows drive prefix, any of which would make the key absolute and
-     * so make a provider ignore its own root; a key longer than {@value #MAX_KEY_LENGTH_BYTES} bytes;
-     * an empty component, which is a doubled or trailing separator naming no content at all; a
-     * {@code .} or {@code ..} component, which names something other than what it appears to; and a
-     * component longer than {@value #MAX_KEY_COMPONENT_LENGTH_BYTES} bytes. A colon that is not a
-     * drive prefix is legal in a POSIX file name and is deliberately allowed.
-     *
-     * @param key the key to check
-     * @throws GeneralException if the key does not satisfy the grammar, naming the rule it broke
-     */
-    static void requireUsableKey(String key) throws GeneralException {
-        if (key == null || key.trim().isEmpty()) {
-            throw new GeneralException("A content store key must not be empty");
-        }
-        for (int index = 0; index < key.length(); index++) {
-            if (Character.isISOControl(key.charAt(index))) {
-                throw new GeneralException("A content store key must not contain a control character");
-            }
-        }
-        // A leading separator or a Windows drive prefix would make a provider ignore its own root entirely.
-        if (key.startsWith("/") || key.startsWith("\\")
-                || (key.length() > 1 && key.charAt(1) == ':' && Character.isLetter(key.charAt(0)))) {
-            throw new GeneralException("A content store key must be relative and must not carry a drive prefix:"
-                    + " [" + key + "]");
-        }
-        if (key.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_LENGTH_BYTES) {
-            throw new GeneralException("A content store key must be at most " + MAX_KEY_LENGTH_BYTES
-                    + " bytes long");
-        }
-        // Split keeping trailing empties, so that "a/b/" and "a//b" are both seen as an empty component.
-        for (String component : key.split("/", -1)) {
-            if (component.isEmpty()) {
-                throw new GeneralException("A content store key must not contain an empty component: ["
-                        + key + "]");
-            }
-            if (".".equals(component) || "..".equals(component)) {
-                throw new GeneralException("A content store key must not contain a '" + component
-                        + "' component: [" + key + "]");
-            }
-            if (component.getBytes(StandardCharsets.UTF_8).length > MAX_KEY_COMPONENT_LENGTH_BYTES) {
-                throw new GeneralException("A content store key component must be at most "
-                        + MAX_KEY_COMPONENT_LENGTH_BYTES + " bytes long: [" + key + "]");
-            }
         }
     }
 

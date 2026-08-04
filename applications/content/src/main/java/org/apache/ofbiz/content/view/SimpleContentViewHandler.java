@@ -139,7 +139,7 @@ public class SimpleContentViewHandler extends AbstractViewHandler {
                             .cache()
                             .queryOne();
                     if (contentRevisionItem == null) {
-                        throw new ReportedFailure("ContentRevisionItem record not found for contentId=" + rootContentId
+                        throw new ViewHandlerException("ContentRevisionItem record not found for contentId=" + rootContentId
                                 + ", contentRevisionSeqId=" + contentRevisionSeqId + ", itemContentId=" + contentId);
                     }
                     dataResourceId = contentRevisionItem.getString("newDataResourceId");
@@ -199,13 +199,13 @@ public class SimpleContentViewHandler extends AbstractViewHandler {
                     } catch (GenericServiceException e) {
                         Debug.logError(e, MODULE);
                         request.setAttribute("_ERROR_MESSAGE_", e.getMessage());
-                        throw new ReportedFailure(e.getMessage());
+                        throw new ViewHandlerException(e.getMessage());
                     }
                     if (ServiceUtil.isError(permSvcResp)) {
                         String errorMsg = ServiceUtil.getErrorMessage(permSvcResp);
                         Debug.logError(errorMsg, MODULE);
                         request.setAttribute("_ERROR_MESSAGE_", errorMsg);
-                        throw new ReportedFailure(errorMsg);
+                        throw new ViewHandlerException(errorMsg);
                     }
 
                     // no service errors; now check the actual response
@@ -214,48 +214,13 @@ public class SimpleContentViewHandler extends AbstractViewHandler {
                         String errorMsg = (String) permSvcResp.get("failMessage");
                         Debug.logError(errorMsg, MODULE);
                         request.setAttribute("_ERROR_MESSAGE_", errorMsg);
-                        throw new ReportedFailure(errorMsg);
+                        throw new ViewHandlerException(errorMsg);
                     }
                 }
                 UtilHttp.streamContentToBrowser(response, bais, byteBuffer.limit(), contentType2, fileName);
             }
         } catch (IOException | GeneralException e) {
-            // Logged here and reported as its message alone, because the message is all a reader can act on:
-            // this handler serves content bytes, so the failures it meets are operational - a content store
-            // that holds nothing yet, a location an allow list forbids - and the class and stack that carry
-            // that detail belong in the log rather than on the page. See ReportedFailure below.
-            Debug.logError(e, "Serving content through the view handler failed", MODULE);
-            throw new ReportedFailure(e.getMessage());
-        }
-    }
-
-    /**
-     * The failure this handler reports, whose {@code toString()} is its message and nothing else.
-     *
-     * <p>{@code ControlServlet} renders {@code throwable.toString()} into the error page it serves, so a
-     * plain {@link ViewHandlerException} puts its own fully qualified class name in front of the operator
-     * message an end user reads - {@code org.apache.ofbiz.webapp.view.ViewHandlerException: ...} - while the
-     * {@code stream} request that serves the very same content reports the message alone. Overriding
-     * {@code toString()} here is what makes the two envelopes identical, and it discloses nothing about the
-     * implementation behind the page (CWE-209). Every throwing site of this handler logs the failure it is
-     * reporting first, so nothing is lost: the class, the cause and the stack are in the log, where an
-     * operator looks for them.
-     *
-     * <p>Confined to this class on purpose. It is not a framework change: {@code ViewHandlerException}
-     * behaves exactly as it always has for every other view handler.
-     */
-    private static final class ReportedFailure extends ViewHandlerException {
-
-        private static final long serialVersionUID = 1L;
-
-        ReportedFailure(String message) {
-            super(message);
-        }
-
-        @Override
-        public String toString() {
-            String message = getMessage();
-            return message == null ? super.toString() : message;
+            throw new ViewHandlerException(e.getMessage());
         }
     }
 }

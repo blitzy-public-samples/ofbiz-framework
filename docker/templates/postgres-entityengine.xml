@@ -33,9 +33,9 @@ access. For a detailed description see the core/docs/entityconfig.html file.
  - Those re-reads are STRUCTURAL, not schema validation. The entry point does not validate the rendered file
  - against framework/entity/dtd/entity-config.xsd, and it has no means to: the runtime image carries no XML
  - schema validator on PATH, and the Entity Engine's own parse of this file logs a validation error rather than
- - refusing to start. XSD validity is therefore a BUILD-time gate instead - SchemaInitEntryPointTests and
- - EntityEngineConfigContractTests each render this template and validate the result against that schema with
- - external access forbidden - while the container's own gate is the targeted read-back of the attributes the
+ - refusing to start. XSD validity is therefore a BUILD-time concern instead - a rendered configuration is a
+ - plain XML document that framework/entity/dtd/entity-config.xsd describes, and any XML tool can be pointed at
+ - it - while the container's own gate is the targeted read-back of the attributes the
  - deployed profile depends on: the TLS mode of every managed URI, the JDBC deadlines, both startup-DDL flags of
  - every named managed datasource, the cache-clear value, the test delegator's isolation from it, and the
  - database identity each datasource authenticates as - a schema can only say the document is well typed,
@@ -55,14 +55,12 @@ access. For a detailed description see the core/docs/entityconfig.html file.
  - The raw template is well formed but is NOT XSD-valid, because boolean and integer attributes hold
  - placeholders rather than typed values; validate only after the render has substituted them.
  -
- - The placeholder census is 20 distinct placeholders in 41 occurrences, and the two sides guard different
- - failures rather than the same one. EntityEngineConfigContractTests pins the census itself from the build, name
- - by name and count by count, so a placeholder cannot be added, removed or repeated here without that test
- - failing. docker-entrypoint.sh does not re-count the census; what it enforces at run time is CLOSURE - a
- - placeholder for which it has no writer survives the substitution pass, and the rendered file is then refused
- - and deleted rather than installed with the undelimited placeholder text standing in for an attribute value -
- - which the Entity Engine would read as the value itself. Between them, the census
- - cannot drift at build time and an uncovered placeholder cannot reach a running instance.
+ - The placeholder census is 20 distinct placeholders in 41 occurrences. docker-entrypoint.sh does not re-count
+ - that census; what it enforces at run time is CLOSURE - a placeholder for which it has no writer survives the
+ - substitution pass, and the rendered file is then refused and deleted rather than installed with the
+ - undelimited placeholder text standing in for an attribute value, which the Entity Engine would read as the
+ - value itself. So a placeholder added here without a matching substitution in the entry point cannot reach a
+ - running instance: it fails the start of the first container that renders this template.
  -
  - WHY THERE ARE 20. Because of the maintenance rule below, the sixteen and the four are identified by the
  - environment variable each is substituted from rather than by placeholder name.
@@ -143,13 +141,12 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          lookup is not available when the configuration is rendered, because only the JMS API is bundled and the
          provider's client library is deployment specific. Any failure of the three aborts the start up under both
          OFBIZ_PROFILE=dev and OFBIZ_PROFILE=prod.
-         DELIVERY IS PROVED AUTOMATICALLY, in the ordinary build gate, by
-         framework/entityext/src/test/java/org/apache/ofbiz/entityext/cache/DistributedCacheInvalidationPropagationTests.java:
-         it drives the production publisher and the production consumer against two instances' caches and asserts
-         that each of the five invalidations the engine raises is published to the service its consumer implements,
-         that the shipped service definitions route it to EntityCacheServices, that delivering the payload removes
-         the row from a peer's real entity cache, and that the peer applies the clear with distribute=false so
-         consuming one cannot re-publish it. Only the broker hop is substituted, for the dependency reason above.
+         DELIVERY IS OFBiz'S OWN MECHANISM, not this refactor's: the publisher, the consumer and the service
+         definitions that route between them are DistributedCacheClear, EntityCacheServices and
+         framework/entityext/servicedef/services.xml, unchanged here and covered by the framework's own test
+         tiers. What this render decides is only whether the two default delegators publish at all. The broker
+         hop depends on a deployment's own broker, client library, credentials and topic, so DOCKER.adoc carries
+         the two-container procedure and the log lines that show an invalidation being published and applied.
          The remaining deployment-specific requirement is that every instance be configured with the same physical
          topic and listen on it; running two instances is what exercises a specific broker, client library,
          credentials and topic, so DOCKER.adoc keeps that procedure as supplemental operator guidance alongside the

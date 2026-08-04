@@ -494,8 +494,9 @@ DISABLE_COMPONENT_STYLESHEET="$COMPONENT_ROOT_DIR/disable-component.xslt"
 # first container start the committed value is gone from the running instance, so unless the default is
 # reconstructed from a value known to this script, "remove the variable" means nothing: a TLS accelerator
 # port or a cross-subdomain session valve enabled once would stay enabled for the life of the instance.
-# framework/catalina's CatalinaContainerDescriptorTests asserts these same three values on the committed
-# descriptor, so the two cannot drift apart unnoticed.
+# Keep them equal to the committed descriptor: they are read back from
+# framework/catalina/ofbiz-component.xml, so changing a value there without changing it here would make
+# "remove the variable" restore the wrong default rather than the shipped one.
 # The jvm-route default is a VALUE rather than nothing on purpose. ContainerConfig treats an empty
 # property as absent, so restoring the committed value is what actually removes an operator's override
 # - writing an empty string would leave the property declared and the attribute unset, which is a
@@ -2585,18 +2586,29 @@ serving_datasource_names() {
 #   checkOnStart      = !"false".equals(attribute)   - ABSENT MEANS ENABLED
 #   addMissingOnStart =  "true".equals(attribute)    - absent means disabled
 # and GenericDelegator:285-290 consults the second only when the first is enabled, while every
-# DDL-emitting branch of DatabaseUtil.checkDb is guarded by it. That gives two distinct outcomes rather
-# than one, and they are reported differently on purpose:
+# DDL-emitting branch of DatabaseUtil.checkDb is guarded by it.
 #
-#   check-on-start="false"                        -> no DDL and no startup schema read. Correct.
-#   otherwise, add-missing-on-start="true"        -> the instance WILL issue CREATE/ALTER. Refused.
-#   otherwise                                     -> no DDL, but a full schema read on every boot.
-#                                                    Reported, not refused: it is a cost and a metadata
-#                                                    privilege, not the hazard this check exists for,
-#                                                    and refusing would break the documented
-#                                                    externally-provisioned path over something safe.
+# WHAT IS REQUIRED: BOTH flags present and BOTH the exact literal "false" - the posture AAP 0.6.4
+# names for run mode - on every non-embedded datasource the serving delegators map. Anything else is
+# REFUSED, and the message says which of the two is wrong. This gate deliberately does NOT settle for
+# "as it happens, no DDL would be issued":
 #
-# Init mode is exempt by definition - it is the one execution that is supposed to apply DDL.
+#   * An ABSENT check-on-start reads as ENABLED. The instance then reads the whole schema on every
+#     boot, which needs metadata privileges the fleet is supposed not to have and delays every start.
+#     Tolerating it also means the file never states its posture, so the difference between "this
+#     deployment decided not to issue DDL" and "nobody thought about it" is invisible.
+#   * An add-missing-on-start of "true" under a check-on-start of "false" issues nothing TODAY, only
+#     because the engine consults the second flag solely when the first is enabled. It is a declared
+#     intent to create and alter objects, one flag away from a whole fleet doing so, and a later
+#     re-render or hand-edit of the first flag is all it takes. A configuration that says it may add
+#     missing objects is not a serving configuration.
+#
+# So the two things this refuses that a "would any DDL happen right now" test would let through are
+# an unstated posture and a declared DDL intent. Both are refused at start-up, where an operator can
+# still fix the file, rather than discovered when a fleet member creates a table.
+#
+# Init mode is exempt by definition - it is the one execution that is supposed to apply DDL, and it
+# renders both flags true on purpose.
 require_serving_mode_ddl_safety() {
   if [ "${RESOLVED_SCHEMA_INIT:-false}" = "true" ]; then
     return 0
@@ -2608,7 +2620,18 @@ require_serving_mode_ddl_safety() {
   local origin="committed configuration"
   if [ -f "$ENTITY_ENGINE_OVERRIDE" ]; then
     authoritative="$ENTITY_ENGINE_OVERRIDE"
-    origin="rendered override"
+    # Named by WHOSE file it is, because the two are corrected in different places and the refusal has to
+    # send an operator to the right one: a render of this script's is fixed by supplying the OFBIZ_POSTGRES_*
+    # variables or deleting the file, while an unmarked file is the deployment's own and only its author can
+    # correct it. The marker is read from the first few lines only, exactly as
+    # entity_engine_override_ownership reads it, so a large mounted file - or a deployment's own comment
+    # further down that happens to mention the marker - cannot decide ownership.
+    if head --lines=5 "$ENTITY_ENGINE_OVERRIDE" 2>/dev/null \
+      | grep --quiet --fixed-strings "$ENTITY_ENGINE_GENERATED_MARKER"; then
+      origin="rendered override"
+    else
+      origin="entity engine configuration supplied by this deployment"
+    fi
   fi
 
   # Derived from the delegators' own group-maps rather than from MANAGED_DATASOURCE_NAMES, so the gate
@@ -2634,6 +2657,15 @@ require_serving_mode_ddl_safety() {
       continue
     fi
 
+    # Normalised before it is matched, because this gate now REFUSES anything that is not the exact
+    # literal and a refusal has to be about the posture rather than about the spelling. XML permits
+    # whitespace around "=" and permits single quotes, and a mounted file an operator wrote by hand may
+    # use either; matching the canonical form alone would fail a correctly configured datasource. Only
+    # the START TAG is normalised - datasource_attributes stops at the first ">" - so no credential is
+    # touched: the username and password live in the <inline-jdbc> child, past that point.
+    attributes=$(printf '%s' "$attributes" \
+      | sed --expression='s/[[:space:]]*=[[:space:]]*/=/g' --expression="s/'/\"/g")
+
     # An EMBEDDED datasource keeps its startup DDL and is not judged here. That is not an exception to the
     # guarantee but the shape of it: an embedded database is a file on this container's own volume, so it is
     # single-instance by construction, it is never part of a fleet, and applying the entity model to it on
@@ -2648,19 +2680,28 @@ require_serving_mode_ddl_safety() {
       continue
     fi
 
+    # check-on-start first, because it is the flag the engine consults first and the one whose absence
+    # means ENABLED. The severest case is called out by name: when the schema check is on AND the
+    # configuration asks for missing objects to be added, this instance really would issue DDL.
     case "$attributes" in
-    *'check-on-start="false"'*)
-      continue
-      ;;
-    esac
-
-    case "$attributes" in
+    *'check-on-start="false"'*) ;;
     *'add-missing-on-start="true"'*)
-      config_fatal "$authoritative ($origin) leaves startup DDL enabled on the '$datasourceName' datasource: check-on-start is not \"false\" and add-missing-on-start is \"true\". A serving instance would issue CREATE and ALTER statements against the managed database, which is what OFBIZ_SCHEMA_INIT=true exists to do exactly once. Re-render this configuration by supplying the OFBIZ_POSTGRES_* variables, or delete $ENTITY_ENGINE_OVERRIDE so the committed configuration applies."
+      config_fatal "$authoritative ($origin) leaves startup DDL enabled on the '$datasourceName' datasource, which its 'default' and 'default-no-eca' delegators map: check-on-start is not \"false\" and add-missing-on-start is \"true\". A serving instance would issue CREATE and ALTER statements against the shared database, which is what OFBIZ_SCHEMA_INIT=true exists to do exactly once. Set check-on-start=\"false\" and add-missing-on-start=\"false\" on that datasource, or re-render this configuration by supplying the OFBIZ_POSTGRES_* variables, or delete $ENTITY_ENGINE_OVERRIDE so the committed configuration applies."
+      ;;
+    *)
+      config_fatal "$authoritative ($origin) does not set check-on-start=\"false\" on the '$datasourceName' datasource, which its 'default' and 'default-no-eca' delegators map. The engine reads that attribute as !\"false\".equals(value), so an absent attribute and any other value both leave the startup schema check ENABLED: every instance would read the whole schema on every boot, needing metadata privileges the serving fleet is not meant to hold, and one edit to add-missing-on-start away from issuing CREATE and ALTER. AAP run mode requires the exact literal check-on-start=\"false\" and add-missing-on-start=\"false\" on every non-embedded datasource a serving delegator maps. Set both on that datasource, or re-render this configuration by supplying the OFBIZ_POSTGRES_* variables, or delete $ENTITY_ENGINE_OVERRIDE so the committed configuration applies."
       ;;
     esac
 
-    printf '%s\n' "WARNING: $authoritative ($origin) does not set check-on-start=\"false\" on the '$datasourceName' datasource, which its serving delegators map. No DDL is issued because add-missing-on-start is not \"true\", but the engine reads the whole schema on every boot, which needs metadata privileges and delays start up. AAP run mode expects both flags to be \"false\"." >&2
+    # add-missing-on-start must be the explicit literal "false" as well, even though the engine has
+    # already been told not to look at it. See the header: a configuration that declares it may add
+    # missing objects is one flag away from a fleet that does, and an absent attribute states nothing.
+    case "$attributes" in
+    *'add-missing-on-start="false"'*) ;;
+    *)
+      config_fatal "$authoritative ($origin) does not set add-missing-on-start=\"false\" on the '$datasourceName' datasource, which its 'default' and 'default-no-eca' delegators map. check-on-start is correctly \"false\", so no DDL is issued as this file stands, but the schema-creating flag is left unstated or enabled: the engine reads it as \"true\".equals(value) and consults it the moment check-on-start is enabled, so this posture is one edit or one re-render away from every instance issuing CREATE and ALTER. AAP run mode requires both flags to be the exact literal \"false\". Set add-missing-on-start=\"false\" on that datasource, or re-render this configuration by supplying the OFBIZ_POSTGRES_* variables, or delete $ENTITY_ENGINE_OVERRIDE so the committed configuration applies."
+      ;;
+    esac
   done <<<"$servingDatasources"
 }
 
@@ -3195,22 +3236,21 @@ xml_escape_value() {
 ###############################################################################
 # Escape a value for use as a java.util.Properties value.
 #
-# Two escapes are required, and both have a matching decoder in
-# docker/send_ofbiz_stop_signal.sh, which reads these files back to build the shutdown request:
+# Two escapes are required, because java.util.Properties is what reads these files back:
 #
 #   - A literal backslash is doubled. Properties interprets backslash escapes and treats a trailing
 #     backslash as a line continuation, so an unescaped backslash would either vanish or swallow the
 #     next line.
 #   - A LEADING blank (space or tab) is escaped as '\<blank>'. Properties skips the run of whitespace
 #     between the '=' and the value, so an unescaped leading blank is DISCARDED: the server would hold
-#     a key with the blank stripped while the shutdown client - which decodes '\<blank>' back to the
-#     blank - would send the value with it, and AdminServerContainer's String.equals comparison would
-#     reject every shutdown request. Escaping is done rather than rejecting the value because these
-#     secrets are operator supplied and a leading blank is legal in all of them.
+#     a secret with the blank stripped while the operator who supplied it holds one with the blank, and
+#     every comparison against it - AdminServerContainer's String.equals on the admin key, a JWT
+#     signature - would then fail for a reason nothing reports. Escaping is done rather than rejecting
+#     the value because these secrets are operator supplied and a leading blank is legal in all of them.
 #
 # The backslash rule is applied FIRST and the leading-blank rule SECOND, so that the backslash the
-# second rule introduces is not itself doubled; the decoder mirrors that by removing the leading-blank
-# escape before collapsing doubled backslashes.
+# second rule introduces is not itself doubled - which is the order java.util.Properties itself undoes
+# them in.
 #
 # Escaping exactly ONE leading blank is enough, and that is deliberate rather than an oversight: once
 # the first blank is escaped the parser is past the separator, so every character after it - blanks
@@ -5920,19 +5960,17 @@ render_security_configuration() {
 # so a key written there is present in a file that "docker diff" reports as changed, that "docker cp"
 # can read, and that "docker commit" would capture into a new image layer - which means committing or
 # exporting a running container published the key, and any image built that way had to be treated as
-# compromised. It was written to keep "docker stop" graceful, and it is not needed for that:
-# docker/send_ofbiz_stop_signal.sh consults OFBIZ_ADMIN_KEY FIRST, which is set for the trap this script
-# arms, and otherwise takes the first READABLE file from a candidate list whose first entry is exactly
-# the override above - a file this script creates mode 0600 owned by the runtime user, which is the user
-# the container's own "docker exec" runs as. So the fallback existed for a case that does not arise,
-# while the copy it left behind was a live credential in an exportable layer.
+# compromised. It was written to keep "docker stop" graceful, and it is not needed for that: _main ends
+# in 'exec', so the served JVM is PID 1 and receives SIGTERM itself, and OFBiz stops on that signal
+# without any shared secret being presented to its admin port. The traps this script arms cover the
+# INITIALISATION phase only, where no admin port is listening yet in any case. So the copy left behind
+# was a live credential in an exportable layer, for a shutdown path that does not use it.
 #
 # FAIL CLOSED ON THE ONE FILE THAT MATTERS. Because there is no second copy to fall back on, the render
 # is verified: the override must exist, must declare the property exactly once, and must read back the
-# value that was validated. A failure there aborts the start rather than leaving an instance whose
-# shutdown request would be answered with Config.java's "NA" default - a value AdminServerContainer
-# compares with String.equals and always rejects, which would degrade "docker stop" to a SIGKILL after
-# the timeout.
+# value that was validated. A failure there aborts the start rather than leaving an instance running on
+# Config.java's "NA" default - a value AdminServerContainer compares with String.equals, so every admin
+# request an operator made with the key they supplied would be rejected for a reason nothing reports.
 #
 # The write goes through render_config_from, so it is staged in a tracked mode 0600 file beside its
 # destination and moved into place with a single rename: no reader ever sees a half written file, and a
@@ -9237,8 +9275,9 @@ render_database_configuration() {
     # false - including an unsubstituted placeholder - ENABLES it, while add-missing-on-start is read
     # as "true".equals(value) and so resolves to false unless the value is exactly true. Both receive
     # the same resolved mode here; the two names exist so the template states each attribute's value
-    # explicitly instead of relying on one literal meaning the same thing under two parse rules, which
-    # is also what EntityEngineConfigContractTests pins.
+    # explicitly instead of relying on one literal meaning the same thing under two parse rules. Both
+    # rendered literals are read back from the rendered file below, and SchemaInitGatingTests drives this
+    # renderer from the build and asserts each attribute's literal in each mode.
     write_xml_token_substitution '@CHECK_ON_START@' "$RESOLVED_SCHEMA_INIT" OFBIZ_SCHEMA_INIT
     write_xml_token_substitution '@ADD_MISSING_ON_START@' "$RESOLVED_SCHEMA_INIT" OFBIZ_SCHEMA_INIT
     write_xml_token_substitution '@DISTRIBUTED_CACHE_CLEAR@' "$RESOLVED_DISTRIBUTED_CACHE_CLEAR" OFBIZ_DISTRIBUTED_CACHE_CLEAR
@@ -10358,10 +10397,14 @@ shutdown_ofbiz() {
 #
 # The signal is forwarded to the initialisation child this script is waiting on, if there is one, and
 # the child is reaped before exiting, so a data-load JVM is asked to stop rather than being orphaned
-# or killed abruptly. When no child is running the documented shutdown helper is invoked instead -
-# docker/send_ofbiz_stop_signal.sh states that this script calls it from its termination trap - and
-# its failure is tolerated, because during initialisation there is no listening admin port for it to
-# reach (bin/ofbiz --load-data resolves load-data.properties, which declares no ofbiz.admin.port).
+# or killed abruptly. When no child is running shutdown_ofbiz is invoked instead, exactly as the
+# upstream entry point does, and its failure is tolerated: during initialisation there is no listening
+# admin port for the shipped helper to reach (bin/ofbiz --load-data resolves load-data.properties,
+# which declares no ofbiz.admin.port), and the served instance is not started yet in any case.
+#
+# These traps cover the initialisation phase ONLY. _main ends in 'exec', which replaces this shell, so
+# a signal arriving once OFBiz is serving is delivered to the JVM as PID 1 and OFBiz stops on it
+# directly - no shared secret and no helper script take part in that path.
 #
 # The handler disarms itself first so a second signal cannot restart it half way through.
 # $1 - signal name without the SIG prefix, $2 - signal number
