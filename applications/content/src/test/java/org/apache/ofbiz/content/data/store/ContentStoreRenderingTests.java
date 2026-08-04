@@ -51,7 +51,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
- * Executable contract of the container's object-store configuration renderer: the step that turns the seven
+ * Executable contract of the container's object-store configuration renderer: the step that turns the nine
  * {@code OFBIZ_CONTENT_STORE_PROVIDER} / {@code OFBIZ_S3_*} variables into
  * {@code /ofbiz/config/content.properties}, which is the resource {@link ContentStoreFactory} and
  * {@link S3ContentStore} actually read.
@@ -72,7 +72,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  * the environment and the committed source file.
  *
  * <p>What is established, in order: that the committed source still carries every anchor the substitution
- * needs; that all seven variables reach the runtime resource and round trip through the three grammars they
+ * needs; that all nine variables reach the runtime resource and round trip through the three grammars they
  * pass through - the sed replacement, the properties value and the shell - byte for byte, including values made
  * of nothing but characters special to those grammars; that the rendered file is readable only by the user that
  * wrote it; that a later start replaces every value an earlier one wrote; that withdrawing the variables removes
@@ -106,7 +106,7 @@ public final class ContentStoreRenderingTests {
             "applications/content/src/main/java/org/apache/ofbiz/content/data/store/";
 
     /**
-     * The seven variables and the seven properties they are rendered into, in the order the script pairs them.
+     * The nine variables and the nine properties they are rendered into, in the order the script pairs them.
      *
      * <p>Written here as one list rather than two so a case cannot assert a variable against the wrong
      * property, and so "every variable is covered" is a property of the table instead of a claim in a comment.
@@ -118,7 +118,12 @@ public final class ContentStoreRenderingTests {
             new Setting("OFBIZ_S3_ENDPOINT", "content.store.s3.endpoint"),
             new Setting("OFBIZ_S3_ACCESS_KEY_ID", "content.store.s3.access.key.id"),
             new Setting("OFBIZ_S3_SECRET_ACCESS_KEY", "content.store.s3.secret.access.key"),
-            new Setting("OFBIZ_S3_PATH_STYLE", "content.store.s3.path.style"));
+            new Setting("OFBIZ_S3_PATH_STYLE", "content.store.s3.path.style"),
+            new Setting("OFBIZ_S3_SSE", "content.store.s3.sse"),
+            new Setting("OFBIZ_S3_SSE_KMS_KEY_ID", "content.store.s3.sse.kms.key.id"));
+
+    /** The KMS key the fully configured fixture names, quoted in the rotation case as a withdrawn value. */
+    private static final String KMS_KEY_FIXTURE = "arn:aws:kms:eu-west-1:111122223333:key/render-fixture";
 
     /** A complete object-store configuration, used wherever the case is about the render and not the values. */
     private static final Map<String, String> FULLY_CONFIGURED = Map.of(
@@ -128,7 +133,13 @@ public final class ContentStoreRenderingTests {
             "OFBIZ_S3_ENDPOINT", "https://objects.example.internal:9000",
             "OFBIZ_S3_ACCESS_KEY_ID", "RENDER-FIXTURE-ACCESS-KEY",
             "OFBIZ_S3_SECRET_ACCESS_KEY", "RENDER-FIXTURE-SECRET-KEY",
-            "OFBIZ_S3_PATH_STYLE", "true");
+            "OFBIZ_S3_PATH_STYLE", "true",
+            // KMS rather than AES256, because it is the mode with a second value to get right: the key has
+            // to be rendered too, and the colons in both the mode and the key ARN pass through the sed
+            // replacement and the properties grammar that the escaping cases below exercise deliberately.
+            "OFBIZ_S3_SSE", "aws:kms",
+            "OFBIZ_S3_SSE_KMS_KEY_ID", KMS_KEY_FIXTURE);
+
 
     @BeforeAll
     public static void requireAShell() {
@@ -137,7 +148,7 @@ public final class ContentStoreRenderingTests {
 
     /**
      * The substitution is anchored on {@code ^<property>=}, so the committed source has to declare each of the
-     * seven exactly once, at column one. A renamed anchor leaves the value unsubstituted; a duplicated one lets
+     * nine exactly once, at column one. A renamed anchor leaves the value unsubstituted; a duplicated one lets
      * {@link java.util.Properties} honour the declaration the substitution did not touch. Both are silent, and
      * both change where durable content is written, so the census is asserted before anything is rendered.
      *
@@ -157,7 +168,7 @@ public final class ContentStoreRenderingTests {
     }
 
     /**
-     * The whole of CR-03 in one case: every one of the seven variables reaches the resource the application
+     * The whole of CR-03 in one case: every one of the nine variables reaches the resource the application
      * reads, and reaches it unchanged.
      *
      * <p>Read back with {@link java.util.Properties} rather than with a regular expression, because the
@@ -186,7 +197,7 @@ public final class ContentStoreRenderingTests {
     }
 
     /**
-     * The committed resource annotates each of the seven declarations with the variable that supplies it - the
+     * The committed resource annotates each of the nine declarations with the variable that supplies it - the
      * {@code <- OFBIZ_...} markers - and until now those markers were prose: nothing established that the
      * variable named beside a property is the variable the container really renders into it. A marker that names
      * the wrong variable is worse than no marker, because an operator configures what it says and gets something
@@ -263,7 +274,7 @@ public final class ContentStoreRenderingTests {
 
     /**
      * A render that changes nothing about the backend still has to produce the whole resource, because an
-     * override in OFBiz is resolved per resource and not merged per key: a fragment holding only these seven
+     * override in OFBiz is resolved per resource and not merged per key: a fragment holding only these nine
      * keys would lose the upload path prefix, the read bound and everything else the file declares.
      *
      * @param tempDir a per-test temporary directory, injected by JUnit
@@ -439,6 +450,11 @@ public final class ContentStoreRenderingTests {
         rotated.put("OFBIZ_S3_ACCESS_KEY_ID", "ROTATED-ACCESS-KEY");
         rotated.put("OFBIZ_S3_SECRET_ACCESS_KEY", "ROTATED-SECRET-KEY");
         rotated.put("OFBIZ_S3_PATH_STYLE", "false");
+        // The encryption mode rotates with the rest, and rotates to the mode that must NOT carry a key: a
+        // render that kept the withdrawn KMS key would be refused by require_object_store_encryption, and one
+        // that rendered it anyway would leave the deployment naming a key it no longer encrypts with.
+        rotated.put("OFBIZ_S3_SSE", "AES256");
+        rotated.put("OFBIZ_S3_SSE_KMS_KEY_ID", "");
         RendererRun second = render(tempDir, sandbox, rotated);
 
         assertTrue(second.succeeded(), "the rotated render must succeed. Output:\n" + second.output());
@@ -449,7 +465,7 @@ public final class ContentStoreRenderingTests {
         }
         String bytes = Files.readString(sandbox.resolve(OVERRIDE), StandardCharsets.UTF_8);
         for (String withdrawn : List.of("RENDER-FIXTURE-ACCESS-KEY", "RENDER-FIXTURE-SECRET-KEY",
-                "ofbiz-content-fixture", "objects.example.internal")) {
+                "ofbiz-content-fixture", "objects.example.internal", KMS_KEY_FIXTURE)) {
             assertFalse(bytes.contains(withdrawn), "no trace of the superseded value [" + withdrawn + "] may"
                     + " survive anywhere in " + OVERRIDE + ": a shadowed duplicate is still a readable copy of a"
                     + " credential this deployment has withdrawn");
@@ -711,7 +727,7 @@ public final class ContentStoreRenderingTests {
     }
 
     /**
-     * A blank value is meaningful for six of the seven properties, and the render has to preserve that rather
+     * A blank value is meaningful for eight of the nine properties, and the render has to preserve that rather
      * than treat blank as absent. Blank credentials are what select the AWS default provider chain - an
      * instance role, an ECS task role or an EKS service account - which is the recommended production
      * configuration, so a render that omitted the declarations would shadow the committed resource with the
@@ -762,7 +778,15 @@ public final class ContentStoreRenderingTests {
         Properties rendered = loadProperties(sandbox.resolve(OVERRIDE));
         assertEquals("database", rendered.getProperty("content.store.provider"),
                 "the database backend must be what the artefact selects");
-        for (Setting setting : SETTINGS.subList(1, SETTINGS.size() - 1)) {
+        for (Setting setting : SETTINGS) {
+            // Filtered by NAME rather than by position, so that adding a setting to the table cannot silently
+            // move which ones this case asserts about. The two exclusions are the selector itself, asserted
+            // just above, and the addressing style, which ofbiz_setup_env defaults to false on every start and
+            // which is therefore rendered with a value rather than blank whatever the backend.
+            if ("content.store.provider".equals(setting.property())
+                    || "content.store.s3.path.style".equals(setting.property())) {
+                continue;
+            }
             assertEquals("", rendered.getProperty(setting.property()), setting.property() + " must be blank when"
                     + " no object store is configured, so nothing selects one by accident");
         }

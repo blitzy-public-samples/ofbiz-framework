@@ -146,8 +146,10 @@
 # OFBIZ_HOST
 # OFBIZ_CONTENT_URL_PREFIX
 # OFBIZ_ENABLE_AJP_PORT
+# OFBIZ_AJP_BIND_ADDRESS
 # OFBIZ_JVM_ROUTE
 # OFBIZ_SSL_ACCELERATOR_PORT
+# OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED
 # OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS
 #
 # Object storage. OFBIZ_CONTENT_STORE_PROVIDER selects which backend stores DataResource content and
@@ -981,7 +983,68 @@ MIN_DISTINCT_CHARACTERS=8
 # repaired, because those values only ever unlock a container-local H2 file that is not part of a
 # load-balanced fleet, and that file is not one this change is permitted to modify.
 DATABASE_PASSWORD_MIN_LENGTH=16
-RETIRED_DATABASE_PASSWORDS=(ofbiz ofbizolap ofbiztenant postgres password)
+RETIRED_DATABASE_PASSWORDS=(
+  # Generic values only. These are not credentials anyone needs to protect - they are the weak names an
+  # operator reaches for - so they stay legible, and naming one back to the operator is helpful.
+  ofbiz ofbizolap ofbiztenant postgres password
+)
+
+# The four passwords docker/examples/postgres-demo publishes in its tracked env files - the PostgreSQL
+# superuser password in postgres.env and the three per-group OFBiz passwords in ofbiz-postgres.env - held
+# as SHA-256 digests rather than as the values themselves.
+#
+# They pass every length and entropy test because they WERE generated randomly once, and then were
+# committed, which is what retires them: an operator who deploys that example unchanged, or copies a
+# value out of it, is running on a credential printed in a public source tree. Recording them here is
+# what turns "change these before you deploy" from advice into a refusal to start. The example files
+# themselves are reference material this change set is not permitted to modify (technical specification
+# section 0.2.1), so the enforcement lives at the only point that can refuse: here.
+#
+# WHY DIGESTS AND NOT THE VALUES. This file is copied into the image (Dockerfile, COPY --chmod=555) and
+# is world readable there. Listing the literals would have made the entry point itself the single most
+# concentrated list of published OFBiz credentials in the image - four of which are not otherwise in the
+# image at all - which is the opposite of the objective this deny list serves. A digest refuses exactly
+# the same values, because the check is an equality test either way, and carries none of them.
+RETIRED_DATABASE_PASSWORD_DIGESTS=(
+  'f97849fcba25ed0fbe0a88f0ee246114fea800d6e647a68ee58279a8e6624b96' # postgres.env, superuser
+  '658323dd9c94db8722c8c5932e2a310e09c92dcb3a958bb25e60d3d87a9158ab' # ofbiz-postgres.env, ofbiz group
+  'ee991b83660187072e0ac660cc8fe1575726851b625704ecb8bc02d8621399d6' # ofbiz-postgres.env, olap group
+  'd4725317535bff2870d6a09cca3085f8f711f560252e9ffca9af3eb90e44cdda' # ofbiz-postgres.env, tenant group
+)
+
+# The signing and shared-secret values this repository publishes, which may never authenticate or sign
+# anything again. Refused in EVERY profile and for EVERY secret variable, by secret_is_usable.
+#
+# Each of these is a syntactically perfect key: 64 characters, high entropy, no forbidden character. They
+# fail no strength test, and that is exactly the danger - they are published, so an operator who copies
+# one out of a test fixture or a documentation example gets a value that looks strong and is known to
+# anybody who can read the source tree. Anyone holding it can forge a JWT for every user, decrypt
+# forgot-password material, or - for the admin key - shut the instance down.
+#
+# Sources, all of which are files this change set is not permitted to modify (technical specification
+# section 0.2.1), which is why the deny-list rather than deletion is the control:
+#  - framework/security/src/test/resources/security.properties (the unit-test fixture pair)
+#  - framework/security/src/docs/asciidoc/_include/sy-password-and-JWT.adoc (the documented example pair)
+#  - the 'NA' code default and the former shipped ofbiz.admin.key literal, both handled below.
+# Add to this list, never remove from it: a value that has been published stays retired for ever.
+#
+# HELD AS SHA-256 DIGESTS, NOT AS THE VALUES. This file is copied into the image world readable
+# (Dockerfile, COPY --chmod=555). Listing the literals would put two documentation keys and a former
+# shipped admin key into the image that are otherwise not in it, and would make the entry point the most
+# concentrated list of published OFBiz secrets in the whole image - which defeats the purpose of the
+# list. Comparing digests refuses exactly the same values, because either way the test is equality, and
+# it also means this file needs no quoting gymnastics for the two example keys that contain a literal
+# '$'. Regenerate an entry with: printf '%s' '<published value>' | sha256sum
+RETIRED_SIGNING_KEY_DIGESTS=(
+  'f8015884de9718460b1dd6ef87dc4dfc7ad067f499b8a22cedc9890e1756799e' # test fixture, login.secret_key_string
+  '316a34db71469692f221a8c8d419aed44271eab73e16b513bbd491ad20ade7dd' # test fixture, security.token.key
+  'b671656865cd8af79e5bcd5edfa540b9cdf275761e37e9ddcdcc1470ce60c9df' # sy-password-and-JWT.adoc, login example
+  '8f502d6f9ead9bd173fcb47945765f434d098aa71ca1ad6e6fc736d257a3bc9e' # sy-password-and-JWT.adoc, token example
+  # The admin key this repository shipped in start.properties until this change set removed it. A
+  # deployment that carried it forward into OFBIZ_ADMIN_KEY would be reachable by anybody who has ever
+  # read the file's history.
+  '9b1dcb080aff9dd7346c624791f2dbdbb3062a04854633eeb3ad0a7da949326d' # former shipped ofbiz.admin.key
+)
 
 # The complete TLS mode vocabulary of the PostgreSQL JDBC driver. Every one of these remains available
 # in the dev profile, so a developer can still point the container at a database with no TLS at all.
@@ -1224,12 +1287,20 @@ POSTGRES_INIT_IDENTITY_VARIABLES=(
 # through /proc by anything sharing the PID namespace, and inherited by every hook and child process -
 # for the life of the instance.
 #
-# The set is closed at seven because these are the seven settings a deployment can only supply from
-# outside: which backend to use, where the store is and what to authenticate to it as. A variable
-# rendered into a property no provider reads would be configuration this image promises to honour and
-# then silently ignores, so nothing is rendered that the Java side does not consume.
+# The set is closed at nine because these are the nine settings a deployment can only supply from
+# outside: which backend to use, where the store is, what to authenticate to it as, and how the objects
+# it writes are encrypted at rest. A variable rendered into a property no provider reads would be
+# configuration this image promises to honour and then silently ignores, so nothing is rendered that the
+# Java side does not consume.
 #
-# The Java side reads more content.store.* properties than these seven - the read bound, the local
+# The two ENCRYPTION settings are here for the same reason the credential pair is, and not because they
+# are secret. content.store.s3.sse and content.store.s3.sse.kms.key.id are DEPLOYMENT properties on the
+# Java side - ContentStoreFactory ignores a SystemProperty row for them, because at-rest protection must
+# not be switchable from a database row - and the copy of content.properties a container reads is
+# re-rendered from the committed blank on every start. Without a variable each one would therefore be
+# unreachable in the one profile that needs it: a container could never ask for encryption at all.
+#
+# The Java side reads more content.store.* properties than these nine - the read bound, the local
 # fallback, the object-key prefix, the two s3 call deadlines and the retry cap - and deliberately no
 # variable carries them. Each has a committed default every deployment can run on, none is a secret,
 # and each is overridable per instance through a SystemProperty row without a restart, so adding a
@@ -1247,6 +1318,8 @@ CONTENT_STORE_VARIABLES=(
   OFBIZ_S3_ACCESS_KEY_ID
   OFBIZ_S3_SECRET_ACCESS_KEY
   OFBIZ_S3_PATH_STYLE
+  OFBIZ_S3_SSE
+  OFBIZ_S3_SSE_KMS_KEY_ID
 )
 CONTENT_STORE_PROPERTIES=(
   content.store.provider
@@ -1256,6 +1329,28 @@ CONTENT_STORE_PROPERTIES=(
   content.store.s3.access.key.id
   content.store.s3.secret.access.key
   content.store.s3.path.style
+  content.store.s3.sse
+  content.store.s3.sse.kms.key.id
+)
+
+# The server-side encryption modes S3ContentStore can request, lower-cased for comparison, paired index
+# by index with the canonical spelling each one is rendered as. 'none' and a blank value both mean "send
+# no encryption header", which is what an unconfigured deployment and a store that encrypts everything by
+# its own bucket policy both want.
+#
+# Canonicalised rather than passed through so that the rendered property carries the one spelling the
+# Java side and this documentation both use: the provider compares case-insensitively, but a rendered
+# 'AWS:KMS' would leave an operator comparing what they set with what the file says and finding a
+# difference that means nothing.
+CONTENT_STORE_SSE_MODES=(
+  none
+  aes256
+  aws:kms
+)
+CONTENT_STORE_SSE_CANONICAL=(
+  none
+  AES256
+  aws:kms
 )
 
 # The content.properties settings this script renders that are DERIVED rather than supplied, with the
@@ -1326,6 +1421,7 @@ RUNTIME_APPLIED_VARIABLES=(
   OFBIZ_HOST
   OFBIZ_CONTENT_URL_PREFIX
   OFBIZ_ENABLE_AJP_PORT
+  OFBIZ_AJP_BIND_ADDRESS
   OFBIZ_DISABLE_COMPONENTS
   OFBIZ_JVM_ROUTE
   OFBIZ_SSL_ACCELERATOR_PORT
@@ -1369,6 +1465,8 @@ RUNTIME_APPLIED_VARIABLES=(
   OFBIZ_S3_ACCESS_KEY_ID
   OFBIZ_S3_SECRET_ACCESS_KEY
   OFBIZ_S3_PATH_STYLE
+  OFBIZ_S3_SSE
+  OFBIZ_S3_SSE_KMS_KEY_ID
   OFBIZ_POSTGRES_OFBIZ_INIT_USER
   OFBIZ_POSTGRES_OFBIZ_INIT_PASSWORD
   OFBIZ_POSTGRES_OLAP_INIT_USER
@@ -1412,6 +1510,7 @@ CONTAINER_CONTROL_VARIABLES=(
   OFBIZ_DB_MAX_CONNECTIONS
   OFBIZ_JMS_TLS_HOSTNAME_VERIFICATION
   OFBIZ_JMS_TOPIC_ACL_ACKNOWLEDGED
+  OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED
   OFBIZ_SKIP_DB_DRIVER_DOWNLOAD
 )
 
@@ -1521,6 +1620,77 @@ restore_trace() {
   if [ "$SECRET_REGION_DEPTH" -eq 0 ] && [ "$TRACE_ENABLED" = "true" ]; then
     set -x
   fi
+}
+
+###############################################################################
+# The SHA-256 digest, as lower-case hex, produced by the most recent
+# resolve_value_digest call. A digest of a secret, not the secret, so it is safe
+# to hold and to compare - but it is never printed either, because printing it
+# would publish a verifier for the value.
+RESOLVED_VALUE_DIGEST=""
+
+###############################################################################
+# Compute the SHA-256 digest of a value that must not be printed, into RESOLVED_VALUE_DIGEST.
+#
+# This is what lets RETIRED_SIGNING_KEY_DIGESTS and RETIRED_DATABASE_PASSWORD_DIGESTS hold digests
+# instead of the published credentials themselves. An equality test on digests refuses exactly the values
+# an equality test on literals would, and it keeps those values out of this file - which is copied into
+# the image world readable.
+#
+# Published in a global rather than on stdout for the same reason as RESOLVED_SECRET: a caller using a
+# command substitution would run this in a SUBSHELL, where the config_fatal below exits only that
+# subshell. The caller would then carry on with an empty digest, match nothing, and accept a retired
+# credential - a security check that silently passes, which is the one outcome this must not have.
+#
+# The value is written to the digest tool's STDIN by the printf BUILTIN, so it never becomes an argument
+# of any process and never appears in /proc/<pid>/cmdline. Tracing is suspended around the whole region.
+#
+# Fails closed. If neither sha256sum (coreutils) nor openssl is present, no digest can be computed, so
+# the retired-value check could not be performed - and skipping a security check is worse than refusing
+# to start. Both tools are present in the image's base layer (eclipse-temurin:17).
+# $1 - value (never printed)
+resolve_value_digest() {
+  hide_secrets
+  RESOLVED_VALUE_DIGEST=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    RESOLVED_VALUE_DIGEST=$(printf '%s' "$1" | sha256sum | cut --delimiter=' ' --fields=1)
+  elif command -v openssl >/dev/null 2>&1; then
+    RESOLVED_VALUE_DIGEST=$(printf '%s' "$1" | openssl dgst -sha256 -hex | sed 's/^.*= *//')
+  else
+    restore_trace
+    config_fatal "Neither sha256sum nor openssl is available, so this start up cannot check the supplied secrets against the credentials this repository has published (see RETIRED_SIGNING_KEY_DIGESTS). Refusing to start rather than skipping that check. Install coreutils or openssl in the image."
+  fi
+  if [ ${#RESOLVED_VALUE_DIGEST} -ne 64 ]; then
+    restore_trace
+    config_fatal "The digest tool returned ${#RESOLVED_VALUE_DIGEST} characters instead of a 64 character SHA-256 digest, so the check against the credentials this repository has published cannot be trusted. Refusing to start."
+  fi
+  restore_trace
+}
+
+###############################################################################
+# Whether a value is one of the credentials this repository has published.
+#
+# Returns 0 when the value's digest appears in either retired list, 1 otherwise. Both lists are consulted
+# for every value: a database password that happens to be a published signing key is no more usable than
+# the other way round, and checking both costs one digest computation either way.
+#
+# Called OUTSIDE a command substitution by both callers, so that the fail-closed exits inside
+# resolve_value_digest end the start up rather than a subshell.
+# $1 - value (never printed)
+value_is_retired() {
+  hide_secrets
+  resolve_value_digest "$1"
+  local known
+  for known in "${RETIRED_SIGNING_KEY_DIGESTS[@]}" "${RETIRED_DATABASE_PASSWORD_DIGESTS[@]}"; do
+    if [ "$RESOLVED_VALUE_DIGEST" = "$known" ]; then
+      RESOLVED_VALUE_DIGEST=""
+      restore_trace
+      return 0
+    fi
+  done
+  RESOLVED_VALUE_DIGEST=""
+  restore_trace
+  return 1
 }
 
 ###############################################################################
@@ -2074,8 +2244,8 @@ require_admin_password() {
 # Require a managed database password that can actually protect the database.
 #
 # There is deliberately no default. A missing password is a fatal misconfiguration, and the published
-# values named by RETIRED_DATABASE_PASSWORDS are refused in every profile so that a database still
-# provisioned with one of them cannot be reached. In the prod profile the value must additionally
+# values recorded in RETIRED_DATABASE_PASSWORDS and RETIRED_DATABASE_PASSWORD_DIGESTS are refused in
+# every profile so that a database still provisioned with one of them cannot be reached. In the prod profile the value must additionally
 # clear the shared length and entropy floor.
 #
 # Tracing is suspended for the whole function and the value is never printed - not in an error
@@ -2092,12 +2262,18 @@ require_database_password() {
     config_fatal "$name must be set when OFBIZ_POSTGRES_HOST is set. There is no default database password."
   fi
 
+  # Two lists, one refusal. The generic weak names are compared by value so the message can be specific;
+  # the credentials docker/examples/postgres-demo publishes are compared by digest so this file does not
+  # carry them into the image. See RETIRED_DATABASE_PASSWORD_DIGESTS.
   local retired
   for retired in "${RETIRED_DATABASE_PASSWORDS[@]}"; do
     if [ "$value" = "$retired" ]; then
-      config_fatal "$name is one of the published default passwords that are no longer accepted. Set a private password and rotate the database."
+      config_fatal "$name must not be '$retired'. That is one of the published default passwords that are no longer accepted. Set a private password and rotate the database."
     fi
   done
+  if value_is_retired "$value"; then
+    config_fatal "$name is one of the credentials this repository publishes - the passwords in docker/examples/postgres-demo, or a key from its test fixtures or documentation - and is permanently refused in every profile. Set a private password and rotate the database role that used it."
+  fi
 
   if [ "$OFBIZ_PROFILE" = 'prod' ] && ! secret_is_usable "$value" "$DATABASE_PASSWORD_MIN_LENGTH" ''; then
     config_fatal "$name $SECRET_REJECTION_REASON. OFBIZ_PROFILE=prod requires a private, high entropy database password."
@@ -2838,6 +3014,19 @@ secret_is_usable() {
   local minLength="$2"
   local forbidden="$3"
   SECRET_REJECTION_REASON=""
+
+  # Checked before the length and entropy floors, because a retired value clears both. See
+  # RETIRED_SIGNING_KEY_DIGESTS: these are published 64-character keys that no strength test can
+  # distinguish from a private one, so the only thing that can refuse them is recognising them. Applied
+  # here rather than in each caller because this is the one funnel every secret passes through - a value
+  # supplied through the environment reaches it via resolve_secret -> validate_secret_strength, and a
+  # value pre-provisioned in a mounted configuration file reaches it via
+  # require_preprovisioned_value_usable - so no path can supply a retired value to anything.
+  if [ -n "$value" ] && value_is_retired "$value"; then
+    SECRET_REJECTION_REASON="is a value published in this repository's test fixtures, documentation or history and is permanently refused; generate a private value and rotate anything that used it"
+    restore_trace
+    return 1
+  fi
 
   if [ -z "$value" ]; then
     SECRET_REJECTION_REASON="must not be empty"
@@ -4597,6 +4786,91 @@ run_hook_scrubbed() {
 }
 
 ###############################################################################
+# The security decisions this start up has taken, as they stood immediately before the current hook.
+#
+# A fingerprint rather than a copy of the values: every name listed in record_security_decisions is a
+# NON-SECRET setting, but keeping them in one string means the comparison is a single test that cannot
+# forget an entry, and it never has to print any of them individually.
+SECURITY_DECISION_FINGERPRINT=""
+
+# The shell options in force immediately before the current hook, without the xtrace flag, which
+# run_hook_scrubbed owns.
+SECURITY_DECISION_SHELL_OPTIONS=""
+
+###############################################################################
+# Record the security decisions and shell options in force, so that a hook cannot move them unnoticed.
+#
+# WHY EVERY ONE OF THESE IS HERE. A hook is operator code, and a SOURCED hook runs in this very shell -
+# so an assignment inside it lands on this script's own variables, after the pre-flight has already
+# validated them and, for a post-configuration hook, after the configuration has been rendered from them
+# (CWE-15). Each name below decides something a later step relies on:
+#  - OFBIZ_PROFILE decides whether a missing, weak or published credential aborts the start. A hook that
+#    set it to 'dev' after require_profile ran would turn every fail-fast into a generated value.
+#  - RESOLVED_SCHEMA_INIT and SCHEMA_INIT_APPLIED decide whether this execution is the one-shot DDL job
+#    and whether it may report success. A hook that moved either could make a serving instance apply DDL,
+#    or make an init job that applied nothing exit 0 and start a fleet against an empty database.
+#  - RESOLVED_SKIP_INIT decides whether the data load and the admin user load run at all.
+#  - the AJP, accelerator and cross-subdomain settings decide which ports are exposed, what is marked
+#    HTTPS and whether a session is forced for every request.
+#  - the content-store provider decides where uploaded content is written.
+# The DEPLOYMENT SECRETS are deliberately NOT in this list: run_hook_scrubbed removes them from the shell
+# for the duration of the hook and restores the saved values afterwards, so a hook cannot change one, and
+# putting them in a fingerprint string would be the disclosure this whole mechanism exists to prevent.
+record_security_decisions() {
+  SECURITY_DECISION_FINGERPRINT=$(printf '%s\n' \
+    "OFBIZ_PROFILE=${OFBIZ_PROFILE:-}" \
+    "RESOLVED_SCHEMA_INIT=${RESOLVED_SCHEMA_INIT:-}" \
+    "SCHEMA_INIT_APPLIED=${SCHEMA_INIT_APPLIED:-}" \
+    "RESOLVED_SKIP_INIT=${RESOLVED_SKIP_INIT:-}" \
+    "OFBIZ_ENABLE_AJP_PORT=${OFBIZ_ENABLE_AJP_PORT:-}" \
+    "OFBIZ_AJP_BIND_ADDRESS=${OFBIZ_AJP_BIND_ADDRESS:-}" \
+    "OFBIZ_SSL_ACCELERATOR_PORT=${OFBIZ_SSL_ACCELERATOR_PORT:-}" \
+    "OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED=${OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED:-}" \
+    "OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS=${OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS:-}" \
+    "OFBIZ_CONTENT_STORE_PROVIDER=${OFBIZ_CONTENT_STORE_PROVIDER:-}" \
+    "OFBIZ_CONTENT_URL_PREFIX=${OFBIZ_CONTENT_URL_PREFIX:-}" \
+    "OFBIZ_HOOK_SECRET_ALLOWLIST=${OFBIZ_HOOK_SECRET_ALLOWLIST:-}")
+  # '$-' without the xtrace flag, which run_hook_scrubbed suspends and restores on its own terms, plus
+  # the option that is not reported there.
+  SECURITY_DECISION_SHELL_OPTIONS="${-//x/}:$(set +o | grep --count -- '-o pipefail' || true)"
+}
+
+###############################################################################
+# Refuse to carry on when a hook moved one of those decisions, or relaxed the shell.
+#
+# Refused rather than repaired. Re-applying the recorded value would leave the hook's intent silently
+# discarded, and a hook that reaches for OFBIZ_PROFILE has either misunderstood what a hook is for or is
+# doing something the deployment needs to see. The message names WHICH decision moved, never a secret,
+# and the operator's remedy is to set the variable in the container's environment where the pre-flight
+# validates it, not from inside a hook.
+#
+# 'set -e' in particular is restored to being checked: a hook that turned it off would make every
+# subsequent config_fatal's non-zero status non-fatal, which is the difference between a refused start
+# and a silently misconfigured one.
+# $1 - the hook that ran, for the message
+require_unchanged_security_decisions() {
+  local hookPath="$1"
+  local before="$SECURITY_DECISION_FINGERPRINT"
+  local beforeOptions="$SECURITY_DECISION_SHELL_OPTIONS"
+
+  record_security_decisions
+
+  if [ "$SECURITY_DECISION_FINGERPRINT" != "$before" ]; then
+    local moved
+    # Only the NAMES are reported, taken from the lines that differ. comm needs sorted input and these
+    # lines are already in a fixed order, so a plain diff of the two lists is enough.
+    moved=$(printf '%s\n' "$SECURITY_DECISION_FINGERPRINT" \
+      | grep --invert-match --line-regexp --fixed-strings --file=<(printf '%s\n' "$before") \
+      | sed 's|=.*||' | tr '\n' ' ' || true)
+    config_fatal "The hook $hookPath changed a setting this start up has already acted on: ${moved% }. Those decisions are taken and validated before any hook runs - the profile decides whether a missing secret aborts the start, the schema-init flag decides whether DDL is applied, and the connector settings decide which ports are exposed and what is marked HTTPS - so a hook changing one would apply a configuration that was never validated. Set the variable in the container's environment instead."
+  fi
+
+  if [ "$SECURITY_DECISION_SHELL_OPTIONS" != "$beforeOptions" ]; then
+    config_fatal "The hook $hookPath changed this shell's options. 'set -e' and the pipeline failure mode are what make a refused validation stop the start up, so a hook must not relax them. Run whatever needs different options in a subshell inside the hook."
+  fi
+}
+
+###############################################################################
 # Execute the shell scripts at the paths passed to this function.
 # Args:
 # 1:  Name of the hook stage being executed. Used for logging.
@@ -4605,7 +4879,9 @@ run_hook_scrubbed() {
 #     Scripts will be sourced if they are not executable.
 #
 # Every hook runs through run_hook_scrubbed, which suspends tracing and removes the deployment secrets
-# from the environment for the duration of the hook. See that function for why.
+# from the environment for the duration of the hook, and then through
+# require_unchanged_security_decisions, which refuses to carry on if the hook moved a security decision
+# this start up has already taken. See both functions for why.
 run_init_hooks() {
   local hookStage="$1"
   shift
@@ -4615,10 +4891,14 @@ run_init_hooks() {
     *.sh)
       if [ -x "$filePath" ]; then
         printf '%s: running %s\n' "$hookStage" "$filePath"
+        record_security_decisions
         run_hook_scrubbed "$filePath" execute
+        require_unchanged_security_decisions "$filePath"
       else
         printf '%s: sourcing %s\n' "$hookStage" "$filePath"
+        record_security_decisions
         run_hook_scrubbed "$filePath" source
+        require_unchanged_security_decisions "$filePath"
       fi
       ;;
     *)
@@ -6428,6 +6708,79 @@ catalina_effective_ports() {
     | sort --numeric-sort --unique
 }
 
+###############################################################################
+# Print the bind address the production container's connector for one EFFECTIVE port declares, or
+# nothing when that connector declares none and therefore binds every interface.
+#
+# Only ACTIVE declarations count: the committed descriptor carries the address property as the comment
+# '<!--<property name="address" value=""/>-->', so '<property' must be the first non-blank text on the
+# line, exactly as render_ajp_connector_address requires. The port is compared AFTER the port offset is
+# added, because that is the port the instance really binds; see catalina_effective_ports.
+# $1 - the effective port
+catalina_connector_bind_address_for_port() {
+  sed --quiet "/$CATALINA_PRODUCTION_CONTAINER/,/<\/container>/p" "$CATALINA_COMPONENT_DESCRIPTOR" \
+    | awk -v target="$1" -v offset="$RESOLVED_PORT_OFFSET" '
+        /^[[:space:]]*<property name="[A-Za-z-]+" value="connector">/ { inConnector = 1; address = ""; port = ""; next }
+        inConnector && /^[[:space:]]*<\/property>/ {
+            if (port != "" && (port + offset) == target) { print address }
+            inConnector = 0; address = ""; port = ""; next
+        }
+        inConnector && /^[[:space:]]*<property name="port" value="[0-9]+"\/>/ {
+            match($0, /value="[0-9]+"/); port = substr($0, RSTART + 7, RLENGTH - 8); next
+        }
+        inConnector && /^[[:space:]]*<property name="address" value="[^"]*"\/>/ {
+            match($0, /value="[^"]*"/); address = substr($0, RSTART + 7, RLENGTH - 8); next
+        }'
+}
+
+###############################################################################
+# Refuse to mark forwarded traffic secure on a port that anybody can reach.
+#
+# WHAT SslAcceleratorValve ACTUALLY DOES. It marks a request secure when request.getLocalPort() equals
+# the configured port, and it consults nothing else: not X-Forwarded-Proto, not Forwarded, not the source
+# address. The port number is therefore NOT the trust decision - the NETWORK is (CWE-345, CWE-441). If a
+# client can open a cleartext socket to that port directly, its request is treated as HTTPS by everything
+# keyed on request.isSecure(): cookies marked secure are accepted over clear text, https-only request
+# maps and X.509-gated paths become reachable, and absolute URLs are rebuilt as https - all over an
+# unencrypted hop the proxy never saw.
+#
+# WHAT IS ENFORCED HERE. The connector that receives the forwarded traffic must be bound to ONE
+# interface, so the port is reachable only where the deployment put it. When it is, this is silent. When
+# it is not - the committed descriptor leaves the http connector's address commented out, which binds
+# every interface - the deployment must state explicitly that the network restricts the port, through
+# OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED=true. Without that statement the start is refused.
+#
+# This is the same shape as OFBIZ_JMS_TOPIC_ACL_ACKNOWLEDGED: a control this container cannot verify from
+# the inside is turned into a recorded decision rather than a silent assumption, and the refusal names
+# exactly what has to be true. RemoteIpValve is the mechanism that would authenticate the hop from inside
+# Tomcat, and CatalinaContainer does not install it, so it is not available through this configuration
+# surface.
+# $1 - the validated effective accelerator port
+require_ssl_accelerator_trust_boundary() {
+  local acceleratorPort="$1"
+  local bindAddress
+  bindAddress=$(catalina_connector_bind_address_for_port "$acceleratorPort")
+
+  case "$bindAddress" in
+  '' | '0.0.0.0' | '::' | '[::]' | '*' | '0:0:0:0:0:0:0:0' | '[0:0:0:0:0:0:0:0]') ;;
+  *)
+    # Bound to one interface: the port is reachable only where the deployment put it, so there is
+    # nothing left to acknowledge.
+    printf '%s\n' "OFBIZ_SSL_ACCELERATOR_PORT=$acceleratorPort: the connector receiving the forwarded traffic is bound to [$bindAddress], so requests on that port cannot arrive from anywhere else."
+    return 0
+    ;;
+  esac
+
+  local acknowledged normalised
+  acknowledged="${OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED:-false}"
+  normalised=$(require_boolean OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED "$acknowledged") \
+    || config_fatal "OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED must be a boolean: true or false."
+  if [ "$normalised" != 'true' ]; then
+    config_fatal "OFBIZ_SSL_ACCELERATOR_PORT=$acceleratorPort would mark every request arriving on that port as HTTPS, and the connector serving it binds EVERY interface of this container, so any client that can reach the instance directly - not only the load balancer - would be treated as if it had used TLS. Either bind the connector to a single interface (set OFBIZ_AJP_BIND_ADDRESS for the AJP connector, or bind-mount a descriptor that declares the http connector's 'address'), or confirm that a security group, firewall rule or private subnet admits only the proxy by setting OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED=true. See the TRUST BOUNDARY note in $CATALINA_COMPONENT_DESCRIPTOR and DOCKER.adoc."
+  fi
+  printf '%s\n' "OFBIZ_SSL_ACCELERATOR_PORT=$acceleratorPort with OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED=true: requests on that port are marked HTTPS on the strength of the port alone. The connector binds every interface, so the network layer must admit the proxy and nothing else, and the proxy must strip and re-set the client's X-Forwarded-* and Forwarded headers."
+}
+
 render_catalina_configuration() {
   require_single_production_container
 
@@ -6489,6 +6842,7 @@ render_catalina_configuration() {
       effectivePortList=$(printf '%s' "$effectivePorts" | tr '\n' ' ')
       config_fatal "OFBIZ_SSL_ACCELERATOR_PORT=$acceleratorPort matches no port the '$CATALINA_PRODUCTION_CONTAINER' block of $CATALINA_COMPONENT_DESCRIPTOR will listen on, which are: ${effectivePortList% }.${offsetNote} It must be the LOCAL port this instance receives the proxy's forwarded traffic on, not the load balancer's public HTTPS port, and not a port declared only by the test container."
     fi
+    require_ssl_accelerator_trust_boundary "$acceleratorPort"
   fi
   rewrite_catalina_property ssl-accelerator-port "$acceleratorPort"
 
@@ -6603,6 +6957,39 @@ render_ajp_connector_address() {
   # unscoped edit this replaced produced, one appended copy per restart, which a persistent lib volume
   # written by an older image can still be in. The guard was unreachable on the path that needed it most.
   if [ -n "$OFBIZ_ENABLE_AJP_PORT" ]; then
+    # THE ADDRESS IS THE TRUST DECISION, so it is the operator's to make and there is no default.
+    #
+    # AJP is an UNAUTHENTICATED protocol as this descriptor configures it: secretRequired is false and no
+    # secret is declared, which is the upstream out-of-the-box shape and is why Tomcat's own default for
+    # this connector is to bind LOCALHOST ONLY - anybody who can open a socket to the port speaks AJP,
+    # and an AJP request can set the request attributes that OFBiz reads (CWE-306, CWE-319). This script
+    # used to insert address="0.0.0.0" here, which took that localhost default away and published the
+    # unauthenticated port on every interface the container has, in response to a variable whose name says
+    # nothing about exposure.
+    #
+    # The bind address is therefore REQUIRED and must name one interface. A wildcard is refused rather
+    # than accepted with a warning: on a wildcard bind the port is reachable from every network the
+    # container is attached to, and no proxy configuration can take that back. An operator who wants the
+    # port reachable by a specific proxy names the address the proxy connects to - the container's own
+    # address on the proxy's network - and the network layer restricts the rest.
+    local ajpAddress="${OFBIZ_AJP_BIND_ADDRESS:-}"
+    if [ -z "$ajpAddress" ]; then
+      config_fatal "OFBIZ_ENABLE_AJP_PORT is set but OFBIZ_AJP_BIND_ADDRESS is not. The AJP connector is unauthenticated - this descriptor declares secretRequired=false and no secret - so it may only be bound to an interface the deployment has deliberately chosen. Set OFBIZ_AJP_BIND_ADDRESS to the address the reverse proxy connects to (127.0.0.1 for a proxy in this same container or pod), or leave OFBIZ_ENABLE_AJP_PORT unset to keep Tomcat's localhost-only default."
+    fi
+    reject_unsafe_value OFBIZ_AJP_BIND_ADDRESS "$ajpAddress"
+    reject_edge_whitespace OFBIZ_AJP_BIND_ADDRESS "$ajpAddress"
+    case "$ajpAddress" in
+    '0.0.0.0' | '::' | '[::]' | '*' | '0:0:0:0:0:0:0:0' | '[0:0:0:0:0:0:0:0]')
+      config_fatal "OFBIZ_AJP_BIND_ADDRESS must not be a wildcard address ($ajpAddress). That publishes the unauthenticated AJP port on every network this container is attached to. Name the single interface the reverse proxy connects to instead."
+      ;;
+    esac
+    # Written into an XML attribute, so the characters that would close it are refused outright rather
+    # than escaped - no address contains any of them.
+    case "$ajpAddress" in
+    *'"'* | *"'"* | *'<'* | *'>'* | *'&'* | *[[:space:]]*)
+      config_fatal "OFBIZ_AJP_BIND_ADDRESS must not contain a quote, an angle bracket, an ampersand or whitespace. It is written into an XML attribute of $descriptor."
+      ;;
+    esac
     # Skipped, not returned from, when an earlier start of this same container already applied it:
     # re-inserting would duplicate the line, and returning would skip the read-back that catches a
     # duplicate which was already there.
@@ -6612,8 +6999,18 @@ render_ajp_connector_address() {
       # '0,/re/ a text' would append after every line of the range instead, and an unaddressed '/re/ a text'
       # after every match in the file - which is what reached the test container.
       sed --in-place "0,\|$anchor|{\|$anchor| a\\
-            <property name=\"address\" value=\"0.0.0.0\"/>
+            <property name=\"address\" value=\"$(sed_escape_replacement "$ajpAddress")\"/>
 }" "$descriptor"
+    fi
+    # Read back the VALUE as well as the count below: the address decides which networks can reach an
+    # unauthenticated port, so it must be the value that was validated and not whatever an earlier start,
+    # or a bind-mounted descriptor, left behind.
+    local renderedAjpAddress
+    renderedAjpAddress=$(catalina_ajp_connector_block \
+      | sed --quiet "s|^[[:blank:]]*<property name=\"address\" value=\"\\(.*\\)\"/>.*|\\1|p" \
+      | head --lines=1)
+    if [ "$renderedAjpAddress" != "$ajpAddress" ]; then
+      config_fatal "The AJP connector of the '$CATALINA_PRODUCTION_CONTAINER' block in $descriptor is bound to [$renderedAjpAddress] rather than the requested OFBIZ_AJP_BIND_ADDRESS. Refusing to start rather than publishing an unauthenticated port on an interface that was not validated."
     fi
   else
     if [ "$addressPresent" = "true" ]; then
@@ -6794,6 +7191,8 @@ render_content_store_configuration() {
   local endpoint="$OFBIZ_S3_ENDPOINT"
   local accessKeyId="$OFBIZ_S3_ACCESS_KEY_ID"
   local secretAccessKey="$OFBIZ_S3_SECRET_ACCESS_KEY"
+  local sse="${OFBIZ_S3_SSE-}"
+  local sseKmsKeyId="${OFBIZ_S3_SSE_KMS_KEY_ID-}"
   local pathStyle
 
   # An object-store setting supplied without selecting the object store is a contradiction, and which
@@ -6869,6 +7268,21 @@ render_content_store_configuration() {
       reject_unsafe_value OFBIZ_S3_SECRET_ACCESS_KEY "$secretAccessKey"
       reject_edge_whitespace OFBIZ_S3_SECRET_ACCESS_KEY "$secretAccessKey"
     fi
+
+    # How the objects this deployment writes are encrypted at rest, validated by the same function the
+    # early resolver used and canonicalised to the one spelling the rendered property carries. Left blank
+    # unless a mode was asked for, which is what a store that encrypts every object under its own bucket
+    # policy - the posture DOCKER.adoc requires of a deployed object store - needs from this image.
+    if [ -n "$sse" ]; then
+      reject_unsafe_value OFBIZ_S3_SSE "$sse"
+      reject_edge_whitespace OFBIZ_S3_SSE "$sse"
+    fi
+    if [ -n "$sseKmsKeyId" ]; then
+      reject_unsafe_value OFBIZ_S3_SSE_KMS_KEY_ID "$sseKmsKeyId"
+      reject_edge_whitespace OFBIZ_S3_SSE_KMS_KEY_ID "$sseKmsKeyId"
+    fi
+    require_object_store_encryption "$sse" "$sseKmsKeyId"
+    sse="$RESOLVED_S3_SSE_MODE"
   fi
 
   pathStyle=$(require_boolean OFBIZ_S3_PATH_STYLE "${OFBIZ_S3_PATH_STYLE:-false}") \
@@ -6916,6 +7330,8 @@ render_content_store_configuration() {
       content.store.s3.access.key.id) value="$accessKeyId" ;;
       content.store.s3.secret.access.key) value="$secretAccessKey" ;;
       content.store.s3.path.style) value="$pathStyle" ;;
+      content.store.s3.sse) value="$sse" ;;
+      content.store.s3.sse.kms.key.id) value="$sseKmsKeyId" ;;
       content.store.s3.insecure.endpoint.allowed) value="$insecureEndpointAllowed" ;;
       esac
       printf 's|^%s=.*|%s=%s|\n' "$(properties_key_pattern "$property")" "$property" \
@@ -6944,6 +7360,8 @@ render_content_store_configuration() {
     content.store.s3.access.key.id) expected="$accessKeyId" ;;
     content.store.s3.secret.access.key) expected="$secretAccessKey" ;;
     content.store.s3.path.style) expected="$pathStyle" ;;
+    content.store.s3.sse) expected="$sse" ;;
+    content.store.s3.sse.kms.key.id) expected="$sseKmsKeyId" ;;
     content.store.s3.insecure.endpoint.allowed) expected="$insecureEndpointAllowed" ;;
     esac
     # A non-blank value must be declared with something after the '=': that is the half that catches a
@@ -6982,11 +7400,142 @@ render_content_store_configuration() {
   # credential, the bucket and region because they describe the deployment's storage topology and a
   # log line is the wrong place to publish it.
   if [ "$provider" = "s3" ]; then
-    printf '%s\n' "Content storage provider: s3 (rendered into config/content.properties) with endpoint-override [$([ -n "$endpoint" ] && printf 'true' || printf 'false')], path-style [$pathStyle], credentials [$([ -n "$accessKeyId" ] && printf 'configured-properties' || printf 'aws-default-provider-chain')]. The bucket must already exist and be writable; this script neither creates nor probes it."
+    printf '%s\n' "Content storage provider: s3 (rendered into config/content.properties) with endpoint-override [$([ -n "$endpoint" ] && printf 'true' || printf 'false')], path-style [$pathStyle], credentials [$([ -n "$accessKeyId" ] && printf 'configured-properties' || printf 'aws-default-provider-chain')], server-side-encryption [${sse:-none}]. The bucket must already exist and be writable; this script neither creates nor probes it. Encryption reported as 'none' means this image sends no encryption header, which is correct only where the bucket encrypts every object by its own default - configure that bucket-side default, or set OFBIZ_S3_SSE."
   else
     printf '%s\n' "Content storage provider: $provider (rendered into config/content.properties). No object store is contacted."
   fi
   restore_trace
+}
+
+###############################################################################
+# Refuse a deployment secret supplied as a JVM system property.
+#
+# WHY THIS IS NOT A MATTER OF TASTE. Config.java resolves the admin shared secret with
+# System.getProperty("ofbiz.admin.key") BEFORE it reads start.properties, so '-Dofbiz.admin.key=...'
+# silently overrides the mode 0600 file this script renders - and every JVM argument is world readable
+# for the life of the process: it is in /proc/<pid>/cmdline, in the output of ps for any user in the
+# container or on the host, in a container inspect, in a crash report and in an hs_err file
+# (CWE-214, CWE-522). A secret passed that way is therefore published to anything that can list
+# processes, and it defeats the protection every other line of this script provides.
+#
+# The signing keys are refused for the same reason even though the properties are read from
+# security.properties rather than from a system property: an operator who reaches for '-D' for one
+# secret reaches for it for the others, and a value on the command line is exposed whether or not the
+# application happens to consult it.
+#
+# WHERE THE VALUES ARE INSPECTED. The three places a JVM argument can arrive from: the two variables the
+# generated start script appends to the JVM command line (JAVA_OPTS and OFBIZ_OPTS), the two the JVM
+# itself picks up from the environment (JAVA_TOOL_OPTIONS and _JAVA_OPTIONS), and the container command
+# this script execs. Refused rather than stripped: silently removing an argument would leave the operator
+# believing the secret had been applied, and the correct value would then be whatever the file happened
+# to hold.
+#
+# The MATCH IS ON THE PROPERTY NAME ONLY and no value is ever printed, so this function cannot itself
+# become the disclosure it prevents.
+# $@ - the container command, inspected alongside the option variables
+reject_secret_bearing_jvm_options() {
+  hide_secrets
+  local ofbizSource ofbizProperty ofbizArgument
+
+  for ofbizSource in JAVA_OPTS OFBIZ_OPTS JAVA_TOOL_OPTIONS _JAVA_OPTIONS; do
+    for ofbizProperty in ofbiz.admin.key login.secret_key_string security.token.key; do
+      case " ${!ofbizSource:-} " in
+      *"-D$ofbizProperty="*)
+        restore_trace
+        config_fatal "$ofbizSource passes the secret '$ofbizProperty' as a JVM system property. Every JVM argument is readable through /proc/<pid>/cmdline, 'ps', a container inspect and any crash report, and for ofbiz.admin.key the property also overrides the protected file this script renders. Remove it and supply the value through its own environment variable (OFBIZ_ADMIN_KEY, OFBIZ_LOGIN_SECRET_KEY, OFBIZ_JWT_TOKEN_KEY), which is rendered into a mode 0600 configuration file instead. Rotate the value that was exposed."
+        ;;
+      esac
+    done
+  done
+
+  for ofbizArgument in "$@"; do
+    for ofbizProperty in ofbiz.admin.key login.secret_key_string security.token.key; do
+      case "$ofbizArgument" in
+      "-D$ofbizProperty="*)
+        restore_trace
+        config_fatal "The container command passes the secret '$ofbizProperty' as a JVM system property. Every JVM argument is readable through /proc/<pid>/cmdline, 'ps', a container inspect and any crash report, and for ofbiz.admin.key the property also overrides the protected file this script renders. Remove it and supply the value through its own environment variable (OFBIZ_ADMIN_KEY, OFBIZ_LOGIN_SECRET_KEY, OFBIZ_JWT_TOKEN_KEY). Rotate the value that was exposed."
+        ;;
+      esac
+    done
+  done
+
+  restore_trace
+}
+
+###############################################################################
+# Require a value that is usable as a content URL ORIGIN, and cannot break out of the markup it is
+# emitted into.
+#
+# WHY THE SHAPE MATTERS HERE AND NOT FOR AN ORDINARY SETTING. This value becomes
+# content.url.prefix.secure and content.url.prefix.standard, which OFBiz prepends to EVERY content URL
+# it renders - through ContentUrlTag and the @ofbizContentUrl FreeMarker transform - and those emit the
+# result into HTML attributes and script contexts. A prefix carrying a quote, an angle bracket or a
+# backtick therefore closes the attribute it lands in and injects markup or script into every page of
+# every webapp at once (CWE-20 leading to CWE-79). The renderers cannot be relied on to escape it: they
+# are out of this change set's scope, and one of them writes the prefix into a URL attribute unescaped.
+# So the value is REFUSED HERE, at the only point that sees it before it becomes configuration, and the
+# accepted grammar is deliberately narrower than "a URL": an absolute origin with an optional path, made
+# only of characters that are inert in every context it reaches.
+#
+# WHAT IS REFUSED, AND WHY EACH ONE:
+#  - anything that is not an absolute http:// or https:// URI. A relative or scheme-less value would make
+#    the prefix resolve against whatever page is being rendered, which is not a prefix at all, and a
+#    'javascript:' or 'data:' value would put executable content into every link.
+#  - https is REQUIRED in the prod profile. The prefix is emitted on pages served over TLS, so an http
+#    origin is mixed content: the browser blocks or downgrades it, and an attacker on the path can
+#    replace every asset the deployment serves. The dev profile keeps the full vocabulary.
+#  - userinfo ('@' in the authority). It would put a credential into a rendered page and into this
+#    container's configuration file.
+#  - a quote, an angle bracket, a backtick, a backslash or whitespace, anywhere. These are the characters
+#    that end an HTML attribute, open a tag or terminate a script string.
+#  - a query or a fragment. The path OFBiz appends would land after them, producing a URL that addresses
+#    something other than the content; a prefix has no use for either.
+#  - a '..' segment, which would let the prefix climb out of the path it names.
+# $1 - variable name, $2 - value
+require_content_url_origin() {
+  local name="$1"
+  local value="$2"
+
+  if [ "${#value}" -gt 512 ]; then
+    config_fatal "$name is longer than 512 characters, which is not a content URL prefix."
+  fi
+  case "$value" in
+  *'"'* | *"'"* | *'<'* | *'>'* | *'`'* | *"\\"* | *[[:space:]]*)
+    config_fatal "$name must not contain a quote, an angle bracket, a backtick, a backslash or whitespace. The prefix is emitted into HTML attributes on every rendered page, so such a value would break out of the attribute and inject markup or script."
+    ;;
+  esac
+  case "$value" in
+  *'?'* | *'#'*)
+    config_fatal "$name must not contain a query string or a fragment. OFBiz appends the content path to this prefix, so anything after a '?' or a '#' would swallow that path."
+    ;;
+  esac
+  case "$value" in
+  *'..'*)
+    config_fatal "$name must not contain a '..' path segment."
+    ;;
+  esac
+
+  local scheme authority
+  case "$value" in
+  'https://'*) scheme='https'; authority="${value#https://}" ;;
+  'http://'*) scheme='http'; authority="${value#http://}" ;;
+  *)
+    config_fatal "$name must be an absolute URL beginning with 'https://' or 'http://', such as https://cdn.example.com or https://cdn.example.com/assets. A relative value is not a prefix, and any other scheme would put executable content into every rendered link."
+    ;;
+  esac
+  # The authority is everything up to the first '/', which is where the optional path begins.
+  authority="${authority%%/*}"
+  if [ -z "$authority" ]; then
+    config_fatal "$name names no host. Supply the origin the content is served from, such as https://cdn.example.com."
+  fi
+  case "$authority" in
+  *@*)
+    config_fatal "$name must not contain user information ('@') in its authority. A credential in the prefix would be rendered into every page that references content."
+    ;;
+  esac
+  if [ "$OFBIZ_PROFILE" = 'prod' ] && [ "$scheme" != 'https' ]; then
+    config_fatal "$name must use https when OFBIZ_PROFILE=prod. An http prefix is mixed content on a TLS-served page: the browser blocks or downgrades it, and anybody on the network path can replace every asset the deployment serves."
+  fi
 }
 
 ###############################################################################
@@ -7031,6 +7580,7 @@ render_content_url_configuration() {
   # rendered file and the loaded value disagreeing about the origin itself.
   reject_unsafe_value OFBIZ_CONTENT_URL_PREFIX "$urlPrefix"
   reject_leading_whitespace OFBIZ_CONTENT_URL_PREFIX "$urlPrefix"
+  require_content_url_origin OFBIZ_CONTENT_URL_PREFIX "$urlPrefix"
 
   local sedScript
   sedScript=$(mktemp)
@@ -7730,6 +8280,8 @@ resolve_content_store_configuration() {
   RESOLVED_S3_SECRET_ACCESS_KEY=""
   RESOLVED_S3_PATH_STYLE=""
   RESOLVED_S3_CREDENTIAL_SOURCE=""
+  RESOLVED_S3_SSE_MODE=""
+  RESOLVED_S3_SSE_KMS_KEY_ID=""
 
   trim_configuration_value "${OFBIZ_CONTENT_STORE_PROVIDER-}"
   local provider="$TRIMMED_VALUE"
@@ -7796,6 +8348,23 @@ resolve_content_store_configuration() {
     RESOLVED_S3_CREDENTIAL_SOURCE='aws-default-provider-chain'
   fi
 
+  # At-rest protection, checked on this early path for the same reason the endpoint and the credential
+  # pair are: an encryption configuration the provider will refuse must stop the start before the
+  # database is touched, not at the first upload - by which time content is in the store with whatever
+  # protection the bucket happened to apply. require_object_store_encryption sets RESOLVED_S3_SSE_MODE.
+  trim_configuration_value "${OFBIZ_S3_SSE-}"
+  local requestedSse="$TRIMMED_VALUE"
+  trim_configuration_value "${OFBIZ_S3_SSE_KMS_KEY_ID-}"
+  # shellcheck disable=SC2034  # recorded for the start-up trace; the render re-derives it from the environment
+  RESOLVED_S3_SSE_KMS_KEY_ID="$TRIMMED_VALUE"
+  if [ -n "$requestedSse" ]; then
+    reject_unsafe_value OFBIZ_S3_SSE "$requestedSse"
+  fi
+  if [ -n "$RESOLVED_S3_SSE_KMS_KEY_ID" ]; then
+    reject_unsafe_value OFBIZ_S3_SSE_KMS_KEY_ID "$RESOLVED_S3_SSE_KMS_KEY_ID"
+  fi
+  require_object_store_encryption "$requestedSse" "$RESOLVED_S3_SSE_KMS_KEY_ID"
+
   restore_trace
 }
 
@@ -7832,6 +8401,58 @@ require_object_store_credential_pair() {
 }
 
 ###############################################################################
+# Refuse a server-side encryption configuration the provider could not honour, and canonicalise it.
+#
+# Owned here because both paths need it and they must agree: resolve_content_store_configuration checks
+# it on the earliest path in _main, before the database is touched, and render_content_store_configuration
+# checks it again while substituting it. S3ContentStore.validatedServerSideEncryption applies exactly
+# these three rules to the rendered properties, so a value this function accepts is a value the provider
+# accepts - and a deployment that got it wrong is told at start up rather than at the first upload, by
+# which time content is already in the store unencrypted.
+#
+# THE TWO PAIRING RULES ARE REFUSALS, NOT WARNINGS, AND THAT IS THE POINT.
+#  - aws:kms without a key would send a KMS request the store cannot resolve to a key, so every upload
+#    would fail; naming the key is the only way the mode means anything.
+#  - A key with any other mode is the dangerous direction: the key is configured, an operator reading the
+#    configuration sees KMS protection, and no encryption header is ever sent. Protection that looks like
+#    it is in force and is not is worse than protection that is plainly absent.
+#
+# Neither value is a secret - a mode is one of three words and a KMS key identifier is an ARN or an alias,
+# both of which are useless without a principal permitted to use them - so both may be quoted in a
+# refusal, which is what lets an operator see a stray space or a wrong case.
+# $1 - the mode as supplied, already trimmed; $2 - the KMS key identifier as supplied, already trimmed
+# Sets RESOLVED_S3_SSE_MODE to the canonical spelling the render writes ('' when no header is to be sent).
+require_object_store_encryption() {
+  local mode="$1"
+  local kmsKeyId="$2"
+  local folded
+  folded=$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')
+
+  RESOLVED_S3_SSE_MODE=''
+  if [ -n "$folded" ]; then
+    local index
+    local matched='false'
+    for index in "${!CONTENT_STORE_SSE_MODES[@]}"; do
+      if [ "$folded" = "${CONTENT_STORE_SSE_MODES[$index]}" ]; then
+        RESOLVED_S3_SSE_MODE="${CONTENT_STORE_SSE_CANONICAL[$index]}"
+        matched='true'
+        break
+      fi
+    done
+    if [ "$matched" = 'false' ]; then
+      config_fatal "OFBIZ_S3_SSE is '$mode', which is not a server-side encryption mode this image can request. Set it to one of: ${CONTENT_STORE_SSE_CANONICAL[*]} - or leave it unset to send no encryption header, which is what a store that encrypts every object by its own bucket policy needs. S3ContentStore refuses the same value, so starting on it would fail when the provider is built."
+    fi
+  fi
+
+  if [ "$RESOLVED_S3_SSE_MODE" = 'aws:kms' ] && [ -z "$kmsKeyId" ]; then
+    config_fatal "OFBIZ_S3_SSE=aws:kms requires OFBIZ_S3_SSE_KMS_KEY_ID to name the key objects are encrypted with. Supply the key id, ARN or alias, or set OFBIZ_S3_SSE=AES256 to use the store's own managed keys."
+  fi
+  if [ "$RESOLVED_S3_SSE_MODE" != 'aws:kms' ] && [ -n "$kmsKeyId" ]; then
+    config_fatal "OFBIZ_S3_SSE_KMS_KEY_ID is set but OFBIZ_S3_SSE is '${mode:-unset}', so the key would never be sent and the objects it names would not be encrypted with it. Set OFBIZ_S3_SSE=aws:kms to use the key, or remove OFBIZ_S3_SSE_KMS_KEY_ID."
+  fi
+}
+
+###############################################################################
 # Report object-store settings that were supplied but will have no effect.
 #
 # Supplying a bucket, a region and a credential and then leaving the provider unset - or leaving it at
@@ -7849,7 +8470,7 @@ warn_about_inactive_object_store_settings() {
   # start, so it is always set and its presence is not evidence of operator intent. Only the settings
   # that have no default can distinguish "supplied" from "defaulted".
   for variableName in OFBIZ_S3_BUCKET OFBIZ_S3_REGION OFBIZ_S3_ENDPOINT OFBIZ_S3_ACCESS_KEY_ID \
-    OFBIZ_S3_SECRET_ACCESS_KEY; do
+    OFBIZ_S3_SECRET_ACCESS_KEY OFBIZ_S3_SSE OFBIZ_S3_SSE_KMS_KEY_ID; do
     if [ -n "${!variableName-}" ]; then
       supplied="$supplied $variableName"
     fi
@@ -7989,6 +8610,34 @@ require_jms_provider_url() {
     config_fatal "$name must be a JMS provider URL naming a transport, such as tcp://broker:61616 or failover:(tcp://a:61616,tcp://b:61616)."
     ;;
   esac
+
+  # '@' closes the userinfo route to a credential; this closes the QUERY-PARAMETER route, which every
+  # broker family leaves open. ActiveMQ alone accepts 'password', 'jms.password', 'trustStorePassword'
+  # and 'keyStorePassword' as transport options, and Artemis, Qpid and the Solace and IBM MQ clients each
+  # spell an equivalent. A secret arriving that way would be written into serviceengine.xml as an
+  # ordinary attribute rather than into a mode 0600 secret file, would be echoed by the confirmation this
+  # script prints for the transport, and would reach every diagnostic that quotes the provider URL - the
+  # exact exposure the userinfo refusal above exists to prevent (CWE-522, CWE-532). Refused rather than
+  # redacted, because a value this script cannot classify as a secret cannot be protected as one, and the
+  # broker credentials already have variables of their own that are handled as secrets throughout.
+  # Walked with jms_url_parameters, the same helper the TLS pre-flight uses, so this sees exactly the
+  # parameters that pre-flight sees - including a wrapper-level option such as
+  # 'failover:(tcp://a,tcp://b)?nested.password=...', which belongs to every endpoint in the list while
+  # appearing on none of them. It lower-cases the names, so the patterns below need no case handling, and
+  # it must never be printed: the whole point is that these lines can carry the value.
+  local ofbizJmsParameter ofbizJmsKey
+  while IFS= read -r ofbizJmsParameter; do
+    [ -n "$ofbizJmsParameter" ] || continue
+    ofbizJmsKey="${ofbizJmsParameter%%=*}"
+    case "$ofbizJmsKey" in
+    *password* | *passphrase* | *secret* | *token* | *credential* | *apikey* | *accesskey* | *privatekey* \
+      | key | *.key | *_key | *-key)
+      config_fatal "$name carries the query parameter '$ofbizJmsKey', which names a secret. Broker credentials and key-store passwords must not be embedded in the provider URL: it is written into serviceengine.xml as a plain attribute, it is reported in this script's output and it is quoted by every diagnostic that names the transport (CWE-522, CWE-532). Supply the broker credentials through OFBIZ_JMS_USERNAME and OFBIZ_JMS_PASSWORD, which are written into a mode 0600 file and never printed, and a key-store password through the JVM's own key-store options."
+      ;;
+    esac
+  done <<EOF
+$(jms_url_parameters "$value")
+EOF
 }
 
 ###############################################################################
@@ -9121,8 +9770,8 @@ render_database_configuration() {
     reject_unsafe_value "$variableName" "${!variableName}"
   done
 
-  # Each password must be supplied and must not be one of the published values named by
-  # RETIRED_DATABASE_PASSWORDS. There is no way to opt out: a managed database is reachable over the
+  # Each password must be supplied and must not be one of the published values recorded in
+  # RETIRED_DATABASE_PASSWORDS or RETIRED_DATABASE_PASSWORD_DIGESTS. There is no way to opt out: a managed database is reachable over the
   # network, so a deployment with a guessable database password has no database password.
   for variableName in OFBIZ_POSTGRES_OFBIZ_PASSWORD OFBIZ_POSTGRES_OLAP_PASSWORD \
     OFBIZ_POSTGRES_TENANT_PASSWORD; do
@@ -10846,6 +11495,13 @@ _main() {
   # zero-configuration start working without settling that decision silently; a value that is neither
   # profile is refused here.
   require_profile
+
+  # Immediately after the profile, and before anything is rendered: a secret passed as a JVM argument is
+  # already published to every process listing in the container by the time this script runs, so the only
+  # useful response is to refuse to start and tell the operator to rotate it. Placed here rather than
+  # beside the exec at the end so the refusal happens before minutes of data loading, and so it cannot be
+  # reached by any path that skips the end of _main.
+  reject_secret_bearing_jvm_options "$@"
 
   # Checked unconditionally, because a driver jar left in lib-extra takes class path precedence over the
   # bundled driver whether or not the data initialisation is skipped.

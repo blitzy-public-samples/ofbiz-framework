@@ -133,9 +133,11 @@ import org.apache.ofbiz.entity.condition.EntityCondition;
  * the delegator from the webapp's declared {@code entityDelegatorName} context-param removes that
  * misreport: a context-param is deployment-descriptor configuration and no request can change it.
  *
- * <p>A spelling under {@code /health/} that is not exactly one of the two probe paths is not mapped to
- * this servlet at all and is answered by the container as any other unmapped path is.
- * {@link #isProbePath} is the single definition of what a probe path is.
+ * <p>A spelling under {@code /health/} that is not exactly one of the two probe paths is answered
+ * {@code 404} by this servlet. {@link #isProbePath} is the single definition of what a probe path is, and
+ * it is the ROUTE: the {@code servlet-mapping} is deliberately the {@code /health/} prefix so that this
+ * class - rather than the container's default servlet - is the one that answers a near miss, because only
+ * this class discards the session the filter chain minted for it. See point 3 below.
  *
  * <p><strong>A probe runs the webapp's ordinary filter chain, exactly as {@code /ping.txt} does.</strong>
  * That is the registration the Agent Action Plan prescribes - a {@code servlet}/{@code servlet-mapping}
@@ -148,7 +150,10 @@ import org.apache.ofbiz.entity.condition.EntityCondition;
  * {@code ContextFilter} both call {@code getSession()} unconditionally, {@code ControlFilter} before it
  * consults its allow-list, which is equally true of every anonymous path the descriptor already admits.
  * {@link #discardAnySessionMintedForThisProbe} therefore invalidates a session this request created and
- * suppresses its cookie, so a probe leaves no session behind however this servlet is wired up.</li>
+ * suppresses its cookie, so a probe leaves no session behind however this servlet is wired up. It runs
+ * from {@link #service} as the FIRST thing this class does, before the method gate and before the route,
+ * so it covers a refused method and a near-miss path as well as a probe - each of which arrives with a
+ * session already created.</li>
  * <li><strong>The chain may parse a request body before this class refuses one.</strong>
  * {@code ControlFilter} calls {@code UtilHttp.getParameterMap} and {@code ContextFilter} calls
  * {@code WebAppUtil.setAttributesFromRequestBody}. The header-only {@code 400} below is still this
@@ -158,9 +163,13 @@ import org.apache.ofbiz.entity.condition.EntityCondition;
  * {@code /health/live} and {@code /health/ready} - and never the {@code /health} prefix.
  * {@code allowedPaths} is matched with {@code startsWith}, so a single {@code /health} entry would admit
  * every {@code /health*} spelling to the chain anonymously. With the exact entries, the only near misses
- * admitted are longer spellings of those two paths, and no {@code servlet-mapping} answers any of them:
- * the container replies {@code 404} from its default servlet, so nothing is reachable that was not
- * reachable before.</li>
+ * admitted are LONGER SPELLINGS of those two paths - {@code /health/live-x},
+ * {@code /health/ready/anything} - and those are exactly what the {@code /health/} prefix mapping brings
+ * here. Letting the container's default servlet answer them {@code 404} instead left the session
+ * {@code ControlFilter} had already created in place until it expired on its own, so any client that
+ * could reach the webapp could mint unbounded sessions through {@code /health/live-<nonce>}
+ * (CWE-400). Answering them here discards that session and still replies {@code 404}: nothing is
+ * reachable that was not reachable before, and nothing accumulates behind it.</li>
  * </ol>
  *
  * <p>Every field is a private constant or a thread-safe counter, so the single instance the container
@@ -460,6 +469,15 @@ public class HealthCheckServlet extends HttpServlet {
     @Override
     protected void service(HttpServletRequest request, HttpServletResponse response)
             throws IOException, ServletException {
+        // FIRST, before the method gate and before any routing, and before anything is written to the
+        // response - a committed response cannot have its headers changed.
+        //
+        // Every request that reaches this class arrives with a session already created for it, because
+        // ControlFilter calls getSession() before it consults its allow-list. That is true of a probe, of
+        // a refused method and of a near-miss path under the /health/ prefix this servlet is mapped to
+        // alike, so the discard belongs here rather than on the one path that serves a probe: putting it
+        // after the method gate left 'POST /health/live-x' with a session nothing removed.
+        discardAnySessionMintedForThisProbe(request, response);
         if (methodRefused(request, response)) {
             return;
         }
@@ -520,11 +538,11 @@ public class HealthCheckServlet extends HttpServlet {
      * The body guard runs before the routing and does not read the request body: Content-Length and
      * Transfer-Encoding are headers, so an oversized or chunked body is refused for the cost of a
      * header lookup and is then discarded by the container rather than by this JVM's heap. Neither
-     * branch touches the session, and liveness in addition resolves no delegator and issues no query,
-     * so it stays answerable while the datasource is unavailable.
+     * branch touches the session - service above has already discarded any session that was minted for
+     * the request - and liveness in addition resolves no delegator and issues no query, so it stays
+     * answerable while the datasource is unavailable.
      */
     private static void handleProbe(HttpServletRequest request, HttpServletResponse response, String path) throws IOException {
-        discardAnySessionMintedForThisProbe(request, response);
         if (carriesEntityBody(request)) {
             writeResponse(response, HttpServletResponse.SC_BAD_REQUEST, BODY_UNKNOWN);
             return;

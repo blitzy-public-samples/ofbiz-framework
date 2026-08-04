@@ -30,21 +30,37 @@ import java.io.StringWriter;
 import java.io.Writer;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
+import java.net.InetSocketAddress;
 import java.net.Inet6Address;
 import java.net.InetAddress;
+import java.net.Socket;
 import java.net.URL;
 import java.net.URLConnection;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SecureDirectoryStream;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.security.Security;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -56,9 +72,16 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import javax.transaction.Status;
 import javax.transaction.Synchronization;
 
@@ -104,6 +127,7 @@ import org.apache.ofbiz.entity.model.ModelReader;
 import org.apache.ofbiz.entity.transaction.GenericTransactionException;
 import org.apache.ofbiz.entity.transaction.TransactionUtil;
 import org.apache.ofbiz.entity.util.EntityQuery;
+import org.apache.ofbiz.entity.util.EntityUtil;
 import org.apache.ofbiz.entity.util.EntityUtilProperties;
 import org.apache.ofbiz.service.GenericServiceException;
 import org.apache.ofbiz.service.LocalDispatcher;
@@ -141,6 +165,40 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     private static final int HTTP_REDIRECT_ABOVE = 400;
     private static final String ERR_RESOURCE = "ContentErrorUiLabels";
     private static final String PROPERTY_RESOURCE = "content";
+
+    /** The name every staging entry a reconstructed local copy is written through begins with. */
+    private static final String LOCAL_COPY_STAGING_PREFIX = ".ofbiz-content-cache-";
+
+    /** How much of a reconstructed copy is held in memory at a time, which is a buffer and not a bound. */
+    private static final int LOCAL_COPY_BUFFER = 8192;
+
+    /** The mode a reconstructed content copy is created with: readable and writable by its owner alone. */
+    private static final Set<PosixFilePermission> LOCAL_COPY_FILE_PERMISSIONS =
+            PosixFilePermissions.fromString("rw-------");
+
+    /** The mode a content directory this instance has to create is given, for the same reason. */
+    private static final Set<PosixFilePermission> LOCAL_COPY_DIRECTORY_PERMISSIONS =
+            PosixFilePermissions.fromString("rwx------");
+
+    /**
+     * Whether this filesystem applies POSIX modes at all, decided once. A mode requested on a filesystem
+     * that has none - a Windows volume - raises {@link UnsupportedOperationException} from the create call
+     * itself, so it is asked here rather than caught there.
+     */
+    private static final boolean POSIX_SUPPORTED =
+            FileSystems.getDefault().supportedFileAttributeViews().contains("posix");
+
+    /** Where a committing transaction's captured bytes are held, relative to {@code ofbiz.home}. */
+    private static final String PUBLICATION_STAGING_DIRECTORY = "runtime/tmp/content-publish";
+
+    /** The name every captured copy begins with, so the staging area's contents are self-describing. */
+    private static final String PUBLICATION_STAGING_PREFIX = "publish-";
+
+    /** How many times a generated staging name is tried before the capture is treated as impossible. */
+    private static final int PUBLICATION_STAGING_ATTEMPTS = 32;
+
+    /** Whether the absence of {@link SecureDirectoryStream} has already been reported. */
+    private static final AtomicBoolean SECURE_DIRECTORY_STREAM_REPORTED = new AtomicBoolean();
 
     /**
      * The storage keys whose local-copy answer has already been reported, so that a resource waiting to be
@@ -578,6 +636,33 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     }
 
     /**
+     * Refuses a {@code URL_RESOURCE} fetch, keeping every detail of WHY server-side.
+     *
+     * <p>Each refusal below is decided from something the caller must not be told: the host the resource
+     * names, the address that host resolved to - which, when the refusal is "this is private", names an
+     * address inside the deployment's own network - or the protocol it asked for. These refusals travel
+     * back through the content-rendering path, where they can reach a rendered page, so a caller learns
+     * only that the content could not be retrieved and an opaque reference to look up (CWE-209). The
+     * reason, with the host and the address in it, goes to the log beside the same reference.
+     *
+     * <p>The message of the returned exception carries no cause either, deliberately: {@code
+     * GeneralException.getMessage()} appends the message of any cause it is given, and the causes here -
+     * {@code UnknownHostException} for one - report the host they failed on.
+     *
+     * <p>Returned rather than thrown so that every call site reads {@code throw refuseUrlResource(...)},
+     * which keeps the control flow visible at the site and lets the compiler see the method ends there.
+     *
+     * @param detail the whole reason, for the log; may name hosts, addresses and settings
+     * @return the exception to throw
+     */
+    private static GeneralException refuseUrlResource(String detail) {
+        String reference = UUID.randomUUID().toString();
+        Debug.logError("URL_RESOURCE refusal [" + reference + "]: " + detail, MODULE);
+        return new GeneralException("The requested URL_RESOURCE content could not be retrieved. Reference ["
+                + reference + "].");
+    }
+
+    /**
      * Validates a URL for the URL_RESOURCE data type against SSRF (Server-Side Request Forgery)
      * attacks. Enforces:
      * <ul>
@@ -593,11 +678,11 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         // 1. Protocol: only http and https are permitted
         String protocol = url.getProtocol();
         if (!"http".equalsIgnoreCase(protocol) && !"https".equalsIgnoreCase(protocol)) {
-            throw new GeneralException("URL_RESOURCE only supports http/https protocols; rejected: " + protocol);
+            throw refuseUrlResource("only http and https are supported; the resource names [" + protocol + "]");
         }
         String host = url.getHost();
         if (UtilValidate.isEmpty(host)) {
-            throw new GeneralException("URL_RESOURCE URL has no host component");
+            throw refuseUrlResource("the resource names no host");
         }
 
         // 2. Allow-list: if configured, the host must match one of the entries
@@ -617,7 +702,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 }
             }
             if (!hostAllowed) {
-                throw new GeneralException("URL_RESOURCE host is not in the allowed list: " + host);
+                throw refuseUrlResource("host [" + host + "] is not in content.data.url.resource.allowed.hosts");
             }
         }
 
@@ -626,10 +711,10 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         try {
             addresses = InetAddress.getAllByName(host);
         } catch (UnknownHostException e) {
-            throw new GeneralException("URL_RESOURCE host cannot be resolved: " + host);
+            throw refuseUrlResource("host [" + host + "] cannot be resolved");
         }
         if (addresses == null || addresses.length == 0) {
-            throw new GeneralException("URL_RESOURCE host resolved to no addresses: " + host);
+            throw refuseUrlResource("host [" + host + "] resolved to no addresses");
         }
         for (InetAddress addr : addresses) {
             checkNotPrivateOrReservedAddress(addr);
@@ -637,6 +722,26 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         // Returned so that the peer the request is actually made to can be checked against the peer that was
         // authorised here; see requireValidatedPeer.
         return addresses;
+    }
+
+    /**
+     * How the address a {@code URL_RESOURCE} fetch may reach is decided, which is not the same question
+     * for the two places a fetch is made from.
+     *
+     * <p>{@link #EXTERNAL} is a target named by a {@code DataResource} row: the host is data, so it is put
+     * through the whole allow-list and address policy, and no private or reserved address may be reached.
+     * {@link #SELF} is this deployment's own configured base URL with a relative resource appended: the host
+     * comes from {@code url.properties} and the site configuration rather than from a row, and it is
+     * routinely a private or loopback address - a container in a private subnet reaching itself. Applying the
+     * external policy there would refuse every real deployment, so the address policy is not applied and what
+     * IS enforced instead is that the authority of the URL fetched is the authority the deployment
+     * configured; see {@link #openSelfOriginResource}.
+     */
+    private enum FetchOrigin {
+        /** A target named by row data. */
+        EXTERNAL,
+        /** This deployment's own configured origin. */
+        SELF
     }
 
     /**
@@ -648,46 +753,108 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * before a single byte of the response is consumed, so an answer that has changed is refused and the
      * connection is dropped rather than read.
      *
+     * <p><strong>This is the weaker of the two checks, and for {@code https} it is no longer the only one.</strong>
+     * Comparing resolutions before and after says nothing about the address the connection was actually made
+     * to; {@link PinnedPeerSocketFactory} inspects THAT, at the socket layer, for every {@code https} fetch. For
+     * cleartext {@code http} the JDK offers no socket seam on {@code HttpURLConnection}, so what binds the
+     * connect to the validated answer there is the JVM's positive DNS cache - which
+     * {@link #requireDnsCacheBindsTheValidation} now REQUIRES rather than assumes - plus this comparison.
+     *
      * <p>The connection itself is made through the unchanged URL, deliberately: rewriting it to the authorised
      * IP literal would send that literal as the {@code Host} header - {@code HttpURLConnection} treats
      * {@code Host} as a restricted header and ignores an attempt to set it - which breaks name-based virtual
-     * hosting and, over TLS, certificate verification. Two things bind the connection to the authorised answer
-     * instead: the JVM's positive DNS cache, which serves the connect that immediately follows the validation
-     * from the very answer that was validated, and for {@code https} the certificate check, which a service on
-     * a rebound private address cannot satisfy for the requested name. This check is what remains after those
-     * two, and a deployment that wants the question closed entirely configures
-     * {@code content.data.url.resource.allowed.hosts}.
+     * hosting and, over TLS, certificate verification. A deployment that wants the question closed entirely
+     * configures {@code content.data.url.resource.allowed.hosts}.
      *
      * @param url the resource URL being fetched
      * @param validated the addresses that were authorised before the connection was made
+     * @param origin whether the address policy applies to the answer, which it does not for this deployment's
+     *     own origin
      * @throws GeneralException if the host no longer resolves to the authorised addresses, or resolves to an
      *     address that may not be reached
      */
-    private static void requireValidatedPeer(URL url, InetAddress[] validated) throws GeneralException {
+    private static void requireValidatedPeer(URL url, InetAddress[] validated, FetchOrigin origin)
+            throws GeneralException {
         InetAddress[] current;
         try {
             current = InetAddress.getAllByName(url.getHost());
         } catch (UnknownHostException e) {
-            throw new GeneralException("URL_RESOURCE host cannot be resolved: " + url.getHost());
+            throw refuseUrlResource("host [" + url.getHost() + "] cannot be resolved");
         }
         if (current == null || current.length == 0) {
-            throw new GeneralException("URL_RESOURCE host resolved to no addresses: " + url.getHost());
+            throw refuseUrlResource("host [" + url.getHost() + "] resolved to no addresses");
         }
         Set<String> authorised = new HashSet<>();
         for (InetAddress addr : validated) {
             authorised.add(addr.getHostAddress());
         }
         for (InetAddress addr : current) {
-            checkNotPrivateOrReservedAddress(addr);
+            if (origin == FetchOrigin.EXTERNAL) {
+                checkNotPrivateOrReservedAddress(addr);
+            }
             if (!authorised.contains(addr.getHostAddress())) {
-                throw new GeneralException("URL_RESOURCE host resolution changed while the request was being"
-                        + " made, so the response is refused rather than read");
+                throw refuseUrlResource("host [" + url.getHost() + "] resolved to [" + addr.getHostAddress()
+                        + "], which is not one of the addresses authorised before the request was made, so the"
+                        + " response is refused rather than read");
             }
         }
     }
 
     /**
-     * Opens the response a {@code URL_RESOURCE} names, authorised, peer-checked, size-capped and owning its
+     * Requires that the JVM will serve the connect that follows a validation from the answer that was
+     * validated, for the one scheme where nothing else can bind the two.
+     *
+     * <p><strong>The gap this closes.</strong> For cleartext {@code http} the JDK exposes no socket factory on
+     * {@code HttpURLConnection}, so the address the connection is made to cannot be inspected or chosen from
+     * here: the client resolves the name itself. Everything that made the earlier before-and-after comparison
+     * meaningful therefore rested on the JVM's positive DNS cache serving that second resolution from the
+     * first one's answer - an assumption, written in a comment, that a deployment could switch off without
+     * knowing it had. With {@code networkaddress.cache.ttl=0} the comparison compares two independent lookups
+     * and a name that alternates between a public and a private answer passes it while the connection goes to
+     * the private one (CWE-350, CWE-918).
+     *
+     * <p>So the assumption is now a checked precondition: caching disabled means the fetch is refused, with the
+     * two ways to make it possible again named. It is checked per fetch rather than once per JVM because a
+     * security property can be set at any time by any code in the JVM, so a value read at class initialisation
+     * would say nothing about the value in force now.
+     *
+     * <p>Only cleartext {@code http} reaches this. An {@code https} fetch is bound by
+     * {@link PinnedPeerSocketFactory}, which inspects the peer the connection was really made to, and by the
+     * certificate check, which a service on a rebound address cannot satisfy for the requested name.
+     *
+     * @param url the resource URL being fetched, for the report
+     * @throws GeneralException if the JVM caches no positive DNS answer
+     */
+    private static void requireDnsCacheBindsTheValidation(URL url) throws GeneralException {
+        // The security property is what the JDK reads first; the system property is the legacy form it falls
+        // back to. Absent means the JDK default, which caches positive answers, so absence is not a failure.
+        String configured = Security.getProperty("networkaddress.cache.ttl");
+        if (UtilValidate.isEmpty(configured)) {
+            configured = System.getProperty("sun.net.inetaddr.ttl");
+        }
+        if (UtilValidate.isEmpty(configured)) {
+            return;
+        }
+        long ttl;
+        try {
+            ttl = Long.parseLong(configured.trim());
+        } catch (NumberFormatException unusable) {
+            // Unparseable means the JDK ignores it and applies its own default, which caches.
+            return;
+        }
+        if (ttl != 0) {
+            return;
+        }
+        throw refuseUrlResource("host [" + url.getHost() + "] is named over cleartext http while this JVM caches"
+                + " no positive DNS answer (networkaddress.cache.ttl=0), so the address this validation"
+                + " authorised is not the address the connection would be made to and a rebinding answer would"
+                + " not be seen. Name the resource over https, where the connected peer is inspected at the"
+                + " socket layer, or allow a positive DNS cache, or restrict"
+                + " content.data.url.resource.allowed.hosts to hosts this deployment trusts.");
+    }
+
+    /**
+     * Opens the response a {@code URL_RESOURCE} names, authorised, peer-pinned, size-capped and owning its
      * own connection.
      *
      * <p>Extracted so that both places a {@code URL_RESOURCE} is fetched - the text render and the stream seam
@@ -706,7 +873,88 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * @throws IOException if the connection cannot be made or the response cannot be opened
      */
     private static Map<String, Object> openUrlResource(URL url) throws GeneralException, IOException {
-        InetAddress[] validated = checkUrlResourceAllowed(url);
+        return openFetchedResource(url, FetchOrigin.EXTERNAL);
+    }
+
+    /**
+     * Opens a resource of THIS deployment's own origin through the same hardened path as an external one.
+     *
+     * <p><strong>The gap this closes.</strong> A {@code URL_RESOURCE} whose {@code objectInfo} is relative is
+     * resolved against the deployment's own base URL and used to be fetched with {@code URL.getContent()}: no
+     * timeouts, so a hung origin held the rendering thread indefinitely; redirects followed automatically, so a
+     * {@code Location} header could take the fetch to a host nothing authorised; no ceiling on the response, so
+     * the whole of it was materialised in the heap; and no release of the connection (CWE-918, CWE-400). It is
+     * the same fetch as the absolute case in every respect but which host it goes to, so it goes through the
+     * same opener.
+     *
+     * <p><strong>What is checked here instead of the address policy.</strong> The host is not row data - it is
+     * built by {@code buildRequestPrefix} from {@code url.properties} and the {@code WebSite} configuration -
+     * and it is routinely private or loopback, so refusing private addresses would refuse every real
+     * deployment. What the row DOES contribute is the path, so what is enforced is that appending the path did
+     * not move the fetch off the configured origin: scheme, host and port must be exactly the prefix's own. A
+     * relative value that reaches a different authority is refused rather than fetched, which is the case an
+     * appended {@code //host/} or an embedded credential would otherwise produce.
+     *
+     * @param resource the URL built from the deployment's own prefix and the resource's relative path
+     * @param origin the prefix the resource was built from, whose authority the fetch may not leave
+     * @return the {@code stream} and {@code length} pair, exactly as {@link #openUrlResource} returns it
+     * @throws GeneralException if the resource left the configured origin, or the fetch is refused
+     * @throws IOException if the connection cannot be made or the response cannot be opened
+     */
+    private static Map<String, Object> openSelfOriginResource(URL resource, URL origin)
+            throws GeneralException, IOException {
+        if (!sameOrigin(resource, origin)) {
+            throw refuseUrlResource("a relative resource resolved to [" + resource.getProtocol() + "://"
+                    + resource.getAuthority() + "], which is not this deployment's configured origin ["
+                    + origin.getProtocol() + "://" + origin.getAuthority() + "], so it is refused rather than"
+                    + " fetched");
+        }
+        return openFetchedResource(resource, FetchOrigin.SELF);
+    }
+
+    /**
+     * Reports whether two URLs name the same scheme, host and port.
+     *
+     * <p>The port is compared as the EFFECTIVE port, so {@code https://host} and {@code https://host:443} are
+     * one origin: {@link URL#getPort()} answers -1 for a URL that named no port, and comparing that with 443
+     * would refuse a legitimate fetch. The host comparison is case-insensitive because a host name is, and the
+     * scheme comparison is too.
+     *
+     * @param one the first URL
+     * @param other the second URL
+     * @return whether both name the same origin
+     */
+    private static boolean sameOrigin(URL one, URL other) {
+        return one.getProtocol().equalsIgnoreCase(other.getProtocol())
+                && one.getHost().equalsIgnoreCase(other.getHost())
+                && effectivePort(one) == effectivePort(other);
+    }
+
+    /**
+     * The port a URL names, or the default port of its scheme when it named none.
+     *
+     * @param url the URL
+     * @return the effective port
+     */
+    private static int effectivePort(URL url) {
+        return url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
+    }
+
+    /**
+     * The one fetch implementation both callers share.
+     *
+     * @param url the absolute resource URL, with a host
+     * @param origin which address policy applies to it
+     * @return the {@code stream} and {@code length} pair
+     * @throws GeneralException if the URL is not allowed, the peer is not the authorised one, the response is a
+     *     redirect, or the reported length exceeds the configured maximum
+     * @throws IOException if the connection cannot be made or the response cannot be opened
+     */
+    private static Map<String, Object> openFetchedResource(URL url, FetchOrigin origin)
+            throws GeneralException, IOException {
+        InetAddress[] validated = origin == FetchOrigin.EXTERNAL
+                ? checkUrlResourceAllowed(url)
+                : resolveOwnOrigin(url);
         int connectTimeout = (int) UtilProperties.getPropertyNumber("security",
                 "content.data.url.resource.connect.timeout", 10000.0);
         int readTimeout = (int) UtilProperties.getPropertyNumber("security",
@@ -726,19 +974,31 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 HttpURLConnection http = (HttpURLConnection) con;
                 http.setInstanceFollowRedirects(false);
             }
+            if (con instanceof HttpsURLConnection) {
+                // The peer the connection is really made to is inspected at the socket layer, which is the one
+                // place it can be seen. Installed per connection, so nothing about this fetch changes the
+                // defaults any other code in this JVM uses.
+                HttpsURLConnection https = (HttpsURLConnection) con;
+                https.setSSLSocketFactory(new PinnedPeerSocketFactory(https.getSSLSocketFactory(), validated,
+                        connectTimeout, origin));
+            } else if (origin == FetchOrigin.EXTERNAL) {
+                // Cleartext http to a host named by row data: there is no socket seam, so the property that
+                // makes the before-and-after comparison mean anything is required explicitly.
+                requireDnsCacheBindsTheValidation(url);
+            }
             con.connect();
-            requireValidatedPeer(url, validated);
+            requireValidatedPeer(url, validated, origin);
             if (con instanceof HttpURLConnection) {
                 int responseCode = ((HttpURLConnection) con).getResponseCode();
                 if (responseCode >= HTTP_REDIRECT_LOWEST && responseCode < HTTP_REDIRECT_ABOVE) {
-                    throw new GeneralException("URL_RESOURCE request returned a redirect (" + responseCode
-                            + "); redirects are not followed for security reasons");
+                    throw refuseUrlResource("the response was a redirect (" + responseCode + "), and a"
+                            + " Location header names a target none of the checks above authorised");
                 }
             }
             long contentLength = con.getContentLengthLong();
             if (contentLength > maxResponseSize) {
-                throw new GeneralException("URL_RESOURCE response Content-Length (" + contentLength
-                        + " bytes) exceeds the configured maximum of " + maxResponseSize + " bytes");
+                throw refuseUrlResource("the response reported " + contentLength + " bytes, over the"
+                        + " content.data.url.resource.max.response.size ceiling of " + maxResponseSize);
             }
             Map<String, Object> opened = UtilMisc.toMap("stream",
                     new UrlResourceStream(con.getInputStream(), con, maxResponseSize), "length", contentLength);
@@ -747,6 +1007,233 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         } finally {
             if (!handedOver) {
                 disconnect(con);
+            }
+        }
+    }
+
+    /**
+     * Resolves the addresses of this deployment's OWN origin, without the external address policy.
+     *
+     * <p>The policy is deliberately absent - see {@link FetchOrigin} - but the resolution is not: the answer is
+     * what the peer inspection and the before-and-after comparison are made against, so a self-origin fetch is
+     * pinned to its own configured host exactly as an external one is pinned to a public one.
+     *
+     * @param url the URL built from this deployment's configured prefix
+     * @return the addresses its host resolves to, never empty
+     * @throws GeneralException if the host cannot be resolved
+     */
+    private static InetAddress[] resolveOwnOrigin(URL url) throws GeneralException {
+        String host = url.getHost();
+        if (UtilValidate.isEmpty(host)) {
+            throw refuseUrlResource("this deployment's configured content prefix names no host, so a relative"
+                    + " resource cannot be fetched from it");
+        }
+        InetAddress[] addresses;
+        try {
+            addresses = InetAddress.getAllByName(host);
+        } catch (UnknownHostException e) {
+            throw refuseUrlResource("this deployment's own host [" + host + "] cannot be resolved");
+        }
+        if (addresses == null || addresses.length == 0) {
+            throw refuseUrlResource("this deployment's own host [" + host + "] resolved to no addresses");
+        }
+        return addresses;
+    }
+
+    /**
+     * A TLS socket factory that will not let a fetch reach an address the validation did not authorise.
+     *
+     * <p><strong>The defect this closes.</strong> Authorising a name by resolving it and then connecting
+     * through the name resolves it a SECOND time, inside the HTTP client, and nothing compared the address that
+     * second resolution produced with the one that was authorised. A name that answers with a public address
+     * when it is checked and a private one when it is connected to - DNS rebinding, or a short TTL and an
+     * attacker-controlled zone - therefore reached the private address, and the only thing standing in the way
+     * was a comparison of two lookups that were both made from this JVM (CWE-918, CWE-350).
+     *
+     * <p><strong>Where the peer becomes visible.</strong> {@code HttpsURLConnection} connects the plain socket
+     * itself and hands it to this factory for the TLS layer, so the layered overload sees an ALREADY CONNECTED
+     * socket and can read the address off it. Nothing has been sent at that point and no handshake has begun,
+     * so refusing there means the request is never made and the response is never read. When the client instead
+     * asks this factory to create the socket - the overload it falls back to - the address is not read but
+     * CHOSEN: the socket is connected to an authorised address, and the host name is kept for SNI and for
+     * certificate verification, which is what makes pinning compatible with name-based virtual hosting.
+     *
+     * <p><strong>The name is never replaced.</strong> Every overload receives the original host name and passes
+     * it to the delegate, so the {@code Host} header, the SNI extension and the certificate check all continue
+     * to name the host the resource asked for. Verification is not weakened anywhere: no trust manager and no
+     * hostname verifier is replaced, and a certificate that does not name the requested host is refused by the
+     * JDK exactly as before.
+     *
+     * <p>For an {@link FetchOrigin#EXTERNAL} fetch the connected peer is put through the whole address policy
+     * as well as the authorised set, so an address that is private for a reason the set never saw is refused
+     * too. For {@link FetchOrigin#SELF} only the set applies, because this deployment's own origin is
+     * legitimately private.
+     */
+    private static final class PinnedPeerSocketFactory extends SSLSocketFactory {
+
+        private final SSLSocketFactory delegate;
+        private final InetAddress[] authorised;
+        private final Set<String> authorisedAddresses;
+        private final int connectTimeout;
+        private final FetchOrigin origin;
+
+        /**
+         * @param delegate the factory that does the TLS work, which is the connection's own
+         * @param authorised the addresses the validation authorised, in the order it produced them
+         * @param connectTimeout how long a socket this factory connects itself may take, in milliseconds
+         * @param origin which address policy applies to the peer
+         */
+        private PinnedPeerSocketFactory(SSLSocketFactory delegate, InetAddress[] authorised, int connectTimeout,
+                FetchOrigin origin) {
+            this.delegate = delegate;
+            this.authorised = authorised.clone();
+            this.authorisedAddresses = new HashSet<>();
+            for (InetAddress address : authorised) {
+                this.authorisedAddresses.add(address.getHostAddress());
+            }
+            this.connectTimeout = connectTimeout;
+            this.origin = origin;
+        }
+
+        @Override
+        public String[] getDefaultCipherSuites() {
+            return delegate.getDefaultCipherSuites();
+        }
+
+        @Override
+        public String[] getSupportedCipherSuites() {
+            return delegate.getSupportedCipherSuites();
+        }
+
+        @Override
+        public Socket createSocket(Socket connected, String host, int port, boolean autoClose)
+                throws IOException {
+            // The overload HttpsURLConnection uses: the socket is already connected, so this is the address the
+            // request would really go to.
+            requireAuthorised(connected.getInetAddress());
+            return delegate.createSocket(connected, host, port, autoClose);
+        }
+
+        @Override
+        public Socket createSocket(String host, int port) throws IOException {
+            return connectToAuthorised(host, port, null, 0);
+        }
+
+        @Override
+        public Socket createSocket(String host, int port, InetAddress localHost, int localPort)
+                throws IOException {
+            return connectToAuthorised(host, port, localHost, localPort);
+        }
+
+        @Override
+        public Socket createSocket(InetAddress address, int port) throws IOException {
+            requireAuthorised(address);
+            return delegate.createSocket(address, port);
+        }
+
+        @Override
+        public Socket createSocket(InetAddress address, int port, InetAddress localAddress, int localPort)
+                throws IOException {
+            requireAuthorised(address);
+            return delegate.createSocket(address, port, localAddress, localPort);
+        }
+
+        /**
+         * Connects a socket to an authorised address and layers TLS for the ORIGINAL name on top of it.
+         *
+         * <p>Each authorised address is tried in turn, so a host with several addresses behaves as it does
+         * without pinning; only addresses outside the authorised set are unreachable. The name is what the TLS
+         * layer is told, so SNI and certificate verification are unchanged.
+         *
+         * @param host the host name the resource named
+         * @param port the port to connect to
+         * @param localAddress the local address to bind, or null for any
+         * @param localPort the local port to bind
+         * @return the connected TLS socket
+         * @throws IOException if no authorised address could be reached
+         */
+        private Socket connectToAuthorised(String host, int port, InetAddress localAddress, int localPort)
+                throws IOException {
+            IOException last = null;
+            for (InetAddress address : authorised) {
+                Socket plain = new Socket();
+                try {
+                    if (localAddress != null) {
+                        plain.bind(new InetSocketAddress(localAddress, localPort));
+                    }
+                    plain.connect(new InetSocketAddress(address, port), connectTimeout);
+                } catch (IOException unreachable) {
+                    closeQuietly(plain);
+                    last = unreachable;
+                    continue;
+                }
+                try {
+                    return layer(plain, host, port);
+                } catch (IOException handshake) {
+                    closeQuietly(plain);
+                    throw handshake;
+                }
+            }
+            throw last == null ? new IOException("URL_RESOURCE fetch reached no authorised address") : last;
+        }
+
+        /**
+         * Layers TLS for one name over a connected socket, naming the host in SNI and requiring the
+         * certificate to identify it.
+         *
+         * @param plain the connected socket
+         * @param host the host name the resource named
+         * @param port the port
+         * @return the TLS socket, which owns the plain one
+         * @throws IOException if the TLS layer cannot be created
+         */
+        private Socket layer(Socket plain, String host, int port) throws IOException {
+            SSLSocket secured = (SSLSocket) delegate.createSocket(plain, host, port, true);
+            SSLParameters parameters = secured.getSSLParameters();
+            // Stated rather than left to the caller: this socket was connected by address, and endpoint
+            // identification is what makes the certificate be checked against the NAME regardless.
+            parameters.setServerNames(Collections.singletonList(new SNIHostName(host)));
+            parameters.setEndpointIdentificationAlgorithm("HTTPS");
+            secured.setSSLParameters(parameters);
+            return secured;
+        }
+
+        /**
+         * Refuses a peer the validation did not authorise, or that the address policy does not allow.
+         *
+         * @param address the address the connection was made to, or is about to be made to
+         * @throws IOException if it may not be reached
+         */
+        private void requireAuthorised(InetAddress address) throws IOException {
+            if (address == null) {
+                throw new IOException("URL_RESOURCE fetch has no peer address to check");
+            }
+            if (origin == FetchOrigin.EXTERNAL) {
+                try {
+                    checkNotPrivateOrReservedAddress(address);
+                } catch (GeneralException refused) {
+                    // The reason is already in the log with its own reference; the outward message carries
+                    // neither the address nor the reason.
+                    throw new IOException("URL_RESOURCE fetch was refused before any request was sent");
+                }
+            }
+            if (!authorisedAddresses.contains(address.getHostAddress())) {
+                throw new IOException(refuseUrlResource("the connection was made to ["
+                        + address.getHostAddress() + "], which is not one of the addresses the validation"
+                        + " authorised, so no request is sent and no response is read").getMessage());
+            }
+        }
+
+        /**
+         * Closes a socket without letting the close fail the fetch.
+         *
+         * @param socket the socket to close
+         */
+        private static void closeQuietly(Socket socket) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                Debug.logVerbose("A pinned URL_RESOURCE socket could not be closed cleanly", MODULE);
             }
         }
     }
@@ -847,19 +1334,19 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      */
     private static void checkNotPrivateOrReservedAddress(InetAddress addr) throws GeneralException {
         if (addr.isLoopbackAddress()) {
-            throw new GeneralException("URL_RESOURCE target resolves to a loopback address: " + addr.getHostAddress());
+            throw refuseUrlResource("the target resolves to a loopback address: " + addr.getHostAddress());
         }
         if (addr.isLinkLocalAddress()) {
-            throw new GeneralException("URL_RESOURCE target resolves to a link-local address: " + addr.getHostAddress());
+            throw refuseUrlResource("the target resolves to a link-local address: " + addr.getHostAddress());
         }
         if (addr.isSiteLocalAddress()) {
-            throw new GeneralException("URL_RESOURCE target resolves to a private (site-local) address: " + addr.getHostAddress());
+            throw refuseUrlResource("the target resolves to a private (site-local) address: " + addr.getHostAddress());
         }
         if (addr.isAnyLocalAddress()) {
-            throw new GeneralException("URL_RESOURCE target resolves to a wildcard address: " + addr.getHostAddress());
+            throw refuseUrlResource("the target resolves to a wildcard address: " + addr.getHostAddress());
         }
         if (addr.isMulticastAddress()) {
-            throw new GeneralException("URL_RESOURCE target resolves to a multicast address: " + addr.getHostAddress());
+            throw refuseUrlResource("the target resolves to a multicast address: " + addr.getHostAddress());
         }
         byte[] b = addr.getAddress();
         if (addr instanceof Inet4Address) {
@@ -867,28 +1354,28 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             int i1 = b[1] & 0xFF;
             // 0.0.0.0/8 – "this" network (RFC 1122)
             if (i0 == 0) {
-                throw new GeneralException("URL_RESOURCE target resolves to a reserved network address (0.0.0.0/8): " + addr.getHostAddress());
+                throw refuseUrlResource("the target resolves to a reserved network address (0.0.0.0/8): " + addr.getHostAddress());
             }
             // 100.64.0.0/10 – shared address space / CGNAT (RFC 6598)
             if (i0 == 100 && i1 >= 64 && i1 <= 127) {
-                throw new GeneralException("URL_RESOURCE target resolves to a shared address space (CGNAT, 100.64.0.0/10): " + addr.getHostAddress());
+                throw refuseUrlResource("the target resolves to a shared address space (CGNAT, 100.64.0.0/10): " + addr.getHostAddress());
             }
             // 192.0.0.0/24 – IETF protocol assignments (RFC 6890)
             if (i0 == 192 && i1 == 0 && (b[2] & 0xFF) == 0) {
-                throw new GeneralException("URL_RESOURCE target resolves to an IETF reserved address (192.0.0.0/24): " + addr.getHostAddress());
+                throw refuseUrlResource("the target resolves to an IETF reserved address (192.0.0.0/24): " + addr.getHostAddress());
             }
             // 198.18.0.0/15 – network benchmarking (RFC 2544)
             if (i0 == 198 && (i1 == 18 || i1 == 19)) {
-                throw new GeneralException("URL_RESOURCE target resolves to a benchmarking address (198.18.0.0/15): " + addr.getHostAddress());
+                throw refuseUrlResource("the target resolves to a benchmarking address (198.18.0.0/15): " + addr.getHostAddress());
             }
             // 240.0.0.0/4 – reserved for future use (RFC 1112)
             if ((i0 & 0xF0) == 240) {
-                throw new GeneralException("URL_RESOURCE target resolves to a reserved address (240.0.0.0/4): " + addr.getHostAddress());
+                throw refuseUrlResource("the target resolves to a reserved address (240.0.0.0/4): " + addr.getHostAddress());
             }
         } else if (addr instanceof Inet6Address) {
             // fc00::/7 – Unique Local Addresses (ULA), private IPv6 (RFC 4193)
             if ((b[0] & 0xFE) == 0xFC) {
-                throw new GeneralException("URL_RESOURCE target resolves to a unique-local (private) IPv6 address: " + addr.getHostAddress());
+                throw refuseUrlResource("the target resolves to a unique-local (private) IPv6 address: " + addr.getHostAddress());
             }
             // ::ffff:0:0/96 – IPv4-mapped IPv6; re-validate the embedded IPv4 address
             boolean isIpv4Mapped = true;
@@ -903,7 +1390,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                     checkNotPrivateOrReservedAddress(
                             InetAddress.getByAddress(new byte[]{b[12], b[13], b[14], b[15]}));
                 } catch (UnknownHostException e) {
-                    throw new GeneralException("URL_RESOURCE target contains an invalid IPv4-mapped IPv6 address");
+                    throw refuseUrlResource("the target contains an invalid IPv4-mapped IPv6 address");
                 }
             }
         }
@@ -933,13 +1420,15 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         // way the single statement this method used to be is what runs.
         //
         // Resolved with no delegator, because the frozen signature carries none and the services that call it are
-        // out of the plan's scope. That costs nothing where it matters: WHICH provider is selected is a deployment
-        // value read from content.properties alone and never from a SystemProperty row - see
+        // out of the plan's scope. WHICH provider is selected costs nothing: it is a deployment value read from
+        // content.properties alone and never from a SystemProperty row - see
         // ContentStoreFactory.DEPLOYMENT_PROPERTIES - so this resolves the same provider a delegator would. What
         // it does mean is that the tunables this path consults, the whole-read ceiling among them, are the
         // committed ones rather than any per-delegator override; a deployment that overrides them through a
-        // SystemProperty row applies that override to the read seams, which do carry a delegator.
-        ContentStore store = ContentStoreFactory.getContentStore(null);
+        // SystemProperty row applies that override to the read seams, which do carry a delegator. The one thing a
+        // missing delegator cannot be allowed to decide is WHOSE key namespace is used, so it does not decide it:
+        // see storeForSeamWithoutDelegator.
+        ContentStore store = storeForSeamWithoutDelegator();
         if (!ContentStoreFactory.publicationRequired(store)) {
             return resolveContentLocation(dataResourceTypeId, objectInfo, contextRoot, ABSENCE_IS_FINAL);
         }
@@ -953,6 +1442,53 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             registerWriteThrough(store, file, () -> scanFile(file), null);
         }
         return file;
+    }
+
+    /**
+     * Resolves the provider for the one seam whose frozen signature carries no delegator, refusing rather
+     * than serving a key namespace that may not be the caller's.
+     *
+     * <p><strong>The exposure this closes.</strong> A storage key is the content's {@code ofbiz.home}-relative
+     * path (see {@link ContentStoreFactory#storeKey}), and in a multi-tenant deployment that path is built from
+     * {@code content.upload.path.prefix} read through the TENANT's delegator. Resolving the store with no
+     * delegator therefore resolves the BASE deployment's tunables, so an off-instance store reached from here
+     * on behalf of a tenant would read and publish under the base namespace instead of the tenant's - two
+     * tenants recording the same path would name one stored object and could read, overwrite and delete each
+     * other's content (CWE-668, CWE-862), below the level any row-level authorisation can see.
+     * {@link ContentStoreFactory} refuses a tenant delegator that shares the base namespace, which closes the
+     * seams that DO carry a delegator; this closes the one that cannot.
+     *
+     * <p><strong>Refused only where the ambiguity is real, so nothing else changes.</strong> The refusal needs
+     * all three of: multi-tenant mode enabled (it is {@code multitenant=N} in the committed
+     * {@code general.properties}, so a single-tenant deployment has exactly one namespace and is unaffected), a
+     * provider in service, and that provider holding content OFF the instance. Database mode has no provider,
+     * and filesystem mode's tree IS this deployment's own content tree - the same one every OFBiz release has
+     * shared between tenants - so neither reaches a namespace this method could get wrong, and both keep the
+     * single statement this seam used to be.
+     *
+     * <p>Refused rather than warned, and refused here rather than at the first object read: a warning about
+     * cross-tenant content is read after the exposure, and the remedy - a per-tenant
+     * {@code content.upload.path.prefix} or {@code content.store.s3.key.prefix} row, or database storage - is
+     * configuration, not code. A multi-tenant deployment that wants an object store reaches it through the
+     * delegator-carrying seams ({@code getDataResourceStream}, {@code renderDataResourceAsText},
+     * {@code getDataResourceContentUploadPath(Delegator, boolean)}), which resolve the tenant's own namespace.
+     *
+     * @return the provider in service for this seam, or {@code null} for database mode
+     * @throws GeneralException if a provider holding content off the instance cannot be attributed to a
+     *     tenant, or if the configured provider cannot be constructed
+     */
+    private static ContentStore storeForSeamWithoutDelegator() throws GeneralException {
+        ContentStore store = ContentStoreFactory.getContentStore(null);
+        if (ContentStoreFactory.publicationRequired(store) && EntityUtil.isMultiTenantEnabled()) {
+            throw new GeneralException("Content held in an off-instance store cannot be resolved through this"
+                    + " seam while multitenant=Y, because the seam carries no delegator and so cannot tell which"
+                    + " tenant's storage key namespace to use; serving the base deployment's namespace instead"
+                    + " would let two tenants name the same stored object. Give each tenant a SystemProperty row"
+                    + " for content.upload.path.prefix or content.store.s3.key.prefix and use the content"
+                    + " services, which carry a delegator, or leave content.store.provider at database, where"
+                    + " each tenant's content stays in its own database.");
+        }
+        return store;
     }
 
     /**
@@ -995,19 +1531,20 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         requireAuthorisedLocation(dataResourceTypeId, file);
         try (ContentStore.ContentStream content = store.openStream(key)) {
             writeLocalCopy(file, content);
-            Debug.logInfo("The content store holds " + content.length() + " bytes under [" + key + "] that this"
-                    + " instance had no copy of, so the copy was reconstructed from the store", MODULE);
+            Debug.logInfo("The content store holds " + content.length() + " bytes under "
+                    + ContentStore.logReference(key) + " that this instance had no copy of, so the copy was"
+                    + " reconstructed from the store", MODULE);
             return true;
         } catch (FileNotFoundException absentInStore) {
-            Debug.logVerbose(absentInStore, "The content store holds nothing under [" + key + "] either, so the"
-                    + " content does not exist", MODULE);
+            Debug.logVerbose(absentInStore, "The content store holds nothing under "
+                    + ContentStore.logReference(key) + " either, so the content does not exist", MODULE);
             return false;
         } catch (IOException e) {
             // Reported, not propagated: this runs where the caller expects either a File or the absence its own
             // branch reports, and a store that cannot be read is not the same as content that does not exist.
             // The caller's own refusal follows, and this line is what tells an operator why.
-            Debug.logError(e, "The content store could not be read for [" + key + "], so this instance's missing"
-                    + " copy of it could not be reconstructed", MODULE);
+            Debug.logError(e, "The content store could not be read for " + ContentStore.logReference(key)
+                    + ", so this instance's missing copy of it could not be reconstructed", MODULE);
             return false;
         }
     }
@@ -1035,18 +1572,92 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * once cannot interleave their bytes. Missing directories are created, because the instance that received the
      * upload created them and this one never did.
      *
+     * <p><strong>Descriptor-relative, and no link is followed.</strong> Every operation below - creating the
+     * staging entry, writing it and renaming it onto the destination - is performed relative to a directory this
+     * method holds OPEN, so an ancestor exchanged for a symbolic link after the location was authorised cannot
+     * redirect any of them: the descriptor still refers to the directory that was checked, not to whatever the
+     * path now names. Path-based operations resolve the whole path afresh on every call, which is the gap this
+     * closes (CWE-367, CWE-59): {@link #requireAuthorisedLocation} and the containment checks run against the
+     * path, and the write that followed them resolved it a second time. Each missing level is created with an
+     * explicit owner-only mode rather than whatever the process umask happens to be, and each level that already
+     * exists is required to be a real directory, checked {@code NOFOLLOW_LINKS} (CWE-732).
+     *
+     * <p>{@link SecureDirectoryStream} is a documented optional capability. Where the filesystem does not
+     * provide one there is no descriptor to work relative to, so the path-based form is used and the loss of
+     * the guarantee is reported once - the same treatment, for the same reason, that
+     * {@code FileSystemContentStore} gives it.
+     *
      * @param file the location to reconstruct
      * @param content the store's content, positioned at its first byte
      * @throws IOException if the copy cannot be written
      */
     private static void writeLocalCopy(File file, InputStream content) throws IOException {
-        Path target = file.toPath();
+        Path target = file.toPath().toAbsolutePath();
         Path directory = target.getParent();
-        if (directory != null) {
-            Files.createDirectories(directory);
+        if (directory == null) {
+            throw new IOException("A content location with no directory above it cannot be reconstructed");
         }
-        Path staging = Files.createTempFile(directory == null ? target.toAbsolutePath().getParent() : directory,
-                ".ofbiz-content-cache-", ".tmp");
+        createOwnerOnlyDirectories(directory);
+        Path name = target.getFileName();
+        try (DirectoryStream<Path> opened = Files.newDirectoryStream(directory)) {
+            if (opened instanceof SecureDirectoryStream) {
+                @SuppressWarnings("unchecked")
+                SecureDirectoryStream<Path> secure = (SecureDirectoryStream<Path>) opened;
+                writeLocalCopyRelativeTo(secure, name, content);
+                return;
+            }
+            reportMissingSecureDirectoryStream();
+        }
+        writeLocalCopyByPath(target, directory, content);
+    }
+
+    /**
+     * Writes and publishes the local copy through an open directory descriptor.
+     *
+     * <p>The staging name is generated and created {@code CREATE_NEW}, so nothing can pre-exist under it and no
+     * symbolic link planted at that name can be followed; the rename that publishes it is descriptor-relative
+     * and replaces the destination in one step.
+     *
+     * @param directory the destination's own directory, held open
+     * @param name the single-component name of the destination
+     * @param content the store's content, positioned at its first byte
+     * @throws IOException if the copy cannot be written or published
+     */
+    private static void writeLocalCopyRelativeTo(SecureDirectoryStream<Path> directory, Path name,
+            InputStream content) throws IOException {
+        Path staging = Paths.get(LOCAL_COPY_STAGING_PREFIX + Long.toHexString(ThreadLocalRandom.current().nextLong())
+                + ".tmp");
+        boolean published = false;
+        try {
+            try (SeekableByteChannel channel = directory.newByteChannel(staging,
+                    EnumSet.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE),
+                    ownerOnlyFileAttributes())) {
+                copyInto(content, channel);
+            }
+            directory.move(staging, directory, name);
+            published = true;
+        } finally {
+            if (!published) {
+                try {
+                    directory.deleteFile(staging);
+                } catch (IOException alreadyGone) {
+                    Debug.logVerbose(alreadyGone, "A staged content copy could not be removed after a failed"
+                            + " reconstruction", MODULE);
+                }
+            }
+        }
+    }
+
+    /**
+     * Writes and publishes the local copy by path, for a filesystem that provides no directory descriptor.
+     *
+     * @param target the destination
+     * @param directory the destination's own directory
+     * @param content the store's content, positioned at its first byte
+     * @throws IOException if the copy cannot be written or published
+     */
+    private static void writeLocalCopyByPath(Path target, Path directory, InputStream content) throws IOException {
+        Path staging = Files.createTempFile(directory, LOCAL_COPY_STAGING_PREFIX, ".tmp");
         try {
             Files.copy(content, staging, StandardCopyOption.REPLACE_EXISTING);
             try {
@@ -1063,6 +1674,114 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             if (staging != null) {
                 Files.deleteIfExists(staging);
             }
+        }
+    }
+
+    /**
+     * Copies a store's content into an open channel.
+     *
+     * @param content the content, positioned at its first byte
+     * @param channel the channel to write it to
+     * @throws IOException if it cannot be copied
+     */
+    private static void copyInto(InputStream content, SeekableByteChannel channel) throws IOException {
+        byte[] buffer = new byte[LOCAL_COPY_BUFFER];
+        int read;
+        while ((read = content.read(buffer)) >= 0) {
+            ByteBuffer pending = ByteBuffer.wrap(buffer, 0, read);
+            while (pending.hasRemaining()) {
+                channel.write(pending);
+            }
+        }
+    }
+
+    /**
+     * Creates every missing level of a content directory with an explicit owner-only mode, following no link.
+     *
+     * <p>One level at a time from the top, because that is what lets each level be judged: a level that already
+     * exists is read {@code NOFOLLOW_LINKS} and must be a real directory, so a symbolic link standing in for one
+     * is refused rather than descended into, and a level that does not exist is created with
+     * {@code rwx------} rather than with whatever the process umask leaves. {@link Files#createDirectories}
+     * offers neither - it follows links and applies the umask - which is why it is not used.
+     *
+     * <p>A level created concurrently by another thread or instance is not a failure: the
+     * {@link FileAlreadyExistsException} is answered by re-reading the level and accepting it if it is now a
+     * real directory, which is the same outcome as having found it there.
+     *
+     * @param directory the directory the content is filed in
+     * @throws IOException if a level exists and is not a directory, or cannot be created
+     */
+    private static void createOwnerOnlyDirectories(Path directory) throws IOException {
+        Path level = directory.getRoot();
+        if (level == null) {
+            throw new IOException("A content directory that is not absolute cannot be created safely");
+        }
+        for (Path step : directory) {
+            level = level.resolve(step);
+            requireDirectoryOrCreateIt(level);
+        }
+    }
+
+    /**
+     * Requires one path level to be a real directory, creating it owner-only when it is absent.
+     *
+     * @param level the level to establish
+     * @throws IOException if it exists and is not a directory, or cannot be created
+     */
+    private static void requireDirectoryOrCreateIt(Path level) throws IOException {
+        try {
+            BasicFileAttributes existing = Files.readAttributes(level, BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            if (existing.isDirectory()) {
+                return;
+            }
+            throw new IOException("A content directory level is " + (existing.isSymbolicLink() ? "a symbolic link"
+                    : "not a directory") + ", so the content below it is not reconstructed");
+        } catch (NoSuchFileException absent) {
+            try {
+                Files.createDirectory(level, ownerOnlyDirectoryAttributes());
+            } catch (FileAlreadyExistsException raced) {
+                BasicFileAttributes now = Files.readAttributes(level, BasicFileAttributes.class,
+                        LinkOption.NOFOLLOW_LINKS);
+                if (!now.isDirectory()) {
+                    throw new IOException("A content directory level appeared and is not a directory, so the"
+                            + " content below it is not reconstructed", raced);
+                }
+            }
+        }
+    }
+
+    /**
+     * The attributes a reconstructed content file is created with, or none where POSIX modes do not apply.
+     *
+     * @return the file attributes to create with
+     */
+    private static FileAttribute<?>[] ownerOnlyFileAttributes() {
+        return POSIX_SUPPORTED
+                ? new FileAttribute<?>[]{PosixFilePermissions.asFileAttribute(LOCAL_COPY_FILE_PERMISSIONS)}
+                : new FileAttribute<?>[0];
+    }
+
+    /**
+     * The attributes a created content directory is given, or none where POSIX modes do not apply.
+     *
+     * @return the file attributes to create with
+     */
+    private static FileAttribute<?>[] ownerOnlyDirectoryAttributes() {
+        return POSIX_SUPPORTED
+                ? new FileAttribute<?>[]{PosixFilePermissions.asFileAttribute(LOCAL_COPY_DIRECTORY_PERMISSIONS)}
+                : new FileAttribute<?>[0];
+    }
+
+    /**
+     * Reports the absence of {@link SecureDirectoryStream} once, so the loss of the guarantee is visible
+     * without a line per reconstruction.
+     */
+    private static void reportMissingSecureDirectoryStream() {
+        if (SECURE_DIRECTORY_STREAM_REPORTED.compareAndSet(false, true)) {
+            Debug.logWarning("This filesystem does not provide SecureDirectoryStream, so a reconstructed content"
+                    + " copy is written by path: an ancestor directory exchanged for a symbolic link between the"
+                    + " containment check and the write cannot be ruled out on this filesystem", MODULE);
         }
     }
 
@@ -1687,7 +2406,18 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 }
                 String fixedUrlStr = prefix + sep + url.toString();
                 URL fixedUrl = UtilURL.fromUrlString(fixedUrlStr);
-                text = (String) fixedUrl.getContent();
+                URL configuredOrigin = UtilURL.fromUrlString(prefix);
+                if (fixedUrl == null || configuredOrigin == null) {
+                    throw refuseUrlResource("a relative resource and this deployment's configured prefix ["
+                            + prefix + "] did not combine into a URL that can be fetched");
+                }
+                // The SAME hardened opener the absolute case uses, with the address policy replaced by an
+                // origin check: this used to be URL.getContent(), which had no timeouts, followed redirects to
+                // wherever a Location header named, held the whole response in the heap and released nothing.
+                try (InputStream body = (InputStream) openSelfOriginResource(fixedUrl, configuredOrigin)
+                        .get("stream")) {
+                    text = IOUtils.toString(body, StandardCharsets.UTF_8);
+                }
             }
             out.append(text);
 
@@ -2208,9 +2938,9 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         try {
             status = TransactionUtil.getStatus();
         } catch (GenericTransactionException e) {
-            Debug.logWarning(e, "Content written below [" + target.getName() + "] cannot be published to the"
-                    + " content store, because the status of the transaction it was resolved in could not be"
-                    + " established", MODULE);
+            Debug.logWarning(e, "Content written below " + ContentStore.logReference(target.getAbsolutePath())
+                    + " cannot be published to the content store, because the status of the transaction it was"
+                    + " resolved in could not be established", MODULE);
             return false;
         }
         String identity = target.getAbsolutePath();
@@ -2229,9 +2959,9 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                     delegator));
         } catch (GenericTransactionException e) {
             PENDING_WRITE_THROUGHS.get().remove(identity);
-            Debug.logWarning(e, "Content written below [" + target.getName() + "] cannot be published to the"
-                    + " content store, because the publish could not be registered with the transaction that"
-                    + " resolved it", MODULE);
+            Debug.logWarning(e, "Content written below " + ContentStore.logReference(target.getAbsolutePath())
+                    + " cannot be published to the content store, because the publish could not be registered"
+                    + " with the transaction that resolved it", MODULE);
             return false;
         }
         return true;
@@ -2369,6 +3099,15 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         private final Delegator delegator;
 
         /**
+         * What this transaction publishes, captured in {@link #beforeCompletion()} and consumed once in
+         * {@link #afterCompletion(int)}. Null until it is captured, and null again afterwards, so a callback
+         * invoked twice cannot publish the same staged copies twice. Not volatile because both callbacks are
+         * invoked by the transaction manager on the thread that is completing the transaction, which is the
+         * thread that captured it.
+         */
+        private List<PublicationStep> plan;
+
+        /**
          * Binds one target's content to the completion of the transaction that resolved it.
          *
          * @param store the provider to bring into step
@@ -2386,17 +3125,77 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             this.delegator = delegator;
         }
 
+        /**
+         * Captures, INSIDE the transaction, exactly the bytes this transaction is publishing.
+         *
+         * <p><strong>The defect this closes.</strong> The publication used to happen entirely in
+         * {@link #afterCompletion(int)}: the target was scanned again there and the file was re-opened and
+         * streamed to the store. Between the ceiling check here and that re-read, any other transaction, thread
+         * or process could rewrite the same file - two uploads to one location, a rollback restoring an earlier
+         * version, or a write this deployment's own validation went on to reject - and the commit of THIS
+         * transaction published whatever happened to be on disk at that moment, under this transaction's
+         * authority (CWE-362, CWE-367). Nothing about the row that committed described those bytes.
+         *
+         * <p>So the bytes are copied to a private, transaction-owned staging file here, while the transaction is
+         * still open, and {@link #afterCompletion(int)} publishes THAT copy and nothing else. A staging file is
+         * created {@code CREATE_NEW} under a name no other transaction can name, is never written again after it
+         * is closed, and is removed whichever way the transaction ends. What the store receives is therefore the
+         * bytes this transaction had, whole, or nothing at all.
+         *
+         * <p><strong>The ceiling is now applied to the staged copy</strong>, which is what makes the check and
+         * the publication describe the same object: measuring the live file and then publishing a re-read of it
+         * left the two able to disagree. Refusing still means something here because the transaction is still
+         * open - it is marked for rollback, so no row is committed for content the store could hold but no
+         * instance could afterwards read in one piece - which is exactly why this work belongs before the commit
+         * and not after it.
+         *
+         * <p>A failure to stage is also a rollback rather than a report. Staging is a local copy, so a failure
+         * means this instance cannot write to its own disk; committing a row whose content is known to be
+         * unpublishable would leave the deployment with a resource that resolves to nothing on every other
+         * instance.
+         */
         @Override
         public void beforeCompletion() {
             long limit = ContentStoreFactory.maxObjectSize(delegator);
-            for (Map.Entry<File, Snapshot> now : scan.get().entrySet()) {
-                Snapshot state = now.getValue();
-                if (!state.existed() || state.equals(before.get(now.getKey())) || state.length() <= limit) {
-                    continue;
+            // ONE scan, and the last one: every decision below is taken from it, so nothing that happens after
+            // this line can change what this transaction publishes.
+            Map<File, Snapshot> now = scan.get();
+            List<PublicationStep> steps = new ArrayList<>();
+            try {
+                for (Map.Entry<File, Snapshot> entry : now.entrySet()) {
+                    Snapshot state = entry.getValue();
+                    if (state.equals(before.get(entry.getKey()))) {
+                        continue;
+                    }
+                    if (!state.existed()) {
+                        // Present when this transaction resolved it and absent now: the single-file scan reports
+                        // an absent location as an ABSENT snapshot rather than by omitting it, so this - and not
+                        // the loop below, which covers a child that left a directory listing - is where a
+                        // deleted upload is noticed.
+                        if (before.getOrDefault(entry.getKey(), Snapshot.ABSENT).existed()) {
+                            steps.add(PublicationStep.removal(entry.getKey()));
+                        }
+                        continue;
+                    }
+                    PublicationStep staged = PublicationStep.captured(entry.getKey());
+                    steps.add(staged);
+                    if (staged.length() > limit) {
+                        discard(steps);
+                        refuseOversizedContent(staged.length(), limit);
+                        return;
+                    }
                 }
-                refuseOversizedContent(state.length(), limit);
+                for (Map.Entry<File, Snapshot> entry : before.entrySet()) {
+                    if (entry.getValue().existed() && !now.containsKey(entry.getKey())) {
+                        steps.add(PublicationStep.removal(entry.getKey()));
+                    }
+                }
+            } catch (IOException | RuntimeException cannotCapture) {
+                discard(steps);
+                refuseUncapturedContent(cannotCapture);
                 return;
             }
+            plan = steps;
         }
 
         /**
@@ -2406,87 +3205,241 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
          * @param limit the ceiling it exceeds
          */
         private void refuseOversizedContent(long length, long limit) {
-            Debug.logError("Content store refusal: content written below [" + identity + "] is " + length
+            Debug.logError("Content store refusal: content written below " + ContentStore.logReference(identity)
+                    + " is " + length
                     + " bytes, over the " + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of " + limit
                     + "; the transaction is rolled back rather than recording content the store may hold but no"
                     + " instance could read whole. Raise that ceiling to store content this large.", MODULE);
+            rollBack("Content larger than " + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY
+                    + " cannot be published to the content store");
+        }
+
+        /**
+         * Marks the transaction for rollback when this instance could not take its own copy of the bytes.
+         *
+         * @param failure why the copy could not be taken
+         */
+        private void refuseUncapturedContent(Exception failure) {
+            Debug.logError(failure, "Content store refusal: content written below "
+                    + ContentStore.logReference(identity) + " could not be copied to this instance's staging area,"
+                    + " so the bytes this transaction would publish cannot be captured. The transaction is rolled"
+                    + " back rather than committing a row whose content no other instance could read.", MODULE);
+            rollBack("Content could not be captured for publication to the content store");
+        }
+
+        /**
+         * Marks the transaction for rollback, reporting a failure to do so rather than propagating it.
+         *
+         * @param reason the reason recorded with the rollback
+         */
+        private void rollBack(String reason) {
             try {
-                TransactionUtil.setRollbackOnly("Content larger than "
-                        + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " cannot be published to the content"
-                        + " store", null);
+                TransactionUtil.setRollbackOnly(reason, null);
             } catch (GenericTransactionException e) {
-                Debug.logError(e, "The transaction recording oversized content could not be marked for rollback,"
-                        + " so the row may commit without the content being published", MODULE);
+                Debug.logError(e, "The transaction recording content that cannot be published could not be marked"
+                        + " for rollback, so the row may commit without the content being published", MODULE);
             }
         }
 
         @Override
         public void afterCompletion(int status) {
             PENDING_WRITE_THROUGHS.get().remove(identity);
-            if (status != Status.STATUS_COMMITTED) {
-                // Nothing was written to the store, and nothing is removed from it. A transaction that did not
-                // commit leaves the store exactly as it was - including whatever version of this content was
-                // already there, and any write another transaction committed in the meantime.
+            List<PublicationStep> steps = plan;
+            plan = null;
+            if (steps == null) {
+                // Either the transaction never reached beforeCompletion - a rollback, which is nothing to do -
+                // or it did and refused, having already marked itself for rollback. A commit without a captured
+                // plan would mean this synchronization was never given the chance to capture one, which is
+                // reported because the row then describes content the store was never handed.
+                if (status == Status.STATUS_COMMITTED) {
+                    Debug.logError("The transaction recording content below " + ContentStore.logReference(identity)
+                            + " committed without this deployment having captured the bytes to publish, so the"
+                            + " content store was not brought into step with it and the content has to be"
+                            + " published by hand", MODULE);
+                }
                 return;
             }
-            Map<File, Snapshot> now = scan.get();
-            for (Map.Entry<File, Snapshot> entry : now.entrySet()) {
-                if (!entry.getValue().equals(before.get(entry.getKey()))) {
-                    bringIntoStep(entry.getKey(), entry.getValue());
+            try {
+                if (status != Status.STATUS_COMMITTED) {
+                    // Nothing was written to the store, and nothing is removed from it. A transaction that did
+                    // not commit leaves the store exactly as it was - including whatever version of this content
+                    // was already there, and any write another transaction committed in the meantime.
+                    return;
                 }
-            }
-            for (Map.Entry<File, Snapshot> entry : before.entrySet()) {
-                if (entry.getValue().existed() && !now.containsKey(entry.getKey())) {
-                    bringIntoStep(entry.getKey(), Snapshot.ABSENT);
+                for (PublicationStep step : steps) {
+                    bringIntoStep(step);
                 }
+            } finally {
+                // Whichever way the transaction ended, and whether or not each step succeeded: the staged copies
+                // are this transaction's own and nothing reads them afterwards. The deployment's own tree still
+                // holds the content, so a step that failed is republished from there by hand, exactly as the
+                // report above says - keeping a second copy of it here would only fill the disk.
+                discard(steps);
             }
         }
 
         /**
-         * Publishes or removes one location's content, reporting rather than propagating a failure.
+         * Publishes or removes one captured step's content, reporting rather than propagating a failure.
          *
-         * @param file the location
-         * @param state what it holds now
+         * @param step the captured publication or removal
          */
-        private void bringIntoStep(File file, Snapshot state) {
+        private void bringIntoStep(PublicationStep step) {
             String key = null;
             try {
-                String relative = deploymentRelativePath(file);
+                String relative = deploymentRelativePath(step.file());
                 if (relative == null) {
                     // Outside the deployment's own tree, so no key describes it and the read seams read it from
                     // where it is. Nothing to publish and nothing to remove.
                     return;
                 }
                 key = ContentStoreFactory.storeKey(store, relative);
-                if (state.existed()) {
-                    publish(key, file, state.length());
-                } else {
+                if (step.staged() == null) {
                     store.delete(key);
                     Debug.logInfo("Content was removed by a committed transaction, so it was removed from the"
-                            + " content store under [" + key + "] as well", MODULE);
+                            + " content store under " + ContentStore.logReference(key) + " as well", MODULE);
+                    return;
                 }
+                publish(key, step);
             } catch (GeneralException | IOException | RuntimeException e) {
                 Debug.logError(e, "The transaction recording content committed, but the content store could not be"
-                        + " brought into step with it under [" + key + "]. The store and this deployment's own"
-                        + " tree now disagree about this content, and it should be published by hand.", MODULE);
+                        + " brought into step with it under " + ContentStore.logReference(key) + ". The store and"
+                        + " this deployment's own tree now disagree about this content, and it should be published"
+                        + " by hand.", MODULE);
             }
         }
 
         /**
-         * Streams one location's content to the store.
+         * Streams one captured copy to the store.
+         *
+         * <p>The copy, not the live file: it is the bytes this transaction validated, it cannot have changed
+         * since, and its length and its content are read from the same object - so the store is never told a
+         * length that describes different bytes.
          *
          * @param key the storage key
-         * @param file the location
-         * @param length how many bytes it holds
+         * @param step the captured publication
          * @throws GeneralException if the provider refuses the key or the length
-         * @throws IOException if the content cannot be read or stored
+         * @throws IOException if the copy cannot be read or stored
          */
-        private void publish(String key, File file, long length) throws GeneralException, IOException {
-            try (InputStream content = Files.newInputStream(file.toPath(), StandardOpenOption.READ)) {
-                store.put(key, content, length);
+        private void publish(String key, PublicationStep step) throws GeneralException, IOException {
+            try (InputStream content = Files.newInputStream(step.staged(), StandardOpenOption.READ)) {
+                store.put(key, content, step.length());
             }
-            Debug.logInfo("Published " + length + " bytes to the content store under [" + key + "]", MODULE);
+            Debug.logInfo("Published " + step.length() + " bytes to the content store under "
+                    + ContentStore.logReference(key), MODULE);
         }
+
+        /**
+         * Removes every staged copy of a plan, whether it was published or not.
+         *
+         * @param steps the plan, which may be partly built
+         */
+        private static void discard(List<PublicationStep> steps) {
+            for (PublicationStep step : steps) {
+                step.discard();
+            }
+        }
+    }
+
+    /**
+     * One location's captured contribution to what a committing transaction publishes.
+     *
+     * <p>A publication carries the immutable staged copy of the bytes and their length; a removal carries
+     * neither, because there is nothing to capture. Both carry the location, which is what the storage key is
+     * derived from at publication time.
+     *
+     * @param file the location this step describes
+     * @param staged the private copy of its bytes, or null when the step is a removal
+     * @param length how many bytes the staged copy holds, 0 for a removal
+     */
+    private record PublicationStep(File file, Path staged, long length) {
+
+        /**
+         * Captures the current bytes of a location into a private copy this transaction owns.
+         *
+         * <p>Copied rather than referenced, and the length taken from the COPY: a length read from the live
+         * file could describe different bytes by the time the copy was made, and the store would then be told a
+         * length that does not match what it is being given.
+         *
+         * @param file the location whose bytes are being published
+         * @return the captured step
+         * @throws IOException if the bytes cannot be copied
+         */
+        private static PublicationStep captured(File file) throws IOException {
+            Path staging = createPublicationStagingFile();
+            boolean captured = false;
+            try {
+                Files.copy(file.toPath(), staging, StandardCopyOption.REPLACE_EXISTING);
+                long length = Files.size(staging);
+                captured = true;
+                return new PublicationStep(file, staging, length);
+            } finally {
+                if (!captured) {
+                    deleteQuietly(staging);
+                }
+            }
+        }
+
+        /**
+         * Records that a location's content is gone, so its key is to be removed from the store.
+         *
+         * @param file the location
+         * @return the removal step
+         */
+        private static PublicationStep removal(File file) {
+            return new PublicationStep(file, null, 0L);
+        }
+
+        /** Removes this step's staged copy, if it has one. */
+        private void discard() {
+            if (staged != null) {
+                deleteQuietly(staged);
+            }
+        }
+
+        /**
+         * Removes a staged copy without letting the removal fail a completion callback.
+         *
+         * @param staging the copy to remove
+         */
+        private static void deleteQuietly(Path staging) {
+            try {
+                Files.deleteIfExists(staging);
+            } catch (IOException | RuntimeException failure) {
+                Debug.logWarning("A staged content copy could not be removed from the publication staging area:"
+                        + " " + failure.getClass().getName(), MODULE);
+            }
+        }
+    }
+
+    /**
+     * Creates the private file one transaction's captured bytes are held in.
+     *
+     * <p>Under {@code runtime/tmp}, which is this deployment's own scratch area, in a directory of this
+     * mechanism's own so that nothing else writes there and an operator can see what it holds. Created
+     * {@code CREATE_NEW} under a generated name, and owner-only: the bytes are content, and a copy of content
+     * is protected exactly as the content is.
+     *
+     * @return the staging file, empty and open to nothing
+     * @throws IOException if it cannot be created
+     */
+    private static Path createPublicationStagingFile() throws IOException {
+        Path directory = Paths.get(System.getProperty("ofbiz.home", "."), PUBLICATION_STAGING_DIRECTORY)
+                .toAbsolutePath();
+        createOwnerOnlyDirectories(directory);
+        for (int attempt = 0; attempt < PUBLICATION_STAGING_ATTEMPTS; attempt++) {
+            Path candidate = directory.resolve(PUBLICATION_STAGING_PREFIX
+                    + Long.toHexString(ThreadLocalRandom.current().nextLong()) + ".tmp");
+            try {
+                Files.newByteChannel(candidate, EnumSet.of(StandardOpenOption.CREATE_NEW,
+                        StandardOpenOption.WRITE), ownerOnlyFileAttributes()).close();
+                return candidate;
+            } catch (FileAlreadyExistsException taken) {
+                Debug.logVerbose(taken, "A publication staging name was already taken, so another is tried",
+                        MODULE);
+            }
+        }
+        throw new IOException("No unused publication staging name could be found after "
+                + PUBLICATION_STAGING_ATTEMPTS + " attempts");
     }
 
     /**
@@ -2590,7 +3543,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             // read failure part way through an output that has already been written to.
             stored = store.openStream(key);
         } catch (FileNotFoundException absent) {
-            refuseUnlessLocalCopyMayAnswer(key, absentLocally, delegator, absent);
+            refuseUnlessLocalCopyMayAnswer(key, file, absentLocally, delegator, absent);
             return false;
         }
         try (InputStreamReader in = new InputStreamReader(stored, StandardCharsets.UTF_8)) {
@@ -2634,7 +3587,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         try {
             content = store.openStream(key);
         } catch (FileNotFoundException absent) {
-            refuseUnlessLocalCopyMayAnswer(key, absentLocally, delegator, absent);
+            refuseUnlessLocalCopyMayAnswer(key, file, absentLocally, delegator, absent);
             return null;
         }
         // The stream is handed on unread and the length comes from the same open, so nothing is
@@ -2665,46 +3618,108 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      * instance. It is refused.</li>
      * </ul>
      *
-     * <p><strong>The refusal says nothing about where the content lives.</strong> A storage key is this
-     * deployment's own layout - the {@code ofbiz.home}-relative path of the content, under whatever prefix the
-     * bucket is organised by - and this refusal travels back through the content-rendering path, where it can
-     * reach a rendered page. So the key goes to the log, beside an opaque reference, and the message carries the
-     * reference and the setting an operator would change (CWE-200). The provider's own absence report is not
-     * attached either, for the same reason: {@code GeneralException.getMessage()} appends the message of any cause
-     * it is given, so attaching it would put the path straight back into the text.
+     * <p><strong>The refusal says nothing about where the content lives, and neither does the log.</strong> A
+     * storage key is this deployment's own layout - the {@code ofbiz.home}-relative path of the content, under
+     * whatever prefix the bucket is organised by - and this refusal travels back through the content-rendering
+     * path, where it can reach a rendered page. The caller is given an opaque reference and the setting an
+     * operator would change (CWE-200); the log line carries the same reference and
+     * {@link ContentStore#logReference} in place of the key itself, because a centrally collected log is not a
+     * place to re-publish customer file names either (CWE-532). The provider's own absence report is not
+     * attached to the outward message for the first reason: {@code GeneralException.getMessage()} appends the
+     * message of any cause it is given, so attaching it would put the path straight back into the text.
      *
+     * <p><strong>The strict posture also ERASES the remnant, when the deployment asks it to.</strong> See
+     * {@link #eraseLocalRemnant}: a local file the authoritative store does not hold cannot be served, and for a
+     * deployment with an erasure obligation it must not go on existing either.
      * @param key the provider key that holds nothing
+     * @param file the resolved location this instance holds a copy at, which the erasure below reaches
      * @param absentLocally whether the location holds nothing on this instance's disk either
      * @param delegator the delegator the fallback setting is resolved through
      * @param absent the provider's report of absence, kept for the log
      * @throws GeneralException when a local copy exists but may not answer for the provider
      */
-    private static void refuseUnlessLocalCopyMayAnswer(String key, boolean absentLocally, Delegator delegator,
-            FileNotFoundException absent) throws GeneralException {
+    private static void refuseUnlessLocalCopyMayAnswer(String key, File file, boolean absentLocally,
+            Delegator delegator, FileNotFoundException absent) throws GeneralException {
         if (absentLocally) {
-            Debug.logVerbose(absent, "The configured content store holds nothing under [" + key + "] and this"
-                    + " instance holds no copy either, so the content does not exist", MODULE);
+            Debug.logVerbose(absent, "The configured content store holds nothing under "
+                    + ContentStore.logReference(key) + " and this instance holds no copy either, so the content"
+                    + " does not exist", MODULE);
             return;
         }
         if (!ContentStoreFactory.localFallbackEnabled(delegator)) {
             String reference = UUID.randomUUID().toString();
-            Debug.logError(absent, "Content store refusal [" + reference + "]: the store holds no content under ["
-                    + key + "] while a local copy of it exists, and content.store.local.fallback is false, so the"
-                    + " local copy is not served in its place. Place the content in the store, or set"
-                    + " content.store.local.fallback=true to allow local copies to answer while content is"
-                    + " migrated into it.", MODULE);
+            Debug.logError(absent, "Content store refusal [" + reference + "]: the store holds no content under "
+                    + ContentStore.logReference(key) + " while a local copy of it exists, and"
+                    + " content.store.local.fallback is false, so the local copy is not served in its place."
+                    + " Place the content in the store, or set content.store.local.fallback=true to allow local"
+                    + " copies to answer while content is migrated into it.", MODULE);
+            eraseLocalRemnant(key, file, delegator, reference);
             throw new GeneralException("The requested content is not available from this deployment's content"
                     + " store, and content.store.local.fallback does not allow a local copy to answer for it."
                     + " Reference [" + reference + "].");
         }
         if (REPORTED_FALLBACK_KEYS.size() < REPORTED_FALLBACK_KEY_LIMIT && REPORTED_FALLBACK_KEYS.add(key)) {
-            Debug.logWarning(absent, "The configured content store holds nothing under [" + key + "], so the"
-                    + " local copy answers for it because content.store.local.fallback allows it. Content"
-                    + " written since the store was configured is published to it by the transaction that"
-                    + " writes it, so this content predates the store and belongs copied into it.", MODULE);
+            Debug.logWarning(absent, "The configured content store holds nothing under "
+                    + ContentStore.logReference(key) + ", so the local copy answers for it because"
+                    + " content.store.local.fallback allows it. Content written since the store was configured is"
+                    + " published to it by the transaction that writes it, so this content predates the store and"
+                    + " belongs copied into it.", MODULE);
             return;
         }
-        Debug.logVerbose(absent, "The configured content store holds nothing under [" + key + "], so the local"
-                + " copy answers for it because content.store.local.fallback allows it", MODULE);
+        Debug.logVerbose(absent, "The configured content store holds nothing under "
+                + ContentStore.logReference(key) + ", so the local copy answers for it because"
+                + " content.store.local.fallback allows it", MODULE);
+    }
+
+    /**
+     * Removes a local copy of content the authoritative store no longer holds, so that an authorised deletion
+     * reaches every instance rather than only the one that performed it.
+     *
+     * <p><strong>The gap this closes.</strong> A deletion that commits removes the content from this
+     * deployment's tree and, through {@code ContentWriteThrough}, from the store - but only on the instance that
+     * performed it. Every other instance that had read the content through the store holds a reconstructed copy
+     * of it at the same path, and nothing ever removed those. For a deployment carrying a retention or erasure
+     * obligation that is a copy of a customer's document surviving the deletion that was supposed to erase it
+     * (CWE-212, CWE-459), on as many instances as had served it, for as long as those instances live. The
+     * refusal above stops such a copy being SERVED once the store is authoritative; this stops it EXISTING.
+     *
+     * <p><strong>Why it is a setting, and why it defaults to off.</strong> The evidence available here is "the
+     * store does not hold this key", which is also what a mistyped bucket, a wrong
+     * {@code content.store.s3.key.prefix} or a store that has not finished being loaded looks like - and
+     * deleting local content on that evidence would destroy the deployment's only copy. So erasure is what a
+     * deployment ASKS for, with {@code content.store.local.erase.on.store.miss=true}, once it has satisfied
+     * itself that the store really is the whole of its content; until then a remnant is refused, reported and
+     * left alone. Both halves are needed for erasure to be enforceable rather than a manual reconciliation:
+     * the setting is read on every use, so turning it on takes effect across the fleet without a restart, and
+     * every instance then erases each remnant the first time anything touches it.
+     *
+     * <p>A failure to delete is reported and swallowed. The caller's refusal follows either way - the content is
+     * not served whether or not the file could be removed - and an exception here would replace a precise
+     * refusal with a filesystem error.
+     *
+     * @param key the provider key the store holds nothing under, for the report
+     * @param file the local copy to remove
+     * @param delegator the delegator the erasure setting is resolved through
+     * @param reference the reference the refusal was reported under, so both lines can be matched
+     */
+    private static void eraseLocalRemnant(String key, File file, Delegator delegator, String reference) {
+        if (!ContentStoreFactory.localRemnantErasureEnabled(delegator)) {
+            return;
+        }
+        try {
+            // NOFOLLOW is not available on a delete - deleting a symbolic link deletes the link and never its
+            // target - so the delete itself cannot be redirected. The location was authorised by the read that
+            // reached here, and nothing but that location is removed.
+            if (Files.deleteIfExists(file.toPath())) {
+                Debug.logInfo("Content store erasure [" + reference + "]: the store holds nothing under "
+                        + ContentStore.logReference(key) + ", so this instance's local copy of it was removed"
+                        + " because " + ContentStoreFactory.LOCAL_REMNANT_ERASURE_PROPERTY + " is true. The"
+                        + " authoritative store is the record of what exists.", MODULE);
+            }
+        } catch (IOException | RuntimeException failure) {
+            Debug.logError(failure, "Content store erasure [" + reference + "]: this instance's local copy of "
+                    + ContentStore.logReference(key) + " could not be removed, so a copy of content the store no"
+                    + " longer holds survives on this instance and has to be removed by hand", MODULE);
+        }
     }
 }

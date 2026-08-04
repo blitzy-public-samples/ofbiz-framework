@@ -121,6 +121,9 @@ public final class ObjectStoreIntegrationTests {
         "ofbiz.test.s3.access.key.id", "ofbiz.test.s3.secret.access.key",
     };
 
+    /** The setting a tenant separates the paths its own content is recorded under with. */
+    private static final String UPLOAD_PATH_PREFIX_PROPERTY = "content.upload.path.prefix";
+
     /** A resource identifier the store holds content for in these tests. */
     private static final String RESOURCE_ID = "90000";
 
@@ -371,11 +374,22 @@ public final class ObjectStoreIntegrationTests {
      * {@link #thePerRunKeyPrefixSeparatesOneRunsObjectsFromAnothersInTheSameBucket} asserts directly, against the
      * same store.
      *
+     * <p><strong>Which is exactly why a TENANT has to have a namespace of its own.</strong> Because the key is
+     * the path and nothing about the reader takes part in it, two tenants that leave
+     * {@code content.upload.path.prefix} at the committed default record their content under the same paths, and
+     * therefore under one object per path: each could then read, overwrite and delete the other's documents
+     * (CWE-668, CWE-862), below the level any row-level authorisation can see. In database mode - the committed
+     * default - each tenant's content is in its own database and no such sharing is possible, so it is selecting
+     * an object store that creates the exposure, and {@code ContentStoreFactory} refuses that combination rather
+     * than serving it. Both halves are asserted here, against the real store, because both are statements about
+     * which OBJECT a row reaches.
+     *
      * @param home a per-test temporary directory standing in for {@code ofbiz.home}
      * @throws Exception if the store cannot be reached, which fails the test
      */
     @Test
-    public void oneRowMeansOneObjectWhicheverDelegatorReadsIt(@TempDir Path home) throws Exception {
+    public void oneRowMeansOneObjectAndATenantThatWouldShareTheNamespaceIsRefused(@TempDir Path home)
+            throws Exception {
         System.setProperty("ofbiz.home", home.toString());
         Path uploads = Files.createDirectories(home.resolve("runtime/uploads"));
         Files.writeString(uploads.resolve("shared.txt"), "never served in this test");
@@ -383,7 +397,9 @@ public final class ObjectStoreIntegrationTests {
         ContentStoreFactory.clearCache();
         ContentStore store = ContentStoreFactory.getContentStore();
         Delegator base = ContentStoreTestSupport.seamDelegator("default", null);
-        Delegator tenant = ContentStoreTestSupport.seamDelegator("default", "DEMO1");
+        Delegator sharingTenant = ContentStoreTestSupport.seamDelegator("default", "DEMO1");
+        Delegator separatedTenant = ContentStoreTestSupport.seamDelegator("default", "DEMO2",
+                Map.of(UPLOAD_PATH_PREFIX_PROPERTY, "runtime/uploads/DEMO2"));
         String sharedKey = record(ContentStoreFactory.storeKey(store, "runtime/uploads/shared.txt"));
         String otherKey = record(ContentStoreFactory.storeKey(store, "runtime/uploads/other.txt"));
         assertNotEquals(sharedKey, otherKey, "two paths must reach two objects");
@@ -391,15 +407,27 @@ public final class ObjectStoreIntegrationTests {
         store.put(sharedKey, "the content that row names".getBytes(StandardCharsets.UTF_8));
         store.put(otherKey, "the content the other row names".getBytes(StandardCharsets.UTF_8));
 
-        // One row, two delegators, one object: the key is the content's path and nothing about the reader takes
-        // part in it, which is what keeps the two providers agreeing about what a row means.
+        // One row, one object, for every reader that HAS a namespace: the key is the content's path and nothing
+        // about the reader takes part in it, which is what keeps the two providers agreeing about what a row means.
         assertEquals("the content that row names", ContentStoreTestSupport.renderedThroughSeam("OFBIZ_FILE",
                 "/runtime/uploads/shared.txt", null, base, RESOURCE_ID),
                 "the base delegator must reach the object the row's path names");
         assertEquals("the content that row names", ContentStoreTestSupport.renderedThroughSeam("OFBIZ_FILE",
-                "/runtime/uploads/shared.txt", null, tenant, RESOURCE_ID),
-                "a tenant delegator reading the same row must reach the same object, because the row names the"
-                        + " content and the reader does not");
+                "/runtime/uploads/shared.txt", null, separatedTenant, RESOURCE_ID),
+                "a tenant that records its content under an upload path prefix of its own must be served, and must"
+                        + " reach the object the row's path names: what the prefix separates is the paths the"
+                        + " tenant's own rows are written under, not which object an already-recorded path names");
+        // A tenant that would share the base deployment's namespace is refused instead. It is refused at
+        // resolution, before any object is addressed, because one key for two tenants is an exposure rather than
+        // a read that happens to return the wrong bytes.
+        GeneralException refused = assertThrows(GeneralException.class, () -> ContentStoreTestSupport
+                .renderedThroughSeam("OFBIZ_FILE", "/runtime/uploads/shared.txt", null, sharingTenant,
+                        RESOURCE_ID), "a tenant that resolves the base deployment's own upload path prefix would"
+                                + " name the same objects as every other such tenant, and must be refused rather"
+                                + " than served from a shared key namespace");
+        assertTrue(refused.getMessage().contains(UPLOAD_PATH_PREFIX_PROPERTY), "the refusal must name ["
+                + UPLOAD_PATH_PREFIX_PROPERTY + "], because an operator cannot act on a refusal that does not say"
+                + " what to configure: [" + refused.getMessage() + "]");
         // And a different row still reaches a different object, so the above is not "every read returns the same
         // thing".
         assertEquals("the content the other row names", ContentStoreTestSupport.renderedThroughSeam("OFBIZ_FILE",

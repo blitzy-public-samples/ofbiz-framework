@@ -546,6 +546,126 @@ public final class ContentStoreEntryPointTests {
     }
 
     /**
+     * An at-rest encryption configuration the provider could not honour is refused before the JVM starts, with
+     * the mistake named.
+     *
+     * <p>Both layers judge this and they have to agree: {@code require_object_store_encryption} refuses the
+     * value here, and {@code S3ContentStore.validatedServerSideEncryption} refuses the same value again when it
+     * is written straight into {@code content.properties}. The two pairing rules are the substance of it - a
+     * KMS mode with no key would fail every upload, and a key with any other mode is protection that looks like
+     * it is in force and never sends an encryption header at all - so both directions are refused rather than
+     * warned about, in every profile.
+     *
+     * @param mode the value of {@code OFBIZ_S3_SSE} to supply, empty for unset
+     * @param kmsKeyId the value of {@code OFBIZ_S3_SSE_KMS_KEY_ID} to supply, empty for unset
+     * @param diagnostic the words the refusal must carry
+     * @param tempDir a per-test temporary directory, injected by JUnit
+     * @throws IOException if the script cannot be driven
+     */
+    @ParameterizedTest(name = "sse [{0}] with key [{1}] is refused")
+    @CsvSource({
+        // A mode this image cannot request. Refused rather than read as "no encryption", which is the whole
+        // point: a mistyped AES256 would otherwise write plaintext objects and report success.
+        "aes-256,'',is not a server-side encryption mode",
+        "sse-s3,'',is not a server-side encryption mode",
+        "kms,'',is not a server-side encryption mode",
+        "aws-kms,'',is not a server-side encryption mode",
+        "true,'',is not a server-side encryption mode",
+        // KMS with no key: every upload would be refused by the store.
+        "aws:kms,'',requires OFBIZ_S3_SSE_KMS_KEY_ID",
+        "AWS:KMS,'',requires OFBIZ_S3_SSE_KMS_KEY_ID",
+        // A key that would never be sent, under each mode that would never send it - including unset, which is
+        // the likeliest mistake of the two.
+        "'',arn:aws:kms:eu-west-1:111122223333:key/unused,would never be sent",
+        "none,arn:aws:kms:eu-west-1:111122223333:key/unused,would never be sent",
+        "AES256,arn:aws:kms:eu-west-1:111122223333:key/unused,would never be sent",
+    })
+    public void anEncryptionConfigurationTheProviderCouldNotHonourIsRefused(String mode, String kmsKeyId,
+            String diagnostic, @TempDir Path tempDir) throws IOException {
+        Map<String, String> environment = ShellDriver.environment(
+                "OFBIZ_CONTENT_STORE_PROVIDER", "s3",
+                BUCKET_VARIABLE, "ofbiz-content-fixture",
+                REGION_VARIABLE, "eu-west-1",
+                "OFBIZ_S3_SSE", mode,
+                "OFBIZ_S3_SSE_KMS_KEY_ID", kmsKeyId);
+
+        for (String profile : List.of("dev", "prod")) {
+            ShellDriver.Run run = renderContentStore(tempDir, environment, profile);
+            assertFalse(run.succeeded(), "the " + profile + " profile must refuse sse [" + mode + "] with key ["
+                    + kmsKeyId + "]: an encryption configuration the provider refuses must stop the start rather"
+                    + " than the first upload, output was:\n" + run.output());
+            assertTrue(run.output().contains(diagnostic), "the refusal must say [" + diagnostic + "] so the"
+                    + " operator knows which half to correct, output was:\n" + run.output());
+        }
+    }
+
+    /**
+     * Every encryption configuration the provider can honour is rendered, canonically spelled.
+     *
+     * <p>The mode is compared case-insensitively and rendered in the one spelling the provider, this resource
+     * and the documentation all use, so an operator can compare what they set with what the file says. Unset is
+     * included because it is the committed posture and must keep rendering a blank declaration rather than
+     * disappearing: a bucket that encrypts every object by its own default needs exactly that.
+     *
+     * @param mode the value of {@code OFBIZ_S3_SSE} to supply, empty for unset
+     * @param expected the value the rendered property must hold
+     * @param tempDir a per-test temporary directory, injected by JUnit
+     * @throws IOException if the script cannot be driven
+     */
+    @ParameterizedTest(name = "sse [{0}] renders as [{1}]")
+    @CsvSource({
+        "'',''",
+        "none,none",
+        "NONE,none",
+        "aes256,AES256",
+        "AES256,AES256",
+        "AeS256,AES256",
+    })
+    public void everyEncryptionModeTheProviderAcceptsIsRenderedCanonically(String mode, String expected,
+            @TempDir Path tempDir) throws IOException {
+        Map<String, String> environment = ShellDriver.environment(
+                "OFBIZ_CONTENT_STORE_PROVIDER", "s3",
+                BUCKET_VARIABLE, "ofbiz-content-fixture",
+                REGION_VARIABLE, "eu-west-1",
+                "OFBIZ_S3_SSE", mode);
+
+        ShellDriver.Run run = renderContentStore(tempDir, environment, "prod");
+
+        assertTrue(run.succeeded(), "sse [" + mode + "] must be accepted, output was:\n" + run.output());
+        assertTrue(run.output().contains("server-side-encryption [" + (expected.isEmpty() ? "none" : expected)
+                + "]"), "the start-up summary must report the at-rest posture the instance will use, so a"
+                        + " deployment relying on a bucket default can see that no header is sent, output was:\n"
+                        + run.output());
+    }
+
+    /**
+     * The KMS mode round trips with its key, which is the only accepted configuration that renders two values.
+     *
+     * @param tempDir a per-test temporary directory, injected by JUnit
+     * @throws IOException if the script cannot be driven
+     */
+    @Test
+    public void theKmsModeIsRenderedWithTheKeyItNames(@TempDir Path tempDir) throws IOException {
+        String key = "arn:aws:kms:eu-west-1:111122223333:key/9f1e6d0c-0000-4a3b-8c1d-000000000001";
+        Map<String, String> environment = ShellDriver.environment(
+                "OFBIZ_CONTENT_STORE_PROVIDER", "s3",
+                BUCKET_VARIABLE, "ofbiz-content-fixture",
+                REGION_VARIABLE, "eu-west-1",
+                "OFBIZ_S3_SSE", "AWS:KMS",
+                "OFBIZ_S3_SSE_KMS_KEY_ID", key);
+
+        ShellDriver.Run run = renderContentStore(tempDir, environment, "prod");
+
+        assertTrue(run.succeeded(), "KMS with a key must be accepted, output was:\n" + run.output());
+        assertTrue(run.output().contains("server-side-encryption [aws:kms]"), "the summary must report the mode"
+                + " canonically whatever case it was supplied in, output was:\n" + run.output());
+        // The rendered artefact rather than the summary: the colons in both values pass through the sed
+        // replacement and the properties grammar, and the read-back inside the render is what proves it.
+        assertFalse(run.output().contains("does not hold"), "the render's own read-back must find both values in"
+                + " the rendered resource, output was:\n" + run.output());
+    }
+
+    /**
      * Runs one step of the shipped content-store configuration against a sandbox holding the committed resource.
      *
      * @param workDir a per-test directory for the generated driver scripts

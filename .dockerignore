@@ -22,6 +22,25 @@ Dockerfile
 /bin/
 /build/
 /runtime/
+
+# OPERATOR SECRETS MUST NOT ENTER THE BUILD CONTEXT.
+#
+# Everything not excluded here is packed up and sent to the Docker daemon on every build - a daemon that
+# may be remote, that keeps the context in its own build cache, and whose cache and history any user with
+# access to it can read. That happens regardless of what the Dockerfile COPYs, so a file the image never
+# contains is still disclosed by building.
+#
+# Docker Compose reads a '.env' file next to a compose file for its '${...}' interpolation, which is the
+# documented way to supply the passwords the examples under docker/examples need (see DOCKER.adoc,
+# "Credentials of the compose example"), and '.gitignore' ignores exactly that path so the values stay out
+# of the repository. Without the exclusions below the same values would travel to the builder instead.
+#
+# docker/examples is excluded whole: it is deployment material for an operator, nothing in it is COPYd
+# into the image, and it is where a local '.env' lives.
+**/.env
+**/.env.*
+docker/examples/
+
 /themes/common-theme/webapp/common/js/node_modules/
 /themes/common-theme/webapp/common-theme/js/node_modules/
 /plugins/.svn

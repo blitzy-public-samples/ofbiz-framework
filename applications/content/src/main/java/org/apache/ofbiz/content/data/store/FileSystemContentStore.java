@@ -42,6 +42,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributeView;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
@@ -116,17 +117,13 @@ import org.apache.ofbiz.entity.Delegator;
  * Content is always written to a temporary file created {@code rw-------} in the destination's own
  * directory, so it is private from the instant it exists and so a source that turns out to be unusable -
  * a stream that does not hold the length it declared, a read that fails part way - is refused with the
- * stored content untouched. What happens to that staged copy then depends on what is already there: with
- * nothing stored under the key it is MOVED onto the destination, one rename, so the content appears
- * complete or not at all; with a regular file already stored it is copied onto that file IN PLACE. The
- * in-place rewrite is deliberate - in this provider the storage tree *is* the deployment's existing
- * content tree, and replacing the file would give it a new inode, a new modification time and this
- * provider's permissions rather than the ones the deployment's own upload path produced. Preserving that
- * lifecycle is what the plan requires of filesystem mode (plan section 0.6.3), and it is the same
- * in-place rewrite the {@code DataResource} services perform, so it is not a weaker guarantee than
- * content already has - it is the guarantee it already has. What staging adds is that the bytes copied
- * in are complete before the live file is opened at all. Directories this provider creates are created
- * {@code rwx------}.
+ * stored content untouched. That staged copy is then MOVED onto the
+ * destination - one rename, whether or not anything was stored under the key - so the content a reader
+ * opens is complete or is the whole of what was there before, and never a mixture of the two. In this
+ * provider the storage tree *is* the deployment's existing content tree (plan section 0.6.3), so what a
+ * rename would otherwise take away is kept explicitly: the live file's POSIX permissions are read before
+ * anything is staged and applied to the staging entry, so the published file carries the mode the
+ * deployment's own upload path produced. Directories this provider creates are created {@code rwx------}.
  *
  * <p><strong>Privacy fails closed.</strong> On a filesystem that cannot express POSIX permissions
  * the owner-only mode is applied through the platform's own access flags and then verified; if it
@@ -280,20 +277,27 @@ public final class FileSystemContentStore implements ContentStore {
      * be served the same region twice, because each truncate reset the offset a writer filled from
      * while the reader's own offset stayed where it was.
      *
-     * <p>How the staged copy then becomes the stored content depends on what is already there:
-     * <ul>
-     * <li>Nothing there: the staging entry is MOVED onto the target - one rename, so a concurrent
-     * reader never observes a partially written new file.</li>
-     * <li>A regular file there: that file is rewritten IN PLACE from the staged copy. Rewriting rather
-     * than renaming over is deliberate - see the class documentation for why this provider preserves the
-     * file's inode, modification time and permissions - and it is now a copy from a complete local file
-     * rather than a transfer from a caller's stream, so the only thing a concurrent reader can still see
-     * is a mixture of the old and the new bytes of a successful replacement, exactly as the
-     * pre-refactor local write behaved.</li>
-     * <li>A file that was there when it was looked at and gone by the time it was opened: the staged
-     * copy is moved into place instead, so a concurrent delete cannot turn a write that was asked for
-     * into a failure.</li>
-     * </ul>
+     * <p><strong>The staged copy then becomes the stored content by ONE ATOMIC RENAME, whether or not
+     * anything was stored under the key.</strong> A rename either has happened or has not, so a
+     * concurrent reader opens either the whole of the old content or the whole of the new content and
+     * never a mixture of the two. This provider used to rewrite an existing file IN PLACE, to preserve
+     * that file's inode, modification time and permissions; the cost was that a reader holding the file
+     * open while a replacement was written observed old bytes and new bytes interleaved in one read, and
+     * a reader that opened it mid-replacement could observe a document that never existed (CWE-362).
+     * Content served from here reaches end users, so a torn document is not an acceptable outcome and
+     * atomicity wins.
+     *
+     * <p>What preservation the in-place rewrite gave is kept where it can be: the LIVE file's POSIX
+     * permissions are read before anything is staged and applied to the staging entry, so the renamed
+     * file carries the mode the deployment's own upload path produced rather than this provider's
+     * owner-only staging mode. The inode changes and the modification time becomes the moment of the
+     * write - the latter is equally true of an in-place rewrite, and nothing in this provider, in
+     * {@code DataResourceWorker} or in the {@code DataResource} model depends on the inode. A reader
+     * that already had the old file open keeps reading the old content to its end, which is a consistent
+     * snapshot rather than a fault.
+     *
+     * <p>A concurrent delete between the check and the rename cannot turn a write that was asked for
+     * into a failure: the rename stores the content either way.
      *
      * @param key the provider-relative storage key
      * @param payload the content to write
@@ -309,21 +313,22 @@ public final class FileSystemContentStore implements ContentStore {
                         + relative(location.target) + "] because something that is not a regular file already"
                         + " occupies it");
             }
+            // Read BEFORE the payload is staged, so the mode being preserved is the mode the content had
+            // when this write began rather than one a concurrent writer established in the meantime.
+            Set<PosixFilePermission> storedPermissions = existing == null ? null : location.storedPermissions();
             Staged staged = stage(location, payload);
             boolean consumed = false;
             try {
-                if (existing != null) {
-                    // The open decides, not the check above. Between the two, a concurrent delete of the same
-                    // key can remove the file, and a rewrite opened without CREATE then finds nothing there;
-                    // reporting that as a failure would refuse a write that was asked for, where the upload
-                    // path this provider stands in for - a plain create-or-truncate open - would have stored
-                    // the content. So an open that finds the file gone promotes the staged copy instead.
-                    interleaveBeforeOpen();
-                    if (rewriteFromStaged(location, staged)) {
-                        consumed = true;
-                        return;
-                    }
+                if (storedPermissions != null) {
+                    // The staged entry carries the LIVE file's mode onto the destination, which is what keeps
+                    // the atomic rename below from replacing the deployment's own upload permissions with this
+                    // provider's owner-only staging mode.
+                    stagedPermissions(location, staged, storedPermissions);
                 }
+                // A concurrent delete between the check above and this line does not matter: the move stores
+                // the content either way, which is what a caller that asked for a write is owed, and is what
+                // the plain create-or-truncate open this provider stands in for would have done.
+                interleaveBeforeOpen();
                 promote(location, staged);
                 consumed = true;
             } finally {
@@ -365,29 +370,6 @@ public final class FileSystemContentStore implements ContentStore {
     }
 
     /**
-     * Rewrites the file already stored at a location from a completed staged copy, in place.
-     *
-     * @param location the located destination, open on its own directory
-     * @param staged the completed staged copy
-     * @return true when the live file was rewritten, false when it had been removed meanwhile and the
-     *     caller should promote the staged copy instead
-     * @throws IOException if the rewrite fails for any other reason
-     */
-    private boolean rewriteFromStaged(Location location, Staged staged) throws IOException {
-        OutputStream rewrite;
-        try {
-            rewrite = location.openForRewrite();
-        } catch (NoSuchFileException removedMeanwhile) {
-            return false;
-        }
-        try (OutputStream out = rewrite; InputStream from = staged.openForRead(location)) {
-            from.transferTo(out);
-        }
-        discard(location, staged);
-        return true;
-    }
-
-    /**
      * A completed, private staging entry the stored content is produced from.
      *
      * <p>One name for the two forms a staging entry can take, so {@link #store} decides once what to do
@@ -417,20 +399,6 @@ public final class FileSystemContentStore implements ContentStore {
                             LinkOption.NOFOLLOW_LINKS)));
         }
 
-        /**
-         * Opens the completed staging entry for reading, so its bytes can be copied onto a live file.
-         *
-         * @param location the destination this entry was created beside
-         * @return the stream to read from, which the caller closes
-         * @throws IOException if it cannot be opened
-         */
-        private InputStream openForRead(Location location) throws IOException {
-            if (path != null) {
-                return Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS);
-            }
-            return Channels.newInputStream(location.directory.newByteChannel(name,
-                    Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)));
-        }
     }
 
     /**
@@ -477,11 +445,46 @@ public final class FileSystemContentStore implements ContentStore {
     }
 
     /**
-     * Moves a completed staged copy onto a destination that holds nothing.
+     * Applies the live content's permissions to the staging entry that is about to replace it.
+     *
+     * <p>Descriptor-relative where the platform allows it, so the change cannot be redirected by an
+     * exchange of an ancestor; through the staging entry's own path in the documented
+     * no-{@link SecureDirectoryStream} fallback, where the ancestor walk has already been performed.
+     *
+     * <p>A failure to apply them is REPORTED AND ACCEPTED rather than propagated. The staging entry was
+     * created {@code rw-------}, so the only consequence is that the published file is more private than
+     * the one it replaced, never less - and refusing the whole write because a mode could not be copied
+     * would turn a cosmetic loss into an outage.
+     *
+     * @param location the located destination
+     * @param staged the completed staging entry
+     * @param permissions the permissions the stored content had
+     */
+    private void stagedPermissions(Location location, Staged staged, Set<PosixFilePermission> permissions) {
+        try {
+            PosixFileAttributeView view = staged.path() != null
+                    ? Files.getFileAttributeView(staged.path(), PosixFileAttributeView.class,
+                            LinkOption.NOFOLLOW_LINKS)
+                    : location.directory.getFileAttributeView(staged.name(), PosixFileAttributeView.class,
+                            LinkOption.NOFOLLOW_LINKS);
+            if (view != null) {
+                view.setPermissions(permissions);
+            }
+        } catch (IOException | RuntimeException e) {
+            Debug.logWarning("The permissions of the content at [" + relative(location.target) + "] could not be"
+                    + " carried onto its replacement, which is therefore stored with this provider's owner-only"
+                    + " mode: " + e.getClass().getName(), MODULE);
+        }
+    }
+
+    /**
+     * Moves a completed staged copy onto a destination that holds nothing or replaces what is there.
      *
      * <p>One rename, within one directory, so a concurrent reader never observes a partially written new
-     * file. Both the staging entry and the move are relative to the directory the location holds open,
-     * so neither can be redirected by an exchange of an ancestor.
+     * file and never a mixture of an old and a new one: a rename is atomic on every filesystem this
+     * provider runs on, and both the descriptor-relative form and the {@link Files#move} fallback replace
+     * an existing entry in a single step. Both the staging entry and the move are relative to the
+     * directory the location holds open, so neither can be redirected by an exchange of an ancestor.
      *
      * @param location the located destination, open on its own directory
      * @param staged the completed staged copy
@@ -1079,6 +1082,32 @@ public final class FileSystemContentStore implements ContentStore {
         }
 
         /**
+         * Reads the POSIX permissions of the content stored here, without following a link.
+         *
+         * <p>Read so that {@link #store} can carry them onto the staging entry it renames into place, which
+         * is what keeps an atomic replacement from changing the mode the deployment's own upload path
+         * produced. Answers null when the platform cannot express POSIX permissions or when the content is
+         * no longer there - in both cases the write proceeds with the staging entry's owner-only mode, which
+         * is the private default and never a widening.
+         *
+         * @return the stored permissions, or null when there are none to preserve
+         * @throws IOException if the attributes cannot be read for a reason other than absence
+         */
+        private Set<PosixFilePermission> storedPermissions() throws IOException {
+            try {
+                PosixFileAttributeView view = directory == null
+                        ? Files.getFileAttributeView(target, PosixFileAttributeView.class, LinkOption.NOFOLLOW_LINKS)
+                        : directory.getFileAttributeView(name, PosixFileAttributeView.class,
+                                LinkOption.NOFOLLOW_LINKS);
+                return view == null ? null : view.readAttributes().permissions();
+            } catch (NoSuchFileException removedMeanwhile) {
+                return null;
+            } catch (UnsupportedOperationException notPosix) {
+                return null;
+            }
+        }
+
+        /**
          * Requires that the key holds a regular file, reporting absence the way the contract requires.
          *
          * @return the attributes read while checking, for a caller that needs them; note that they
@@ -1122,26 +1151,6 @@ public final class FileSystemContentStore implements ContentStore {
                 return Files.newByteChannel(target, Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
             }
             return directory.newByteChannel(name, Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS));
-        }
-
-        /**
-         * Opens the content for rewriting in place, truncating it, relative to the directory this
-         * location holds open.
-         *
-         * <p>Without {@code CREATE}, so it writes to the file that is already there or to nothing at
-         * all, and with {@code NOFOLLOW_LINKS}, so it cannot write through a link.
-         *
-         * @return the stream to write to, which the caller closes
-         * @throws IOException if it cannot be opened
-         */
-        private OutputStream openForRewrite() throws IOException {
-            if (directory == null) {
-                return Files.newOutputStream(target, StandardOpenOption.WRITE,
-                        StandardOpenOption.TRUNCATE_EXISTING, LinkOption.NOFOLLOW_LINKS);
-            }
-            return Channels.newOutputStream(directory.newByteChannel(name,
-                    Set.of(StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING,
-                            LinkOption.NOFOLLOW_LINKS)));
         }
 
         /**

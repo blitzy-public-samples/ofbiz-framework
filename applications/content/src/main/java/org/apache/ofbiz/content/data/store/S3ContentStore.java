@@ -29,6 +29,8 @@ import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -47,6 +49,8 @@ import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.exception.SdkServiceException;
 import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.profiles.Profile;
+import software.amazon.awssdk.profiles.ProfileFile;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
@@ -322,6 +326,62 @@ public final class S3ContentStore implements ContentStore {
      */
     private static final String INSECURE_ENDPOINT_PROPERTY = "content.store.s3.insecure.endpoint.allowed";
 
+    /**
+     * The property that selects server-side encryption for every object this provider writes: blank or
+     * {@code none}, {@code AES256} for the store's own managed keys, or {@code aws:kms}.
+     *
+     * <p>Blank is the committed default and means the request carries NO encryption header, which leaves
+     * the decision to the bucket: Amazon S3 has applied SSE-S3 to every new object by default since
+     * January 2023, so a bucket there is encrypted either way. An S3-COMPATIBLE store makes no such
+     * promise - several persist plaintext unless asked - which is why this exists: setting it makes the
+     * requirement explicit on the request rather than assumed of the store, and a store that cannot honour
+     * it fails the write instead of silently storing plaintext (CWE-311).
+     */
+    private static final String SSE_PROPERTY = "content.store.s3.sse";
+
+    /**
+     * The property that names the KMS key {@code aws:kms} encrypts with. Required when the mode is
+     * {@code aws:kms} and refused otherwise, so a key that would never be used cannot be left configured
+     * in the belief that it is protecting something.
+     */
+    private static final String SSE_KMS_KEY_PROPERTY = "content.store.s3.sse.kms.key.id";
+
+    /** The value of {@link #SSE_PROPERTY} that means "send no encryption header". */
+    private static final String SSE_NONE = "none";
+
+    /** The value of {@link #SSE_PROPERTY} that selects the store's own managed keys. */
+    private static final String SSE_AES256 = "AES256";
+
+    /** The value of {@link #SSE_PROPERTY} that selects KMS. */
+    private static final String SSE_KMS = "aws:kms";
+
+    /**
+     * The AWS SDK's own AMBIENT endpoint sources, in the order the SDK consults them.
+     *
+     * <p>Each pair is {@code {environment variable, system property}}, and the SDK reads them WITHOUT this
+     * class seeing the value: a request would be signed and sent to whatever they name, bypassing every
+     * check in {@link #validatedEndpoint} - which is only ever applied to the endpoint this deployment
+     * configured. An operator, a base image or a compromised orchestration template that sets
+     * {@code AWS_ENDPOINT_URL_S3} therefore redirects all content traffic, and the credential with it, to a
+     * host of their choosing (CWE-15, CWE-918).
+     *
+     * <p>{@link #resolvedEndpointOverride} closes that by resolving the EFFECTIVE endpoint here rather
+     * than leaving it to the SDK: an ambient value is validated and installed explicitly, or refused.
+     */
+    private static final String[][] SDK_AMBIENT_ENDPOINT_SOURCES = {
+        {"AWS_ENDPOINT_URL_S3", "aws.endpointUrlS3"},
+        {"AWS_ENDPOINT_URL", "aws.endpointUrl"},
+    };
+
+    /** The shared-configuration key that names an endpoint in an AWS profile file. */
+    private static final String PROFILE_ENDPOINT_KEY = "endpoint_url";
+
+    /**
+     * The shared-configuration key by which a profile names its {@code services} section, and the section
+     * type of that section. A per-service endpoint is declared as {@code s3.endpoint_url} inside it.
+     */
+    private static final String PROFILE_SERVICES_KEY = "services";
+
     /** The shortest bucket name an S3-compatible store accepts. */
     private static final int BUCKET_MIN_LENGTH = 3;
 
@@ -453,6 +513,12 @@ public final class S3ContentStore implements ContentStore {
     private final long streamTimeoutMillis;
     private final AwsCredentialsProvider credentialsProvider;
 
+    /** The server-side encryption mode every PutObject carries, or null when no header is sent. */
+    private final String serverSideEncryption;
+
+    /** The KMS key id the {@code aws:kms} mode encrypts with, or null for every other mode. */
+    private final String sseKmsKeyId;
+
     /** The delegator every {@code content.store.*} value is read through; null reads the file alone. */
     private final Delegator delegator;
 
@@ -526,7 +592,10 @@ public final class S3ContentStore implements ContentStore {
         // another client, turning one mistyped property into an unbounded leak of connection pools and
         // their threads. After this line nothing that can throw remains before the last assignment.
         String prefix = validatedKeyPrefix(property(KEY_PREFIX_PROPERTY, delegator));
-        URI endpointOverride = UtilValidate.isNotEmpty(endpoint) ? validatedEndpoint(endpoint) : null;
+        URI endpointOverride = resolvedEndpointOverride(endpoint);
+        String serverSideEncryption = validatedServerSideEncryption(deploymentValue(SSE_PROPERTY),
+                deploymentValue(SSE_KMS_KEY_PROPERTY));
+        String kmsKeyId = deploymentValue(SSE_KMS_KEY_PROPERTY);
 
         // Past this line every refusal comes from the SDK, and every SDK object created is either
         // owned by a constructed instance or closed on the way out.
@@ -571,10 +640,17 @@ public final class S3ContentStore implements ContentStore {
         this.streamTimeoutMillis = streamTimeout(delegator);
         this.credentialsProvider = credentials;
         this.delegator = delegator;
+        this.serverSideEncryption = serverSideEncryption;
+        this.sseKmsKeyId = SSE_KMS.equals(serverSideEncryption) ? kmsKeyId : null;
+        // Booleans and the encryption MODE, never a bucket, a region, an endpoint, a key prefix or a
+        // credential: this line is written on every start and would otherwise put the deployment's storage
+        // address into the log of every instance. The encryption mode is named because it is a security
+        // posture an operator has to be able to confirm from the log, and it is not a secret.
         Debug.logInfo("Content storage provider s3 initialised with endpoint-override ["
-                + UtilValidate.isNotEmpty(endpoint) + "], path-style [" + pathStyle + "], static-credentials ["
+                + (endpointOverride != null) + "], path-style [" + pathStyle + "], static-credentials ["
                 + UtilValidate.isNotEmpty(accessKeyId) + "], key-prefix [" + UtilValidate.isNotEmpty(keyPrefix)
-                + "]", MODULE);
+                + "], server-side-encryption [" + (this.serverSideEncryption == null ? SSE_NONE
+                : this.serverSideEncryption) + "]", MODULE);
     }
 
     /**
@@ -715,6 +791,12 @@ public final class S3ContentStore implements ContentStore {
         // nothing here that this instance is responsible for releasing.
         this.credentialsProvider = null;
         this.delegator = delegator;
+        // Resolved through the same validator the deployment constructor uses, so a test that sets
+        // content.store.s3.sse exercises the real decision rather than a second one written for tests.
+        this.serverSideEncryption = validatedServerSideEncryption(deploymentValue(SSE_PROPERTY),
+                deploymentValue(SSE_KMS_KEY_PROPERTY));
+        this.sseKmsKeyId = SSE_KMS.equals(this.serverSideEncryption)
+                ? deploymentValue(SSE_KMS_KEY_PROPERTY) : null;
     }
 
     /**
@@ -987,8 +1069,20 @@ public final class S3ContentStore implements ContentStore {
      */
     private void putObject(String key, RequestBody body) throws GeneralException, IOException {
         String objectKey = objectKey(key);
+        PutObjectRequest.Builder request = PutObjectRequest.builder().bucket(bucket).key(objectKey);
+        // The encryption header is attached only when a mode is configured. Sending nothing is not the same
+        // as sending "none": it leaves the decision to the bucket, which on Amazon S3 means SSE-S3 by
+        // default, and it keeps a store that does not understand the header working. When a mode IS
+        // configured the header is sent on every write, so a store that cannot honour it fails the write
+        // rather than storing plaintext without saying so.
+        if (serverSideEncryption != null) {
+            request.serverSideEncryption(serverSideEncryption);
+            if (sseKmsKeyId != null) {
+                request.ssekmsKeyId(sseKmsKeyId);
+            }
+        }
         try {
-            s3Client.putObject(PutObjectRequest.builder().bucket(bucket).key(objectKey).build(), body);
+            s3Client.putObject(request.build(), body);
         } catch (SdkException e) {
             throw storeFailure("store", objectKey, e);
         }
@@ -1184,8 +1278,8 @@ public final class S3ContentStore implements ContentStore {
                 return;
             }
             String reference = reference();
-            Debug.logError("Content store refusal [" + reference + "]: the response for object [" + objectKey
-                    + "] in bucket [" + bucket + "] was still being read after the " + STREAM_TIMEOUT_PROPERTY
+            Debug.logError("Content store refusal [" + reference + "]: the response for " + logReference(objectKey)
+                    + " was still being read after the " + STREAM_TIMEOUT_PROPERTY
                     + " deadline of " + streamTimeoutMillis + " milliseconds, so it was abandoned rather than"
                     + " allowed to hold a request thread and a pooled connection indefinitely", MODULE);
             throw terminate(new IOException("The requested content took longer to transfer than this instance"
@@ -1265,8 +1359,8 @@ public final class S3ContentStore implements ContentStore {
      */
     private IOException bodyFailure(String operation, String objectKey, IOException cause) {
         String reference = reference();
-        Debug.logError("Content store failure [" + reference + "]: could not " + operation + " the response for"
-                + " object [" + objectKey + "] in bucket [" + bucket + "]; failure ["
+        Debug.logError("Content store failure [" + reference + "]: could not " + operation + " the response for "
+                + logReference(objectKey) + "; failure ["
                 + cause.getClass().getSimpleName() + "]", MODULE);
         return new IOException("The content store could not " + operation + " the requested content."
                 + " Reference [" + reference + "].");
@@ -1295,7 +1389,7 @@ public final class S3ContentStore implements ContentStore {
             return declared;
         }
         content.abort();
-        Debug.logError("Content store refusal: object [" + objectKey + "] in bucket [" + bucket + "] was served"
+        Debug.logError("Content store refusal: " + logReference(objectKey) + " was served"
                 + " without a usable content length, so its size cannot be reported to a consumer that has to"
                 + " declare one", MODULE);
         throw new IOException("The requested content could not be served because the store did not report its"
@@ -1345,7 +1439,7 @@ public final class S3ContentStore implements ContentStore {
             // because a GET always carries one - which is what a HEAD could not tell us. Described rather
             // than logged as an object, for the reason storeFailure gives: handing the SDK failure to Debug
             // writes its message and stack trace, which is what redaction exists to prevent.
-            Debug.logVerbose("The S3 content store holds nothing under [" + objectKey + "]: "
+            Debug.logVerbose("The S3 content store holds nothing under " + logReference(objectKey) + ": "
                     + redacted(absent), MODULE);
             return false;
         } catch (S3Exception e) {
@@ -1355,7 +1449,7 @@ public final class S3ContentStore implements ContentStore {
                 return true;
             }
             if (isAbsence(e)) {
-                Debug.logVerbose("The S3 content store holds nothing under [" + objectKey + "]: " + redacted(e),
+                Debug.logVerbose("The S3 content store holds nothing under " + logReference(objectKey) + ": " + redacted(e),
                         MODULE);
                 return false;
             }
@@ -1380,13 +1474,13 @@ public final class S3ContentStore implements ContentStore {
             // Idempotent by contract, and S3 itself reports a delete of an absent object as success,
             // so this is only reached by a store that reports the miss instead. Described rather than
             // logged as an object, for the reason storeFailure gives.
-            Debug.logVerbose("The S3 content store already holds nothing under [" + objectKey + "]: "
+            Debug.logVerbose("The S3 content store already holds nothing under " + logReference(objectKey) + ": "
                     + redacted(absent), MODULE);
         } catch (S3Exception e) {
             if (!isAbsence(e)) {
                 throw storeFailure("remove", objectKey, e);
             }
-            Debug.logVerbose("The S3 content store already holds nothing under [" + objectKey + "]: " + redacted(e),
+            Debug.logVerbose("The S3 content store already holds nothing under " + logReference(objectKey) + ": " + redacted(e),
                     MODULE);
         } catch (SdkException e) {
             throw storeFailure("remove", objectKey, e);
@@ -1448,8 +1542,8 @@ public final class S3ContentStore implements ContentStore {
      */
     private IOException oversized(String objectKey, String size, long limit) {
         String reference = reference();
-        Debug.logError("Content store refusal [" + reference + "]: object [" + objectKey + "] in bucket [" + bucket
-                + "] is " + size + " bytes, over the " + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of "
+        Debug.logError("Content store refusal [" + reference + "]: " + logReference(objectKey)
+                + " is " + size + " bytes, over the " + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of "
                 + limit + "; content this large has to be streamed rather than read whole", MODULE);
         return new IOException("The requested content is larger than this instance may read in one piece."
                 + " Reference [" + reference + "].");
@@ -1624,6 +1718,189 @@ public final class S3ContentStore implements ContentStore {
      *     carries user information, a query or a fragment, if it names an instance metadata address,
      *     or if it is plaintext and neither loopback nor explicitly permitted
      */
+    /**
+     * Resolves the endpoint this client will really use, so that no endpoint reaches the wire without
+     * having been through {@link #validatedEndpoint}.
+     *
+     * <p><strong>The defect this exists to close.</strong> Installing {@code endpointOverride} only when
+     * {@code content.store.s3.endpoint} was configured left the SDK's own ambient sources in charge of
+     * every other case. Those sources - {@code AWS_ENDPOINT_URL_S3} and {@code AWS_ENDPOINT_URL} in the
+     * environment, {@code aws.endpointUrlS3} and {@code aws.endpointUrl} as system properties, and
+     * {@code endpoint_url} in a shared configuration profile - are read by the SDK, not by this class, so
+     * a value set in any of them redirected every signed request, and the credential with it, to a host
+     * that {@code validatedEndpoint} never saw: not checked for plaintext, not checked against the
+     * instance metadata addresses, not checked for embedded user information (CWE-15, CWE-918).
+     *
+     * <p><strong>How it is closed.</strong> This method decides, and the decision is explicit in all
+     * three cases:
+     *
+     * <ul>
+     * <li><strong>Configured here.</strong> The value is validated and installed. {@code endpointOverride}
+     * has the highest precedence in the SDK, so nothing ambient can displace it - but an ambient source
+     * that names something DIFFERENT is still refused rather than ignored, because an operator who set one
+     * believes it is in effect, and a deployment must not be reading content from one place while its
+     * operator is certain it reads from another.</li>
+     * <li><strong>Not configured here, but set ambiently.</strong> The ambient value is validated by
+     * exactly the same rules and then installed EXPLICITLY, which both subjects it to those rules and
+     * removes the precedence question: the endpoint on the wire is the endpoint that was checked. Two
+     * ambient sources naming different endpoints are refused rather than resolved by precedence.</li>
+     * <li><strong>Not configured anywhere.</strong> No override is installed and the SDK resolves the
+     * standard regional endpoint for the configured region. Deliberately NOT replaced with an endpoint
+     * derived here: the SDK's resolution also honours the dualstack, FIPS and accelerate settings, and
+     * an override silently disables all of them.</li>
+     * </ul>
+     *
+     * <p>A refusal names the SOURCE and never the value, because an endpoint can carry user information.
+     *
+     * @param configuredEndpoint the value of {@code content.store.s3.endpoint}, possibly blank
+     * @return the endpoint to install, or null when the SDK's own regional resolution applies
+     * @throws GeneralException if any effective endpoint fails validation, or if two sources disagree
+     */
+    private URI resolvedEndpointOverride(String configuredEndpoint) throws GeneralException {
+        String ambientSource = null;
+        String ambientValue = null;
+        for (String[] source : SDK_AMBIENT_ENDPOINT_SOURCES) {
+            String fromEnvironment = trimmedToNull(System.getenv(source[0]));
+            String fromProperty = trimmedToNull(System.getProperty(source[1]));
+            String found = fromEnvironment != null ? fromEnvironment : fromProperty;
+            String foundIn = fromEnvironment != null ? source[0] : source[1];
+            if (found == null) {
+                continue;
+            }
+            if (ambientValue == null) {
+                ambientValue = found;
+                ambientSource = foundIn;
+            } else if (!ambientValue.equals(found)) {
+                throw new GeneralException("The AWS SDK endpoint sources " + ambientSource + " and " + foundIn
+                        + " name different endpoints, so which one this deployment would read content from"
+                        + " depends on SDK precedence rather than on a decision. Set " + ENDPOINT_PROPERTY
+                        + " to the endpoint this deployment must use, or remove all but one of them.");
+            }
+        }
+        String profileSource = profileEndpointSource();
+        if (profileSource != null && ambientValue == null) {
+            // Refused rather than validated and installed, because a profile file can declare an endpoint
+            // per service section and per profile, and picking the one the SDK would have picked means
+            // reimplementing its precedence - which is exactly the guessing this method exists to remove.
+            throw new GeneralException("The AWS shared configuration at " + profileSource + " declares "
+                    + PROFILE_ENDPOINT_KEY + ", which the SDK would apply to this client without this"
+                    + " deployment ever validating it. Set " + ENDPOINT_PROPERTY + " to the endpoint this"
+                    + " deployment must use, or remove " + PROFILE_ENDPOINT_KEY + " from that file.");
+        }
+
+        if (UtilValidate.isNotEmpty(configuredEndpoint)) {
+            URI configured = validatedEndpoint(configuredEndpoint);
+            if (ambientValue != null && !ambientValue.equals(configuredEndpoint)) {
+                throw new GeneralException("The AWS SDK endpoint source " + ambientSource + " names an endpoint"
+                        + " other than " + ENDPOINT_PROPERTY + ". This client uses the configured one, so the"
+                        + " variable has no effect and is almost certainly not doing what whoever set it"
+                        + " intended. Remove it, or make the two agree.");
+            }
+            return configured;
+        }
+        if (ambientValue == null) {
+            return null;
+        }
+        Debug.logInfo("The AWS SDK endpoint source " + ambientSource + " is set while " + ENDPOINT_PROPERTY
+                + " is not, so its value has been validated by the same rules and installed explicitly as this"
+                + " client's endpoint override. Configure " + ENDPOINT_PROPERTY + " instead, so the endpoint"
+                + " this deployment uses is part of its own configuration.", MODULE);
+        return validatedEndpoint(ambientValue);
+    }
+
+    /**
+     * Reports the AWS shared configuration file that declares {@value #PROFILE_ENDPOINT_KEY}, or null when
+     * none does.
+     *
+     * <p>Read through the SDK's own {@link ProfileFile}, so this sees exactly what the SDK would see -
+     * including the file locations {@code AWS_CONFIG_FILE} and {@code AWS_SHARED_CREDENTIALS_FILE} point
+     * at - rather than a second, divergent parser. Every profile and every {@code services} section is
+     * examined, because the setting is legal in all of them.
+     *
+     * <p>A failure to READ the shared configuration answers null rather than propagating: the file is
+     * optional, most deployments have none, and a malformed one is not this provider's to report. The
+     * consequence of answering null is only that the SDK's own resolution applies, which is the behaviour
+     * without this check.
+     *
+     * @return a description of where the setting was found, for the refusal, or null
+     */
+    private static String profileEndpointSource() {
+        try {
+            ProfileFile profileFile = ProfileFile.defaultProfileFile();
+            for (Map.Entry<String, Profile> entry : profileFile.profiles().entrySet()) {
+                if (entry.getValue().property(PROFILE_ENDPOINT_KEY).isPresent()) {
+                    return "profile [" + entry.getKey() + "]";
+                }
+                Optional<String> servicesSection = entry.getValue().property(PROFILE_SERVICES_KEY);
+                if (servicesSection.isPresent()
+                        && profileFile.getSection(PROFILE_SERVICES_KEY, servicesSection.get())
+                                .filter(section -> section.properties().keySet().stream()
+                                        .anyMatch(key -> key.endsWith(PROFILE_ENDPOINT_KEY)))
+                                .isPresent()) {
+                    return "services section [" + servicesSection.get() + "] of profile [" + entry.getKey() + "]";
+                }
+            }
+            return null;
+        } catch (RuntimeException unreadable) {
+            Debug.logVerbose("The AWS shared configuration could not be examined for an " + PROFILE_ENDPOINT_KEY
+                    + " declaration: " + unreadable.getClass().getName(), MODULE);
+            return null;
+        }
+    }
+
+    /**
+     * Validates the configured server-side encryption mode, and its key when it needs one.
+     *
+     * @param mode the value of {@code content.store.s3.sse}, possibly blank
+     * @param kmsKeyId the value of {@code content.store.s3.sse.kms.key.id}, possibly blank
+     * @return the mode to send on every PutObject, or null when no encryption header is to be sent
+     * @throws GeneralException if the mode is not one this provider supports, if {@code aws:kms} is
+     *     selected without a key, or if a key is configured for a mode that would never use it
+     */
+    private static String validatedServerSideEncryption(String mode, String kmsKeyId) throws GeneralException {
+        String requested = mode == null ? "" : mode.trim();
+        String selected;
+        if (requested.isEmpty() || SSE_NONE.equalsIgnoreCase(requested)) {
+            selected = null;
+        } else if (SSE_AES256.equalsIgnoreCase(requested)) {
+            selected = SSE_AES256;
+        } else if (SSE_KMS.equalsIgnoreCase(requested)) {
+            selected = SSE_KMS;
+        } else {
+            throw new GeneralException(SSE_PROPERTY + " must be blank, '" + SSE_NONE + "', '" + SSE_AES256
+                    + "' or '" + SSE_KMS + "'; [" + requested + "] is not a server-side encryption mode this"
+                    + " provider can request.");
+        }
+        boolean keySupplied = UtilValidate.isNotEmpty(kmsKeyId);
+        if (SSE_KMS.equals(selected) && !keySupplied) {
+            throw new GeneralException(SSE_PROPERTY + "=" + SSE_KMS + " requires " + SSE_KMS_KEY_PROPERTY
+                    + " to name the key objects are encrypted with.");
+        }
+        if (!SSE_KMS.equals(selected) && keySupplied) {
+            // Refused rather than ignored: a configured key that is never sent looks like protection that
+            // is in force when it is not.
+            throw new GeneralException(SSE_KMS_KEY_PROPERTY + " is set while " + SSE_PROPERTY + " is not '"
+                    + SSE_KMS + "', so the key would never be used. Set " + SSE_PROPERTY + "=" + SSE_KMS
+                    + " to use it, or clear the key.");
+        }
+        return selected;
+    }
+
+    /**
+     * Trims a value and reports blank as absent, so an empty environment variable is not mistaken for a
+     * setting.
+     *
+     * @param value the value to normalise
+     * @return the trimmed value, or null when there was nothing but whitespace
+     */
+    private static String trimmedToNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
     private URI validatedEndpoint(String endpoint) throws GeneralException {
         URI uri;
         try {
@@ -2070,8 +2347,8 @@ public final class S3ContentStore implements ContentStore {
      * @return the exception to throw
      */
     private FileNotFoundException absent(String key, String objectKey, SdkException cause) {
-        Debug.logVerbose("The S3 content store holds no content under object [" + objectKey + "] in bucket ["
-                + bucket + "]: " + redacted(cause), MODULE);
+        Debug.logVerbose("The S3 content store holds no content under " + logReference(objectKey) + ": "
+                + redacted(cause), MODULE);
         FileNotFoundException absent = new FileNotFoundException("No content is stored under [" + key + "]");
         // initCause because FileNotFoundException declares no constructor that takes one.
         absent.initCause(new RedactedStoreCause(cause));
@@ -2111,8 +2388,8 @@ public final class S3ContentStore implements ContentStore {
      */
     private IOException storeFailure(String operation, String objectKey, SdkException cause) {
         String reference = reference();
-        Debug.logError("Content store failure [" + reference + "]: could not " + operation + " object [" + objectKey
-                + "] in bucket [" + bucket + "]; " + redacted(cause), MODULE);
+        Debug.logError("Content store failure [" + reference + "]: could not " + operation + " "
+                + logReference(objectKey) + "; " + redacted(cause), MODULE);
         return new IOException("The content store could not " + operation + " the requested content."
                 + " Reference [" + reference + "].", new RedactedStoreCause(cause));
     }
@@ -2233,6 +2510,24 @@ public final class S3ContentStore implements ContentStore {
                 : "";
         return type + ", status [" + service.statusCode() + "], error-code [" + (errorCode == null ? "" : errorCode)
                 + "], request-id [" + (service.requestId() == null ? "" : service.requestId()) + "]";
+    }
+
+    /**
+     * Names one stored object in the log, without naming it.
+     *
+     * <p>Delegates to {@link ContentStore#logReference(String)} - the one implementation the whole
+     * package shares - over the BUCKET AND THE KEY TOGETHER, because that pair is what identifies an
+     * object: two deployments sharing one key in different buckets must not report the same reference,
+     * and neither the key (which carries the uploader's file name and the deployment's directory layout)
+     * nor the bucket may reach the log on its own. The result is stable for the life of the deployment,
+     * so an operator can tell one object's repeated failure from many objects failing once, and it
+     * cannot be turned back into either half. See that method for the diagnostic override.
+     *
+     * @param objectKey the prefixed object key, as sent to the store
+     * @return the reference to write into a log message
+     */
+    private String logReference(String objectKey) {
+        return ContentStore.logReference(bucket + "/" + objectKey);
     }
 
     /**

@@ -54,9 +54,17 @@ under the License.
              interchangeable instances that a request can be moved between mid-session, and nothing in this
              configuration makes it one. Every claim of statelessness in this work is about DURABLE state and
              only about durable state: the database holds the data, the object store holds file-backed content
-             and uploads, the entity caches are kept coherent by distributed cache clear, and health probes
-             create nothing at all - ControlFilter and ContextFilter pass the two probe paths through before
-             either of them creates a session, so being polled by a load balancer leaves no state behind.
+             and uploads, the entity caches are kept coherent by distributed cache clear, and being polled by
+             a load balancer leaves no session behind.
+             That last point has to be stated precisely, because it is NOT achieved by a probe bypassing the
+             webapp's filters. It does not bypass them: ControlFilter and ContextFilter are both mapped to /*
+             and both call getSession() unconditionally, ControlFilter before it even consults its allowedPaths
+             list, so a session IS created for a probe exactly as it is for /ping.txt. What leaves nothing
+             behind is that HealthCheckServlet then invalidates the session created for the request and
+             suppresses its cookie - and it is mapped on the /health/ PREFIX precisely so that it, rather than
+             the container's default servlet, answers a near miss such as /health/live-x and discards that
+             request's session too. The valve exemption described further down is the layer above that, at
+             engine scope.
              Session state is the one category that is neither durable nor externalised, and its loss is
              recoverable by signing in again, which is why it is accepted rather than solved here.
 
@@ -135,7 +143,15 @@ under the License.
                  does it safely - internalProxies / trustedProxies pinned to the proxy's own addresses plus an
                  explicit protocolHeader - and it authenticates the hop that this valve cannot. That valve is not
                  installed by CatalinaContainer, so with this configuration surface that authentication of the
-                 hop has to come from the network restriction and header hygiene described above. -->
+                 hop has to come from the network restriction and header hygiene described above.
+                 THE ENTRY POINT NOW ENFORCES THAT DECISION RATHER THAN LEAVING IT TO THIS COMMENT. When
+                 OFBIZ_SSL_ACCELERATOR_PORT is supplied, docker-entrypoint.sh looks up the connector that serves
+                 that port and checks whether it declares an explicit, non-wildcard 'address'. If it does, the
+                 port is reachable only where the deployment put it and the start proceeds silently. If it does
+                 not - which is the shipped shape, since the address properties below are commented out and the
+                 connectors therefore bind every interface - the start is REFUSED unless
+                 OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED=true records that a security group, firewall
+                 rule or private subnet admits the proxy alone. -->
             <property name="ssl-accelerator-port" value=""/>
             <!-- Shares the session cookie across sub-domains by installing CrossSubdomainSessionValve. Only the
                  literal "true" (case-insensitive) enables it; the default is "false". Configurable via
@@ -143,22 +159,27 @@ under the License.
                  Enable it only when instances are served under several sub-domains of one parent domain and a
                  shared session cookie is genuinely required - the valve calls request.getSession(true), so it
                  forces a session for every request it handles.
-                 The valve exempts the two health probe paths and passes them straight down the pipeline. This
-                 valve runs at ENGINE scope, above every context, so without the exemption it would mint a
-                 session for a probe before any context saw it - including for a probe path addressed to a
-                 context that neither maps nor allow-lists it - and would rewrite a domain-widened session
-                 cookie onto a response no probe client reads.
+                 The valve exempts the two health probe paths and passes them straight down the pipeline
+                 without touching the session or the cookie. This valve runs at ENGINE scope, above every
+                 context, so without the exemption it would mint a session for a probe before any context saw
+                 it - including for a probe path addressed to a context that neither maps nor allow-lists it,
+                 which is the one case the endpoint itself cannot cover - and would rewrite a domain-widened
+                 session cookie onto a response no probe client reads.
+                 Stated exactly, so it is not read as more than it is: what the exemption removes is the
+                 ENGINE-scope session and the widened cookie. A probe path sent to a context that does not
+                 map it is still refused by that context's own chain, and that chain's unconditional
+                 getSession() still applies to it, exactly as it does to any other path that context
+                 refuses. Point a target group at a context that maps the endpoint.
                  Inside a webapp the probe is served by HealthCheckServlet through an ordinary servlet
                  mapping, so the webapp's own filter chain still runs in front of it - and ControlFilter and
                  ContextFilter both call getSession() unconditionally, so a session IS created there. The
-                 servlet therefore discards a session that was created for the probe, and suppresses the
+                 servlet therefore discards the session that was created for the request, and suppresses the
                  session cookie on its response, which is what keeps a probe from accumulating sessions
-                 whatever chain a webapp registers it behind. This valve's exemption is the layer above that:
-                 it keeps the ENGINE-scope valve from widening a session cookie's domain for a probe, on a
-                 path no context may even map.
+                 whatever chain a webapp registers it behind. This valve's exemption is the layer above that.
                  The paths this valve exempts are the servlet's own published HealthCheckServlet.isProbePath
                  contract, not a copy of the literals, so the exemption cannot drift from what the endpoint
-                 serves. -->
+                 serves, and the match is EXACT: a near miss such as /health/live-x is NOT exempt here and is
+                 handled by this valve like any other request. -->
             <property name="enable-cross-subdomain-sessions" value="false"/>
         </property>
         <property name="ajp-connector" value="connector">
@@ -186,6 +207,16 @@ under the License.
                  So if you want to use AJP you need to set the values depending on your configuration.
                  Using ".*" to allowedRequestAttributesPattern put you at risk.
             -->
+            <!-- CONTAINER DEPLOYMENTS: THE BIND ADDRESS IS THE TRUST DECISION FOR THIS CONNECTOR.
+                 With secretRequired false and no secret declared above, this connector is UNAUTHENTICATED -
+                 whoever can open a socket to the port speaks AJP and can set the request attributes OFBiz
+                 reads - which is exactly why Tomcat's own default for it is to bind localhost only, as the
+                 note above records.
+                 docker-entrypoint.sh therefore refuses to enable it without being told where to bind:
+                 OFBIZ_ENABLE_AJP_PORT inserts an 'address' property here from OFBIZ_AJP_BIND_ADDRESS, that
+                 variable is required, every wildcard spelling (0.0.0.0, ::, *) is refused, and the rendered
+                 value is read back and compared with the validated one. Withdrawing OFBIZ_ENABLE_AJP_PORT
+                 removes the inserted line again, restoring Tomcat's localhost-only default. -->
             <property name="secretRequired" value="false"/>
             <!-- <property name="allowedRequestAttributesPattern" value=".*"/> -->
             <!-- commented out because the values match the Tomcat defaults:

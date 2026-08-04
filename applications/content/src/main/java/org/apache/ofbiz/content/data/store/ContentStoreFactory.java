@@ -23,6 +23,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.SortedSet;
@@ -36,6 +37,7 @@ import org.apache.ofbiz.base.util.GeneralException;
 import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.base.util.UtilValidate;
 import org.apache.ofbiz.entity.Delegator;
+import org.apache.ofbiz.entity.DelegatorFactory;
 import org.apache.ofbiz.entity.util.EntityUtilProperties;
 
 /**
@@ -74,14 +76,15 @@ import org.apache.ofbiz.entity.util.EntityUtilProperties;
  * other unrecognised value.
  *
  * <p><strong>Deployment values come from the property file alone; only tunables may be overridden
- * from the database.</strong> The seven values that decide WHERE durable content is written and WHO
- * it is written as - the selector, the bucket, the region, the endpoint, the addressing style and
- * the two credentials - are read from {@code content.properties} only, never from the
+ * from the database.</strong> The nine values that decide WHERE durable content is written, WHO
+ * it is written as and whether it is stored encrypted - the selector, the bucket, the region, the
+ * endpoint, the addressing style, the two credentials and the two server-side-encryption settings -
+ * are read from {@code content.properties} only, never from the
  * {@code SystemProperty} entity. They are the values the container entry point validates and
  * renders from the environment, and a second, database-resident control plane over them would be a
  * way to bypass that validation entirely: a row could point a production fleet at a plaintext
- * endpoint, at another bucket, or at another principal, in a change no start-up check ever sees and
- * with no atomicity across the seven. The documented non-secret tunables - the key prefix, the read
+ * endpoint, at another bucket, at another principal, or into a bucket with no encryption asked of
+ * it, in a change no start-up check ever sees and with no atomicity across the nine. The documented non-secret tunables - the key prefix, the read
  * ceiling, the migration fallback, the deadlines and the retry cap - keep honouring a
  * {@code SystemProperty} row, because they change how the configured store is used rather than
  * which store it is.
@@ -99,7 +102,8 @@ import org.apache.ofbiz.entity.util.EntityUtilProperties;
  * construction-bound because they are sealed into a client, its credential provider and its override
  * configuration, none of which can be replaced under requests already holding it.</li>
  * <li><em>Dynamic</em> - {@link #DYNAMIC_PROPERTIES}. Read on every use, so a change applies at once
- * with no restart: {@code content.store.max.object.size} and {@code content.store.local.fallback}.
+ * with no restart: {@code content.store.max.object.size}, {@code content.store.local.fallback} and
+ * {@code content.store.local.erase.on.store.miss}.
  * Each is a number or a flag consulted by the operation that needs it; nothing is built from them.
  * They are excluded from the fingerprint precisely so that changing one never produces a "restart to
  * apply" line for a change that is already in force.</li>
@@ -147,8 +151,9 @@ import org.apache.ofbiz.entity.util.EntityUtilProperties;
  * {@code content.store.s3.key.prefix} rather than by the key derivation.
  * {@link #maxObjectSize} bounds what any single read may
  * materialise, {@link #publicationRequired} says whether a local write still has to be handed to the
- * provider, and {@link #localFallbackEnabled} decides what a store miss means for a resource this
- * instance holds a file for.
+ * provider, {@link #localFallbackEnabled} decides what a store miss means for a resource this
+ * instance holds a file for, and {@link #localRemnantErasureEnabled} decides whether such a resource
+ * is erased as well as refused.
  */
 public final class ContentStoreFactory {
 
@@ -186,20 +191,26 @@ public final class ContentStoreFactory {
      */
     static final Set<String> DYNAMIC_PROPERTIES = Set.of(
             "content.store.max.object.size",
-            "content.store.local.fallback");
+            "content.store.local.fallback",
+            // Dynamic for a reason of its own: it is the switch a deployment turns on when it has an erasure
+            // obligation to satisfy, and requiring a fleet-wide restart to satisfy one would be the wrong
+            // answer. Read on every use, so it applies from the next read on every instance.
+            "content.store.local.erase.on.store.miss");
 
     /**
      * The values that decide where durable content is written and which principal writes it, and
      * which are therefore read from {@code content.properties} alone.
      *
-     * <p>These are the seven the container entry point validates and renders from the environment,
+     * <p>These are the ones the container entry point validates and renders from the environment,
      * together with the plaintext-endpoint allowance it derives from the deployment profile - the one
      * value that decides whether this deployment's credentials may travel unencrypted, which is a
-     * deployment decision by exactly the same argument. Reading them through the
+     * deployment decision by exactly the same argument - and the two server-side-encryption settings,
+     * which decide whether the content is stored encrypted at all. Reading them through the
      * {@code SystemProperty} entity as well would put a second
      * control plane over the deployment's storage location and identity - one that no start-up
-     * validation sees, that cannot change all seven atomically, and that could send a production
-     * fleet's content and credentials to an endpoint the entry point would have refused. Every other
+     * validation sees, that cannot change all ten atomically, and that could send a production
+     * fleet's content and credentials to an endpoint the entry point would have refused, or store its
+     * content unencrypted. Every other
      * {@code content.store.*} value is a documented tunable and keeps honouring an override; see the
      * class documentation.
      *
@@ -214,7 +225,14 @@ public final class ContentStoreFactory {
             "content.store.s3.access.key.id",
             "content.store.s3.secret.access.key",
             "content.store.s3.path.style",
-            "content.store.s3.insecure.endpoint.allowed");
+            "content.store.s3.insecure.endpoint.allowed",
+            // Server-side encryption is a deployment decision for the same reason the endpoint and the
+            // credentials are: it says whether this deployment's content is stored encrypted at all, the
+            // entry point validates and renders it from the environment, and a SystemProperty row that
+            // could turn it off would be a second control plane over that decision which no start-up
+            // validation sees.
+            "content.store.s3.sse",
+            "content.store.s3.sse.kms.key.id");
 
     /**
      * The ceiling on what a single read may materialise, in bytes.
@@ -231,13 +249,42 @@ public final class ContentStoreFactory {
     private static final String LOCAL_FALLBACK_PROPERTY = "content.store.local.fallback";
 
     /**
+     * The setting that turns a refused local remnant into an erased one.
+     *
+     * <p>Public for the same reason {@link #MAX_OBJECT_SIZE_PROPERTY} is: the erasure the write seam
+     * performs names this setting in the line it reports, so an operator reading that line is told which
+     * setting produced the erasure - and the name comes from the one place it is defined rather than
+     * being spelled out again.
+     */
+    public static final String LOCAL_REMNANT_ERASURE_PROPERTY = "content.store.local.erase.on.store.miss";
+
+    /**
+     * The property that names the tree uploaded content is filed under, read PER DELEGATOR because it is
+     * what separates one tenant's content from another's; see
+     * {@link #requireDistinctTenantKeyNamespace(String, Delegator)}.
+     */
+    private static final String UPLOAD_PATH_PREFIX_PROPERTY = "content.upload.path.prefix";
+
+    /**
+     * The property that names the prefix every object-store key is written beneath, read per delegator for
+     * the same reason.
+     */
+    private static final String KEY_PREFIX_PROPERTY = "content.store.s3.key.prefix";
+
+    /**
      * The committed answer to a store miss for a resource this instance holds a file for.
      *
      * <p>True, so that selecting a provider never refuses content that predates the selection. See
      * {@link #localFallbackEnabled} for why that is the parity-preserving default and what setting
      * it false buys.
      */
-    private static final boolean DEFAULT_LOCAL_FALLBACK = true;
+    private static final boolean DEFAULT_LOCAL_FALLBACK = false;
+
+    /**
+     * The committed erasure posture: a remnant the store does not hold is refused and reported, and
+     * removed only where a deployment has asked for that; see {@link #localRemnantErasureEnabled}.
+     */
+    private static final boolean DEFAULT_LOCAL_REMNANT_ERASURE = false;
 
     /** The committed ceiling on a single read, used whenever the configured value is unusable. */
     private static final long DEFAULT_MAX_OBJECT_SIZE = 10485760L;
@@ -428,30 +475,39 @@ public final class ContentStoreFactory {
      * Reports whether a store miss may fall back to the content the instance holds locally.
      *
      * <p>Read from {@code content.store.local.fallback}, which is {@value #DEFAULT_LOCAL_FALLBACK}
-     * in the committed configuration. The store remains the authority wherever it holds content -
-     * an object in the store always wins over a local copy of the same resource - and this setting
+     * in the committed configuration. The store is the authority wherever it holds content - an
+     * object in the store always wins over a local copy of the same resource - and this setting
      * decides only what a store <em>miss</em> means for a resource this instance happens to hold a
-     * file for. Answering it from that file is what keeps selecting a provider from refusing content
-     * that predates the selection: the shipped demo content, every file-backed resource uploaded
-     * before the provider was configured, and anything an operator has yet to copy into the bucket
-     * would otherwise stop serving the moment the provider is switched on, which is the functional
-     * parity the plan requires of every new capability (plan sections 0.1.2 and 0.7.1). New content
-     * needs no such bridge, because content is published to the store by the transaction that writes it.
+     * file for.
      *
-     * <p>Setting it {@code false} is the strict, fail-closed mode: once a provider is configured,
-     * content it does not hold is an error rather than a file only one fleet member can see. That is
-     * the mode to run once existing content has been migrated, and selecting an object store while
-     * it is set reports a warning naming what will be refused, because the choice is not one to make
-     * by accident.
+     * <p><strong>The committed default is the strict, fail-closed one, and this is why.</strong> A
+     * local copy that answers for a key the store does not hold is indistinguishable from a local
+     * copy that answers for a key the store no longer holds: the deployment deletes a document, the
+     * object goes, and every instance that had reconstructed that document from the store goes on
+     * serving its own copy of it (CWE-212, CWE-459). One is a migration convenience and the other is
+     * a deletion that did not take effect, and nothing at the point of the read can tell them apart.
+     * A deletion that fails to erase is the more serious of the two mistakes by a wide margin, so the
+     * default is the one that cannot make it: a store miss is refused. Configuring an object store is
+     * itself opt-in, so this changes nothing for a deployment that has not configured one - the
+     * committed database mode never consults this setting at all.
+     *
+     * <p>Setting it {@code true} is the MIGRATION WINDOW, and it is deliberately something a
+     * deployment asks for: while it is set, content the store does not hold yet - the shipped demo
+     * content, and every file-backed resource uploaded before the provider was configured - is served
+     * from this instance's own disk, so switching a provider on does not stop a deployment serving
+     * content it served the day before. Each such resource is reported once, naming what has yet to
+     * be copied. New content needs no bridge, because content is published to the store by the
+     * transaction that writes it. Turn it off again once the copy is complete; while it is on, a
+     * deletion is not guaranteed to have reached every instance.
      *
      * <p>An unusable value is reported once and the committed default applies, exactly as every
-     * other setting of this package treats one: a typo must not decide whether a fleet serves its
-     * own shipped content.
+     * other setting of this package treats one: a typo must not decide whether a fleet may serve
+     * content its store does not hold.
      *
      * @param delegator the delegator a {@code SystemProperty} override is read through; may be null,
      *     in which case only {@code content.properties} is consulted
-     * @return true when a local copy may answer a store miss, which is the committed default; false
-     *     only when the value reads as {@code false}
+     * @return true only when the value reads as {@code true}; false, the committed default, in every
+     *     other case
      */
     public static boolean localFallbackEnabled(Delegator delegator) {
         String configured = propertyValue(LOCAL_FALLBACK_PROPERTY, delegator);
@@ -467,6 +523,47 @@ public final class ContentStoreFactory {
         }
         reportUnusableValue(LOCAL_FALLBACK_PROPERTY, configured, "is not true or false");
         return DEFAULT_LOCAL_FALLBACK;
+    }
+
+    /**
+     * Reports whether a local copy the authoritative store does not hold is to be ERASED rather than
+     * merely refused.
+     *
+     * <p>Read from {@code content.store.local.erase.on.store.miss}, which is
+     * {@value #DEFAULT_LOCAL_REMNANT_ERASURE} in the committed configuration, and consulted only where
+     * {@link #localFallbackEnabled} is false - a deployment in its migration window is asking for the
+     * opposite of erasure, and the two settings cannot contradict each other because the erasure is
+     * reached only through the refusal. What it enables is described at
+     * {@code DataResourceWorker.eraseLocalRemnant}: without it an authorised deletion removes the
+     * object and the deleting instance's file while every other instance keeps the copy it
+     * reconstructed, which for a deployment with a retention or erasure obligation is the deletion not
+     * having taken effect.
+     *
+     * <p>Off by default because the evidence is "the store does not hold this key", which is equally
+     * what a mistyped bucket or key prefix looks like: on that evidence, erasing would destroy the
+     * deployment's only copy of its own content. Turning it on is the deployment stating that the
+     * store is the whole of its content, which is a fact only the deployment knows. Read on every use,
+     * so it takes effect across a fleet without a restart.
+     *
+     * @param delegator the delegator a {@code SystemProperty} override is read through; may be null,
+     *     in which case only {@code content.properties} is consulted
+     * @return true only when the value reads as {@code true}; false, the committed default, in every
+     *     other case
+     */
+    public static boolean localRemnantErasureEnabled(Delegator delegator) {
+        String configured = propertyValue(LOCAL_REMNANT_ERASURE_PROPERTY, delegator);
+        if (UtilValidate.isEmpty(configured)) {
+            return DEFAULT_LOCAL_REMNANT_ERASURE;
+        }
+        String normalised = configured.trim().toLowerCase(Locale.ROOT);
+        if ("true".equals(normalised)) {
+            return true;
+        }
+        if ("false".equals(normalised)) {
+            return false;
+        }
+        reportUnusableValue(LOCAL_REMNANT_ERASURE_PROPERTY, configured, "is not true or false");
+        return DEFAULT_LOCAL_REMNANT_ERASURE;
     }
 
     /**
@@ -529,6 +626,13 @@ public final class ContentStoreFactory {
      * its own {@code content.upload.path.prefix}, which is read per delegator. Scoping the object-store
      * key by tenant while the filesystem key stayed unscoped would have made the two providers disagree
      * about what a row means, which is the one thing this method exists to prevent.
+     *
+     * <p><strong>For a tenant that separation is REQUIRED, not advisory, and it is enforced.</strong>
+     * {@link #requireDistinctTenantKeyNamespace(String, Delegator)} refuses to construct a filesystem or
+     * object-store provider for a tenant delegator that resolves the same separator as the base
+     * delegator, so a multi-tenant deployment cannot reach the collision this paragraph describes by
+     * leaving the configuration at its default. Database mode - the committed default, where each
+     * tenant's content stays in its own database - is never affected.
      *
      * @param store the provider the key is for, as resolved by this factory; never null, because
      *     database mode holds content in the {@code DataResource} columns and has no key
@@ -655,9 +759,11 @@ public final class ContentStoreFactory {
         case DATABASE:
             return null;
         case FILESYSTEM:
+            requireDistinctTenantKeyNamespace(selected, delegator);
             Debug.logInfo("Content storage provider [" + FILESYSTEM + "] selected by " + PROVIDER_PROPERTY, MODULE);
             return override == null ? new FileSystemContentStore(delegator) : override.create(FILESYSTEM, delegator);
         case S3:
+            requireDistinctTenantKeyNamespace(selected, delegator);
             Debug.logInfo("Content storage provider [" + S3 + "] selected by " + PROVIDER_PROPERTY, MODULE);
             if (!localFallbackEnabled(delegator)) {
                 // Reported at selection rather than at the first refused read, because the refusal an
@@ -680,6 +786,74 @@ public final class ContentStoreFactory {
                     + " " + DATABASE + ", " + FILESYSTEM + " or " + S3 + ", or be left unset for " + DATABASE
                     + " storage. Content is not stored in a backend other than the one named.");
         }
+    }
+
+    /**
+     * Refuses to serve a TENANT delegator from a shared key namespace.
+     *
+     * <p><strong>The exposure this closes, and why it belongs to this change set.</strong> A provider key
+     * is the content's {@code ofbiz.home}-relative path, which is the same string for every provider (see
+     * {@link #storeKey}). In a multi-tenant deployment that path comes from
+     * {@code content.upload.path.prefix}, read through the tenant's own delegator, so two tenants that
+     * leave it at the committed default record content under the SAME path - and therefore under the same
+     * storage key. Each could then read, overwrite and delete the other's documents (CWE-668, CWE-862),
+     * and no row-level authorisation would see it happen, because the collision is below the row.
+     *
+     * <p>That sharing is not new to the filesystem: {@code runtime/uploads} has always been one tree.
+     * What IS new is that a multi-tenant deployment's content used to be in the {@code DataResource}
+     * columns of each tenant's OWN database - perfectly isolated - and selecting {@code filesystem} or
+     * {@code s3} moves it into one namespace. Since that move is what this change set adds, the guard
+     * against it belongs here, and it is applied ONLY to the capability being added: database mode, which
+     * is the committed default, never reaches this method, and a deployment with no tenant delegator is
+     * unaffected.
+     *
+     * <p><strong>What counts as distinct.</strong> Either separator is enough, because either one gives
+     * the tenant a key space of its own: an upload path prefix that is not the base delegator's - which
+     * separates the paths themselves, and therefore the keys, for every provider - or, for the object
+     * store, a key prefix that is not the base delegator's, which separates the objects inside the
+     * bucket. Both are ordinary per-tenant {@code SystemProperty} rows.
+     *
+     * <p>Refused rather than warned. A warning about cross-tenant content exposure is read after the
+     * exposure, and the remedy is one configuration row.
+     *
+     * @param selected the provider being constructed, for the message
+     * @param delegator the delegator the provider is being constructed for; null and non-tenant
+     *     delegators are accepted without a check
+     * @throws GeneralException if a tenant delegator would share one key namespace with the base delegator
+     */
+    private static void requireDistinctTenantKeyNamespace(String selected, Delegator delegator)
+            throws GeneralException {
+        if (delegator == null || UtilValidate.isEmpty(delegator.getDelegatorTenantId())) {
+            return;
+        }
+        Delegator base = DelegatorFactory.getDelegator(delegator.getDelegatorBaseName());
+        if (base == null) {
+            // Nothing to compare against. The base delegator is always resolvable in a running deployment -
+            // it is the one the tenant delegator was derived from - so this is unreachable rather than a
+            // case with a policy; accepting is the same outcome as a deployment with no tenants at all.
+            return;
+        }
+        String tenantUploadPath = propertyValue(UPLOAD_PATH_PREFIX_PROPERTY, delegator);
+        String baseUploadPath = propertyValue(UPLOAD_PATH_PREFIX_PROPERTY, base);
+        if (!Objects.equals(tenantUploadPath, baseUploadPath)) {
+            return;
+        }
+        if (S3.equals(selected)) {
+            String tenantKeyPrefix = propertyValue(KEY_PREFIX_PROPERTY, delegator);
+            String baseKeyPrefix = propertyValue(KEY_PREFIX_PROPERTY, base);
+            if (!Objects.equals(tenantKeyPrefix, baseKeyPrefix)) {
+                return;
+            }
+        }
+        throw new GeneralException("Content storage provider [" + selected + "] is refused for tenant ["
+                + delegator.getDelegatorTenantId() + "] because it would share one storage key namespace with"
+                + " the base deployment: a storage key is the content's ofbiz.home-relative path, and this"
+                + " tenant resolves the same " + UPLOAD_PATH_PREFIX_PROPERTY + " as the base delegator, so two"
+                + " tenants recording the same path would name the same stored object and could read,"
+                + " overwrite and delete each other's content. Give the tenant a SystemProperty row for "
+                + UPLOAD_PATH_PREFIX_PROPERTY + (S3.equals(selected) ? " or " + KEY_PREFIX_PROPERTY : "")
+                + ", or leave " + PROVIDER_PROPERTY + " at " + DATABASE + ", where each tenant's content stays"
+                + " in its own database.");
     }
 
     /**

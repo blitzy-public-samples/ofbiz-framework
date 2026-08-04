@@ -200,6 +200,78 @@ public interface ContentStore {
     }
 
     /**
+     * The name of the property that turns literal content locations back on in log output.
+     *
+     * <p>Read straight from the system properties rather than through a component configuration file,
+     * because this decision is consulted on the failure path of a storage operation - including a
+     * failure whose cause is that the datasource the property cache would be reloaded from cannot be
+     * reached - and because it is an operator's diagnostic switch for one JVM rather than deployment
+     * configuration for a fleet.
+     */
+    String LOG_IDENTIFIERS_PROPERTY = "ofbiz.content.store.log.identifiers";
+
+    /**
+     * How many hexadecimal characters of the digest a log reference carries. Sixteen is 64 bits, which
+     * is far more than enough for an operator to match two lines about the same object and far too few
+     * to be worth attacking.
+     */
+    int LOG_REFERENCE_LENGTH = 16;
+
+    /**
+     * Derives the stable, opaque reference by which one storage location is named in the log.
+     *
+     * <p><strong>Why a location is not simply logged.</strong> A storage key IS customer data: it is the
+     * {@code ofbiz.home}-relative path of the content, so it carries the uploader's own file name and the
+     * directory a deployment files it under - {@code runtime/uploads/party/10042/passport-scan.pdf} names
+     * a document, a party and what the document is. Container logs are collected centrally, retained far
+     * longer than the content itself, and readable by people who are not authorised to read the content;
+     * writing the key into them re-publishes that data outside every control that protects it
+     * (CWE-532). The bucket name is withheld with it, because a bucket name plus a key is a complete
+     * address for anybody who also holds credentials.
+     *
+     * <p><strong>Why a hash rather than nothing.</strong> An operator diagnosing a storage failure has to
+     * be able to tell whether ten failures are ten objects or one object ten times, and to match a
+     * failure against the refusal a caller was given. A digest of the location gives them exactly that
+     * and nothing else: it is the same for the same location for the life of the deployment, it is
+     * stable across instances, and it cannot be turned back into the path. It is truncated to
+     * {@value #LOG_REFERENCE_LENGTH} characters because it is a correlation handle, not a signature.
+     *
+     * <p><strong>The literal location is still obtainable, deliberately and explicitly.</strong> Some
+     * failures cannot be diagnosed without it - a key that was built wrongly, for instance - so setting
+     * the {@value #LOG_IDENTIFIERS_PROPERTY} system property to {@code true} makes this return the
+     * location itself. That is a decision an operator takes for one JVM, for as long as they need it,
+     * knowing what it puts in the log; it is not the default, and no caller-visible message ever carries
+     * the location whatever this property says.
+     *
+     * @param location the storage location being reported: an object key, a key prefixed with its
+     *     bucket, or a provider-relative path. Never logged as given unless the property above is set
+     * @return the reference to write into a log message; never null and never blank
+     */
+    static String logReference(String location) {
+        String subject = location == null ? "" : location;
+        if (Boolean.parseBoolean(System.getProperty(LOG_IDENTIFIERS_PROPERTY))) {
+            return subject;
+        }
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(subject.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(LOG_REFERENCE_LENGTH);
+            for (int index = 0; hex.length() < LOG_REFERENCE_LENGTH && index < digest.length; index++) {
+                hex.append(Character.forDigit((digest[index] >> 4) & 0xF, 16));
+                hex.append(Character.forDigit(digest[index] & 0xF, 16));
+            }
+            return "ref:" + hex;
+        } catch (java.security.NoSuchAlgorithmException impossible) {
+            // SHA-256 is required of every Java platform, so this cannot happen. It is still handled
+            // rather than declared, because the alternative - propagating a checked exception out of a
+            // method whose only job is to name something in a log - would put a failure to LOG on the
+            // failure path of every storage operation. A constant is returned so the message still says
+            // that a location was involved without saying which.
+            return "ref:unavailable";
+        }
+    }
+
+    /**
      * An open stream over stored content, together with the exact number of bytes it will yield.
      *
      * <p>It is an {@link InputStream}, so every consumer that only wants the bytes treats it as one and
