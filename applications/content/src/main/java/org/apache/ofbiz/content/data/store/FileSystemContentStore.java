@@ -42,21 +42,14 @@ import org.apache.ofbiz.entity.Delegator;
 import org.apache.ofbiz.entity.util.EntityUtilProperties;
 
 /**
- * The filesystem content-storage provider, which encapsulates the upload directory OFBiz has always
- * used.
+ * The filesystem content-storage provider.
  *
- * <p><strong>It is the existing behaviour, not a second copy of it.</strong> The storage root is the
- * upload directory named by {@code content.upload.path.prefix} - {@code runtime/uploads} out of the
- * box - resolved under {@code ofbiz.home}, and the sharding rule that spreads uploads over timestamped
- * sub-directories {@code content.upload.max.files} at a time is implemented here, by the
- * {@link #getUploadPath} overloads that {@code DataResourceWorker} delegates to. Selecting this
- * provider therefore changes <em>where the deployment says content lives</em>, not where it is
- * written: an upload lands in exactly the same directory it always did, and content written before
- * the provider existed is already inside the store.
- *
- * <p>That is what makes an instance replaceable when the upload directory is a shared mount - an NFS
- * or EFS volume attached to every instance - and it needs no credentials, which makes it the way to
- * run the store seam without an object store.
+ * <p>Its storage root is the upload directory named by {@code content.upload.path.prefix} -
+ * {@code runtime/uploads} out of the box - resolved under {@code ofbiz.home}. The sharding rule that
+ * spreads uploads over timestamped sub-directories {@code content.upload.max.files} at a time is
+ * implemented here, by the {@link #getUploadPath} overloads {@code DataResourceWorker} delegates to,
+ * so selecting this provider does not change the directory an upload lands in. It needs no
+ * credentials, and it becomes a fleet-wide store when that directory is a shared mount.
  *
  * <p><strong>Keys</strong> are resolved beneath the storage root and confined to it at operation
  * time, against the root's <em>real</em> path rather than a lexically normalised one. The key grammar
@@ -76,44 +69,20 @@ public final class FileSystemContentStore implements ContentStore {
 
     private static final String MODULE = FileSystemContentStore.class.getName();
 
-    /** The property naming the upload directory, relative to {@code ofbiz.home}. */
     private static final String UPLOAD_PREFIX_PROPERTY = "content.upload.path.prefix";
-
-    /** The property naming how many files one upload sub-directory holds. */
     private static final String MAX_FILES_PROPERTY = "content.upload.max.files";
-
-    /** The upload directory used when the property is unset, matching the shipped configuration. */
     private static final String DEFAULT_UPLOAD_PREFIX = "runtime/uploads";
-
-    /** How many files one upload sub-directory holds when the property is unset or unusable. */
     private static final double DEFAULT_MAX_FILES = 250;
-
-    /** Suffix of the staging file a put writes before moving it onto the destination. */
     private static final String STAGING_SUFFIX = ".ofbizstore";
-
-    /** The largest object {@link #get} will read into memory. */
     private static final int MAX_IN_MEMORY_OBJECT = 16 * 1024 * 1024;
-
-    /** How much of a bounded read is copied at a time. */
     private static final int BUFFER_SIZE = 8192;
 
     private final Path root;
 
-    /**
-     * Creates the provider for the upload directory this deployment is configured with.
-     *
-     * @throws GeneralException if {@code ofbiz.home} is not set, so nothing can be resolved against it
-     */
     FileSystemContentStore() throws GeneralException {
         this(storageRootPath());
     }
 
-    /**
-     * Creates a provider rooted at the given directory.
-     *
-     * @param directory the absolute storage root
-     * @throws GeneralException if no root was given
-     */
     FileSystemContentStore(String directory) throws GeneralException {
         if (UtilValidate.isEmpty(directory)) {
             throw new GeneralException("The filesystem content store has no storage root");
@@ -214,7 +183,6 @@ public final class FileSystemContentStore implements ContentStore {
             prefix = "/" + prefix;
         }
 
-        // descending comparator
         Comparator<Object> desc = (o1, o2) -> {
             if ((Long) o1 > (Long) o2) {
                 return -1;
@@ -224,7 +192,6 @@ public final class FileSystemContentStore implements ContentStore {
             return 0;
         };
 
-        // check for the latest subdirectory
         String parentDir = ofbizHome + prefix;
         File parent = FileUtil.getFile(parentDir);
         TreeMap<Long, File> dirMap = new TreeMap<>(desc);
@@ -238,14 +205,12 @@ public final class FileSystemContentStore implements ContentStore {
                 }
             }
         } else {
-            // if the parent doesn't exist; create it now
             boolean created = parent.mkdir();
             if (!created) {
                 Debug.logWarning("Unable to create top level upload directory [" + parentDir + "].", MODULE);
             }
         }
 
-        // first item in map is the most current directory
         File latestDir = null;
         if (UtilValidate.isNotEmpty(dirMap)) {
             latestDir = dirMap.values().iterator().next();
@@ -273,22 +238,10 @@ public final class FileSystemContentStore implements ContentStore {
         return prefix + "/" + name;
     }
 
-    /**
-     * Returns the configuration signature {@link ContentStoreFactory} caches a resolution against.
-     *
-     * @return the signature
-     * @throws GeneralException if {@code ofbiz.home} is not set
-     */
     static String configurationSignature() throws GeneralException {
         return storageRootPath();
     }
 
-    /**
-     * Creates the next upload sub-directory under the upload prefix.
-     *
-     * @param parent the upload prefix directory
-     * @return the new sub-directory
-     */
     private static File makeNewDirectory(File parent) {
         File latestDir = null;
         boolean newDir = false;
@@ -304,22 +257,11 @@ public final class FileSystemContentStore implements ContentStore {
         return latestDir;
     }
 
-    /**
-     * Returns how many files one upload sub-directory holds.
-     *
-     * @return the configured maximum, or the shipped default when it is unset or unusable
-     */
     private static double maxFiles() {
         double configured = UtilProperties.getPropertyNumber("content", MAX_FILES_PROPERTY);
         return configured < 1 ? DEFAULT_MAX_FILES : configured;
     }
 
-    /**
-     * Resolves the storage root, which is the configured upload directory under {@code ofbiz.home}.
-     *
-     * @return the absolute storage root
-     * @throws GeneralException if {@code ofbiz.home} is not set, so nothing can be resolved against it
-     */
     private static String storageRootPath() throws GeneralException {
         String home = System.getProperty("ofbiz.home");
         if (UtilValidate.isEmpty(home)) {
@@ -366,14 +308,6 @@ public final class FileSystemContentStore implements ContentStore {
         return resolved;
     }
 
-    /**
-     * Reads a stream into memory, refusing content larger than this provider will hold.
-     *
-     * @param content the stream to read
-     * @param key the storage key, for the message
-     * @return the content
-     * @throws IOException if the stream cannot be read or holds more than the in-memory limit
-     */
     private static byte[] readBounded(InputStream content, String key) throws IOException {
         byte[] buffer = new byte[BUFFER_SIZE];
         ByteArrayOutputStream held = new ByteArrayOutputStream();
@@ -387,13 +321,6 @@ public final class FileSystemContentStore implements ContentStore {
         return held.toByteArray();
     }
 
-    /**
-     * Reports an object this store does not hold, as the contract's one absence signal.
-     *
-     * @param key the storage key
-     * @param cause what the filesystem reported
-     * @return the exception to throw
-     */
     private static FileNotFoundException absence(String key, IOException cause) {
         FileNotFoundException absent = new FileNotFoundException("The content store holds no [" + key + "]");
         absent.initCause(cause);

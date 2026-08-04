@@ -37,15 +37,17 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  *
  * <ul>
  *   <li>{@code /health/live} - is this JVM answering HTTP at all? Always 200 with
- *       {@code {"status":"UP"}}. A load balancer uses it to decide whether to restart the instance, so
- *       it deliberately depends on nothing outside the servlet container: an instance whose database is
- *       briefly unreachable is not a broken instance.</li>
+ *       {@code {"status":"UP"}}. It signals only that the servlet container is serving, and deliberately
+ *       depends on nothing outside it: an instance whose database is briefly unreachable still answers
+ *       200 here.</li>
  *   <li>{@code /health/ready} - can this instance serve a request that touches the database? 200 with
  *       {@code {"status":"UP","database":"UP"}} when a query against the base delegator succeeds, and
- *       503 with {@code {"status":"DOWN","database":"DOWN"}} when it does not. A load balancer uses it
- *       to decide whether to send traffic, so an instance that cannot reach its datasource is taken out
- *       of rotation rather than restarted.</li>
+ *       503 with {@code {"status":"DOWN","database":"DOWN"}} when it does not. It signals only whether
+ *       this instance is currently fit to receive a request.</li>
  * </ul>
+ *
+ * <p>What a probe result is used for is the caller's policy, not this class's: a load balancer decides
+ * target health and routing from it, and an orchestrator may decide replacement from it.</p>
  *
  * <p>The readiness query mirrors the {@code ping} service in
  * {@code org.apache.ofbiz.common.CommonServices}: it counts rows in {@code SequenceValueItem}, a seed
@@ -69,13 +71,8 @@ public final class HealthCheckServlet extends HttpServlet {
 
     private static final String MODULE = HealthCheckServlet.class.getName();
 
-    /** The liveness path, relative to the webapp's context path. */
     private static final String PROBE_LIVE = "/health/live";
-
-    /** The readiness path, relative to the webapp's context path. */
     private static final String PROBE_READY = "/health/ready";
-
-    /** The seed entity the readiness query counts; see the {@code ping} service. */
     private static final String READINESS_ENTITY = "SequenceValueItem";
 
     private static final String BODY_LIVE_UP = "{\"status\":\"UP\"}";
@@ -87,13 +84,6 @@ public final class HealthCheckServlet extends HttpServlet {
     private static final String CACHE_CONTROL_HEADER = "Cache-Control";
     private static final String CACHE_CONTROL_VALUE = "no-store";
 
-    /**
-     * Answers a probe sent with GET.
-     *
-     * @param request the probe request
-     * @param response the response to write
-     * @throws IOException if the response cannot be written
-     */
     @Override
     protected void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
         handleProbe(request, response);
@@ -115,13 +105,6 @@ public final class HealthCheckServlet extends HttpServlet {
         handleProbe(request, response);
     }
 
-    /**
-     * Serves one probe: routes on the requested path and writes the verdict.
-     *
-     * @param request the probe request
-     * @param response the response to write
-     * @throws IOException if the response cannot be written
-     */
     private void handleProbe(HttpServletRequest request, HttpServletResponse response) throws IOException {
         String path = pathWithinWebapp(request);
         if (PROBE_LIVE.equals(path)) {

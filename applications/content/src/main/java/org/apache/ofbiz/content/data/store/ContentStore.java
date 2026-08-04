@@ -24,40 +24,40 @@ import java.io.InputStream;
 import org.apache.ofbiz.base.util.GeneralException;
 
 /**
- * The storage contract for file-backed content, with one implementation per storage backend.
- *
- * <p>File-backed {@code DataResource} content - {@code LOCAL_FILE}, {@code OFBIZ_FILE} and
- * {@code CONTEXT_FILE} together with their {@code _BIN} variants - has always lived on the local
- * filesystem of the instance that wrote it, which is the one piece of durable state that stops an
- * instance from being freely replaceable. This interface is the seam that lets that content live
- * somewhere every instance can reach instead.
+ * The five-method storage contract for file-backed {@code DataResource} content - {@code LOCAL_FILE},
+ * {@code OFBIZ_FILE} and {@code CONTEXT_FILE} together with their {@code _BIN} variants - with one
+ * implementation per storage backend.
  *
  * <p><strong>Selection.</strong> An implementation is chosen at run time by
  * {@link ContentStoreFactory} from the {@code content.store.provider} property of the {@code content}
  * resource. The three accepted values are {@code database} (the shipped default), {@code filesystem}
- * and {@code s3}. Under {@code database} - and under an unset or unrecognised value - <em>no
- * implementation of this interface is used at all</em>: the pre-existing {@code DataResource}
- * database-storage path runs completely unchanged and no storage client is ever constructed.
+ * and {@code s3}. Under {@code database} - and under an unset or unrecognised value - the factory
+ * returns <em>no provider at all</em>: the pre-existing {@code DataResource} database-storage path runs
+ * unchanged and no storage client is constructed.
  *
  * <p><strong>Keys.</strong> A key is an opaque, provider-relative POSIX path. It carries no leading
  * or trailing slash, no empty segment, no {@code .} or {@code ..} segment, no backslash and no
  * control character; a key that breaks that grammar is rejected with a {@link GeneralException}
- * rather than resolved. Deriving the key from the content's own scoped, {@code ofbiz.home}-relative
- * path is what makes one key mean the same object on every instance and in every provider.
+ * rather than resolved. Choosing which key names which content, and deciding whether a caller may
+ * address it, are the caller's responsibility - see
+ * {@link ContentStoreFactory#requireUsableKey(String)}.
  *
  * <p><strong>Absence is not failure.</strong> {@link #get} and {@link #openStream} report an object
  * this store does not hold by throwing {@link java.io.FileNotFoundException} - and nothing else
  * throws it. Every other outcome, a provider or network fault included, is an {@link IOException}
  * that is not a {@code FileNotFoundException}, or a {@link GeneralException} for a configuration or
- * key fault. Callers depend on that distinction: content that is genuinely absent is a 404, while a
- * store that cannot answer must never be reported as missing content.
+ * key fault. Callers depend on that distinction so that a store which cannot answer is never mistaken
+ * for content that is genuinely absent.
+ *
+ * <p><strong>Streams are the caller's.</strong> {@link #openStream} hands back an open stream that the
+ * caller closes; {@link #get} reads a bounded object into memory and closes what it opened.
  *
  * <p><strong>Replacement is atomic.</strong> A {@link #put} that replaces an existing object is
  * atomic as far as a concurrent reader is concerned: the reader sees either the whole previous object
- * or the whole new one, never a mixture of the two.
+ * or the whole new one, never a mixture of the two. {@link #delete} is idempotent.
  *
- * <p><strong>Logging.</strong> Implementations log the storage key, and the container that holds it
- * where the provider has one, and never the content itself.
+ * <p><strong>Logging.</strong> Where an implementation logs a storage operation it names the key, and
+ * the container holding it where the provider has one, and never the content itself.
  *
  * <p>Implementations are thread safe.
  *

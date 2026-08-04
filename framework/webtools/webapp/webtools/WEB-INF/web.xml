@@ -26,12 +26,10 @@ under the License.
     <context-param>
         <param-name>entityDelegatorName</param-name>
         <param-value>default</param-value>
-        <!--<description>The Name of the Entity Delegator to use, defined in entityengine.xml</description>-->
     </context-param>
     <context-param>
         <param-name>localDispatcherName</param-name>
         <param-value>webtools</param-value>
-        <!--<description>A unique name used to identify/recognize the local dispatcher for the Service Engine</description>-->
     </context-param>
     <context-param>
         <description>The location of the main-decorator screen to use for this webapp; referred to as a context variable
@@ -104,7 +102,6 @@ under the License.
         <listener-class>org.apache.ofbiz.webapp.control.LoginEventListener</listener-class>
     </listener>
     <!-- NOTE: not all app servers support mounting implementations of the HttpSessionActivationListener interface -->
-    <!-- <listener><listener-class>org.apache.ofbiz.webapp.control.ControlActivationEventListener</listener-class></listener> -->
 
     <servlet>
         <description>Main Control Servlet</description>
@@ -162,22 +159,6 @@ under the License.
     | "503"   ; Service Unavailable
     | "504"   ; Gateway Time-out
     | "505"   ; HTTP Version not supported
-    -->
-
-    <!--
-      <security-constraint>
-        <web-resource-collection>
-          <web-resource-name>Entire Site</web-resource-name>
-          <description>Entire Site</description>
-          <url-pattern>/*</url-pattern>
-        </web-resource-collection>
-    -->
-    <!-- For enabling SSL, specify CONFIDENTIAL or INTEGRAL. -->
-    <!--
-        <user-data-constraint>
-          <transport-guarantee>CONFIDENTIAL</transport-guarantee>
-        </user-data-constraint>
-      </security-constraint>
     -->
 
 </web-app>

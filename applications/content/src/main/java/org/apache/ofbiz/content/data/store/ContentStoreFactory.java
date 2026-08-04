@@ -47,16 +47,20 @@ import org.apache.ofbiz.entity.util.EntityUtilProperties;
  * </ul>
  *
  * <p><strong>{@code null} is the documented database-mode signal.</strong> An unrecognised value is
- * never fatal: it is logged once as a warning naming the offending value and then treated as
+ * never fatal: it is logged as a warning naming the offending value and then treated as
  * {@code database}, so a typo cannot stop a deployment from starting.
  *
- * <p><strong>Resolution happens once per JVM.</strong> The provider is built on first use and cached
- * together with a signature of the configuration it was built from. A later configuration change - a
- * rotated credential, a different bucket, a different provider - is reported as a warning and takes
- * effect on the next restart; the cached provider is deliberately neither replaced nor closed while it
- * is running, because a caller may still be reading a stream it opened, and closing a provider out from
- * under that caller would turn a configuration change into a failed request. In a container deployment
- * configuration arrives from the environment at start, so a change is a redeploy in any case.
+ * <p><strong>The cache is conditional.</strong> Only a {@code filesystem} or {@code s3} resolution is
+ * cached, and only once one has been built: {@code database} mode answers {@code null} without
+ * populating the cache, so while the configuration names {@code database} every call re-reads the
+ * property and a later change to {@code filesystem} or {@code s3} does take effect in the same JVM.
+ * Once a provider IS cached it is kept for the life of the JVM, together with a signature of the
+ * configuration it was built from: a subsequent configuration change - a rotated credential, a
+ * different bucket, a different provider, or a move back to {@code database} - is reported as a warning
+ * and takes effect on the next restart. The cached provider is deliberately neither replaced nor closed
+ * while it is running, because a caller may still be reading a stream it opened, and closing a provider
+ * out from under that caller would turn a configuration change into a failed request. In a container
+ * deployment configuration arrives from the environment at start, so a change is a redeploy in any case.
  *
  * <p>Thread safe: creation is serialised and the cached resolution is published through a volatile
  * field, so concurrent callers share one provider and none of them can observe a half-built one.
@@ -67,7 +71,6 @@ public final class ContentStoreFactory {
 
     private static final String MODULE = ContentStoreFactory.class.getName();
 
-    /** The property resource every setting below is read from. */
     private static final String RESOURCE = "content";
 
     private static final String PROVIDER_PROPERTY = "content.store.provider";
@@ -110,14 +113,11 @@ public final class ContentStoreFactory {
     }
 
     /**
-     * Package-private test seam: drops the cached provider, closing it if it holds resources, so that a
-     * subsequent {@link #getContentStore()} re-resolves {@code content.store.provider} from
-     * configuration.
+     * Drops the cached provider, closing it if it holds resources, so that a subsequent
+     * {@link #getContentStore()} re-resolves {@code content.store.provider} from configuration.
      *
-     * <p>Production code never calls this - the provider is resolved once and cached for the life of the
-     * JVM. It exists so that {@code ContentStoreFactoryTest} can exercise several provider values within
-     * a single JVM, which is impossible while a static resolution is cached. Closing here is safe in a
-     * way that closing on supersede is not: a test holds no open stream when it resets.
+     * <p>Closing here is safe in a way that closing on supersede is not: this is called only when no
+     * caller holds a stream the provider opened.
      */
     static void clearCache() {
         synchronized (CREATION_LOCK) {
@@ -133,13 +133,6 @@ public final class ContentStoreFactory {
         }
     }
 
-    /**
-     * Reads a content property.
-     *
-     * @param name the property name
-     * @param defaultValue what to answer when the property is absent or blank
-     * @return the trimmed value, or {@code defaultValue}
-     */
     static String setting(String name, String defaultValue) {
         String value = UtilProperties.getPropertyValue(RESOURCE, name);
         return UtilValidate.isEmpty(value) ? defaultValue : value.trim();
@@ -151,8 +144,13 @@ public final class ContentStoreFactory {
      * <p>Every provider validates through here, so one key is accepted or refused identically whatever
      * backend is configured, and no provider has to be trusted to repeat the checks correctly. The
      * grammar is deliberately narrow: a relative POSIX path whose segments are all non-empty and
-     * neither {@code .} nor {@code ..}. That leaves no spelling that could resolve outside a filesystem
-     * provider's root or address an unintended object in a bucket.
+     * neither {@code .} nor {@code ..}, with no backslash and no control character. That is a
+     * traversal-resistant form, so no accepted spelling can escape a filesystem provider's root.
+     *
+     * <p>It is NOT an authorization check. Whether the caller may address the content a key names, and
+     * whether the key is the one that names the intended content, remain the caller's responsibility -
+     * for the content-store seam in {@code DataResourceWorker} that means the location allow-lists it
+     * applies and the {@code ofbiz.home}-relative path it derives the key from.
      *
      * @param key the storage key to check
      * @throws GeneralException if the key is empty or breaks the grammar
@@ -178,19 +176,9 @@ public final class ContentStoreFactory {
         }
     }
 
-    /**
-     * Resolves a configured provider name to the store that serves it.
-     *
-     * @param configured the value of {@code content.store.provider}
-     * @return the store, or null for database storage
-     * @throws GeneralException if a provider is named but its configuration is incomplete or unusable
-     */
     private static ContentStore resolve(String configured) throws GeneralException {
         String provider = configured == null ? DATABASE : configured.trim().toLowerCase(Locale.ROOT);
         if (!provider.isEmpty() && !DATABASE.equals(provider) && !FILESYSTEM.equals(provider) && !S3.equals(provider)) {
-            // Logged and defaulted rather than thrown: refusing to start over a typo in one property
-            // would make a mis-typed deployment worse off than the shipped default, which is the
-            // behaviour this factory guarantees.
             Debug.logWarning("Unrecognised " + PROVIDER_PROPERTY + " [" + configured + "]. It must be " + DATABASE
                     + ", " + FILESYSTEM + " or " + S3 + "; falling back to " + DATABASE + " storage.", MODULE);
             provider = DATABASE;
@@ -271,9 +259,6 @@ public final class ContentStoreFactory {
                 + " from it; restart the instance to apply the change.", MODULE);
     }
 
-    /**
-     * A cached store together with the configuration signature it was built from.
-     */
     private static final class Resolution {
 
         private final String signature;

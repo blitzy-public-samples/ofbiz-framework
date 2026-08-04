@@ -63,23 +63,19 @@ import static org.mockito.Mockito.when;
 /**
  * Provider selection and S3-provider behaviour, as pure unit tests.
  *
- * <p>Nothing here opens a database connection, resolves a delegator, starts a transaction, writes a file
- * or reaches the network. Selection is exercised by varying {@code content.store.provider} in memory and
- * asserting only what {@code ContentStoreFactory} answers; the S3 provider is exercised against a Mockito
- * mock of the SDK client, passed in through the provider's package-private test seam, so no AWS
- * configuration, credential resolution or endpoint is involved.
+ * <p><strong>Hermetic.</strong> Nothing here opens a database connection, resolves a delegator, starts a
+ * transaction, writes a file or reaches the network. Selection is exercised by varying
+ * {@code content.store.provider} in memory and asserting only what {@code ContentStoreFactory} answers;
+ * the S3 provider is exercised against a Mockito mock of the SDK client, so no AWS configuration,
+ * credential resolution or endpoint is involved.
  *
- * <p>The class is {@code final} because Checkstyle's {@code DesignForExtension} does not exempt
- * {@code @BeforeEach} and {@code @AfterEach} - only the JUnit 4 lifecycle annotations - and this class
- * needs both.
- *
- * <p>Every value it changes is restored afterwards. {@code UtilProperties.setPropertyValueInMemory}
- * mutates the shared, cached {@code Properties} instance for the resource, and Gradle runs the whole unit
- * tier in one JVM, so an unrestored override would change what other test classes observe.
+ * <p><strong>Global state is restored.</strong> {@code UtilProperties.setPropertyValueInMemory} mutates
+ * the shared, cached {@code Properties} instance for the resource, the factory caches its resolution
+ * statically, and Gradle runs the whole unit tier in one JVM - so every property this class writes is put
+ * back, and the factory cache is dropped, after each test.
  */
 public final class ContentStoreFactoryTest {
 
-    /** The property resource the factory and the providers read. */
     private static final String RESOURCE = "content";
 
     private static final String PROVIDER_KEY = "content.store.provider";
@@ -90,14 +86,10 @@ public final class ContentStoreFactoryTest {
     private static final String SECRET_KEY_KEY = "content.store.s3.secret.access.key";
     private static final String PATH_STYLE_KEY = "content.store.s3.path.style";
 
-    /** Every key this test writes, and therefore every key it has to put back. */
     private static final List<String> MANAGED_KEYS = List.of(PROVIDER_KEY, BUCKET_KEY, REGION_KEY, ENDPOINT_KEY,
             ACCESS_KEY_KEY, SECRET_KEY_KEY, PATH_STYLE_KEY);
 
-    /** A storage key of the shape the content-store seam derives from an uploaded file's own path. */
     private static final String KEY = "ofbiz/runtime/uploads/1700000000000/10000.png";
-
-    /** The bucket the mocked client is addressed with. Obviously fake, like every fixture here. */
     private static final String BUCKET = "test-bucket";
 
     private final Map<String, String> original = new LinkedHashMap<>();
@@ -112,8 +104,8 @@ public final class ContentStoreFactoryTest {
         for (String key : MANAGED_KEYS) {
             original.put(key, UtilProperties.getPropertyValue(RESOURCE, key));
         }
-        logErrorOn = Debug.isOn(Debug.ERROR); // save the current setting (to be restored after the tests)
-        Debug.set(Debug.ERROR, false); // disable error logging
+        logErrorOn = Debug.isOn(Debug.ERROR);
+        Debug.set(Debug.ERROR, false);
         ContentStoreFactory.clearCache();
     }
 
@@ -123,8 +115,8 @@ public final class ContentStoreFactoryTest {
             UtilProperties.setPropertyValueInMemory(RESOURCE, held.getKey(), held.getValue());
         }
         original.clear();
-        ContentStoreFactory.clearCache(); // drop and close whatever a test resolved
-        Debug.set(Debug.ERROR, logErrorOn); // restore the error log setting
+        ContentStoreFactory.clearCache();
+        Debug.set(Debug.ERROR, logErrorOn);
     }
 
     @Test
@@ -264,19 +256,11 @@ public final class ContentStoreFactoryTest {
                 "a key with a backslash must be refused");
     }
 
-    /**
-     * Selects a storage provider and drops the cached resolution so the next call re-reads it.
-     *
-     * @param provider the value to write to {@code content.store.provider}
-     */
     private static void select(String provider) {
         UtilProperties.setPropertyValueInMemory(RESOURCE, PROVIDER_KEY, provider);
         ContentStoreFactory.clearCache();
     }
 
-    /**
-     * Writes obviously fake S3 settings, complete enough for the SDK to build a client entirely offline.
-     */
     private static void configureS3() {
         UtilProperties.setPropertyValueInMemory(RESOURCE, BUCKET_KEY, BUCKET);
         UtilProperties.setPropertyValueInMemory(RESOURCE, REGION_KEY, "us-east-1");
@@ -286,12 +270,6 @@ public final class ContentStoreFactoryTest {
         UtilProperties.setPropertyValueInMemory(RESOURCE, PATH_STYLE_KEY, "true");
     }
 
-    /**
-     * Builds the response the mocked client answers a GetObject with.
-     *
-     * @param content the bytes the bucket is pretending to hold
-     * @return the response stream
-     */
     private static ResponseInputStream<GetObjectResponse> response(byte[] content) {
         return new ResponseInputStream<>(GetObjectResponse.builder().contentLength((long) content.length).build(),
                 new ByteArrayInputStream(content));

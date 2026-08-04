@@ -55,14 +55,14 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 /**
  * The S3-compatible object-storage provider, which holds file-backed content in a bucket.
  *
- * <p>It is built on the AWS SDK for Java v2 synchronous {@link S3Client}, configured from the
- * {@code content} property resource - which {@code docker/docker-entrypoint.sh} renders from the
+ * <p>It is built on the AWS SDK for Java v2 synchronous {@link S3Client}, configured from these
+ * {@code content} properties, which {@code docker/docker-entrypoint.sh} renders from the
  * {@code OFBIZ_S3_*} environment variables:
  *
  * <ul>
  *   <li>{@code content.store.s3.bucket} - required.</li>
- *   <li>{@code content.store.s3.region} - required; any value is accepted by an S3-compatible store
- *       that does not use regions, because the SDK only needs one to sign a request.</li>
+ *   <li>{@code content.store.s3.region} - required; an S3-compatible store that does not use regions
+ *       accepts any value, because the SDK only needs one to sign a request.</li>
  *   <li>{@code content.store.s3.endpoint} - optional. When set it is applied with
  *       {@code endpointOverride}, which is what lets the same client address MinIO, Ceph or any other
  *       S3-compatible store as well as Amazon S3.</li>
@@ -74,12 +74,9 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
  * </ul>
  *
  * <p><strong>Every call is bounded.</strong> A content read or write happens inside a request, and
- * usually inside a transaction, so an object store that stops answering must not be able to hold a
- * request thread until the operating system gives up on the socket. The client is therefore built with
- * an explicit per-attempt timeout, an explicit overall API-call timeout that spans retries, and a
- * bounded number of attempts. When the budget is exhausted the SDK raises, this provider translates
- * that into an {@link IOException}, and the caller fails the request rather than hanging: a store that
- * cannot answer is reported as a failure and never as missing content.
+ * usually inside a transaction, so the client is built with an explicit per-attempt timeout, an
+ * explicit overall API-call timeout that spans retries, and a bounded number of attempts, rather than
+ * being allowed to hold a request thread until the operating system gives up on the socket.
  *
  * <p><strong>Transport.</strong> An {@code https} endpoint is expected. A plain {@code http} endpoint
  * is accepted so that a store reached over a network the deployment controls end to end still works,
@@ -89,8 +86,8 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
  * <p>Absence is separated from failure as {@link ContentStore} requires: a key the bucket does not
  * hold becomes {@link FileNotFoundException}, while every other SDK failure - credentials, network,
  * permissions, an absent bucket - becomes an {@link IOException} that is not a
- * {@code FileNotFoundException}. Logging names the bucket and the key and never the content, per the
- * policy {@link ContentStore} publishes.
+ * {@code FileNotFoundException}. Log lines and messages name the bucket and the key and never the
+ * content, per the policy {@link ContentStore} publishes.
  *
  * <p>Thread safe: {@link S3Client} is thread safe and every other field is immutable.
  */
@@ -105,29 +102,15 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     private static final String SECRET_KEY_PROPERTY = "content.store.s3.secret.access.key";
     private static final String PATH_STYLE_PROPERTY = "content.store.s3.path.style";
 
-    /** The largest object {@link #get} will read into memory. */
     private static final int MAX_IN_MEMORY_OBJECT = 16 * 1024 * 1024;
-
-    /** How much of a bounded read is copied at a time. */
     private static final int BUFFER_SIZE = 8192;
-
-    /** How long one attempt at a single request may take. */
     private static final Duration ATTEMPT_TIMEOUT = Duration.ofSeconds(15L);
-
-    /** How long a request may take in total, retries included. */
     private static final Duration CALL_TIMEOUT = Duration.ofSeconds(45L);
-
-    /** How many attempts one request is given before it is failed. */
     private static final int MAX_ATTEMPTS = 3;
 
     private final String bucket;
     private final S3Client client;
 
-    /**
-     * Builds the client for the configuration this deployment declares.
-     *
-     * @throws GeneralException if the configuration is incomplete or unusable
-     */
     S3ContentStore() throws GeneralException {
         this.bucket = required(BUCKET_PROPERTY);
         String region = required(REGION_PROPERTY);
@@ -148,17 +131,6 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         this.client = builder.build();
     }
 
-    /**
-     * Package-private test seam: builds a store around an already-constructed client.
-     *
-     * <p>It exists so that {@code ContentStoreFactoryTest} can exercise every operation of this
-     * provider against a mocked {@link S3Client}, with no AWS configuration, no credential resolution
-     * and no network access. Production code never uses it - the configuration-driven constructor above
-     * is the only route {@link ContentStoreFactory} takes.
-     *
-     * @param s3Client the client to issue requests with
-     * @param s3Bucket the bucket to address
-     */
     S3ContentStore(S3Client s3Client, String s3Bucket) {
         this.client = s3Client;
         this.bucket = s3Bucket;
@@ -248,7 +220,7 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     }
 
     /**
-     * Shuts the SDK client down when this store is superseded by a re-resolved configuration.
+     * Closes the SDK client and releases its resources.
      */
     @Override
     public void close() {
@@ -260,9 +232,9 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
      *
      * <p>It is a SHA-256 digest of every setting the client is constructed from, the secret access key
      * included in full, so that rotating a credential to a different value of the same length still
-     * resolves a new client. A digest rather than the values themselves: the signature is held in
-     * memory next to the cache and compared on every resolution, and a one-way digest cannot give a
-     * credential back.
+     * resolves a new client. A digest rather than the values themselves so that the signature, which is
+     * held in memory next to the cache and compared on every resolution, does not retain the plaintext
+     * settings.
      *
      * @return the signature
      */
@@ -285,12 +257,6 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         }
     }
 
-    /**
-     * Resolves the credentials provider the configuration asks for.
-     *
-     * @return static credentials when both halves are configured, otherwise the SDK's default chain
-     * @throws GeneralException if exactly one half of a static credential pair is configured
-     */
     private static AwsCredentialsProvider credentials() throws GeneralException {
         String accessKey = ContentStoreFactory.setting(ACCESS_KEY_PROPERTY, "");
         String secretKey = ContentStoreFactory.setting(SECRET_KEY_PROPERTY, "");
@@ -308,13 +274,6 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         return StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey));
     }
 
-    /**
-     * Validates the configured endpoint and returns it.
-     *
-     * @param endpoint the configured endpoint
-     * @return the endpoint to override the SDK's own with
-     * @throws GeneralException if it is not an absolute http or https URI
-     */
     private static URI endpointOverride(String endpoint) throws GeneralException {
         URI uri;
         try {
@@ -328,21 +287,15 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
                     + " URI, for example https://s3.example.internal:9000");
         }
         if ("http".equals(scheme)) {
-            Debug.logWarning("The content store endpoint [" + endpoint + "] is plain http, so object content and"
-                    + " the credentials that sign for it cross the network unencrypted. Use https unless the"
-                    + " endpoint is reached over a network the deployment controls end to end; the container"
-                    + " entry point refuses plain http in the prod profile.", MODULE);
+            Debug.logWarning("The content store endpoint [" + endpoint + "] is plain http, so object content"
+                    + " and the request authorization metadata, including the access-key identifier and"
+                    + " signature, cross the network unencrypted. Use https unless the endpoint is reached over"
+                    + " a network the deployment controls end to end; the container entry point refuses plain"
+                    + " http in the prod profile.", MODULE);
         }
         return uri;
     }
 
-    /**
-     * Reads a required setting.
-     *
-     * @param name the property name
-     * @return the configured value
-     * @throws GeneralException if it is absent or blank
-     */
     private static String required(String name) throws GeneralException {
         String value = ContentStoreFactory.setting(name, "");
         if (value.isEmpty()) {
@@ -351,14 +304,6 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         return value;
     }
 
-    /**
-     * Translates an S3 error that may be a 404 into absence, and anything else into failure.
-     *
-     * @param operation what was attempted, for the message
-     * @param key the storage key
-     * @param failure what the SDK reported
-     * @return the exception to throw
-     */
     private IOException notFoundOrFailure(String operation, String key, S3Exception failure) {
         if (failure.statusCode() == 404) {
             return absence(key, failure);
@@ -366,38 +311,17 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
         return failed(operation, key, failure);
     }
 
-    /**
-     * Reports an object the bucket does not hold, as the contract's one absence signal.
-     *
-     * @param key the storage key
-     * @param cause what the SDK reported
-     * @return the exception to throw
-     */
     private FileNotFoundException absence(String key, SdkException cause) {
         FileNotFoundException absent = new FileNotFoundException("The content store holds no " + reference(key));
         absent.initCause(cause);
         return absent;
     }
 
-    /**
-     * Reports a store that could not answer, which is never absence.
-     *
-     * @param operation what was attempted, for the message
-     * @param key the storage key
-     * @param cause what the SDK reported
-     * @return the exception to throw
-     */
     private IOException failed(String operation, String key, SdkException cause) {
         return new IOException("The content store could not " + operation + " " + reference(key) + ": "
                 + cause.getMessage(), cause);
     }
 
-    /**
-     * Names an object in a log line or a message, per the logging policy {@link ContentStore} publishes.
-     *
-     * @param key the storage key
-     * @return the bucket and key
-     */
     private String reference(String key) {
         return "[" + bucket + "/" + key + "]";
     }

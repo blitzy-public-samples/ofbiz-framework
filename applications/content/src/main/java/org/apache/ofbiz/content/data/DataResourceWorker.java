@@ -168,9 +168,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             subCategoryIds.add(newNode);
         }
 
-        // The first two parentCategoryId test just make sure that the first level of children
-        // is gotten. This is a hack to make them available for display, but a more correct
-        // approach should be formulated.
+        // The first two parentCategoryId tests make sure that the first level of children is gotten, so
+        // that they are available for display.
         // The "getAll" switch makes sure all descendants make it into the tree, if true.
         // The other test is to only get all the children if the "leaf" node where all the
         // children of the leaf are wanted for expansion.
@@ -487,21 +486,12 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     }
 
     /**
-     * Checks that the given file is within the provided context root directory.
-     * Uses a dual-check strategy to support EFS/Docker mount points:
-     * 1. Canonical paths (resolves symlinks on both sides) — works for non-mounted paths.
-     * 2. Normalized absolute paths (collapses ".." without following symlinks) — fallback for
-     *    when contextRoot or a subdirectory inside it is a mount point, causing canonical paths
-     *    to diverge. Path traversal via ".." is still blocked by the normalization step.
-     */
-    /**
      * Validates that a CONTEXT_FILE location is inside its webapp root, and binds it to the transaction.
      *
-     * <p>The validation is unchanged. The binding is the content-store seam for the two frozen service
-     * methods that write a CONTEXT_FILE - {@code DataServices.createFileMethod} and
-     * {@code updateFileMethod} - because this is the one method of this class they call after composing
-     * the File they are about to write. Without it, a CONTEXT_FILE write would never reach an external
-     * store. The binding does nothing at all unless a store is configured, and publishes only what the
+     * <p>The validation is unchanged and is delegated to {@link #assertInsideContextRoot}. The binding is
+     * the content-store seam for {@code DataServices.createFileMethod} and {@code updateFileMethod},
+     * because this is the one method of this class they call after composing the File they are about to
+     * write. The binding does nothing at all unless a store is configured, and publishes only what the
      * transaction actually changed.
      *
      * @param file the location to validate
@@ -515,6 +505,14 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
 
     /**
      * Validates that a location is inside a webapp root, with no side effect.
+     *
+     * <p>Uses a dual-check strategy to support EFS/Docker mount points:
+     * <ol>
+     *   <li>Canonical paths (resolves symlinks on both sides) - works for non-mounted paths.</li>
+     *   <li>Normalized absolute paths (collapses ".." without following symlinks) - fallback for when
+     *       contextRoot or a subdirectory inside it is a mount point, causing canonical paths to
+     *       diverge. Path traversal via ".." is still blocked by the normalization step.</li>
+     * </ol>
      *
      * @param file the location to validate
      * @param contextRoot the webapp root the location must be inside
@@ -707,8 +705,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
         }
 
-        // The one file DataServices.createBinaryFileMethod and updateBinaryFileMethod are about to write
-        // is watched from here, so their writes reach the store for every one of the six file types.
+        // DataServices.createBinaryFileMethod and updateBinaryFileMethod resolve here the one file they
+        // are about to write, so binding it here is what carries that write to a configured store.
         bindWrittenFile(file);
         return file;
     }
@@ -759,66 +757,17 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         return FileSystemContentStore.getUploadPath(initialPath, maxFiles, absolute);
     }
 
-    // -------------------------------------------------------------------------------------------------
-    // Content store seam
-    //
-    // File-backed DataResource content - LOCAL_FILE, OFBIZ_FILE, CONTEXT_FILE and their _BIN variants -
-    // has always been read from and written to the local filesystem of the instance that handled the
-    // request, which is the one piece of durable state that keeps an instance from being replaceable.
-    // What follows is the whole of the seam that lets that content live in a store every instance can
-    // reach instead. No entity definition and no service signature changes.
-    //
-    //   readFromStore    the READ side, called from getContentFile and renderFile BEFORE the local file
-    //                    is consulted, which is what makes the store AUTHORITATIVE: an object the store
-    //                    holds is copied onto this instance on every resolution, so no instance can go
-    //                    on serving a copy of content another instance has since replaced. Content the
-    //                    store does not hold falls back to the local file, so content written before the
-    //                    store was configured keeps being served. The filesystem provider needs none of
-    //                    this - its root IS the upload directory, so the local file already is the
-    //                    stored object - and the seam answers false for it immediately.
-    //
-    //   bindUploadDirectory / bindWrittenFile
-    //                    the WRITE side. Both bind a publication to the transaction that is doing the
-    //                    writing, and the two of them together cover every path that writes file-backed
-    //                    content:
-    //                      * getContentFile is where DataServices.createBinaryFileMethod and
-    //                        updateBinaryFileMethod resolve the ONE file they are about to write, for
-    //                        every one of the six file types, so that file is watched by name; and
-    //                      * getDataResourceContentUploadPath is where an upload resolves the directory
-    //                        that createFileMethod then writes into. That service composes its own File
-    //                        from the objectInfo the caller built and never calls this class, so the
-    //                        directory is the one point every upload does pass through, and it is
-    //                        watched for the files the transaction adds or rewrites.
-    //                    Publication runs in beforeCompletion, while the transaction is still active,
-    //                    and any failure rolls it back: a committed DataResource row therefore always
-    //                    names content the store holds. An object published by a transaction that then
-    //                    fails to commit is deleted again in afterCompletion, so a rolled-back write
-    //                    leaves no orphan.
-    //
-    //   storeKey         the naming rule: KEY_NAMESPACE followed by the content's own
-    //                    ofbiz.home-relative POSIX path, which for uploaded content already ends in the
-    //                    immutable dataResourceId. Content outside ofbiz.home has no key and is neither
-    //                    published nor looked up, so no path outside the deployment is reachable through
-    //                    a store. ContentStoreFactory refuses to activate any store at all in a
-    //                    multi-tenant deployment, because this seam cannot establish a tenant scope at
-    //                    every one of its call sites; DOCKER.adoc carries that and the one-bucket-per-
-    //                    deployment rule.
-    //
-    // The seam is inert unless content.store.provider names a provider: ContentStoreFactory answers null
-    // for the shipped 'database' value, and no store code runs at all.
-    // -------------------------------------------------------------------------------------------------
-
-    /** The key space every storage key lives under, so one bucket can safely hold unrelated objects. */
     private static final String KEY_NAMESPACE = "ofbiz";
-
-    /** The largest file this seam publishes in one object, bounded because ContentStore.put takes bytes. */
     private static final long MAX_PUBLISHED_FILE = 64L * 1024L * 1024L;
-
-    /** Publications already bound to the transaction on this thread, by watched identity. */
     private static final ThreadLocal<Set<String>> PENDING_PUBLICATIONS = ThreadLocal.withInitial(HashSet::new);
 
     /**
      * Returns the storage key naming the given content, or null when it cannot have one.
+     *
+     * <p>The key is {@code KEY_NAMESPACE} followed by the content's own {@code ofbiz.home}-relative POSIX
+     * path, so one key means the same object on every instance. Content outside {@code ofbiz.home} has no
+     * key and is therefore neither published nor looked up. The path carries no tenant scope, which is why
+     * {@link ContentStoreFactory} refuses to activate a store at all in a multi-tenant deployment.
      *
      * @param file the content's location on this instance
      * @return the storage key, or null when the location is not inside {@code ofbiz.home}
@@ -970,7 +919,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
      *
      * @param directory the directory to watch
      * @param names the file names to watch, or null to watch every direct child
-     * @param writing whether this is a write path, where the absence of a usable transaction is a fault
+     * @param writing whether this is a write path, where the absence of a usable transaction is a fault -
+     *     a read path reports and carries on, because it has nothing to publish
      */
     private static void bindPublication(File directory, Set<String> names, boolean writing) {
         ContentStore store;
@@ -1028,11 +978,6 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         }
     }
 
-    /**
-     * Deletes a staging file, reporting rather than raising when it cannot be removed.
-     *
-     * @param staged the staging file
-     */
     private static void removeQuietly(Path staged) {
         try {
             Files.deleteIfExists(staged);
@@ -1042,12 +987,6 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         }
     }
 
-    /**
-     * What one file held when a publication was registered.
-     *
-     * @param length how many bytes it held
-     * @param modifiedAt when it was last modified
-     */
     private record FileFacts(long length, long modifiedAt) {
     }
 
@@ -1065,7 +1004,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         private final String identity;
         private final Map<String, FileFacts> before;
         private final long registeredAt;
-        private final List<String> published = new LinkedList<>();
+        private final List<String> created = new LinkedList<>();
 
         private ContentPublication(ContentStore store, File directory, Set<String> names, String identity) {
             this.store = store;
@@ -1094,12 +1033,15 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 // life of the JVM.
                 PENDING_PUBLICATIONS.remove();
             }
-            if (status == Status.STATUS_COMMITTED || published.isEmpty()) {
+            if (status == Status.STATUS_COMMITTED || created.isEmpty()) {
                 return;
             }
-            // The transaction did not commit, so no row names the objects this publication wrote.
-            // Removing them again is what stops a rolled-back write leaving an orphan behind for ever.
-            for (String key : published) {
+            // The transaction did not commit, so the objects it CREATED are named by no committed row and
+            // are removed again, on a best-effort basis, rather than left as orphans. A key that REPLACED
+            // an object an earlier committed row still names is deliberately not in this list: this
+            // publication holds no copy of the previous object, so deleting the key would destroy that
+            // content instead of restoring it.
+            for (String key : created) {
                 try {
                     store.delete(key);
                     Debug.logInfo("Content [" + key + "] was removed from the content store, because the"
@@ -1112,11 +1054,6 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
         }
 
-        /**
-         * Returns the files this publication is responsible for.
-         *
-         * @return the watched files
-         */
         private List<File> candidates() {
             if (names != null) {
                 List<File> named = new LinkedList<>();
@@ -1136,23 +1073,21 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             return Arrays.asList(children);
         }
 
-        /**
-         * Reports whether a watched file was written by this transaction.
-         *
-         * @param candidate the watched file
-         * @return true when it must be published
-         */
         private boolean changed(File candidate) {
             if (!candidate.isFile()) {
                 return false;
             }
             FileFacts earlier = before.get(candidate.getName());
-            // No digest is taken, deliberately. A file this transaction wrote either was not there when
-            // the publication was registered, or its length changed, or its modification time changed,
-            // or it was touched at or after the instant the publication was registered - and that last
-            // clause catches even a rewrite to the same length inside one filesystem timestamp tick.
-            // Hashing every file in the directory instead would make one upload pay for every byte the
+            // A HEURISTIC, deliberately, rather than a digest: a file counts as written when it was not
+            // there when the publication was registered, or its length changed, or its modification time
+            // changed, or it was touched at or after the instant the publication was registered. Hashing
+            // every file in the watched directory instead would make one upload pay for every byte the
             // shard already holds, twice, inside the transaction.
+            // Its limit: a rewrite to exactly the same length can go unnoticed where the filesystem's
+            // lastModified() resolution is coarser than the interval between registration and the write,
+            // because the recorded timestamp can then be unchanged AND below registeredAt. Content that
+            // must be republished in that case is written under a new key - which uploaded content always
+            // is, because the key ends in the immutable dataResourceId.
             return earlier == null
                     || earlier.length() != candidate.length()
                     || earlier.modifiedAt() != candidate.lastModified()
@@ -1160,7 +1095,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         }
 
         /**
-         * Publishes one file, refusing the transaction when the store will not take it.
+         * Publishes one file, refusing the transaction when the store will not take it, and records
+         * whether the object was created rather than replaced.
          *
          * @param file the file to publish
          */
@@ -1179,9 +1115,22 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 throw refuse(key, new IOException("the file holds " + length + " bytes, more than the "
                         + MAX_PUBLISHED_FILE + " bytes this seam publishes as one object"));
             }
+            // Asked before the write, because only an object this transaction created may be removed
+            // again after a non-commit. A store that cannot answer is treated as already holding the key,
+            // so the cleanup errs towards leaving an object behind rather than deleting content an
+            // earlier committed row may still name.
+            boolean replacement = true;
+            try {
+                replacement = store.exists(key);
+            } catch (GeneralException | IOException unknown) {
+                Debug.logWarning(unknown, "The content store could not report whether it already held ["
+                        + key + "], so it is left in place if this transaction does not commit", MODULE);
+            }
             try {
                 store.put(key, Files.readAllBytes(file.toPath()));
-                published.add(key);
+                if (!replacement) {
+                    created.add(key);
+                }
                 Debug.logInfo("Content [" + key + "] was published to the content store", MODULE);
             } catch (GeneralException | IOException failure) {
                 throw refuse(key, failure);
@@ -1216,11 +1165,10 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         }
 
         /**
-         * Records what the watched files held before anything was written.
-         *
-         * <p>Direct children and regular files only: an upload lands as a file in the directory the
-         * upload path named, and descending further would make one upload's commit responsible for every
-         * file the deployment has ever placed below that tree.
+         * Records what the watched files held before anything was written: direct children and regular
+         * files only, because an upload lands as a file in the directory the upload path named, and
+         * descending further would make one upload's commit responsible for every file the deployment has
+         * ever placed below that tree.
          *
          * @param directory the watched directory
          * @param names the watched file names, or null to watch every direct child
@@ -1403,7 +1351,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                     // get the screen renderer; or create a new one
                     ScreenRenderer screens = (ScreenRenderer) context.get("screens");
                     if (screens == null) {
-                     // TODO: replace "screen" to support dynamic rendering of different output
+                     // The renderer is fixed to the theme's "screen" output type; no other output type is
+                     // rendered from here.
                         ScreenStringRenderer screenStringRenderer = new MacroScreenRenderer(modelTheme.getType("screen"),
                                 modelTheme.getScreenRendererLocation("screen"));
                         screens = new ScreenRenderer(out, context, screenStringRenderer);
@@ -1655,8 +1604,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     }
 
     public static void renderFile(String dataResourceTypeId, String objectInfo, String rootDir, Appendable out) throws GeneralException, IOException {
-        // TODO: this method assumes the file is a text file, if it is an image we should respond differently,
-        //  see the comment above for IMAGE_OBJECT type data RESOURCE
+        // This method writes the file to a character Appendable, so it handles text content only. Binary
+        // content is served through getDataResourceStream instead; see the IMAGE_OBJECT handling above.
 
         if ("LOCAL_FILE".equals(dataResourceTypeId) && UtilValidate.isNotEmpty(objectInfo)) {
             File file = FileUtil.getFile(objectInfo);
