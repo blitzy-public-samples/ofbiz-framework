@@ -50,18 +50,12 @@ COPY themes/ themes/
 COPY APACHE2_HEADER build.gradle common.gradle gradle.properties NOTICE settings.gradle dependencies.gradle .
 
 # Build OFBiz while mounting a gradle cache.
-# Only "distTar" is run here, deliberately WITHOUT "generateSecretKeys". That task writes freshly
-# generated login.secret_key_string / security.token.key values into
-# framework/security/config/security.properties, which distTar then packages, so running it here would
-# bake live secret material into a layer where it can never be removed - and would additionally give
-# every built image a different key, breaking a multi-instance fleet that has to share one.
-# Both keys are supplied at run time instead: docker-entrypoint.sh renders them into
-# /ofbiz/config/security.properties (mode 0600) from OFBIZ_LOGIN_SECRET_KEY and
-# OFBIZ_JWT_TOKEN_KEY, generating a per-container value when OFBIZ_PROFILE=dev and
-# failing fast when OFBIZ_PROFILE=prod and a key is absent. /ofbiz/config precedes
-# ofbiz.jar on the classpath, so the rendered values win over the blank anchors the image ships.
-# See DOCKER.adoc, framework/security/config/security.properties and docker/docker-entrypoint.sh.
-# Run ./gradlew generateSecretKeys only for a local (non container) development checkout.
+# "generateSecretKeys" is deliberately not run here: it writes live login.secret_key_string and
+# security.token.key values into framework/security/config/security.properties, which distTar then
+# packages, so a secret would be baked into an image layer that no run-time overwrite can remove.
+# Both keys are supplied at run time from OFBIZ_LOGIN_SECRET_KEY and OFBIZ_JWT_TOKEN_KEY by
+# docker/docker-entrypoint.sh; see DOCKER.adoc. Run "./gradlew generateSecretKeys" only for a local,
+# non-container development checkout.
 RUN --mount=type=cache,id=gradle-cache,sharing=locked,target=/root/.gradle \
     --mount=type=tmpfs,target=runtime/tmp \
     ["./gradlew", "--console", "plain", "distTar"]
@@ -124,17 +118,10 @@ FROM runtimebase AS demo
 USER ofbiz
 
 RUN /ofbiz/bin/ofbiz --load-data
-
-# Record that load, so a container from this image starts immediately instead of loading the demo data
-# a second time. The entry point owns the format of the container state markers, so it writes them here
-# rather than this stage creating them with 'touch': a checksummed marker does not accept an empty file,
-# and an empty data_loaded would suppress the load even when the image is pointed at an external
-# database, leaving the container serving an empty schema. The marker written here is bound to the
-# embedded database baked into this image, so that case loads correctly.
-#
-# No db_config_applied marker is written: no database is configured at build time, so there is nothing
-# for it to record.
-RUN ["/ofbiz/docker-entrypoint.sh", "--write-initial-container-state"]
+RUN mkdir --parents /ofbiz/runtime/container_state
+RUN touch /ofbiz/runtime/container_state/data_loaded
+RUN touch /ofbiz/runtime/container_state/admin_loaded
+RUN touch /ofbiz/runtime/container_state/db_config_applied
 
 VOLUME ["/docker-entrypoint-hooks"]
 VOLUME ["/ofbiz/config", "/ofbiz/runtime", "/ofbiz/lib-extra"]

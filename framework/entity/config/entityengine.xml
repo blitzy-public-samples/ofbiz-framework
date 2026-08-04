@@ -62,61 +62,25 @@ access. For a detailed description see the core/docs/entityconfig.html file.
            parameters come from OFBIZ_POSTGRES_HOST, OFBIZ_POSTGRES_PORT (default 5432),
            OFBIZ_POSTGRES_{OFBIZ,OLAP,TENANT}_{DB,USER,PASSWORD}, OFBIZ_DB_POOL_MIN (default 2) and
            OFBIZ_DB_POOL_MAX (default 250); the two startup-DDL flags come from OFBIZ_SCHEMA_INIT and the
-           cache-invalidation flag from OFBIZ_DISTRIBUTED_CACHE_CLEAR, both defaulting to false - see the
-           cache-invalidation note immediately below and the startup-DDL note above the localpostgres
-           datasource.
-           Every one of those values is validated before it is substituted, and the entry point then re-reads
-           the rendered file and refuses to start if a security-relevant substitution did not take effect, so a
-           stale template fails the start up instead of quietly weakening the configuration.
-         * Development profile with cross-instance cache invalidation: OFBIZ_DISTRIBUTED_CACHE_CLEAR=true
-           without OFBIZ_POSTGRES_HOST renders THIS file into /ofbiz/config/entityengine.xml with nothing but
-           the two cache-clear attributes rewritten, so the behaviour can be exercised on embedded H2.
+           cache-invalidation flag from OFBIZ_DISTRIBUTED_CACHE_CLEAR, both defaulting to false.
          The test delegator ALWAYS stays on embedded H2 in both profiles: the deployed-profile template defines
-         its own localh2* datasources for exactly that reason and the entry point verifies the rendered mapping,
-         so gradlew loadAll and gradlew testIntegration are unaffected, in a container as well as locally.
+         its own localh2* datasources for exactly that reason, so gradlew loadAll and gradlew testIntegration are
+         unaffected, in a container as well as locally.
          H2, MySQL and Oracle datasource definitions remain fully intact and selectable. -->
     <!-- distributed-cache-clear-enabled is configuration-driven and stays "false" here, so an unconfigured
-         checkout keeps single-node cache behaviour. OFBIZ_DISTRIBUTED_CACHE_CLEAR=true makes the container entry
-         point render this attribute, and the matching one on default-no-eca, as "true" - by substituting the
-         placeholder in docker/templates/postgres-entityengine.xml in the deployed profile, or by rewriting these
-         two attributes of this file when no managed database is configured. Only these two delegators are
-         rewritten, and the entry point re-reads the rendered file and refuses to start unless both carry the
-         requested value and "test" carries no such attribute at all. The delegator then uses the
-         DistributedCacheClear defaults, org.apache.ofbiz.entityext.cache.EntityCacheServices running as the
-         "system" user, so no further attribute is needed here.
-         A MESSAGE TRANSPORT IS MANDATORY: the distributedClear* sender services in
+         checkout keeps single-node cache behaviour. In the deployed profile the entry point substitutes the
+         placeholder in docker/templates/postgres-entityengine.xml with OFBIZ_DISTRIBUTED_CACHE_CLEAR, which
+         switches on OFBiz's own cache-invalidation plumbing - DistributedCacheClear and
+         org.apache.ofbiz.entityext.cache.EntityCacheServices, running as the "system" user - so no further
+         attribute is needed here.
+         A MESSAGE TRANSPORT IS REQUIRED BEFORE ENABLING IT: the distributedClear* sender services in
          framework/entityext/servicedef/services.xml are declared engine="jms" location="serviceMessenger", the
-         jms-service of that name is commented out in framework/service/config/serviceengine.xml, no JMS provider
-         client library is bundled, and those services inherit use-transaction true with require-new-transaction
-         false, so a dispatch failure marks the caller's transaction rollback only and loses the entity write that
-         triggered the invalidation.
-         docker/docker-entrypoint.sh therefore treats the transport as part of enabling the flag: whenever the flag
-         resolves to true it renders an active serviceMessenger into /ofbiz/config/serviceengine.xml from the
-         OFBIZ_JMS_* variables, reads every attribute back out of the installed file and compares it with what was
-         requested, asserts that exactly one serviceMessenger is active, and requires that the rendered
-         jndi.properties declares the connection factory and topic names while leaving the two JVM-wide keys
-         java.naming.factory.initial and java.naming.provider.url exactly as shipped. It then requires three
-         pieces of start up evidence: the active element declares listen="true", so this instance subscribes
-         rather than only publishing; the initial-context-factory class named by the jndi-server resolves on the
-         class path, which is where an absent /ofbiz/lib-extra client library is caught by name; and at least one
-         host and port in the provider URL accepts a TCP connection within a bounded deadline.
-         WHAT THE START UP CHECKS COVER, precisely: no JNDI context is created, the connection factory and topic
-         names are checked only for being DECLARED and are never looked up, no credentials are authenticated, no
-         subscriber or publisher is constructed, and nothing is published. They establish that this instance is
-         configured to subscribe, that a client library is on the class path, and that something answers on the
-         broker's port. A live lookup is not available to this path at all: dependencies.gradle bundles only the
-         JMS API, and the provider's client library is deployment specific and supplied by the operator, so there
-         is nothing to perform the lookup with when the configuration is rendered. Any failure of the three aborts
-         the start up under both OFBIZ_PROFILE=dev and OFBIZ_PROFILE=prod.
-         DELIVERY IS NOT THIS FLAG'S MECHANISM TO PROVE. What the flag switches on is OFBiz's own
-         cache-invalidation plumbing - DistributedCacheClear, EntityCacheServices and the service definitions in
-         framework/entityext/servicedef/services.xml that route between them - which this refactor does not modify
-         and which the framework's own test tiers cover. The hop itself needs a specific broker, client library,
-         credentials and topic, none of which exist in this tree, so it is verified against the deployment's own
-         broker: DOCKER.adoc carries the two-container procedure, the operator procedure for supplying the
-         provider client library and the JNDI settings, and the log lines to watch. The broker is deliberately NOT
-         a dimension of /webtools/health/ready: one broker serves the whole fleet, so a readiness dimension over
-         it would empty the load balancer's target group for a fault that leaves every instance able to serve. -->
+         jms-service of that name is commented out in framework/service/config/serviceengine.xml and no JMS
+         provider client library is bundled. Those services inherit use-transaction true with
+         require-new-transaction false, so with the flag on and no transport configured a dispatch failure marks
+         the caller's transaction rollback only and loses the entity write that triggered the invalidation.
+         Configure the broker, supply its client library in /ofbiz/lib-extra and activate the serviceMessenger
+         jms-service first; DOCKER.adoc carries the procedure. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
@@ -459,181 +423,72 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/MySqlDataSource" isolation-level="Serializable"/> -->
     </datasource>
 
-    <!-- Objective 1 (managed PostgreSQL datasource): the three localpostgres* definitions below are the
-         deployed-profile datasources. The Entity Engine configuration parser reads these attributes LITERALLY;
-         there is no property-placeholder or system-property expansion anywhere in this file, so externalization
-         is performed by the container entry point, which renders
-         docker/templates/postgres-entityengine.xml into /ofbiz/config/entityengine.xml (first on the runtime
-         classpath) when OFBIZ_POSTGRES_HOST is set. Contract with that template - committed value on the left,
-         the environment variable the template's corresponding placeholder is filled from on the right. The
-         placeholder NAMES are deliberately not written out here; see the template, which documents each one at
-         the attribute it occupies. The entry point refuses to install a rendered file in which any placeholder
-         survived substitution, and SchemaInitGatingTests drives that render from the build and asserts the
-         resulting attributes, so the two artifacts cannot drift apart silently:
-           jdbc-uri            jdbc:postgresql://127.0.0.1:5432/ofbiz?sslmode=verify-full&amp;connectTimeout=10
-                               &amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true
-                               ..  host from OFBIZ_POSTGRES_HOST, port from OFBIZ_POSTGRES_PORT (default 5432),
-                               database from OFBIZ_POSTGRES_OFBIZ_DB, the whole TLS query string from
-                               OFBIZ_POSTGRES_SSLMODE (default verify-full) and OFBIZ_POSTGRES_SSLROOTCERT, and
-                               the network deadlines from OFBIZ_POSTGRES_{CONNECT,SOCKET,LOGIN,CANCEL,QUERY}_TIMEOUT
-                               and OFBIZ_POSTGRES_TCP_KEEPALIVE - see the deadline note below
-           jdbc-username       ofbiz   ..  from OFBIZ_POSTGRES_OFBIZ_USER
-           jdbc-password       omitted ..  from OFBIZ_POSTGRES_OFBIZ_PASSWORD, which the entry point REQUIRES
-                               with no default at all - see the fail-closed note below
-           pool-minsize        2       ..  from OFBIZ_DB_POOL_MIN
-           pool-maxsize        250     ..  from OFBIZ_DB_POOL_MAX
-           pool-sleeptime      20000   ..  from OFBIZ_DB_POOL_WAIT
-           test-on-borrow      false   ..  from OFBIZ_DB_POOL_TEST_ON_BORROW
-           pool-jdbc-test-stmt SELECT 1  ..  the same literal; a fixed validation query, not configurable
-           test-while-idle     true    ..  the same literal; idle validation is always on
-           check-on-start      false   ..  rendered true in init mode, false in run mode, from OFBIZ_SCHEMA_INIT
-           add-missing-on-start  false ..  rendered the same way from OFBIZ_SCHEMA_INIT, through a placeholder of
-                               its own rather than one shared with check-on-start, because the two attributes are
-                               parsed by different rules and cannot share a single rendered literal safely
-           cache clear flag    false   ..  rendered from OFBIZ_DISTRIBUTED_CACHE_CLEAR, on the two default
-                               delegators only and never on test
-           test delegator      localh2 datasources  ..  stays on those same localh2* datasources in the template,
-                               which now defines them itself, so gradlew loadAll and gradlew testIntegration keep
-                               running against embedded H2 inside a container as well
-         MAINTENANCE RULE: never write an at-sign delimited placeholder name anywhere in THIS file, not even in a
-         comment. This file is itself a sed source - the entry point renders it into /ofbiz/config/entityengine.xml
-         to rewrite the cache-clear attribute when cross-instance invalidation is requested without a managed
-         database - and sed rewrites comments as readily as attributes. A placeholder named here would therefore be
-         substituted in the prose too, and one that is never substituted would survive into the rendered file as a
-         literal, which the entry point refuses outright: every rendered configuration is rejected when any
-         placeholder survives substitution, so a placeholder quoted in prose here would fail that check on a file
-         that is in fact fully rendered. The same rule applies to the template for the stronger reason that its
-         placeholders carry the database passwords: a secret-bearing placeholder named in a comment there would
-         republish the password in clear text, which is why the entry point refuses to render a template that
-         names a placeholder inside a comment at all, secret bearing or not. There is a second, purely
-         syntactic reason for the same rule: a substituted value containing a double hyphen would turn the
-         surrounding comment into malformed XML. Describe placeholders in prose by the attribute they
-         occupy, as the comments here do.
-         The explicit :5432 port below is the PostgreSQL default, so this is a functional no op for anyone already
-         using these definitions, while giving the deployed profile an unambiguous host:port substitution shape:
-         the port is a placeholder of its own, range checked as an integer between 1 and 65535, and a host value
-         that carries an embedded port is refused, so no part of the rendered URI reaches it unvalidated.
-         The olap and tenant datasources follow the same pattern, from OFBIZ_POSTGRES_OLAP_* and
-         OFBIZ_POSTGRES_TENANT_*.
-         NO COMMITTED PASSWORD, FAIL CLOSED: these three definitions carry no jdbc-password at all. jdbc-password
-         is optional in entity-config.xsd while jdbc-username is required, so the long standing ofbiz username
-         default for a locally installed PostgreSQL is kept (a username on its own cannot authenticate) and the
-         password is replaced by an explicit jdbc-password-lookup. EntityConfig.getJdbcPassword resolves that
-         lookup against framework/base/config/passwords.properties, which deliberately contains NO
-         jdbc-password.localpostgres* entry, so opening one of these connections without externalized credentials
-         throws GenericEntityConfException naming the missing property rather than silently authenticating with a
-         password that is public in the source tree. Supply the password through the deployed profile (the template
-         token above), or, for a local PostgreSQL, add the jdbc-password.localpostgres* property to a
-         passwords.properties that is not committed. The application's other secrets are configured through
-         framework/security/config/security.properties and
+    <!-- The three localpostgres* definitions below are the managed-RDBMS datasources. The Entity Engine
+         configuration parser reads these attributes LITERALLY - there is no property-placeholder or
+         system-property expansion anywhere in this file - so a deployment externalises them through
+         docker/templates/postgres-entityengine.xml, which the container entry point renders into
+         /ofbiz/config/entityengine.xml (first on the runtime classpath) when OFBIZ_POSTGRES_HOST is set. That
+         template documents each placeholder at the attribute it occupies, and its datasource definitions are
+         derived from these three, so the two stay in step.
+         MAINTENANCE RULE: never write an at-sign delimited placeholder name anywhere in THIS file, not even in
+         a comment, and describe placeholders by the attribute they occupy as the comments here do. The template
+         is a sed source and a name written in prose would be substituted there too.
+         NO COMMITTED PASSWORD, FAIL CLOSED: these three definitions carry no jdbc-password at all.
+         jdbc-password is optional in entity-config.xsd while jdbc-username is required, so the long standing
+         ofbiz username default for a locally installed PostgreSQL is kept (a username on its own cannot
+         authenticate) and the password is replaced by an explicit jdbc-password-lookup.
+         EntityConfig.getJdbcPassword resolves that lookup against framework/base/config/passwords.properties,
+         which deliberately contains NO jdbc-password.localpostgres* entry, so opening one of these connections
+         without externalized credentials throws GenericEntityConfException naming the missing property rather
+         than silently authenticating with a password that is public in the source tree. Supply the password
+         through the deployed profile (the template substitutes it from the environment) or, for a local
+         PostgreSQL, add the jdbc-password.localpostgres* property to a passwords.properties that is not
+         committed. The application's other secrets live in framework/security/config/security.properties and
          framework/start/src/main/resources/org/apache/ofbiz/base/start/start.properties, which ship without a
          value and are injected from the environment at deploy time; none of them belongs here.
-         TLS REQUIRED AND VERIFIED, NOT PREFERRED: every managed URI below pins sslmode=verify-full, which encrypts
-         the connection, checks that the server certificate chains to a trusted root AND checks that the hostname
-         matches that certificate. It is spelled out rather than left to the driver because pgJDBC's own default,
-         sslmode=prefer, silently falls back to an UNENCRYPTED connection when the server declines TLS, and
-         sslmode=require encrypts without authenticating the peer, so a man in the middle can present any
-         certificate: both leave the database password above - and every entity row after it - readable or
-         forgeable by anyone on the path between the fleet and the managed database. An absent query string is
-         therefore not a neutral default, it is the weakest of the six modes.
-         verify-full needs a trusted root, and pgJDBC does NOT consult the JVM trust store by default: it reads
-         sslrootcert, which defaults to ${user.home}/.postgresql/root.crt. A deployment therefore either mounts its
-         provider CA bundle and points OFBIZ_POSTGRES_SSLROOTCERT at it, or imports the CA into the JVM trust store
-         and appends sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory.
-         OFBIZ_POSTGRES_SSLMODE can relax the mode for a development database that has no TLS listener - the whole
-         query string above is substituted as a single unit, so the rendered URI stays well formed with or without a
-         trusted root path - but the entry point refuses every non-verifying mode when OFBIZ_PROFILE=prod, and it
-         re-reads the rendered file and refuses to start unless every managed URI in it really carries the resolved
-         mode. The deployed profile therefore cannot be downgraded to plaintext, whether by an environment variable
-         or by a template that predates the substitution.
-         EVERY NETWORK WAIT IS BOUNDED: each managed URI below also pins the pgJDBC deadlines, and each managed
-         pool below pins its borrow wait, because in both cases the value that applies when the setting is absent
-         is not a deadline at all. pgJDBC leaves socketTimeout and loginTimeout at 0, which means NO LIMIT, so a
-         thread that reaches a database which has stopped answering - a managed instance that failed over, a
-         dropped NAT mapping, a network partition - blocks on the socket read for as long as the kernel keeps the
-         connection open. That is not confined to request threads: the same block strands the startup entity check
-         and the readiness probe's query, which is what makes an instance that is merely waiting
-         indistinguishable from one that is wedged. Independently, InlineJdbc reads an absent pool-sleeptime as
-         300000 ms, five minutes, which is longer than any load-balancer health-check timeout, so an exhausted
-         pool presented as a hung instance rather than as pool exhaustion.
-         socketTimeout bounds a SINGLE socket read rather than a statement, so the value is deliberately generous
-         enough that no normal statement, data load or schema check is affected while still being finite - it is
-         what lets a stalled readiness query eventually return so readiness recovers without a restart. There is
-         deliberately no queryTimeout here: it would apply to EVERY statement and abort legitimately long work
-         such as a data load or a large report, so it stays off unless a deployment sets
-         OFBIZ_POSTGRES_QUERY_TIMEOUT, which the entry point then renders into the URI.
-         pool-jdbc-test-stmt with test-while-idle stops the pool handing out a connection that died while idle,
-         the ordinary outcome of a managed-database failover; without a validation query DBCP performs no
-         validation at all, whichever of the test-* flags is set, and a borrowing thread would then block on a
-         dead socket until socketTimeout expired. Validating during the eviction runs that already happen every
-         time-between-eviction-runs-millis costs a request nothing, so test-on-borrow - one extra round trip on
-         every single borrow - stays false and is opt-in through OFBIZ_DB_POOL_TEST_ON_BORROW.
-         These committed literals match the entry point's own defaults, so a deployment that renders the template
-         and one that uses these definitions directly - a non-container install pointing the default delegator at
-         localpostgres - are bounded identically. Only the three managed localpostgres* definitions carry them:
-         the MySQL, Oracle and other dialect definitions are preserved exactly as they are for portability.
-         RELAXING IT, AND ENFORCING IT FROM THE SERVER: because this file is read literally, the mode pinned above
-         cannot be relaxed from the environment; only the rendered deployed profile can, through
-         OFBIZ_POSTGRES_SSLMODE. A non-container installation that points a delegator at these definitions against
-         an ordinary local PostgreSQL, which ships with ssl=off, therefore edits the URI in its own copy of this
-         file, the same copy it must already extend with the jdbc-password.localpostgres* property described
-         above, since these definitions deliberately carry no password. The two levers cover different things
-         and neither substitutes for the other: a hostssl rule in pg_hba.conf, or rds.force_ssl on a managed
-         instance, makes the SERVER refuse an unencrypted client and cannot be forgotten the way a per-client
-         setting can, while the client sslmode is what decides whether this instance verifies the server's
-         certificate and hostname. A deployment that requires encrypted, verified connections sets both. Note also that pgJDBC ignores libpq's PGSSLMODE and
-         PGSSLROOTCERT environment variables, so neither the mode nor the trusted root can be supplied that
-         way. A deployment that needs pgJDBC TLS properties this file does not parameterise supplies its own
-         override instead: mount an entityengine.xml under /ofbiz/config and leave OFBIZ_POSTGRES_HOST unset,
-         which suppresses the template while keeping the mounted file first on the classpath.
-         THE MOUNTED FILE IS YOURS AND THE CONTAINER LEAVES IT ALONE. Every entityengine.xml the entry point
-         renders carries an OFBIZ-CONTAINER-GENERATED-ENTITY-ENGINE-CONFIGURATION comment, and that marker is
-         the only thing that entitles the entry point to replace or delete the file at that path: a file
-         without it is never overwritten and never removed, so leaving OFBIZ_POSTGRES_HOST unset really does
-         hand the configuration to the mounted file rather than deleting it as a stale render. Setting
-         OFBIZ_POSTGRES_HOST or OFBIZ_DISTRIBUTED_CACHE_CLEAR while such a file is mounted is refused outright
-         rather than resolved by overwriting it - state the cache-invalidation attribute in the mounted file
-         yourself, exactly as the delegators above declare it. What the entry point still checks on a mounted
-         file, because keeping it is not the same as trusting it: its managed datasources may not leave startup
-         DDL enabled, and in OFBIZ_PROFILE=prod every datasource its default delegator maps must be an external
-         database - an embedded H2, Derby, HSQLDB or SQLite URI, or a mapping whose datasource the file does not
-         declare, fails the start rather than serving a fleet from per-instance databases. See DOCKER.adoc. -->
-    <!-- Objective 4 (gated schema initialization): this managed-RDBMS run mode issues NO startup DDL, so a
-         serving instance needs no DDL privileges and a whole fleet can scale out without racing on schema
-         changes. Schema changes are applied exclusively by a separate one-shot init execution driven by
-         OFBIZ_SCHEMA_INIT=true, which the container entry point runs as three rendered flag pairs:
-         check-on-start and add-missing-on-start both true for the additive pass (it creates missing tables
-         and columns and never drops), then check-on-start true with add-missing-on-start false for a second,
-         non-amending pass that asks the database itself rather than the log whether anything is still
-         missing, then both false again before the process exits 0 without ever reaching the serving command
-         - so the DDL privilege that execution needs never belongs to a long-lived process. Each pass is
-         judged on the loader's exit status, a completion signature in its output and a finite set of known
-         failure and discrepancy signatures, because the loader logs entity-model discrepancies as warnings
-         and still exits zero; success is therefore only reported after the DDL has actually been attempted
-         and verified. A data load of "none" still invokes the ofbiz loader with the option "readers=none",
-         because creating the delegator is what applies the schema and an empty reader list then loads
-         nothing, and OFBIZ_SCHEMA_INIT=true combined with OFBIZ_SKIP_INIT is refused outright rather than
-         exiting successfully having created nothing. After each render the entry point re-reads the file and
-         refuses to continue unless all three managed datasources agree on the requested mode, so neither a
-         stale template nor a hand-edited copy can leave a serving instance issuing DDL.
-         Note how Datasource.java parses the two flags: check-on-start is read as
-         !"false".equals(attribute), so an absent attribute means TRUE and the literal false below is what
-         actually disables the startup schema check, while add-missing-on-start is read as
-         "true".equals(attribute), so its false is explicit rather than required.
+         TLS VERIFIED HERE, DRIVER DEFAULT IN THE RENDERED PROFILE: the URIs below pin sslmode=verify-full,
+         which encrypts the connection, checks that the server certificate chains to a trusted root and checks
+         that the hostname matches it. That is spelled out because pgJDBC's own default, sslmode=prefer,
+         silently falls back to an UNENCRYPTED connection when the server declines TLS. verify-full needs a
+         trusted root and pgJDBC does not consult the JVM trust store by default: it reads sslrootcert, whose
+         default is a file under the runtime user's home directory. The rendered deployed profile therefore
+         leaves the query string without an sslmode, so that a container can reach a database whose CA it has
+         not been given, and a deployment that requires verification appends sslmode and sslrootcert to the
+         template's jdbc-uri values - see the template and DOCKER.adoc. Enforce it from the server as well, with
+         a hostssl rule in pg_hba.conf or rds.force_ssl on a managed instance: a server-side rule cannot be
+         forgotten the way a per-client setting can.
+         EVERY NETWORK WAIT IS BOUNDED: each URI below pins the pgJDBC deadlines and each pool below pins its
+         borrow wait, because the value that applies when either is absent is not a deadline at all. pgJDBC
+         leaves socketTimeout and loginTimeout at 0, which means NO LIMIT, so a thread that reaches a database
+         which has stopped answering blocks on the socket read for as long as the kernel keeps the connection
+         open - and that strands the startup entity check and the readiness probe's query as much as a request
+         thread. Independently, InlineJdbc reads an absent pool-sleeptime as 300000 ms, five minutes, which is
+         longer than any load-balancer health-check timeout, so an exhausted pool would present as a hung
+         instance. socketTimeout bounds a SINGLE socket read rather than a statement, so the value is generous
+         enough that no normal statement, data load or schema check is affected while still being finite. There
+         is deliberately no queryTimeout: it would apply to EVERY statement and abort legitimately long work
+         such as a data load or a large report. pool-jdbc-test-stmt with test-while-idle stops the pool handing
+         out a connection that died while idle, the ordinary outcome of a managed-database failover; without a
+         validation query DBCP performs no validation at all, whichever test-* flag is set. Validating during
+         the eviction runs that already happen costs a request nothing, so test-on-borrow - one extra round trip
+         on every borrow - stays false. The template carries the same deadlines and the same pool settings, so a
+         rendered deployment and a non-container install that points a delegator at these definitions are
+         bounded identically. Only these three managed definitions carry them: the MySQL, Oracle and other
+         dialect definitions are preserved exactly as they are for portability. -->
+    <!-- GATED SCHEMA INITIALIZATION: this managed-RDBMS run mode issues NO startup DDL, so a serving instance
+         needs no DDL privileges and a whole fleet can scale out without racing on schema changes. The schema is
+         applied exclusively by a separate one-shot init execution driven by OFBIZ_SCHEMA_INIT=true, which the
+         container entry point runs by rendering the template with check-on-start and add-missing-on-start both
+         true, starting OFBiz once so the Entity Engine creates the tables the entity model declares (the pass
+         is additive: it creates missing tables and columns and never drops), re-rendering with both false, and
+         exiting without ever reaching the serving command - so the DDL privilege that execution needs never
+         belongs to a long-lived process. It invokes the loader with "readers=none", because creating the
+         delegator is what applies the schema and an empty reader list then loads nothing.
+         Note how Datasource.java parses the two flags: check-on-start is read as !"false".equals(attribute), so
+         an absent attribute means TRUE and the literal false below is what actually disables the startup schema
+         check, while add-missing-on-start is read as "true".equals(attribute), so its false is explicit rather
+         than required.
          Schema truth remains the entity model - no Flyway, Liquibase, schema-version table or hand-written DDL.
-         What the second, non-amending pass establishes, and what it cannot: it refuses a table or column the
-         model declares and the catalogue does not have, a column whose type, width or scale differs from the
-         model, and a column the model has no field for - the last waivable only by
-         OFBIZ_SCHEMA_INIT_ACCEPT_EXISTING=true, because a column the model does not describe is harmless when
-         nullable and fatal to every insert when NOT NULL without a default, and the engine reads that
-         nullability without ever reporting it. It cannot establish nullability, defaults, primary keys,
-         foreign keys or indexes on a table it did not create: measured against PostgreSQL 13.23, the engine
-         reported 1691 primary keys and 1970 foreign keys as missing, and "There are 0 indices in the
-         database", against a catalogue holding all of them, because it creates objects with unquoted
-         upper-case names that PostgreSQL folds to lower case and then looks them up in upper case. The init
-         job therefore proves instead that it created the whole schema itself, by comparing the engine's own
-         entity count with the tables it found missing and the tables it created; a schema it did not create in
-         full is refused unless that same variable accepts it. See DOCKER.adoc.
          The embedded localh2* datasources deliberately keep both flags enabled for zero-configuration local
          development, where the file-based database belongs to the single JVM that opens it. -->
     <datasource name="localpostgres"

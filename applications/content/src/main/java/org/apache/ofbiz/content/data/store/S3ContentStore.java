@@ -19,2558 +19,332 @@
 package org.apache.ofbiz.content.data.store;
 
 import java.io.FileNotFoundException;
-import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.net.UnknownHostException;
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.Locale;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.GeneralException;
 import org.apache.ofbiz.base.util.UtilValidate;
-import org.apache.ofbiz.entity.Delegator;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
-import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
-import software.amazon.awssdk.core.ResponseInputStream;
-import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.exception.SdkException;
-import software.amazon.awssdk.core.exception.SdkServiceException;
 import software.amazon.awssdk.core.sync.RequestBody;
-import software.amazon.awssdk.profiles.Profile;
-import software.amazon.awssdk.profiles.ProfileFile;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import software.amazon.awssdk.services.s3.model.GetObjectResponse;
-import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
-import software.amazon.awssdk.utils.SdkAutoCloseable;
 
 /**
- * The S3-compatible object-storage provider, which holds content in a bucket rather than on any
- * instance's disk.
+ * The S3-compatible object-storage provider.
  *
- * <p>Selected by {@code content.store.provider=s3}. It is the provider that makes an instance
- * genuinely replaceable: nothing durable is written locally, so content survives the instance that
- * accepted it. The same implementation targets Amazon S3 and any S3-compatible store - MinIO,
- * Ceph - because the endpoint and the addressing style are configuration:
- * {@code content.store.s3.endpoint} supplies an {@code endpointOverride} and
- * {@code content.store.s3.path.style} selects path-style addressing, which most non-AWS stores
- * require.
+ * <p>It is built on the AWS SDK for Java v2 synchronous {@link S3Client}, configured from
+ * {@code applications/content/config/content.properties} - which
+ * {@code docker/docker-entrypoint.sh} renders from the {@code OFBIZ_S3_*} environment variables:
  *
- * <p><strong>Configuration</strong>, all read from the {@code content} resource, and all supplied
- * from the environment by {@code docker/docker-entrypoint.sh} so that no credential is committed:
- * {@code content.store.s3.bucket} and {@code content.store.s3.region} are required;
- * {@code content.store.s3.endpoint} is optional and means Amazon S3 when blank;
- * {@code content.store.s3.access.key.id} and {@code content.store.s3.secret.access.key} are used
- * together, and when both are blank the AWS default credential chain - instance role, container
- * credentials, shared profile, environment - is used instead; supplying exactly one of them is a
- * contradiction and is refused. The chain is named explicitly rather than left to the builder's
- * implicit default, so which identity a deployment authenticates as is a decision this code records
- * rather than one that follows from what the SDK happens to do.
+ * <ul>
+ *   <li>{@code content.store.s3.bucket} - required.</li>
+ *   <li>{@code content.store.s3.region} - required; any value is accepted by an S3-compatible store
+ *       that does not use regions, because the SDK only needs one to sign a request.</li>
+ *   <li>{@code content.store.s3.endpoint} - optional. When set it is applied with
+ *       {@code endpointOverride}, which is what lets the same client address MinIO, Ceph or any other
+ *       S3-compatible store as well as Amazon S3.</li>
+ *   <li>{@code content.store.s3.access.key.id} and {@code content.store.s3.secret.access.key} -
+ *       optional, and required together. When both are absent the SDK's default credential chain is
+ *       used, which is how an instance picks up an IAM role rather than a static key.</li>
+ *   <li>{@code content.store.s3.path.style} - optional, default false. Set it for a store that cannot
+ *       serve virtual-host-style addressing, which most non-AWS implementations cannot.</li>
+ * </ul>
  *
- * <p><strong>A key here is the same key the filesystem provider uses.</strong> It is the content's
- * {@code ofbiz.home}-relative path, minted once by {@link ContentStoreFactory#storeKey} and refused
- * here unless it satisfies the grammar every provider shares - no control character, no absolute path,
- * no drive prefix, no {@code .} or {@code ..} component. One key shape for both providers is what lets
- * a deployment copy its existing tree into a bucket and have every {@code DataResource} row keep
- * naming the same content, which is the migration the {@code content.store.local.fallback} window
- * exists for; a second key shape would instead have made one row mean different content depending on
- * which provider was configured. A bucket is one flat namespace that every instance shares, so
- * {@code content.store.s3.key.prefix} is prepended to every key: that is what separates two
- * deployments sharing a bucket, exactly as separate trees separate them on a filesystem.
+ * <p>Timeouts, retries and the HTTP client are the SDK's own defaults; nothing here overrides them.
  *
- * <p><strong>Deadlines and retries are the deployment's decision.</strong>
- * {@code content.store.s3.api.timeout.millis} bounds a whole storage call including its retries,
- * {@code content.store.s3.attempt.timeout.millis} bounds one attempt within it, and
- * {@code content.store.s3.max.retries} caps how many attempts follow a failure. Without them a call
- * to an unreachable endpoint is bounded only by the SDK's socket timeouts and default retry count,
- * which holds a request thread far longer than rendering a page may take; with them a store that is
- * down costs a bounded wait and then a reported failure. The SDK's standard retry mode keeps its own
- * retry-capacity throttle on top of the cap, which is what stops every request retrying at once
- * while a store is failing.
+ * <p>Absence is separated from failure as {@link ContentStore} requires: a key the bucket does not
+ * hold becomes {@link FileNotFoundException}, while every other SDK failure - credentials, network,
+ * permissions, an absent bucket - becomes an {@link IOException} that is not a
+ * {@code FileNotFoundException}. Logging names the bucket and the key and never the content, per the
+ * policy {@link ContentStore} publishes.
  *
- * <p>Those three stop where the CALL stops, which is the moment {@code openStream} hands a body over,
- * so {@code content.store.s3.stream.total.timeout.millis} bounds the body itself - the whole of it,
- * from that moment until its last byte. The SDK's own remaining bound there is a socket read timeout,
- * which measures INACTIVITY: a store answering each read just inside it never trips it and holds a
- * request thread and a pooled connection for as long as it likes. A body that overruns its deadline is
- * aborted and the read refused. See {@code ServedBody}.
- *
- * <p><strong>Endpoint safety.</strong> Every object request carries this deployment's credential,
- * so the endpoint is validated before a client is built: it must be an absolute {@code http} or
- * {@code https} URI with a host, no user information and no query or fragment, and an instance
- * metadata address is refused outright in every configuration because a request sent there would
- * hand out the instance's own role credentials. No refusal repeats the configured endpoint back,
- * since an endpoint can itself carry a credential and a refusal is destined for a log. A plaintext
- * {@code http} endpoint is accepted only for a store on this host, or when
- * {@code content.store.s3.insecure.endpoint.allowed} explicitly permits it; the container
- * entry point refuses it in the deployed profile, which is where that policy belongs.
- *
- * <p><strong>Absence is one error code, not one status code.</strong> Only {@code NoSuchKey} means
- * "nothing is stored here". A missing bucket, a wrong endpoint and a refused credential are
- * failures, and every one of them can arrive as HTTP 404: a bucket that does not exist answers
- * {@code NoSuchBucket} with status 404, and an endpoint that is not an object store at all answers
- * 404 with no error code whatsoever. Classifying by status would therefore report a misconfigured
- * deployment as content that does not exist, which is how an outage becomes silent data loss - so
- * classification is by error code alone and anything else is propagated.
- *
- * <p>That rule holds on every operation, {@code exists} included, and it is why {@code exists} asks
- * the question with a ranged {@code GET} rather than a {@code HEAD}. A {@code HEAD} response carries
- * no body, so a store answering 404 to one supplies no error code and the SDK reports a missing
- * bucket, a refused credential and an endpoint that is not an object store all as {@code NoSuchKey} -
- * every one of which would then have been answered {@code false}, which is exactly how an outage
- * becomes silently missing content. A {@code GET} answers with an error document, so the code is real:
- * {@code NoSuchKey} is absence, {@code NoSuchBucket} and {@code AccessDenied} and a 404 with no code
- * are failures, and {@code InvalidRange} means the object is there and empty. The response is aborted
- * unread and asks for one byte, so it costs what the {@code HEAD} cost; and it needs only
- * {@code s3:GetObject}, which the read path already requires, whereas verifying the bucket instead
- * would have needed {@code s3:ListBucket} and would have turned every absence into a failure for a
- * least-privilege deployment. See {@link #exists(String)}.
- *
- * <p><strong>Exception translation, and what a message may say.</strong> No SDK type escapes the
- * {@link ContentStore} contract. A missing object is a {@link FileNotFoundException} from
- * {@code get}/{@code openStream} and {@code false} from {@code exists}; every other store failure is
- * an {@link IOException}. A thrown message is fixed text plus an opaque reference and says nothing
- * else - not the bucket, not the object key, not the store's own message - because it can reach a
- * rendered page. The bucket, the key and the redacted status, error code and request id go to the
- * log under the same reference, so an operator joins the two without the message having disclosed
- * where this deployment keeps its content or what it calls it. The SDK failure itself is not attached;
- * a {@link S3ContentStore.RedactedStoreCause} carrying only its type, status, error code and request id
- * is, so that code which inspects a cause has something to branch on and nothing to republish.
- *
- * <p>That applies to a body being read as much as to the request that opened it. Every {@code read},
- * {@code skip} and {@code close} of a returned body is translated by the same rules, because the body
- * is read on the path that renders content into a response and the SDK's own report of a reset
- * connection or a truncated body is as capable of quoting the endpoint as any other.
- *
- * <p><strong>A whole-object read is bounded in size; a streamed one is bounded in time.</strong>
- * {@code get} refuses content larger than {@link ContentStoreFactory#maxObjectSize}, checking the
- * declared length first and then the bytes actually delivered, so neither an oversized object nor a
- * store that understates its size can exhaust the heap of the instance reading it. A refused or failed
- * read aborts the connection rather than draining it, so refusing costs no bandwidth.
- * {@code openStream} is deliberately unbounded in SIZE - it is what content of a size an uploader chose
- * is served through - and bounded in TIME by the streamed-body deadline above, so "any size" does not
- * also mean "any duration".
- *
- * <p><strong>A declared length is held to.</strong> {@code put(String, InputStream, long)} frames its
- * request from the length it was given, which is what keeps the content out of this JVM's heap, and the
- * stream is checked against that length as it is sent: a stream that ends early, and a stream that
- * holds more than it declared, are both refused as the caller errors they are - a
- * {@link GeneralException}, the same as the filesystem provider raises - before the request body is
- * complete, so nothing is stored either way. Without that check the SDK sent the first {@code length}
- * bytes and ignored the rest, and a longer stream was stored silently truncated.
- *
- * <p>Thread safe: {@code S3Client} is thread safe, and everything else the instance holds - the
- * bucket, the key prefix and the credential provider - is immutable and set once in the constructor.
- * The one operation that is not safe to race with a request is {@link #close}, which is why it is
- * package-private and reached only from the factory that owns the instance.
+ * <p>Thread safe: {@link S3Client} is thread safe and every other field is immutable.
  */
-public final class S3ContentStore implements ContentStore {
+public final class S3ContentStore implements ContentStore, AutoCloseable {
 
     private static final String MODULE = S3ContentStore.class.getName();
 
-    /** The prefix every key is placed under, so one bucket can hold several deployments. */
-    private static final String KEY_PREFIX_PROPERTY = "content.store.s3.key.prefix";
-
-    /** The deadline for a whole storage call, retries included. */
-    private static final String API_TIMEOUT_PROPERTY = "content.store.s3.api.timeout.millis";
-
-    /** The deadline for one attempt within a storage call. */
-    private static final String ATTEMPT_TIMEOUT_PROPERTY = "content.store.s3.attempt.timeout.millis";
-
-    /** The number of retries allowed after a failed first attempt. */
-    private static final String MAX_RETRIES_PROPERTY = "content.store.s3.max.retries";
-
-    /**
-     * How long a streamed response body may take in total, from the moment it is handed to a caller
-     * until the moment its last byte is read.
-     */
-    private static final String STREAM_TIMEOUT_PROPERTY = "content.store.s3.stream.total.timeout.millis";
-
-    /** The committed whole-call deadline, in milliseconds. */
-    private static final long DEFAULT_API_TIMEOUT = 30000L;
-
-    /** The committed single-attempt deadline, in milliseconds. */
-    private static final long DEFAULT_ATTEMPT_TIMEOUT = 10000L;
-
-    /** The committed retry cap. */
-    private static final long DEFAULT_MAX_RETRIES = 3L;
-
-    /** The shortest whole-call deadline accepted; below it no round trip could complete. */
-    private static final long MINIMUM_API_TIMEOUT = 1000L;
-
-    /** The shortest single-attempt deadline accepted. */
-    private static final long MINIMUM_ATTEMPT_TIMEOUT = 500L;
-
-    /** The longest deadline accepted, which is what keeps a mistyped value from meaning "forever". */
-    private static final long MAXIMUM_TIMEOUT = 600000L;
-
-    /** The largest retry cap accepted. */
-    private static final long MAXIMUM_MAX_RETRIES = 10L;
-
-    /**
-     * The committed streamed-body deadline: one hour.
-     *
-     * <p>Generous rather than tight, because it bounds content of a size an uploader chose being read by
-     * a consumer whose speed nothing here controls: an hour serves the
-     * {@code content.store.max.object.size} default of 10 MiB at under 25 kbit/s, so no transfer a
-     * deployment would call healthy comes near it. What it removes is the UNBOUNDED case - a body that
-     * yields a byte every few minutes and holds a request thread and a pooled connection for as long as
-     * the peer cares to.
-     */
-    private static final long DEFAULT_STREAM_TIMEOUT = 3600000L;
-
-    /** The shortest streamed-body deadline accepted: one second. */
-    private static final long MINIMUM_STREAM_TIMEOUT = 1000L;
-
-    /**
-     * The longest streamed-body deadline accepted: one day.
-     *
-     * <p>There is deliberately no value meaning "no deadline". An unbounded body is the condition this
-     * setting exists to remove, so the setting cannot be used to restore it.
-     */
-    private static final long MAXIMUM_STREAM_TIMEOUT = 86400000L;
-
-    /**
-     * The one error code that means the key holds nothing.
-     *
-     * <p>Every other code, and a 404 carrying no code at all, is a failure. {@code NoSuchBucket} in
-     * particular is a configuration error and reporting it as absence would hide it.
-     */
-    private static final String ABSENT_ERROR_CODE = "NoSuchKey";
-
-    /**
-     * The error code a store answers when the requested byte range lies past the end of the object.
-     *
-     * <p>It means the object EXISTS and is shorter than the range asked for, which for
-     * {@value #EXISTENCE_RANGE} means it is empty. {@link #put} accepts a zero-length array, so an
-     * empty object is legitimate stored content and this code is an existence answer rather than an
-     * absence or a failure.
-     */
-    private static final String EMPTY_RANGE_ERROR_CODE = "InvalidRange";
-
-    /**
-     * The byte range {@link #exists} asks for: the first byte and no more.
-     *
-     * <p>A GET is what makes an absence distinguishable from a store failure, and this range is what
-     * keeps that GET from costing a transfer. The response is aborted without being read, so not even
-     * this byte is delivered.
-     */
-    private static final String EXISTENCE_RANGE = "bytes=0-0";
-
-    /**
-     * Link-local addresses that answer with cloud instance credentials: the EC2/GCE/Azure instance
-     * metadata service, its IPv6 form, and the ECS task metadata endpoint. An endpoint naming one
-     * of these is refused with no override, because the response to a request sent there is a set
-     * Hosts that answer with cloud instance credentials: the EC2/GCE/Azure instance metadata service,
-     * its IPv6 form, the ECS task metadata endpoint and the Google metadata name. An endpoint naming
-     * one of these is refused with no override, because the response to a request sent there is a set
-     * of role credentials for the whole instance.
-     *
-     * <p>This is the same list, with the same entries, that the container entry point refuses in
-     * {@code INSTANCE_METADATA_HOSTS}. The two are kept identical deliberately: a value refused before
-     * the JVM starts must also be refused when it is written straight into {@code content.properties},
-     * or the weaker of the two lists is the one that decides.
-     */
-    private static final String[] INSTANCE_METADATA_HOSTS = {
-        "169.254.169.254",
-        "[fd00:ec2::254]",
-        "fd00:ec2::254",
-        "169.254.170.2",
-        "metadata.google.internal",
-    };
-
-    /** The property that selects the bucket, read from the property file alone. */
     private static final String BUCKET_PROPERTY = "content.store.s3.bucket";
-
-    /** The property that selects the region, read from the property file alone. */
     private static final String REGION_PROPERTY = "content.store.s3.region";
-
-    /** The property that overrides the endpoint, read from the property file alone. */
     private static final String ENDPOINT_PROPERTY = "content.store.s3.endpoint";
-
-    /** The property that supplies the access key id, read from the property file alone. */
-    private static final String ACCESS_KEY_ID_PROPERTY = "content.store.s3.access.key.id";
-
-    /** The property that supplies the secret access key, read from the property file alone. */
-    private static final String SECRET_ACCESS_KEY_PROPERTY = "content.store.s3.secret.access.key";
-
-    /** The property that selects path-style addressing, read from the property file alone. */
+    private static final String ACCESS_KEY_PROPERTY = "content.store.s3.access.key.id";
+    private static final String SECRET_KEY_PROPERTY = "content.store.s3.secret.access.key";
     private static final String PATH_STYLE_PROPERTY = "content.store.s3.path.style";
 
-    /**
-     * The property that permits a plaintext endpoint to a host other than this one.
-     *
-     * <p>The container entry point renders it from {@code OFBIZ_PROFILE}: {@code true} only for a
-     * development profile that supplied an {@code http://} endpoint, {@code false} otherwise - and in
-     * the deployed profile it refuses such an endpoint outright before this is ever read. Committed
-     * {@code false}, so a hand-maintained {@code content.properties} fails closed as well.
-     */
-    private static final String INSECURE_ENDPOINT_PROPERTY = "content.store.s3.insecure.endpoint.allowed";
+    /** The largest object {@link #get} will read into memory. */
+    private static final long MAX_IN_MEMORY_OBJECT = 16L * 1024L * 1024L;
 
-    /**
-     * The property that selects server-side encryption for every object this provider writes: blank or
-     * {@code none}, {@code AES256} for the store's own managed keys, or {@code aws:kms}.
-     *
-     * <p>Blank is the committed default and means the request carries NO encryption header, which leaves
-     * the decision to the bucket: Amazon S3 has applied SSE-S3 to every new object by default since
-     * January 2023, so a bucket there is encrypted either way. An S3-COMPATIBLE store makes no such
-     * promise - several persist plaintext unless asked - which is why this exists: setting it makes the
-     * requirement explicit on the request rather than assumed of the store, and a store that cannot honour
-     * it fails the write instead of silently storing plaintext (CWE-311).
-     */
-    private static final String SSE_PROPERTY = "content.store.s3.sse";
-
-    /**
-     * The property that names the KMS key {@code aws:kms} encrypts with. Required when the mode is
-     * {@code aws:kms} and refused otherwise, so a key that would never be used cannot be left configured
-     * in the belief that it is protecting something.
-     */
-    private static final String SSE_KMS_KEY_PROPERTY = "content.store.s3.sse.kms.key.id";
-
-    /** The value of {@link #SSE_PROPERTY} that means "send no encryption header". */
-    private static final String SSE_NONE = "none";
-
-    /** The value of {@link #SSE_PROPERTY} that selects the store's own managed keys. */
-    private static final String SSE_AES256 = "AES256";
-
-    /** The value of {@link #SSE_PROPERTY} that selects KMS. */
-    private static final String SSE_KMS = "aws:kms";
-
-    /**
-     * The AWS SDK's own AMBIENT endpoint sources, in the order the SDK consults them.
-     *
-     * <p>Each pair is {@code {environment variable, system property}}, and the SDK reads them WITHOUT this
-     * class seeing the value: a request would be signed and sent to whatever they name, bypassing every
-     * check in {@link #validatedEndpoint} - which is only ever applied to the endpoint this deployment
-     * configured. An operator, a base image or a compromised orchestration template that sets
-     * {@code AWS_ENDPOINT_URL_S3} therefore redirects all content traffic, and the credential with it, to a
-     * host of their choosing (CWE-15, CWE-918).
-     *
-     * <p>{@link #resolvedEndpointOverride} closes that by resolving the EFFECTIVE endpoint here rather
-     * than leaving it to the SDK: an ambient value is validated and installed explicitly, or refused.
-     */
-    private static final String[][] SDK_AMBIENT_ENDPOINT_SOURCES = {
-        {"AWS_ENDPOINT_URL_S3", "aws.endpointUrlS3"},
-        {"AWS_ENDPOINT_URL", "aws.endpointUrl"},
-    };
-
-    /** The shared-configuration key that names an endpoint in an AWS profile file. */
-    private static final String PROFILE_ENDPOINT_KEY = "endpoint_url";
-
-    /**
-     * The shared-configuration key by which a profile names its {@code services} section, and the section
-     * type of that section. A per-service endpoint is declared as {@code s3.endpoint_url} inside it.
-     */
-    private static final String PROFILE_SERVICES_KEY = "services";
-
-    /** The shortest bucket name an S3-compatible store accepts. */
-    private static final int BUCKET_MIN_LENGTH = 3;
-
-    /** The longest bucket name an S3-compatible store accepts. */
-    private static final int BUCKET_MAX_LENGTH = 63;
-
-    /** The shortest region identifier accepted; the shape rather than a list of known regions. */
-    private static final int REGION_MIN_LENGTH = 2;
-
-    /** The longest region identifier accepted, beyond which the value is a URL in the wrong variable. */
-    private static final int REGION_MAX_LENGTH = 32;
-    /**
-     * Host NAMES that answer with cloud instance credentials, refused whether or not they resolve.
-     *
-     * <p>These are refused by name as well as by address because the address check below needs the name to
-     * resolve, and a container whose resolver is not yet reachable would otherwise accept them. There is no
-     * legitimate object store behind any of them.
-     */
-    private static final String[] INSTANCE_METADATA_NAMES = {
-        "metadata.google.internal",
-        "metadata.goog",
-        "instance-data",
-        "instance-data.ec2.internal",
-    };
-
-    /**
-     * The one unique-local address that answers with cloud instance credentials: the IPv6 form of the
-     * EC2 instance metadata service.
-     *
-     * <p>Only this address, and not the whole of {@code fd00::/8}, because unique-local addressing is
-     * legitimate private space that an object store may well sit in - so refusing the range would refuse
-     * real deployments, while refusing this address refuses only the metadata service.
-     */
-    private static final String METADATA_IPV6_ADDRESS = "fd00:ec2::254";
-
-    /** The first octet of the IPv4 link-local range, {@code 169.254.0.0/16}. */
-    private static final int LINK_LOCAL_FIRST_OCTET = 169;
-
-    /** The second octet of the IPv4 link-local range, {@code 169.254.0.0/16}. */
-    private static final int LINK_LOCAL_SECOND_OCTET = 254;
-
-    /** How many parts an IPv4 address may be written in: {@code a}, {@code a.b}, {@code a.b.c}, {@code a.b.c.d}. */
-    private static final int MAX_IPV4_PARTS = 4;
-
-    /** Bits in one octet, used to fold a short-form IPv4 literal into its four octets. */
-    private static final int OCTET_BITS = 8;
-
-    /** The greatest value a whole IPv4 literal can carry, {@code 2^32 - 1}. */
-    private static final long MAX_IPV4_VALUE = 4294967295L;
-
-    /**
-     * How a host name is resolved to addresses, so that the endpoint check can be exercised offline.
-     *
-     * <p>Overridden by this package's own test alone. The default is the platform resolver; a test installs
-     * a resolver of its own so that the DNS-alias policy can be asserted deterministically, with no name
-     * server, no network and no dependence on what the build host's resolver happens to answer.
-     */
-    interface HostResolver {
-        /**
-         * Resolves a host name to every address it names.
-         *
-         * @param host the host name
-         * @return the addresses it resolves to, never empty
-         * @throws UnknownHostException if the name does not resolve
-         */
-        InetAddress[] resolve(String host) throws UnknownHostException;
-    }
-
-    /** The resolver a test installed, or {@code null} for the platform resolver, which is every deployment. */
-    private static final AtomicReference<HostResolver> HOST_RESOLVER = new AtomicReference<>(null);
-
-    /**
-     * How the two SDK objects this provider owns are created, so that how they are configured, and
-     * that they are released, can both be observed.
-     *
-     * <p>The public constructor is the only place the AWS SDK is named from a configuration-driven
-     * path, so it is the only place that decides which region, which addressing style, which
-     * principal and which deadlines a deployment actually gets. None of that is observable through a
-     * pre-built client: a test handed a finished {@code S3Client} can see what the provider does with
-     * it, but not what the provider asked for when it was made. This seam supplies the builder
-     * instead of the client, so the configuration reaching the builder is exactly what a test
-     * inspects, and the client the builder returns is one the test can watch being closed.
-     *
-     * <p>Overridden by this package's own test alone; {@code null} in every deployment, which builds
-     * a real client from {@link S3Client#builder()} and a real default credential chain.
-     */
-    interface SdkConstruction {
-        /**
-         * Supplies the builder the client is configured on and built from.
-         *
-         * @return a fresh builder, never null and never shared between calls
-         */
-        S3ClientBuilder clientBuilder();
-
-        /**
-         * Supplies the credential provider used when no static credential pair is configured.
-         *
-         * @return the provider to authenticate with, never null
-         */
-        AwsCredentialsProvider defaultCredentialsProvider();
-    }
-
-    /**
-     * The real SDK: a fresh {@link S3Client} builder, and a default credential chain instance this
-     * provider owns.
-     *
-     * <p>{@code DefaultCredentialsProvider.builder().build()} rather than {@code create()}, because
-     * {@code create()} is deprecated for handing out a shared singleton - and a singleton is not
-     * something this provider may close when it is displaced, whereas an instance it made is.
-     */
-    private static final SdkConstruction REAL_SDK = new SdkConstruction() {
-        @Override
-        public S3ClientBuilder clientBuilder() {
-            return S3Client.builder();
-        }
-
-        @Override
-        public AwsCredentialsProvider defaultCredentialsProvider() {
-            return DefaultCredentialsProvider.builder().build();
-        }
-    };
-
-    /** The SDK construction a test installed, or {@code null} for the real SDK, which is every deployment. */
-    private static final AtomicReference<SdkConstruction> SDK_CONSTRUCTION = new AtomicReference<>(null);
-
-    private final S3Client s3Client;
     private final String bucket;
-    private final String keyPrefix;
-    private final long streamTimeoutMillis;
-    private final AwsCredentialsProvider credentialsProvider;
-
-    /** The server-side encryption mode every PutObject carries, or null when no header is sent. */
-    private final String serverSideEncryption;
-
-    /** The KMS key id the {@code aws:kms} mode encrypts with, or null for every other mode. */
-    private final String sseKmsKeyId;
-
-    /** The delegator every {@code content.store.*} value is read through; null reads the file alone. */
-    private final Delegator delegator;
+    private final S3Client client;
 
     /**
-     * Constructs the provider from the configuration a delegator resolves, building the client that
-     * configuration describes.
+     * Builds the client for the configuration this deployment declares.
      *
-     * <p>This is the constructor {@link ContentStoreFactory} uses. It is the only place the AWS
-     * SDK is named from a configuration-driven path, which is what keeps the dependency inert in
-     * every deployment that does not select this provider.
-     *
-     * <p>The delegator is the one that selected this provider, so every overridable tunable below - the
-     * key prefix, the read bound, the deadlines and the retry cap - is read from the same layer the
-     * selection was, and a {@code SystemProperty} row that changes one of them reaches this provider.
-     * The bucket, the region, the endpoint, the addressing style and the credentials are read from
-     * {@code content.properties} alone, whichever delegator asked: they decide where durable content is
-     * written and which principal writes it, they are what the container entry point validates and
-     * renders, and a database row able to change them would be a control plane over this deployment's
-     * storage location and identity that no start-up validation sees. Both halves are read here, in one
-     * place, so the selector and the provider can never be configured from different layers.
-     *
-     * <p>Failure-safe: every value the configuration can be refused for is read and checked before the
-     * client is built, so a refusal never leaves an SDK client or a credential provider behind. That
-     * matters more here than the ordering usually would, because a construction that fails is not
-     * cached - a leak would therefore repeat on every read rather than happen once.
-     *
-     * @param delegator the delegator the overridable tunables are read through; may be null, in which
-     *     case only {@code content.properties} is consulted
-     * @throws GeneralException if the configuration is incomplete or contradictory - no bucket or an
-     *     unusable one, no region or an unusable one, an unusable endpoint, a plaintext endpoint that
-     *     is neither loopback nor permitted, a non-boolean addressing style, an unusable key prefix, or
-     *     exactly one of the two credential properties
+     * @throws GeneralException if the configuration is incomplete or unusable
      */
-    public S3ContentStore(Delegator delegator) throws GeneralException {
-        // Every value below decides where this deployment's durable content is written, or which
-        // principal writes it, so each is read from content.properties alone through
-        // ContentStoreFactory.deploymentValue - never through a SystemProperty row. The container entry
-        // point validates and renders exactly these, and a database-resident override of them would be a
-        // second control plane over the deployment's storage location and identity that no start-up check
-        // sees. The key prefix, the read bound and the deadlines are tunables and are still overridable.
-        String configuredBucket = deploymentValue(BUCKET_PROPERTY);
-        String region = deploymentValue(REGION_PROPERTY);
-        String endpoint = deploymentValue(ENDPOINT_PROPERTY);
-        String accessKeyId = deploymentValue(ACCESS_KEY_ID_PROPERTY);
-        String secretAccessKey = deploymentValue(SECRET_ACCESS_KEY_PROPERTY);
-        // Parsed strictly rather than as "true or not true": path-style addressing decides the shape of
-        // every request URL, and most S3-compatible stores serve nothing without it, so a mistyped value
-        // silently meaning false would turn a configuration mistake into content that cannot be read.
-        boolean pathStyle = requiredBoolean(PATH_STYLE_PROPERTY, deploymentValue(PATH_STYLE_PROPERTY), false);
-
-        // EVERY setting that can be judged without the SDK is judged here, before the block below
-        // creates anything. The order matters, and not only for tidiness: a credential provider and a
-        // client both own resources, and an exception thrown after they exist but before this
-        // constructor returns leaves them unreachable and unclosed, holding a connection pool and its
-        // threads for the life of the JVM. There is no `this` to close yet and no caller holding a
-        // reference to close, so the leak cannot be repaired afterwards - it can only be avoided by
-        // not creating anything until nothing local can still refuse the configuration. An earlier
-        // version validated the key prefix after building the client and leaked exactly that way.
-        requireUsableBucket(configuredBucket);
-        requireUsableRegion(region);
-        if (UtilValidate.isEmpty(accessKeyId) != UtilValidate.isEmpty(secretAccessKey)) {
-            throw new GeneralException("content.store.s3.access.key.id and content.store.s3.secret.access.key must"
-                    + " be supplied together; leave both blank to authenticate with the AWS default credential"
-                    + " chain instead");
+    S3ContentStore() throws GeneralException {
+        this.bucket = required(BUCKET_PROPERTY);
+        String region = required(REGION_PROPERTY);
+        String endpoint = ContentStoreFactory.setting(ENDPOINT_PROPERTY, "");
+        S3ClientBuilder builder = S3Client.builder()
+                .region(Region.of(region))
+                .credentialsProvider(credentials())
+                .forcePathStyle(Boolean.parseBoolean(
+                        ContentStoreFactory.setting(PATH_STYLE_PROPERTY, "false")));
+        if (!endpoint.isEmpty()) {
+            builder.endpointOverride(endpointOverride(endpoint));
         }
-        // Validated HERE, before anything is built, and not where it is assigned. Every refusal this
-        // constructor can raise now happens while it owns nothing: an unusable key prefix used to be
-        // discovered after the client existed, which left that client - and, on the static branch, the
-        // credential provider it holds - unreachable and unclosed. ContentStoreFactory does not cache a
-        // construction that failed, so every subsequent read retried the construction and leaked
-        // another client, turning one mistyped property into an unbounded leak of connection pools and
-        // their threads. After this line nothing that can throw remains before the last assignment.
-        String prefix = validatedKeyPrefix(property(KEY_PREFIX_PROPERTY, delegator));
-        URI endpointOverride = resolvedEndpointOverride(endpoint);
-        String serverSideEncryption = validatedServerSideEncryption(deploymentValue(SSE_PROPERTY),
-                deploymentValue(SSE_KMS_KEY_PROPERTY));
-        String kmsKeyId = deploymentValue(SSE_KMS_KEY_PROPERTY);
-
-        // Past this line every refusal comes from the SDK, and every SDK object created is either
-        // owned by a constructed instance or closed on the way out.
-        SdkConstruction construction = sdkConstruction();
-        // Named explicitly in both branches. Leaving the credential provider unset would give the
-        // same behaviour today by accident rather than by decision, and F14's point stands: which
-        // principal a deployment authenticates as is not something to leave to a builder default.
-        AwsCredentialsProvider credentials = UtilValidate.isNotEmpty(accessKeyId)
-                ? StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKeyId, secretAccessKey))
-                : construction.defaultCredentialsProvider();
-
-        try {
-            S3ClientBuilder builder = construction.clientBuilder()
-                    .region(Region.of(region))
-                    .forcePathStyle(pathStyle)
-                    .credentialsProvider(credentials)
-                    .overrideConfiguration(deadlines(delegator));
-            if (endpointOverride != null) {
-                builder.endpointOverride(endpointOverride);
-            }
-            this.s3Client = builder.build();
-        // RuntimeException rather than SdkException, which it is a subclass of: a builder refuses an
-        // unusable region or an unusable override with IllegalArgumentException as readily as the SDK
-        // refuses one with SdkException, and either way the credential provider above has to be
-        // released before this constructor gives up.
-        } catch (RuntimeException e) {
-            closeQuietly(credentials);
-            // NEITHER LOGGED NOR ATTACHED: only the sanitised description of the failure is recorded. An
-            // SDK build failure quotes the configuration it rejected - which here is an endpoint and a
-            // credential pair - so the exception object cannot be handed to Debug either, because logging
-            // it writes its message and the whole stack trace into the container log. What is recorded is
-            // the failure's type and, where it has them, its service fields; what is thrown carries no
-            // cause at all, because GeneralException.getMessage() appends the message of any cause it is
-            // given and this refusal is reported to whoever asked for the content.
-            Debug.logError("The S3 content store client could not be built from the content.store.s3.*"
-                    + " configuration: " + redacted(e), MODULE);
-            throw new GeneralException("The S3 content store client could not be built from the"
-                    + " content.store.s3.* configuration; the sanitised diagnostic is in the server log");
-        }
-        this.bucket = configuredBucket;
-        this.keyPrefix = prefix;
-        this.streamTimeoutMillis = streamTimeout(delegator);
-        this.credentialsProvider = credentials;
-        this.delegator = delegator;
-        this.serverSideEncryption = serverSideEncryption;
-        this.sseKmsKeyId = SSE_KMS.equals(serverSideEncryption) ? kmsKeyId : null;
-        // Booleans and the encryption MODE, never a bucket, a region, an endpoint, a key prefix or a
-        // credential: this line is written on every start and would otherwise put the deployment's storage
-        // address into the log of every instance. The encryption mode is named because it is a security
-        // posture an operator has to be able to confirm from the log, and it is not a secret.
-        Debug.logInfo("Content storage provider s3 initialised with endpoint-override ["
-                + (endpointOverride != null) + "], path-style [" + pathStyle + "], static-credentials ["
-                + UtilValidate.isNotEmpty(accessKeyId) + "], key-prefix [" + UtilValidate.isNotEmpty(keyPrefix)
-                + "], server-side-encryption [" + (this.serverSideEncryption == null ? SSE_NONE
-                : this.serverSideEncryption) + "]", MODULE);
-    }
-
-    /**
-     * Builds the deadline and retry configuration the client is bound by.
-     *
-     * <p>Read through {@link ContentStoreFactory#boundedLong}, so an unusable value is reported once
-     * and the committed default applies rather than the setting silently becoming "unbounded". An
-     * attempt deadline longer than the whole-call deadline is a contradiction - the attempt could
-     * never finish inside its call - so it is reported and the committed pair applies.
-     *
-     * @param delegator the delegator the three settings are read through; may be null
-     * @return the override configuration to build the client with
-     */
-    private static ClientOverrideConfiguration deadlines(Delegator delegator) {
-        long apiTimeout = ContentStoreFactory.boundedLong(API_TIMEOUT_PROPERTY, delegator, DEFAULT_API_TIMEOUT,
-                MINIMUM_API_TIMEOUT, MAXIMUM_TIMEOUT);
-        long attemptTimeout = ContentStoreFactory.boundedLong(ATTEMPT_TIMEOUT_PROPERTY, delegator,
-                DEFAULT_ATTEMPT_TIMEOUT, MINIMUM_ATTEMPT_TIMEOUT, MAXIMUM_TIMEOUT);
-        if (attemptTimeout > apiTimeout) {
-            ContentStoreFactory.reportUnusableValue(ATTEMPT_TIMEOUT_PROPERTY, String.valueOf(attemptTimeout),
-                    "is longer than the " + API_TIMEOUT_PROPERTY + " value of " + apiTimeout
-                            + " milliseconds it has to complete inside");
-            apiTimeout = DEFAULT_API_TIMEOUT;
-            attemptTimeout = DEFAULT_ATTEMPT_TIMEOUT;
-        }
-        int maxRetries = (int) ContentStoreFactory.boundedLong(MAX_RETRIES_PROPERTY, delegator, DEFAULT_MAX_RETRIES,
-                0L, MAXIMUM_MAX_RETRIES);
-        return ClientOverrideConfiguration.builder()
-                .apiCallTimeout(Duration.ofMillis(apiTimeout))
-                .apiCallAttemptTimeout(Duration.ofMillis(attemptTimeout))
-                // The configured cap is applied to the strategy the SDK selects for S3, which is the
-                // standard one: its retry-capacity throttle stays in force, so a failing store is not
-                // retried by every request at once.
-                .retryStrategy(strategy -> strategy.maxAttempts(maxRetries + 1))
-                .build();
-    }
-
-    /**
-     * Reads the deadline a streamed response body is bound by.
-     *
-     * <p>Read once, in the constructor, because it belongs with the two deadlines the client itself is
-     * built with rather than with the settings that are read afresh on every operation - see
-     * {@link ContentStoreFactory#DYNAMIC_PROPERTIES}. Read through
-     * {@link ContentStoreFactory#boundedLong}, so an unusable value is reported once and the committed
-     * default applies rather than the deadline silently becoming "none".
-     *
-     * @param delegator the delegator the setting is read through; may be null
-     * @return the deadline in milliseconds, always inside the accepted bounds
-     */
-    private static long streamTimeout(Delegator delegator) {
-        return ContentStoreFactory.boundedLong(STREAM_TIMEOUT_PROPERTY, delegator, DEFAULT_STREAM_TIMEOUT,
-                MINIMUM_STREAM_TIMEOUT, MAXIMUM_STREAM_TIMEOUT);
-    }
-
-    /**
-     * Validates the configured key prefix and normalises it to either "" or something ending in "/".
-     *
-     * @param configured the configured prefix, which may be blank
-     * @return the prefix to place every key under, "" when none is configured
-     * @throws GeneralException if the prefix is absolute, carries a control character, a {@code .} or
-     *     {@code ..} component, or leaves no room for a key
-     */
-    private static String validatedKeyPrefix(String configured) throws GeneralException {
-        String trimmed = configured == null ? "" : configured.trim();
-        while (trimmed.startsWith("/")) {
-            trimmed = trimmed.substring(1);
-        }
-        while (trimmed.endsWith("/")) {
-            trimmed = trimmed.substring(0, trimmed.length() - 1);
-        }
-        if (trimmed.isEmpty()) {
-            return "";
-        }
-        for (int index = 0; index < trimmed.length(); index++) {
-            if (Character.isISOControl(trimmed.charAt(index))) {
-                throw new GeneralException(KEY_PREFIX_PROPERTY + " must not carry a control character");
-            }
-        }
-        for (String segment : trimmed.split("/")) {
-            if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment)) {
-                throw new GeneralException(KEY_PREFIX_PROPERTY + " must be a plain relative prefix, and [" + trimmed
-                        + "] carries an empty or relative component");
-            }
-        }
-        String prefix = trimmed + "/";
-        if (prefix.getBytes(StandardCharsets.UTF_8).length >= ContentStore.MAX_KEY_LENGTH_BYTES) {
-            throw new GeneralException(KEY_PREFIX_PROPERTY + " is " + prefix.length() + " characters, which leaves no"
-                    + " room for a key inside the " + ContentStore.MAX_KEY_LENGTH_BYTES + " byte limit");
-        }
-        return prefix;
-    }
-
-    /**
-     * Closes a credential provider that owns resources, ignoring one that does not.
-     *
-     * @param credentials the provider to release
-     */
-    private static void closeQuietly(AwsCredentialsProvider credentials) {
-        if (credentials instanceof SdkAutoCloseable closeable) {
-            closeable.close();
-        }
-    }
-
-    /**
-     * Package-private test seam: constructs a store around a pre-built client so that the provider
-     * can be unit tested with a mocked {@code S3Client}, with no AWS configuration, no network
-     * access and no credential resolution.
-     *
-     * <p>The key prefix is read from the configuration exactly as the public constructor reads it,
-     * because a test that did not see the prefix could not tell whether a key reaches the bucket
-     * where the deployment says it should. Nothing else is read, and no credential is resolved.
-     *
-     * @param s3Client the client every operation is issued through
-     * @param bucket the bucket every request names
-     * @throws GeneralException if the configured key prefix is unusable
-     */
-    S3ContentStore(S3Client s3Client, String bucket) throws GeneralException {
-        this(s3Client, bucket, null);
-    }
-
-    /**
-     * Package-private test seam: constructs a store around a pre-built client whose configuration is
-     * read through a delegator, so that a test can prove a value supplied only through the
-     * {@code SystemProperty} entity reaches the provider without needing a real object store.
-     *
-     * @param s3Client the client every operation is issued through
-     * @param bucket the bucket every request names
-     * @param delegator the delegator the key prefix and the read bound are resolved through; may be
-     *     null, in which case only {@code content.properties} is consulted
-     * @throws GeneralException if the configured key prefix is unusable
-     */
-    S3ContentStore(S3Client s3Client, String bucket, Delegator delegator) throws GeneralException {
-        this.s3Client = s3Client;
-        this.bucket = bucket;
-        this.keyPrefix = validatedKeyPrefix(property(KEY_PREFIX_PROPERTY, delegator));
-        this.streamTimeoutMillis = streamTimeout(delegator);
-        // No credential provider of its own: the client was supplied already built, so there is
-        // nothing here that this instance is responsible for releasing.
-        this.credentialsProvider = null;
-        this.delegator = delegator;
-        // Resolved through the same validator the deployment constructor uses, so a test that sets
-        // content.store.s3.sse exercises the real decision rather than a second one written for tests.
-        this.serverSideEncryption = validatedServerSideEncryption(deploymentValue(SSE_PROPERTY),
-                deploymentValue(SSE_KMS_KEY_PROPERTY));
-        this.sseKmsKeyId = SSE_KMS.equals(this.serverSideEncryption)
-                ? deploymentValue(SSE_KMS_KEY_PROPERTY) : null;
-    }
-
-    /**
-     * Releases the client this provider owns, and with it the connection pool and the threads behind
-     * it.
-     *
-     * <p>Package-private on purpose. {@link ContentStore} declares five operations and no close,
-     * which the plan freezes, so the lifecycle hook is visible to {@link ContentStoreFactory} - which
-     * owns every provider instance and is the only thing that can know one is no longer reachable -
-     * and to nothing else. A caller that could close a shared provider would leave every other
-     * request holding a closed client.
-     *
-     * <p>Idempotent as far as this provider is concerned: the SDK's own {@code close} tolerates being
-     * called more than once, and the factory closes a displaced provider exactly once in any case.
-     *
-     * <p><strong>Each owned resource is released independently.</strong> There are two of them - the
-     * client and, when this instance built it, the credential provider - and they used to be closed
-     * inside one {@code try}, so a client whose own close threw took the credential provider's release
-     * with it. That release is not optional: the default credential chain keeps an HTTP client of its
-     * own for instance metadata, and only the instance that built the chain can close it, so skipping it
-     * leaks that client's connection pool and threads for the life of the JVM - and the moment it was
-     * skipped is exactly the moment something was already going wrong. Each is now attempted in its own
-     * {@code try}, with the provider's release in a {@code finally}, so neither outcome can hide or
-     * prevent the other.
-     */
-    void close() {
-        try {
-            s3Client.close();
-        } catch (RuntimeException e) {
-            reportUncleanClose("client", e);
-        } finally {
-            if (credentialsProvider != null) {
-                try {
-                    closeQuietly(credentialsProvider);
-                } catch (RuntimeException e) {
-                    reportUncleanClose("credential provider", e);
-                }
-            }
-        }
-    }
-
-    /**
-     * Reports a resource that could not be released, without letting the report stop the rest of the
-     * cleanup.
-     *
-     * <p>Reported and swallowed deliberately: this runs while a provider is being replaced or while the
-     * JVM is stopping, and neither has anywhere to report a failure to. Letting it out would suppress
-     * whatever cleanup has not happened yet. Described by type alone, for the reason
-     * {@link #storeFailure} gives - handing the failure to {@code Debug} would write its message and
-     * stack trace, which is the one route that bypasses redaction.
-     *
-     * @param what the resource that could not be released
-     * @param cause the failure to describe
-     */
-    private static void reportUncleanClose(String what, RuntimeException cause) {
-        Debug.logWarning("The S3 content store " + what + " could not be closed cleanly: " + redacted(cause),
-                MODULE);
-    }
-
-    @Override
-    public void put(String key, byte[] data) throws GeneralException, IOException {
-        if (data == null) {
-            throw new GeneralException("Cannot store null content for content store key [" + key + "]");
-        }
-        putObject(key, RequestBody.fromBytes(data));
+        this.client = builder.build();
     }
 
     @Override
     public void put(String key, InputStream content, long length) throws GeneralException, IOException {
-        if (content == null) {
-            throw new GeneralException("Cannot store content from a null stream for content store key ["
-                    + key + "]");
-        }
-        if (length < 0L) {
-            throw new GeneralException("Cannot store " + length + " bytes for content store key [" + key + "]");
-        }
-        // fromInputStream, not fromContentProvider: the SDK then frames the request from the length it
-        // was given and streams the body, so the content is never held in this JVM's heap in full - which
-        // is the whole reason this overload exists. The stream is deliberately NOT closed here; the
-        // contract leaves it with the caller, which is what lets a caller go on using its own source.
-        //
-        // Wrapped, because framing the request from the declared length is exactly what makes a stream
-        // that disagrees with it dangerous: the SDK sends the first `length` bytes and never looks at the
-        // rest, so a longer stream was stored SILENTLY TRUNCATED - complete as far as any later read
-        // could tell. The wrapper refuses that before the body is complete, so the request fails and the
-        // stored object is left as it was. See ExactLengthBody.
-        ExactLengthBody body = new ExactLengthBody(content, length, key);
-        try {
-            putObject(key, RequestBody.fromInputStream(body, length));
-        } catch (GeneralException | IOException | RuntimeException failed) {
-            // The mismatch is recorded on the wrapper as well as thrown, because what reaches here is
-            // whatever the SDK made of an IOException raised while it was writing the body - it may be
-            // wrapped, and it is translated by putObject into the contract's own IOException, which
-            // deliberately carries no SDK detail. The flag is the one reliable signal, and it changes only
-            // the type of the report: a length that does not match its stream is the CALLER'S mistake, and
-            // this contract reports that as GeneralException in both directions and in both providers.
-            IOException mismatch = body.mismatch();
-            if (mismatch != null) {
-                throw new GeneralException(mismatch.getMessage(), mismatch);
-            }
-            throw failed;
-        }
-        // A completed request whose body was short or long is not reachable - the SDK cannot frame a
-        // request from a length the body did not satisfy - but the flag is checked rather than assumed,
-        // because assuming it would make silent truncation the failure mode again if it ever were.
-        IOException mismatch = body.mismatch();
-        if (mismatch != null) {
-            throw new GeneralException(mismatch.getMessage(), mismatch);
-        }
-    }
-
-    /**
-     * The request body for {@link #put(String, InputStream, long)}, which holds the caller's stream to
-     * the length it was declared with.
-     *
-     * <p><strong>Why this is needed at all.</strong> The SDK frames a {@code PutObject} from the length
-     * it is given: it writes exactly that many bytes from the stream and never asks for another. A stream
-     * holding MORE than it declared was therefore stored truncated, and stored successfully - no error
-     * anywhere, and a later read returning content that looks complete. A stream holding LESS raised
-     * whatever the HTTP client made of an unfillable body, which arrived as a storage failure rather than
-     * as the caller error it is.
-     *
-     * <p><strong>How the long case is caught before it can be stored.</strong> The check cannot wait
-     * until the request is finished, because by then the truncated object exists and undoing it would
-     * mean deleting or rewriting content this provider was not asked to change. So the extra byte is
-     * looked for at the last possible moment that is still too early to matter: on the read that WOULD
-     * complete the body. If the source has another byte, that read throws instead of returning, the SDK
-     * is left with an incomplete body, the request fails and nothing is stored. If it does not, the final
-     * bytes are handed over and the request completes exactly as before.
-     *
-     * <p>One byte of the caller's stream is consumed by that look-ahead. It is inconsequential: the only
-     * case in which a byte is found is the case that is refused anyway.
-     *
-     * <p>{@code mark} and {@code reset} are honoured, including for the counters, because the SDK resets
-     * a mark-supporting stream to retry a failed attempt; without that a retry would be reported as a
-     * stream that ended early. {@code close} is left to {@link FilterInputStream}, which closes the
-     * source exactly as handing the source over unwrapped did.
-     */
-    private static final class ExactLengthBody extends FilterInputStream {
-
-        private final long declared;
-        private final String key;
-        private long delivered;
-        private boolean lookedAhead;
-        private long markedDelivered;
-        private boolean markedLookedAhead;
-        private IOException mismatch;
-
-        /**
-         * Holds a stream to a declared length.
-         *
-         * @param source the caller's stream, which this does not own
-         * @param declared the exact number of bytes the caller said it holds
-         * @param key the key being written, named in a refusal
-         */
-        ExactLengthBody(InputStream source, long declared, String key) {
-            super(source);
-            this.declared = declared;
-            this.key = key;
-        }
-
-        /**
-         * Reports the mismatch this body refused, if it refused one.
-         *
-         * @return the refusal, or {@code null} when the stream held exactly what it declared
-         */
-        private IOException mismatch() {
-            return mismatch;
-        }
-
-        @Override
-        public int read() throws IOException {
-            byte[] one = new byte[1];
-            int produced = read(one, 0, 1);
-            return produced < 0 ? -1 : one[0] & 0xff;
-        }
-
-        @Override
-        public int read(byte[] buffer, int offset, int wanted) throws IOException {
-            if (wanted == 0) {
-                return 0;
-            }
-            if (delivered >= declared) {
-                // The body is already complete. Reached when the declared length is zero, and when the
-                // client reads again to observe the end of the stream.
-                refuseIfLonger();
-                return -1;
-            }
-            int room = (int) Math.min(wanted, declared - delivered);
-            int produced = in.read(buffer, offset, room);
-            if (produced < 0) {
-                throw record(new IOException("The content stream for [" + key + "] ended "
-                        + (declared - delivered) + " bytes before the " + declared + " bytes it declared, so"
-                        + " nothing was stored"));
-            }
-            delivered += produced;
-            if (delivered >= declared) {
-                // Before returning, so that a refusal leaves the body incomplete and the request fails.
-                refuseIfLonger();
-            }
-            return produced;
-        }
-
-        /**
-         * Looks once for a byte beyond the declared length and refuses the write if there is one.
-         *
-         * @throws IOException if the source holds more than it declared
-         */
-        private void refuseIfLonger() throws IOException {
-            if (lookedAhead) {
-                return;
-            }
-            lookedAhead = true;
-            if (in.read() != -1) {
-                throw record(new IOException("The content stream for [" + key + "] holds more than the "
-                        + declared + " bytes it declared, so nothing was stored"));
-            }
-        }
-
-        /**
-         * Records a refusal so that the caller can recognise it whatever the SDK does with it.
-         *
-         * @param refusal the refusal being thrown
-         * @return the same refusal, to be thrown by the caller
-         */
-        private IOException record(IOException refusal) {
-            if (mismatch == null) {
-                mismatch = refusal;
-            }
-            return refusal;
-        }
-
-        @Override
-        public synchronized void mark(int readLimit) {
-            in.mark(readLimit);
-            markedDelivered = delivered;
-            markedLookedAhead = lookedAhead;
-        }
-
-        @Override
-        public synchronized void reset() throws IOException {
-            in.reset();
-            delivered = markedDelivered;
-            lookedAhead = markedLookedAhead;
-            // The refusal is NOT cleared: a stream that disagreed with its length still disagrees with it,
-            // and the retry is only reading the same source again.
-        }
-
-        @Override
-        public int available() throws IOException {
-            return (int) Math.min(in.available(), declared - delivered);
-        }
-
-        @Override
-        public long skip(long count) throws IOException {
-            return in.skip(Math.min(count, declared - delivered));
-        }
-    }
-
-    /**
-     * Issues one {@code PutObject} for either {@code put} overload.
-     *
-     * <p>Both overloads name the same bucket, the same object key and the same failure report; only the
-     * body differs, so the request is built once here rather than twice.
-     *
-     * @param key the provider-relative storage key
-     * @param body the request body the SDK sends
-     * @throws GeneralException if the key is unusable or the store refused the write
-     * @throws IOException if the store could not be written to
-     */
-    private void putObject(String key, RequestBody body) throws GeneralException, IOException {
-        String objectKey = objectKey(key);
-        PutObjectRequest.Builder request = PutObjectRequest.builder().bucket(bucket).key(objectKey);
-        // The encryption header is attached only when a mode is configured. Sending nothing is not the same
-        // as sending "none": it leaves the decision to the bucket, which on Amazon S3 means SSE-S3 by
-        // default, and it keeps a store that does not understand the header working. When a mode IS
-        // configured the header is sent on every write, so a store that cannot honour it fails the write
-        // rather than storing plaintext without saying so.
-        if (serverSideEncryption != null) {
-            request.serverSideEncryption(serverSideEncryption);
-            if (sseKmsKeyId != null) {
-                request.ssekmsKeyId(sseKmsKeyId);
-            }
+        ContentStoreFactory.requireUsableKey(key);
+        if (content == null || length < 0L) {
+            throw new IOException("Content of a known, non-negative length is required to store " + reference(key));
         }
         try {
-            s3Client.putObject(request.build(), body);
-        } catch (SdkException e) {
-            throw storeFailure("store", objectKey, e);
+            client.putObject(PutObjectRequest.builder().bucket(bucket).key(key).contentLength(length).build(),
+                    RequestBody.fromInputStream(content, length));
+        } catch (SdkException failure) {
+            throw failed("store", key, failure);
         }
     }
 
     @Override
     public byte[] get(String key) throws GeneralException, IOException {
-        String objectKey = objectKey(key);
-        long limit = ContentStoreFactory.maxObjectSize(delegator);
-        ResponseInputStream<GetObjectResponse> content;
-        try {
-            content = s3Client.getObject(GetObjectRequest.builder().bucket(bucket).key(objectKey).build());
-        } catch (NoSuchKeyException absent) {
-            throw absent(key, objectKey, absent);
-        } catch (S3Exception e) {
-            if (isAbsence(e)) {
-                throw absent(key, objectKey, e);
-            }
-            throw storeFailure("read", objectKey, e);
-        } catch (SdkException e) {
-            throw storeFailure("read", objectKey, e);
+        ContentStoreFactory.requireUsableKey(key);
+        long held = size(key);
+        if (held > MAX_IN_MEMORY_OBJECT) {
+            throw new IOException("The content store holds " + held + " bytes for " + reference(key) + ", more than"
+                    + " the " + MAX_IN_MEMORY_OBJECT + " bytes that may be read into memory; stream it instead");
         }
-        // Released on every path below, and released by aborting rather than closing whenever the
-        // content was not read to its end: closing a partly-read response drains the rest of the
-        // object off the wire, which is exactly the transfer a refusal exists to avoid.
-        boolean readToEnd = false;
         try {
-            byte[] read = boundedRead(content, objectKey, limit);
-            readToEnd = true;
-            return read;
-        } catch (SdkException e) {
-            throw storeFailure("read", objectKey, e);
-        } finally {
-            if (readToEnd) {
-                content.close();
-            } else {
-                content.abort();
-            }
+            return client.getObjectAsBytes(GetObjectRequest.builder().bucket(bucket).key(key).build()).asByteArray();
+        } catch (NoSuchKeyException absent) {
+            throw absence(key, absent);
+        } catch (SdkException failure) {
+            throw failed("read", key, failure);
         }
     }
 
     @Override
-    public ContentStream openStream(String key) throws GeneralException, IOException {
-        String objectKey = objectKey(key);
-        ResponseInputStream<GetObjectResponse> content;
+    public InputStream openStream(String key) throws GeneralException, IOException {
+        ContentStoreFactory.requireUsableKey(key);
         try {
-            content = s3Client.getObject(GetObjectRequest.builder().bucket(bucket).key(objectKey).build());
+            return client.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build());
         } catch (NoSuchKeyException absent) {
-            throw absent(key, objectKey, absent);
-        } catch (S3Exception e) {
-            if (isAbsence(e)) {
-                throw absent(key, objectKey, e);
-            }
-            throw storeFailure("open", objectKey, e);
-        } catch (SdkException e) {
-            throw storeFailure("open", objectKey, e);
-        }
-        // Wrapped rather than handed over bare, so the caller receives the object's length with the
-        // stream and does not have to issue a HEAD - or read the content - to find it. Closing the
-        // wrapper closes the response, so ownership still passes to the caller exactly as before.
-        // The response is aborted rather than closed if the length cannot be established at all,
-        // because a response left open would hold a connection from the pool for good.
-        long declared = declaredLength(content, objectKey);
-        // Wrapped a second time, by ServedBody, for the two things that were true of the raw response and
-        // must not be: an IOException raised while the body was being read reached the caller with whatever
-        // the SDK put in it, bypassing the translation every other failure of this provider goes through;
-        // and the body had no total deadline, so a peer trickling bytes held a request thread and a pooled
-        // connection for as long as it liked.
-        return new ContentStream(new ServedBody(content, objectKey, streamTimeoutMillis), declared);
-    }
-
-    /**
-     * The response body a caller is handed, which translates every failure and will not be read forever.
-     *
-     * <p><strong>Translation.</strong> Everything this provider throws is fixed text plus an opaque
-     * reference, with the bucket, the key and the sanitised diagnostic logged under that reference - and
-     * that used to stop at the moment {@code openStream} returned. After it, the caller held the SDK's own
-     * {@code ResponseInputStream}: a connection reset, a truncated body or a failure to close raised
-     * whatever the SDK or the HTTP client chose to say, uncorrelated and unredacted, on a path whose whole
-     * purpose is to render content into a response. Every {@code read}, {@code skip} and {@code close}
-     * here therefore goes through {@link #storeFailure}, which is what the request half of the same
-     * operation has always done.
-     *
-     * <p><strong>Deadline.</strong> One deadline over the WHOLE body, fixed when the body is handed over,
-     * rather than a per-read timeout. The SDK's socket and attempt timeouts bound how long one read may
-     * block; neither bounds how long a peer may keep a body open by answering each read just before its
-     * timeout expires. That is the shape a slow-drip response takes, and it costs a request thread and a
-     * pooled connection for its duration. The deadline is checked before each operation and at the moment
-     * an operation returns, so a body that has overrun is refused rather than being allowed one more read.
-     *
-     * <p>An overrun and a failure both {@code abort()} the response rather than closing it: closing a
-     * partly-read response drains the remainder of the object off the wire, which is the transfer a
-     * refusal exists to avoid. Afterwards the body is exhausted for good - a caller that keeps reading
-     * gets the same refusal rather than a partial object that looks complete.
-     */
-    private final class ServedBody extends InputStream {
-
-        private final ResponseInputStream<GetObjectResponse> response;
-        private final String objectKey;
-        private final long deadlineNanos;
-        private IOException terminated;
-        private boolean closed;
-
-        /**
-         * Wraps an open response body.
-         *
-         * @param response the open response, positioned at its first byte
-         * @param objectKey the prefixed object key, for the log rather than for a thrown message
-         * @param timeoutMillis how long the whole body may take
-         */
-        ServedBody(ResponseInputStream<GetObjectResponse> response, String objectKey, long timeoutMillis) {
-            this.response = response;
-            this.objectKey = objectKey;
-            this.deadlineNanos = System.nanoTime() + Duration.ofMillis(timeoutMillis).toNanos();
-        }
-
-        @Override
-        public int read() throws IOException {
-            requireUsable();
-            int produced = (int) translating("read", () -> response.read());
-            requireUsable();
-            return produced;
-        }
-
-        @Override
-        public int read(byte[] buffer, int offset, int wanted) throws IOException {
-            requireUsable();
-            int produced = (int) translating("read", () -> response.read(buffer, offset, wanted));
-            requireUsable();
-            return produced;
-        }
-
-        @Override
-        public long skip(long count) throws IOException {
-            requireUsable();
-            long skipped = translating("read", () -> response.skip(count));
-            requireUsable();
-            return skipped;
-        }
-
-        @Override
-        public int available() throws IOException {
-            requireUsable();
-            return (int) translating("read", () -> (long) response.available());
-        }
-
-        /**
-         * Releases the response, once, reporting a failure to do so the way every other failure of this
-         * provider is reported.
-         *
-         * @throws IOException if the response could not be released
-         */
-        @Override
-        public void close() throws IOException {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            if (terminated != null) {
-                // Already released by the refusal that ended this body. Closing it again would be the drain
-                // that aborting existed to avoid, and a caller closing a body it was refused from is doing
-                // the right thing rather than something to report.
-                return;
-            }
-            translating("close", () -> {
-                response.close();
-                return 0L;
-            });
-        }
-
-        /**
-         * Refuses any further use of a body that has ended, and ends one that has outlived its deadline.
-         *
-         * <p>Called before each operation and again when it returns. Before, so a body that is finished
-         * stays finished and one already past its deadline is not given another read; after, because an
-         * operation can itself be what carries the body past the deadline, and a read that returns bytes
-         * from beyond it would be the overrun this exists to stop.
-         *
-         * <p>Once ended, the SAME refusal is reported to every later call. It has to be: aborting an SDK
-         * response does not necessarily make its underlying stream unreadable, so a body allowed to carry
-         * on after a refusal could keep serving bytes - and a caller that ignored one refusal would then
-         * assemble a partial object that looks complete.
-         *
-         * @throws IOException if this body has ended, or has now outlived its deadline
-         */
-        private void requireUsable() throws IOException {
-            if (terminated != null) {
-                // A new instance carrying the same text, so the reference an operator can act on is the
-                // same one while the stack trace still describes the call that was refused.
-                throw new IOException(terminated.getMessage());
-            }
-            if (System.nanoTime() - deadlineNanos < 0L) {
-                return;
-            }
-            String reference = reference();
-            Debug.logError("Content store refusal [" + reference + "]: the response for " + logReference(objectKey)
-                    + " was still being read after the " + STREAM_TIMEOUT_PROPERTY
-                    + " deadline of " + streamTimeoutMillis + " milliseconds, so it was abandoned rather than"
-                    + " allowed to hold a request thread and a pooled connection indefinitely", MODULE);
-            throw terminate(new IOException("The requested content took longer to transfer than this instance"
-                    + " allows. Reference [" + reference + "]."));
-        }
-
-        /**
-         * Performs one operation on the response, translating an SDK or IO failure into the contract's
-         * own report.
-         *
-         * @param operation what was being attempted, for the diagnostic
-         * @param body the operation to perform
-         * @return whatever the operation returned
-         * @throws IOException if the operation failed
-         */
-        private long translating(String operation, BodyOperation body) throws IOException {
-            try {
-                return body.perform();
-            } catch (SdkException e) {
-                throw terminate(storeFailure(operation, objectKey, e));
-            } catch (IOException e) {
-                throw terminate(bodyFailure(operation, objectKey, e));
-            }
-        }
-
-        /**
-         * Ends this body: abandons the response and records the refusal every later call reports.
-         *
-         * <p>Abandoned rather than closed, because closing a partly-read response drains the remainder of
-         * the object off the wire, which is the transfer a refusal exists to avoid. A failure to abandon it
-         * is reported and swallowed, so it cannot replace the failure being reported.
-         *
-         * @param refusal the refusal that ended this body
-         * @return the same refusal, to be thrown by the caller
-         */
-        private IOException terminate(IOException refusal) {
-            if (terminated == null) {
-                terminated = refusal;
-                try {
-                    response.abort();
-                } catch (RuntimeException e) {
-                    reportUncleanClose("response body", e);
-                }
-            }
-            return refusal;
+            throw absence(key, absent);
+        } catch (SdkException failure) {
+            throw failed("read", key, failure);
         }
     }
 
-    /**
-     * One operation on a response body, so that {@code read}, {@code skip}, {@code available} and
-     * {@code close} are all translated by the same code.
-     */
-    private interface BodyOperation {
-        /**
-         * Performs the operation.
-         *
-         * @return the operation's own result, widened so one signature covers all four
-         * @throws IOException if it fails
-         */
-        long perform() throws IOException;
-    }
-
-    /**
-     * Translates a failure raised while a response body was being read into the contract's failure,
-     * without disclosing where this deployment keeps its content.
-     *
-     * <p>The same rules as {@link #storeFailure}: fixed text plus an opaque reference outward, and the
-     * bucket, the key and a sanitised description of the failure logged under that reference. Separate
-     * from it only because what arrives here is an {@link IOException} - a reset connection, a body that
-     * ended early - rather than an {@link SdkException}, and an {@code IOException}'s own message is as
-     * capable of quoting the endpoint as an SDK one is.
-     *
-     * @param operation what was being attempted, for the diagnostic
-     * @param objectKey the key the response is for
-     * @param cause the failure raised while reading
-     * @return the exception to throw
-     */
-    private IOException bodyFailure(String operation, String objectKey, IOException cause) {
-        String reference = reference();
-        Debug.logError("Content store failure [" + reference + "]: could not " + operation + " the response for "
-                + logReference(objectKey) + "; failure ["
-                + cause.getClass().getSimpleName() + "]", MODULE);
-        return new IOException("The content store could not " + operation + " the requested content."
-                + " Reference [" + reference + "].");
-    }
-
-    /**
-     * Reports the length the store declared for an open response, refusing a response that declares
-     * none.
-     *
-     * <p>A missing or negative {@code Content-Length} is a store that cannot answer the question this
-     * operation exists to answer, and guessing - by reading the content, or by reporting zero - would
-     * either defeat the streaming or make a caller declare a length that is wrong. The response is
-     * aborted rather than closed, because closing a response that has not been read drains the whole
-     * object off the wire, which is exactly the transfer a refusal exists to avoid.
-     *
-     * @param content the open response
-     * @param objectKey the prefixed object key, for the log rather than for the thrown message
-     * @return the declared length, never negative
-     * @throws IOException if the store declared no usable length
-     */
-    private long declaredLength(ResponseInputStream<GetObjectResponse> content, String objectKey)
-            throws IOException {
-        GetObjectResponse response = content.response();
-        Long declared = response == null ? null : response.contentLength();
-        if (declared != null && declared >= 0L) {
-            return declared;
-        }
-        content.abort();
-        Debug.logError("Content store refusal: " + logReference(objectKey) + " was served"
-                + " without a usable content length, so its size cannot be reported to a consumer that has to"
-                + " declare one", MODULE);
-        throw new IOException("The requested content could not be served because the store did not report its"
-                + " size.");
-    }
-
-    /**
-     * {@inheritDoc}
-     *
-     * <p><strong>Asked with a GET, not a HEAD, and that is the whole point.</strong> A {@code HEAD}
-     * response carries no body, so a store answering {@code 404} to one cannot say WHY: the SDK has no
-     * error code to model and raises {@code NoSuchKeyException} whether the key is absent, the bucket
-     * is absent, the credentials cannot see it or the endpoint is not an object store at all. Answering
-     * {@code false} to that is what turns a misconfigured or unreachable store into "the content simply
-     * is not there", which is the one thing {@link ContentStore} forbids a provider to do.
-     *
-     * <p>A {@code GET} answers a failure with an error document, so the SDK models it: an absent key is
-     * {@code NoSuchKey}, an absent bucket is {@code NoSuchBucket}, a refused credential is
-     * {@code AccessDenied}, and a {@code 404} carrying no code at all - what a plain web server
-     * answers - remains a failure. Only the first is absence; everything else is reported through
-     * {@link #storeFailure}.
-     *
-     * <p>The transfer that a GET would otherwise cost is not paid. The request asks for
-     * {@value #EXISTENCE_RANGE} - one byte - and the response is {@code abort()}ed rather than closed,
-     * so the connection is dropped instead of the remainder of the object being drained off the wire.
-     * Content of any size therefore costs the same as the HEAD did, plus that one byte. A store answers
-     * a range that lies beyond the object with {@code InvalidRange}, which is the one error code that
-     * means the object EXISTS - it is what a zero-length object returns, and {@link #put} accepts a
-     * zero-length array - so it is mapped to {@code true} rather than to absence or to a failure.
-     *
-     * <p>It also needs no permission beyond {@code s3:GetObject}, which {@link #get} and
-     * {@link #openStream} already require. Verifying the bucket instead would need
-     * {@code s3:ListBucket}, so a least-privilege deployment granted only object permissions would have
-     * had every absence reported as a failure.
-     */
     @Override
     public boolean exists(String key) throws GeneralException, IOException {
-        String objectKey = objectKey(key);
-        ResponseInputStream<GetObjectResponse> probe = null;
+        ContentStoreFactory.requireUsableKey(key);
         try {
-            probe = s3Client.getObject(GetObjectRequest.builder().bucket(bucket).key(objectKey)
-                    .range(EXISTENCE_RANGE).build());
+            head(key);
             return true;
-        } catch (NoSuchKeyException absent) {
-            // Absence is an answer, not a failure: the contract requires false rather than a throw.
-            // Reached only from a response whose error document named this key as the missing thing,
-            // because a GET always carries one - which is what a HEAD could not tell us. Described rather
-            // than logged as an object, for the reason storeFailure gives: handing the SDK failure to Debug
-            // writes its message and stack trace, which is what redaction exists to prevent.
-            Debug.logVerbose("The S3 content store holds nothing under " + logReference(objectKey) + ": "
-                    + redacted(absent), MODULE);
+        } catch (FileNotFoundException absent) {
             return false;
-        } catch (S3Exception e) {
-            if (isEmptyObjectRange(e)) {
-                // The range asked for lies past the end of the object, so the object is there and has
-                // no bytes in it. Present, not absent, and certainly not a failure.
-                return true;
-            }
-            if (isAbsence(e)) {
-                Debug.logVerbose("The S3 content store holds nothing under " + logReference(objectKey) + ": " + redacted(e),
-                        MODULE);
-                return false;
-            }
-            throw storeFailure("test", objectKey, e);
-        } catch (SdkException e) {
-            throw storeFailure("test", objectKey, e);
-        } finally {
-            if (probe != null) {
-                // Aborted rather than closed: closing drains the rest of the response, and nothing here
-                // reads even the one byte that was asked for.
-                probe.abort();
-            }
         }
     }
 
     @Override
     public void delete(String key) throws GeneralException, IOException {
-        String objectKey = objectKey(key);
+        ContentStoreFactory.requireUsableKey(key);
         try {
-            s3Client.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(objectKey).build());
-        } catch (NoSuchKeyException absent) {
-            // Idempotent by contract, and S3 itself reports a delete of an absent object as success,
-            // so this is only reached by a store that reports the miss instead. Described rather than
-            // logged as an object, for the reason storeFailure gives.
-            Debug.logVerbose("The S3 content store already holds nothing under " + logReference(objectKey) + ": "
-                    + redacted(absent), MODULE);
-        } catch (S3Exception e) {
-            if (!isAbsence(e)) {
-                throw storeFailure("remove", objectKey, e);
-            }
-            Debug.logVerbose("The S3 content store already holds nothing under " + logReference(objectKey) + ": " + redacted(e),
-                    MODULE);
-        } catch (SdkException e) {
-            throw storeFailure("remove", objectKey, e);
+            client.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build());
+        } catch (NoSuchKeyException alreadyGone) {
+            Debug.logInfo("The content store already held no " + reference(key) + ", so there was nothing to"
+                    + " remove", MODULE);
+        } catch (SdkException failure) {
+            throw failed("remove", key, failure);
         }
     }
 
     /**
-     * Reports that this provider DOES hold content off the instance.
-     *
-     * <p>A bucket is a namespace outside every instance, so content that exists only on one instance's
-     * disk is content the rest of the fleet cannot read: it has to be published here before an instance
-     * can be treated as replaceable, which is the whole purpose of this provider.
-     *
-     * @return {@code true}, always
+     * Shuts the SDK client down when this store is superseded by a re-resolved configuration.
      */
     @Override
-    public boolean holdsContentOffInstance() {
-        return true;
+    public void close() {
+        client.close();
     }
 
     /**
-     * Reads a response into an array without letting it exceed the configured ceiling.
+     * Returns the signature {@link ContentStoreFactory} caches a resolution against.
      *
-     * <p>Checked twice, because either check alone is insufficient. The declared length is checked
-     * first so an oversized object is refused before a byte of it is transferred. The bytes actually
-     * delivered are then bounded as well, because a declared length is something the store said
-     * rather than something it is held to: a store that understates it, or omits it, must not be able
-     * to make this method allocate more than the ceiling allows.
+     * <p>It covers every setting the client is constructed from, so a change to any of them resolves a
+     * new client rather than keeping one that no longer matches the configuration. The secret access
+     * key is represented by its length alone: rotating it must still invalidate the cache, and a
+     * signature is held in memory next to the cache rather than being treated as secret material.
      *
-     * @param content the response to read, positioned at its start
-     * @param objectKey the key the response is for, named in the log rather than in a thrown message
-     * @param limit the greatest number of bytes that may be returned
-     * @return the content, never longer than {@code limit}
-     * @throws IOException if the content is longer than {@code limit}, or if the response cannot be
-     *     read
+     * @return the signature
      */
-    private byte[] boundedRead(ResponseInputStream<GetObjectResponse> content, String objectKey, long limit)
-            throws IOException {
-        Long declared = content.response() == null ? null : content.response().contentLength();
-        if (declared != null && declared > limit) {
-            throw oversized(objectKey, String.valueOf(declared), limit);
-        }
-        byte[] read = content.readNBytes((int) limit);
-        // One byte past the ceiling is enough to know the content does not fit; the rest is never
-        // transferred, because the caller aborts the response instead of draining it.
-        if (content.read() != -1) {
-            throw oversized(objectKey, "more than " + limit, limit);
-        }
-        return read;
+    static String configurationSignature() {
+        return String.join("\n",
+                ContentStoreFactory.setting(BUCKET_PROPERTY, ""),
+                ContentStoreFactory.setting(REGION_PROPERTY, ""),
+                ContentStoreFactory.setting(ENDPOINT_PROPERTY, ""),
+                ContentStoreFactory.setting(ACCESS_KEY_PROPERTY, ""),
+                Integer.toString(ContentStoreFactory.setting(SECRET_KEY_PROPERTY, "").length()),
+                ContentStoreFactory.setting(PATH_STYLE_PROPERTY, "false"));
     }
 
     /**
-     * Reports content that does not fit inside the configured ceiling.
+     * Resolves the credentials provider the configuration asks for.
      *
-     * @param objectKey the key the content is stored under, for the log
-     * @param size the size as far as it is known, for the log
-     * @param limit the ceiling that was exceeded
-     * @return the exception to throw, whose message names neither the bucket nor the key
+     * @return static credentials when both halves are configured, otherwise the SDK's default chain
+     * @throws GeneralException if exactly one half of a static credential pair is configured
      */
-    private IOException oversized(String objectKey, String size, long limit) {
-        String reference = reference();
-        Debug.logError("Content store refusal [" + reference + "]: " + logReference(objectKey)
-                + " is " + size + " bytes, over the " + ContentStoreFactory.MAX_OBJECT_SIZE_PROPERTY + " ceiling of "
-                + limit + "; content this large has to be streamed rather than read whole", MODULE);
-        return new IOException("The requested content is larger than this instance may read in one piece."
-                + " Reference [" + reference + "].");
+    private static AwsCredentialsProvider credentials() throws GeneralException {
+        String accessKey = ContentStoreFactory.setting(ACCESS_KEY_PROPERTY, "");
+        String secretKey = ContentStoreFactory.setting(SECRET_KEY_PROPERTY, "");
+        if (accessKey.isEmpty() && secretKey.isEmpty()) {
+            // builder().build() rather than the deprecated create(): the two are equivalent, but only
+            // the builder form survives the SDK's own deprecation of the shortcut.
+            return DefaultCredentialsProvider.builder().build();
+        }
+        if (accessKey.isEmpty() || secretKey.isEmpty()) {
+            // Refused rather than half-applied: falling back to the default chain here would answer a
+            // half-configured deployment with a confusing permission error from a different identity.
+            throw new GeneralException(ACCESS_KEY_PROPERTY + " and " + SECRET_KEY_PROPERTY + " are configured"
+                    + " together, or neither is configured and the SDK's default credential chain is used");
+        }
+        return StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey));
     }
 
     /**
-     * Validates a storage key and places it under the configured prefix.
-     *
-     * <p>The grammar every provider shares is applied first, through
-     * {@link ContentStore#requireUsableKey(String)}, so that this provider refuses exactly the keys the
-     * filesystem provider refuses - a control character, an absolute path, a Windows drive prefix, an
-     * empty component and any {@code .} or {@code ..} component - and content copied between the two
-     * therefore keeps every key it had. That last property is not incidental: it is what lets a
-     * deployment migrate its existing tree into a bucket during the window
-     * {@code content.store.local.fallback} exists to cover.
-     *
-     * <p>The prefix is then applied and the WHOLE result is bounded again, because the shared grammar
-     * bounded the key the caller supplied and it is the prefixed key a store receives. Nothing else is
-     * required of the key here: what a key means is decided once, by
-     * {@link ContentStoreFactory#storeKey}, and a second opinion at this boundary is exactly how the two
-     * providers would come to disagree about which object a {@code DataResource} row names.
-     *
-     * @param key the provider-relative storage key
-     * @return the object key to name in a request, prefix included
-     * @throws GeneralException if the key breaks the shared key grammar, or exceeds the object-key
-     *     length limit once the prefix is applied
-     */
-    private String objectKey(String key) throws GeneralException {
-        ContentStore.requireUsableKey(key);
-        String prefixed = keyPrefix + key;
-        int length = prefixed.getBytes(StandardCharsets.UTF_8).length;
-        if (length > ContentStore.MAX_KEY_LENGTH_BYTES) {
-            throw new GeneralException("The content store key [" + key + "] occupies " + length + " bytes once the"
-                    + " configured key prefix is applied, over the " + ContentStore.MAX_KEY_LENGTH_BYTES
-                    + " bytes an object key may occupy");
-        }
-        return prefixed;
-    }
-
-    /**
-     * Requires a value that is a usable object-store bucket name.
-     *
-     * <p>The published S3 naming rules, applied here rather than left to the store, because the store
-     * reports a malformed name as a failure on the first request - by which time a page is already
-     * trying to render content to a user - whereas this reports it while the provider is being built,
-     * naming the property. These are the same rules, in the same order, that the container entry point
-     * applies to {@code OFBIZ_S3_BUCKET}: 3 to 63 characters of lower-case letters, digits, {@code .}
-     * and {@code -}, beginning and ending with a letter or a digit, no {@code ..}, {@code .-} or
-     * {@code -.} pair, and never the shape of an IPv4 address, which such stores reserve.
-     *
-     * @param bucket the configured bucket name
-     * @throws GeneralException if the value is absent or is not a usable bucket name
-     */
-    private static void requireUsableBucket(String bucket) throws GeneralException {
-        if (UtilValidate.isEmpty(bucket)) {
-            throw new GeneralException(BUCKET_PROPERTY + " is required when content.store.provider=s3;"
-                    + " there is no default bucket");
-        }
-        if (bucket.length() < BUCKET_MIN_LENGTH || bucket.length() > BUCKET_MAX_LENGTH) {
-            throw new GeneralException(BUCKET_PROPERTY + " must be between " + BUCKET_MIN_LENGTH + " and "
-                    + BUCKET_MAX_LENGTH + " characters long, which is what an object-store bucket name allows,"
-                    + " and this one is " + bucket.length());
-        }
-        for (int index = 0; index < bucket.length(); index++) {
-            char character = bucket.charAt(index);
-            boolean accepted = character >= 'a' && character <= 'z' || character >= '0' && character <= '9'
-                    || character == '.' || character == '-';
-            if (!accepted) {
-                throw new GeneralException(BUCKET_PROPERTY + " must contain only lower-case letters, digits, '.'"
-                        + " and '-', which is what an object-store bucket name allows");
-            }
-        }
-        if (!isBucketBoundary(bucket.charAt(0)) || !isBucketBoundary(bucket.charAt(bucket.length() - 1))) {
-            throw new GeneralException(BUCKET_PROPERTY + " must begin and end with a lower-case letter or a digit");
-        }
-        if (bucket.contains("..") || bucket.contains(".-") || bucket.contains("-.")) {
-            throw new GeneralException(BUCKET_PROPERTY + " must not contain '..', '.-' or '-.'. Such a bucket name"
-                    + " cannot be addressed virtual-host-style or over TLS");
-        }
-        if (bucket.matches("[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+")) {
-            throw new GeneralException(BUCKET_PROPERTY + " must not be formatted as an IPv4 address;"
-                    + " S3-compatible stores reserve that shape");
-        }
-    }
-
-    /**
-     * Reports whether a character may begin or end a bucket name.
-     *
-     * @param character the character to test
-     * @return true for a lower-case letter or a digit
-     */
-    private static boolean isBucketBoundary(char character) {
-        return character >= 'a' && character <= 'z' || character >= '0' && character <= '9';
-    }
-
-    /**
-     * Requires a value that is a usable object-store region identifier.
-     *
-     * <p>Validated for shape rather than against a list of known regions, exactly as the container
-     * entry point validates {@code OFBIZ_S3_REGION}: a list would go stale and would refuse a
-     * perfectly good private store, while the shape - lower-case letters, digits and {@code -}, and
-     * short - is what tells a region apart from a whole URL pasted into the wrong setting.
-     *
-     * @param region the configured region identifier
-     * @throws GeneralException if the value is absent or is not a usable region identifier
-     */
-    private static void requireUsableRegion(String region) throws GeneralException {
-        if (UtilValidate.isEmpty(region)) {
-            throw new GeneralException(REGION_PROPERTY + " is required when content.store.provider=s3;"
-                    + " use us-east-1 for a store that has no regions of its own");
-        }
-        if (region.length() < REGION_MIN_LENGTH || region.length() > REGION_MAX_LENGTH) {
-            throw new GeneralException(REGION_PROPERTY + " must be between " + REGION_MIN_LENGTH + " and "
-                    + REGION_MAX_LENGTH + " characters long, and this one is " + region.length()
-                    + ". A region identifier is short - us-east-1 is 9 characters - so an over-long value is"
-                    + " usually an endpoint supplied to the wrong property");
-        }
-        for (int index = 0; index < region.length(); index++) {
-            char character = region.charAt(index);
-            boolean accepted = character >= 'a' && character <= 'z' || character >= '0' && character <= '9'
-                    || character == '-';
-            if (!accepted) {
-                throw new GeneralException(REGION_PROPERTY + " must contain only lower-case letters, digits and"
-                        + " '-', which is the shape of a region identifier such as us-east-1");
-            }
-        }
-        if (region.startsWith("-") || region.endsWith("-")) {
-            throw new GeneralException(REGION_PROPERTY + " must begin and end with a lower-case letter or a digit");
-        }
-    }
-
-    /**
-     * Reads a boolean setting of this provider, refusing a value that is neither {@code true} nor
-     * {@code false}.
-     *
-     * <p>Strict on purpose, and unlike the tunables read through
-     * {@link ContentStoreFactory#boundedLong}: a mistyped bound still leaves content readable at the
-     * committed default, whereas each setting read through here decides how requests are addressed or
-     * whether credentials may travel in clear text. Treating an unrecognised value as {@code false} -
-     * which is what {@code "true".equalsIgnoreCase(value)} does - would answer a configuration mistake
-     * with a silent choice about exactly those things.
-     *
-     * @param property the property being read, named in a refusal
-     * @param configured the configured value, which may be blank
-     * @param whenAbsent the value a blank setting means
-     * @return the parsed value
-     * @throws GeneralException if the value is present and is neither true nor false
-     */
-    private static boolean requiredBoolean(String property, String configured, boolean whenAbsent)
-            throws GeneralException {
-        if (UtilValidate.isEmpty(configured)) {
-            return whenAbsent;
-        }
-        String normalised = configured.trim().toLowerCase(Locale.ROOT);
-        if ("true".equals(normalised)) {
-            return true;
-        }
-        if ("false".equals(normalised)) {
-            return false;
-        }
-        throw new GeneralException(property + " must be true or false, or be left blank for " + whenAbsent
-                + ". A value that is neither is refused rather than read as false, because this setting decides"
-                + " how object-store requests are made.");
-    }
-
-    /**
-     * Validates an endpoint override before this deployment's credentials can be sent to it.
+     * Validates the configured endpoint and returns it.
      *
      * @param endpoint the configured endpoint
-     * @return the endpoint as a URI
-     * @throws GeneralException if it is not a plain absolute http or https URI with a host, if it
-     *     carries user information, a query or a fragment, if it names an instance metadata address,
-     *     or if it is plaintext and neither loopback nor explicitly permitted
+     * @return the endpoint to override the SDK's own with
+     * @throws GeneralException if it is not an absolute http or https URI
      */
-    /**
-     * Resolves the endpoint this client will really use, so that no endpoint reaches the wire without
-     * having been through {@link #validatedEndpoint}.
-     *
-     * <p><strong>The defect this exists to close.</strong> Installing {@code endpointOverride} only when
-     * {@code content.store.s3.endpoint} was configured left the SDK's own ambient sources in charge of
-     * every other case. Those sources - {@code AWS_ENDPOINT_URL_S3} and {@code AWS_ENDPOINT_URL} in the
-     * environment, {@code aws.endpointUrlS3} and {@code aws.endpointUrl} as system properties, and
-     * {@code endpoint_url} in a shared configuration profile - are read by the SDK, not by this class, so
-     * a value set in any of them redirected every signed request, and the credential with it, to a host
-     * that {@code validatedEndpoint} never saw: not checked for plaintext, not checked against the
-     * instance metadata addresses, not checked for embedded user information (CWE-15, CWE-918).
-     *
-     * <p><strong>How it is closed.</strong> This method decides, and the decision is explicit in all
-     * three cases:
-     *
-     * <ul>
-     * <li><strong>Configured here.</strong> The value is validated and installed. {@code endpointOverride}
-     * has the highest precedence in the SDK, so nothing ambient can displace it - but an ambient source
-     * that names something DIFFERENT is still refused rather than ignored, because an operator who set one
-     * believes it is in effect, and a deployment must not be reading content from one place while its
-     * operator is certain it reads from another.</li>
-     * <li><strong>Not configured here, but set ambiently.</strong> The ambient value is validated by
-     * exactly the same rules and then installed EXPLICITLY, which both subjects it to those rules and
-     * removes the precedence question: the endpoint on the wire is the endpoint that was checked. Two
-     * ambient sources naming different endpoints are refused rather than resolved by precedence.</li>
-     * <li><strong>Not configured anywhere.</strong> No override is installed and the SDK resolves the
-     * standard regional endpoint for the configured region. Deliberately NOT replaced with an endpoint
-     * derived here: the SDK's resolution also honours the dualstack, FIPS and accelerate settings, and
-     * an override silently disables all of them.</li>
-     * </ul>
-     *
-     * <p>A refusal names the SOURCE and never the value, because an endpoint can carry user information.
-     *
-     * @param configuredEndpoint the value of {@code content.store.s3.endpoint}, possibly blank
-     * @return the endpoint to install, or null when the SDK's own regional resolution applies
-     * @throws GeneralException if any effective endpoint fails validation, or if two sources disagree
-     */
-    private URI resolvedEndpointOverride(String configuredEndpoint) throws GeneralException {
-        String ambientSource = null;
-        String ambientValue = null;
-        for (String[] source : SDK_AMBIENT_ENDPOINT_SOURCES) {
-            String fromEnvironment = trimmedToNull(System.getenv(source[0]));
-            String fromProperty = trimmedToNull(System.getProperty(source[1]));
-            String found = fromEnvironment != null ? fromEnvironment : fromProperty;
-            String foundIn = fromEnvironment != null ? source[0] : source[1];
-            if (found == null) {
-                continue;
-            }
-            if (ambientValue == null) {
-                ambientValue = found;
-                ambientSource = foundIn;
-            } else if (!ambientValue.equals(found)) {
-                throw new GeneralException("The AWS SDK endpoint sources " + ambientSource + " and " + foundIn
-                        + " name different endpoints, so which one this deployment would read content from"
-                        + " depends on SDK precedence rather than on a decision. Set " + ENDPOINT_PROPERTY
-                        + " to the endpoint this deployment must use, or remove all but one of them.");
-            }
-        }
-        String profileSource = profileEndpointSource();
-        if (profileSource != null && ambientValue == null) {
-            // Refused rather than validated and installed, because a profile file can declare an endpoint
-            // per service section and per profile, and picking the one the SDK would have picked means
-            // reimplementing its precedence - which is exactly the guessing this method exists to remove.
-            throw new GeneralException("The AWS shared configuration at " + profileSource + " declares "
-                    + PROFILE_ENDPOINT_KEY + ", which the SDK would apply to this client without this"
-                    + " deployment ever validating it. Set " + ENDPOINT_PROPERTY + " to the endpoint this"
-                    + " deployment must use, or remove " + PROFILE_ENDPOINT_KEY + " from that file.");
-        }
-
-        if (UtilValidate.isNotEmpty(configuredEndpoint)) {
-            URI configured = validatedEndpoint(configuredEndpoint);
-            if (ambientValue != null && !ambientValue.equals(configuredEndpoint)) {
-                throw new GeneralException("The AWS SDK endpoint source " + ambientSource + " names an endpoint"
-                        + " other than " + ENDPOINT_PROPERTY + ". This client uses the configured one, so the"
-                        + " variable has no effect and is almost certainly not doing what whoever set it"
-                        + " intended. Remove it, or make the two agree.");
-            }
-            return configured;
-        }
-        if (ambientValue == null) {
-            return null;
-        }
-        Debug.logInfo("The AWS SDK endpoint source " + ambientSource + " is set while " + ENDPOINT_PROPERTY
-                + " is not, so its value has been validated by the same rules and installed explicitly as this"
-                + " client's endpoint override. Configure " + ENDPOINT_PROPERTY + " instead, so the endpoint"
-                + " this deployment uses is part of its own configuration.", MODULE);
-        return validatedEndpoint(ambientValue);
-    }
-
-    /**
-     * Reports the AWS shared configuration file that declares {@value #PROFILE_ENDPOINT_KEY}, or null when
-     * none does.
-     *
-     * <p>Read through the SDK's own {@link ProfileFile}, so this sees exactly what the SDK would see -
-     * including the file locations {@code AWS_CONFIG_FILE} and {@code AWS_SHARED_CREDENTIALS_FILE} point
-     * at - rather than a second, divergent parser. Every profile and every {@code services} section is
-     * examined, because the setting is legal in all of them.
-     *
-     * <p>A failure to READ the shared configuration answers null rather than propagating: the file is
-     * optional, most deployments have none, and a malformed one is not this provider's to report. The
-     * consequence of answering null is only that the SDK's own resolution applies, which is the behaviour
-     * without this check.
-     *
-     * @return a description of where the setting was found, for the refusal, or null
-     */
-    private static String profileEndpointSource() {
-        try {
-            ProfileFile profileFile = ProfileFile.defaultProfileFile();
-            for (Map.Entry<String, Profile> entry : profileFile.profiles().entrySet()) {
-                if (entry.getValue().property(PROFILE_ENDPOINT_KEY).isPresent()) {
-                    return "profile [" + entry.getKey() + "]";
-                }
-                Optional<String> servicesSection = entry.getValue().property(PROFILE_SERVICES_KEY);
-                if (servicesSection.isPresent()
-                        && profileFile.getSection(PROFILE_SERVICES_KEY, servicesSection.get())
-                                .filter(section -> section.properties().keySet().stream()
-                                        .anyMatch(key -> key.endsWith(PROFILE_ENDPOINT_KEY)))
-                                .isPresent()) {
-                    return "services section [" + servicesSection.get() + "] of profile [" + entry.getKey() + "]";
-                }
-            }
-            return null;
-        } catch (RuntimeException unreadable) {
-            Debug.logVerbose("The AWS shared configuration could not be examined for an " + PROFILE_ENDPOINT_KEY
-                    + " declaration: " + unreadable.getClass().getName(), MODULE);
-            return null;
-        }
-    }
-
-    /**
-     * Validates the configured server-side encryption mode, and its key when it needs one.
-     *
-     * @param mode the value of {@code content.store.s3.sse}, possibly blank
-     * @param kmsKeyId the value of {@code content.store.s3.sse.kms.key.id}, possibly blank
-     * @return the mode to send on every PutObject, or null when no encryption header is to be sent
-     * @throws GeneralException if the mode is not one this provider supports, if {@code aws:kms} is
-     *     selected without a key, or if a key is configured for a mode that would never use it
-     */
-    private static String validatedServerSideEncryption(String mode, String kmsKeyId) throws GeneralException {
-        String requested = mode == null ? "" : mode.trim();
-        String selected;
-        if (requested.isEmpty() || SSE_NONE.equalsIgnoreCase(requested)) {
-            selected = null;
-        } else if (SSE_AES256.equalsIgnoreCase(requested)) {
-            selected = SSE_AES256;
-        } else if (SSE_KMS.equalsIgnoreCase(requested)) {
-            selected = SSE_KMS;
-        } else {
-            throw new GeneralException(SSE_PROPERTY + " must be blank, '" + SSE_NONE + "', '" + SSE_AES256
-                    + "' or '" + SSE_KMS + "'; [" + requested + "] is not a server-side encryption mode this"
-                    + " provider can request.");
-        }
-        boolean keySupplied = UtilValidate.isNotEmpty(kmsKeyId);
-        if (SSE_KMS.equals(selected) && !keySupplied) {
-            throw new GeneralException(SSE_PROPERTY + "=" + SSE_KMS + " requires " + SSE_KMS_KEY_PROPERTY
-                    + " to name the key objects are encrypted with.");
-        }
-        if (!SSE_KMS.equals(selected) && keySupplied) {
-            // Refused rather than ignored: a configured key that is never sent looks like protection that
-            // is in force when it is not.
-            throw new GeneralException(SSE_KMS_KEY_PROPERTY + " is set while " + SSE_PROPERTY + " is not '"
-                    + SSE_KMS + "', so the key would never be used. Set " + SSE_PROPERTY + "=" + SSE_KMS
-                    + " to use it, or clear the key.");
-        }
-        return selected;
-    }
-
-    /**
-     * Trims a value and reports blank as absent, so an empty environment variable is not mistaken for a
-     * setting.
-     *
-     * @param value the value to normalise
-     * @return the trimmed value, or null when there was nothing but whitespace
-     */
-    private static String trimmedToNull(String value) {
-        if (value == null) {
-            return null;
-        }
-        String trimmed = value.trim();
-        return trimmed.isEmpty() ? null : trimmed;
-    }
-
-    private URI validatedEndpoint(String endpoint) throws GeneralException {
+    private static URI endpointOverride(String endpoint) throws GeneralException {
         URI uri;
         try {
             uri = new URI(endpoint);
-        } catch (URISyntaxException e) {
-            // The value is never echoed, because the case this exists to catch is an endpoint carrying a
-            // credential. That rules out nesting the cause as much as quoting the value: GeneralException
-            // appends a nested exception's message to its own, and URISyntaxException always reports the whole
-            // input it was handed. Its reason and position carry the entire diagnostic and none of the value.
-            throw new GeneralException("content.store.s3.endpoint is not a valid URI: " + e.getReason()
-                    + (e.getIndex() < 0 ? "" : " at index " + e.getIndex()));
+        } catch (URISyntaxException malformed) {
+            throw new GeneralException(ENDPOINT_PROPERTY + " [" + endpoint + "] is not a valid URI", malformed);
         }
         String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
-        if (!"https".equals(scheme) && !"http".equals(scheme)) {
-            throw new GeneralException("content.store.s3.endpoint must be an absolute http or https URI");
-        }
-        if (uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
-            throw new GeneralException("content.store.s3.endpoint must name a host and must carry no user"
-                    + " information, query or fragment");
-        }
-        // Judged before the host is required to be one java.net.URI recognises, and judged on the authority
-        // as written when it is not. URI's host grammar rejects a label that starts with a digit followed by
-        // a letter, so 0xa9.0xfe.0xa9.0xfe reports no host at all - while the resolver inside the HTTP client
-        // accepts it as 169.254.169.254. Refusing it as "no host" would be the right outcome for the wrong
-        // reason, and the reason is what tells an operator what they did.
-        refuseCredentialDisclosingHost(uri.getHost() == null ? authorityHost(endpoint) : uri.getHost());
-        if (uri.getHost() == null) {
-            throw new GeneralException("content.store.s3.endpoint must name a host and must carry no user"
-                    + " information, query or fragment");
-        }
-        // Normalised the way the entry point normalises it - lower-cased and with the brackets of an IPv6
-        // literal removed - so that https://[FD00:EC2::254]/ and https://fd00:ec2::254/ are one host to
-        // both layers. java.net.URI.getHost() keeps the brackets, which is why they are stripped here.
-        String host = unbracketed(uri.getHost().toLowerCase(Locale.ROOT));
-        for (String metadataHost : INSTANCE_METADATA_HOSTS) {
-            if (unbracketed(metadataHost).equals(host)) {
-                throw new GeneralException("content.store.s3.endpoint must not name a cloud instance metadata"
-                        + " address; a request sent there would disclose the instance's own role credentials");
-            }
+        if (UtilValidate.isEmpty(uri.getHost()) || !("http".equals(scheme) || "https".equals(scheme))) {
+            throw new GeneralException(ENDPOINT_PROPERTY + " [" + endpoint + "] must be an absolute http or https"
+                    + " URI, for example https://s3.example.internal:9000");
         }
         if ("http".equals(scheme)) {
-            requirePlaintextEndpointIsAcceptable(host);
+            Debug.logWarning("The content store endpoint [" + endpoint + "] is plain http, so object content and"
+                    + " the credentials that sign for it cross the network unencrypted. Use https unless the"
+                    + " endpoint is reached over a network the deployment controls end to end.", MODULE);
         }
         return uri;
     }
 
     /**
-     * Reports whether an S3 failure means the object is there but has no byte in the requested range.
+     * Reads a required setting.
      *
-     * <p>Only {@link #exists} asks for a range, and it asks for {@value #EXISTENCE_RANGE}, so the one
-     * object this can be true of is an empty one - which {@link #put} is allowed to store. Present, and
-     * therefore neither absence nor failure.
-     *
-     * @param e the SDK failure
-     * @return {@code true} only when the store reported the range as unsatisfiable
+     * @param name the property name
+     * @return the configured value
+     * @throws GeneralException if it is absent or blank
      */
-    private static boolean isEmptyObjectRange(S3Exception e) {
-        AwsErrorDetails details = e.awsErrorDetails();
-        return details != null && EMPTY_RANGE_ERROR_CODE.equals(details.errorCode());
+    private static String required(String name) throws GeneralException {
+        String value = ContentStoreFactory.setting(name, "");
+        if (value.isEmpty()) {
+            throw new GeneralException(name + " is required when content.store.provider is s3");
+        }
+        return value;
     }
 
     /**
-     * Requires that a plaintext endpoint is one this deployment may really use.
+     * Returns how many bytes the bucket holds for a key.
      *
-     * <p>Every object written carries the store credential and every object read may be content that is
-     * not public, so a plaintext endpoint exposes both to anything on the network path. Two cases are
-     * accepted, and nothing else is:
-     *
-     * <ul>
-     * <li><strong>A store on this host.</strong> Traffic to a loopback address never reaches a network,
-     * so there is no path to expose it on. This is the local MinIO a developer runs beside OFBiz, and it
-     * is why the zero-configuration development flow needs no setting at all.</li>
-     * <li><strong>An explicitly permitted store.</strong> {@code content.store.s3.insecure.endpoint
-     * .allowed=true} states that plaintext is acceptable for this deployment. The container entry point
-     * renders it from {@code OFBIZ_PROFILE} - true only for a development profile that supplied an
-     * {@code http://} endpoint, and never in the deployed profile, which refuses such an endpoint
-     * outright before the JVM starts. Committed {@code false}, so a hand-maintained
-     * {@code content.properties} has to say so as well.</li>
-     * </ul>
-     *
-     * <p>The refusal replaces a warning. A warning in a start-up log is not a defence: the credentials
-     * travel in clear text either way, and the deployment that most needs to be told is the one nobody
-     * is reading the log of.
-     *
-     * @param host the endpoint's host, lower-cased and without IPv6 brackets
-     * @throws GeneralException when the endpoint is plaintext, is not on this host, and has not been
-     *     explicitly permitted
+     * @param key the storage key
+     * @return the object's length in bytes
+     * @throws FileNotFoundException if the bucket holds no such key
+     * @throws IOException if the store cannot answer
      */
-    private void requirePlaintextEndpointIsAcceptable(String host) throws GeneralException {
-        if (isLoopbackHost(host)) {
-            Debug.logInfo("content.store.s3.endpoint uses http to a loopback address, which never leaves this"
-                    + " host. Accepted for a store running beside this instance.", MODULE);
-            return;
-        }
-        if (!requiredBoolean(INSECURE_ENDPOINT_PROPERTY, deploymentValue(INSECURE_ENDPOINT_PROPERTY), false)) {
-            throw new GeneralException("content.store.s3.endpoint uses http to a host other than this one, so"
-                    + " object-store traffic and the credentials it carries would not be encrypted. Use https,"
-                    + " or - for a development store only - set " + INSECURE_ENDPOINT_PROPERTY + "=true. A"
-                    + " container renders that setting from OFBIZ_PROFILE and never permits it in the deployed"
-                    + " profile.");
-        }
-        Debug.logWarning("content.store.s3.endpoint uses http, so object-store traffic and the credentials it"
-                + " carries are not encrypted. Accepted only because " + INSECURE_ENDPOINT_PROPERTY + " is true,"
-                + " which is a development setting.", MODULE);
+    private long size(String key) throws IOException {
+        return head(key).contentLength();
     }
 
     /**
-     * Reports whether a host names this machine, and therefore an endpoint whose traffic never reaches
-     * a network.
+     * Reads an object's metadata with HeadObject, which is the existence check this provider uses.
      *
-     * <p>Decided from the literal text rather than by resolving the name, deliberately: resolving it
-     * would make the answer depend on DNS at the moment the provider is built, and a name that resolves
-     * to a loopback address today can resolve elsewhere tomorrow - which is exactly the kind of change
-     * that must not silently turn a refused endpoint into an accepted one.
-     *
-     * @param host the endpoint's host, lower-cased and without IPv6 brackets
-     * @return true for {@code localhost}, an IPv4 loopback address or the IPv6 loopback address
+     * @param key the storage key
+     * @return the object's metadata
+     * @throws FileNotFoundException if the bucket holds no such key
+     * @throws IOException if the store cannot answer
      */
-    private static boolean isLoopbackHost(String host) {
-        return "localhost".equals(host)
-                || "::1".equals(host)
-                || "0:0:0:0:0:0:0:1".equals(host)
-                || host.matches("127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}");
-    }
-
-    /**
-     * Removes the brackets an IPv6 literal is written with, leaving every other host unchanged.
-     *
-     * @param host the host as written
-     * @return the host without surrounding brackets
-     */
-    private static String unbracketed(String host) {
-        return host.startsWith("[") && host.endsWith("]") ? host.substring(1, host.length() - 1) : host;
-    }
-
-    /**
-     * Refuses an endpoint host that names, or resolves to, an address which answers with this deployment's
-     * own credentials.
-     *
-     * <p>A textual comparison against {@code 169.254.169.254} is not a defence, because that address can be
-     * written in forms that share no characters with it: {@code 2852039166} as one decimal number,
-     * {@code 0xA9FEA9FE} as one hexadecimal number, {@code 0251.0376.0251.0376} in octal,
-     * {@code 169.254.43518} in the three-part short form, and every mixture of those. The C resolver, and
-     * therefore the SDK's HTTP client, accepts all of them as the same address. So the host is
-     * <em>canonicalized</em> instead - parsed into the address it actually denotes - and the address is what
-     * is judged.
-     *
-     * <p>What is refused, and why the ranges rather than the individual addresses:
-     *
-     * <ul>
-     * <li>every IPv4 address in {@code 169.254.0.0/16}, the link-local range. The EC2, GCE and Azure
-     * metadata service ({@code 169.254.169.254}) and the ECS task metadata endpoint
-     * ({@code 169.254.170.2}) both live there, and nothing legitimately reachable does: a link-local
-     * address is not routable, so no object store can be behind one;</li>
-     * <li>every IPv6 link-local address, {@code fe80::/10}, for the same reason;</li>
-     * <li>{@code fd00:ec2::254} exactly, the IPv6 form of the EC2 metadata service. Only that address, not
-     * the surrounding unique-local range, which is legitimate private space an object store may well sit
-     * in;</li>
-     * <li>the metadata host <em>names</em> in {@link #INSTANCE_METADATA_NAMES}, refused whether or not they
-     * resolve.</li>
-     * </ul>
-     *
-     * <p><strong>DNS aliases and rebinding.</strong> A name that resolves to any of the above is refused too,
-     * so an alias cannot be used to reach the metadata service. A name that does not resolve at all is
-     * reported and accepted: a container is routinely started before its resolver, or before the private
-     * zone holding the store's name, is reachable, and refusing would turn that into a failed deployment
-     * while accepting costs nothing - the SDK resolves the name again on every connection and this check is
-     * not what stands between the process and the network. For the same reason this check cannot defend
-     * against rebinding, where a name resolves acceptably here and to a metadata address later: nothing at
-     * this layer can, because the resolution that matters happens inside the HTTP client on each request.
-     * The control for that is egress policy - a security group, a firewall rule or a proxy that refuses
-     * link-local destinations - and IMDSv2 on the instance. This check is defence in depth against a
-     * configuration mistake or a single tampered variable, and is deliberately not claimed to be more.
-     *
-     * @param configuredHost the host component of the configured endpoint, as {@code java.net.URI} reports it
-     *     - which keeps the brackets of an IPv6 literal
-     * @throws GeneralException if the host names or resolves to a credential-disclosing address
-     */
-    private static void refuseCredentialDisclosingHost(String configuredHost) throws GeneralException {
-        String host = configuredHost.toLowerCase(Locale.ROOT);
-        if (host.startsWith("[") && host.endsWith("]")) {
-            host = host.substring(1, host.length() - 1);
-        }
-        for (String metadataName : INSTANCE_METADATA_NAMES) {
-            if (metadataName.equals(host)) {
-                throw metadataRefusal();
-            }
-        }
-        InetAddress literal = numericAddress(host);
-        if (literal != null) {
-            if (disclosesCredentials(literal)) {
-                throw metadataRefusal();
-            }
-            return;
-        }
-        InetAddress[] resolved;
+    private HeadObjectResponse head(String key) throws IOException {
         try {
-            HostResolver resolver = HOST_RESOLVER.get();
-            resolved = resolver == null ? InetAddress.getAllByName(host) : resolver.resolve(host);
-        } catch (UnknownHostException unresolved) {
-            // Reported and accepted; see the DNS paragraph above. The name is not echoed at error level
-            // because an endpoint is configuration an operator supplied and may carry deployment topology.
-            Debug.logInfo("The content.store.s3.endpoint host does not resolve yet, so it could not be checked"
-                    + " against the cloud instance metadata addresses. The object store's own client resolves"
-                    + " it again on every connection.", MODULE);
-            return;
-        }
-        for (InetAddress address : resolved) {
-            if (disclosesCredentials(address)) {
-                throw metadataRefusal();
+            return client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
+        } catch (NoSuchKeyException absent) {
+            throw absence(key, absent);
+        } catch (S3Exception failure) {
+            // A store that answers 404 without the NoSuchKey code - which several S3-compatible
+            // implementations do for HeadObject, because a HEAD response carries no error body to put a
+            // code in - is reporting absence just as much as NoSuchKeyException is.
+            if (failure.statusCode() == 404) {
+                throw absence(key, failure);
             }
+            throw failed("read", key, failure);
+        } catch (SdkException failure) {
+            throw failed("read", key, failure);
         }
     }
 
     /**
-     * Extracts the host component of an endpoint textually, for a value {@code java.net.URI} parses but whose
-     * host it declines to recognise.
+     * Reports an object the bucket does not hold, as the contract's one absence signal.
      *
-     * <p>Everything between {@code ://} and the first {@code /}, {@code ?} or {@code #}, less any user
-     * information and any port, with the brackets of an IPv6 literal removed. Deliberately permissive: this
-     * is only ever used to decide whether a value that has already failed URI's host grammar is nonetheless a
-     * metadata address, so being generous about what it extracts can only widen the refusal.
-     *
-     * @param endpoint the configured endpoint
-     * @return the host as written, possibly empty
-     */
-    private static String authorityHost(String endpoint) {
-        int schemeEnd = endpoint.indexOf("://");
-        String authority = schemeEnd < 0 ? endpoint : endpoint.substring(schemeEnd + 3);
-        for (String terminator : new String[] {"/", "?", "#"}) {
-            int end = authority.indexOf(terminator);
-            if (end >= 0) {
-                authority = authority.substring(0, end);
-            }
-        }
-        int userInfoEnd = authority.lastIndexOf('@');
-        if (userInfoEnd >= 0) {
-            authority = authority.substring(userInfoEnd + 1);
-        }
-        if (authority.startsWith("[")) {
-            int bracketEnd = authority.indexOf(']');
-            return bracketEnd < 0 ? authority : authority.substring(1, bracketEnd);
-        }
-        int portStart = authority.lastIndexOf(':');
-        return portStart < 0 ? authority : authority.substring(0, portStart);
-    }
-
-    /**
-     * Reports whether an address is one that answers with the instance's own credentials.
-     *
-     * @param address the address to judge
-     * @return {@code true} when a request sent there could disclose role credentials
-     */
-    private static boolean disclosesCredentials(InetAddress address) {
-        if (address.isLinkLocalAddress()) {
-            // Covers 169.254.0.0/16 and fe80::/10 in every spelling, because this is decided from the
-            // address bytes and not from how the address was written.
-            return true;
-        }
-        byte[] octets = address.getAddress();
-        if (octets.length == 4) {
-            return (octets[0] & 0xFF) == LINK_LOCAL_FIRST_OCTET && (octets[1] & 0xFF) == LINK_LOCAL_SECOND_OCTET;
-        }
-        try {
-            return address.equals(InetAddress.getByName(METADATA_IPV6_ADDRESS));
-        } catch (UnknownHostException impossible) {
-            // A literal, so it never resolves. Kept as a failure rather than swallowed silently.
-            Debug.logWarning("The IPv6 metadata address literal [" + METADATA_IPV6_ADDRESS + "] could not be"
-                    + " parsed, so an endpoint could not be compared with it", MODULE);
-            return false;
-        }
-    }
-
-    /**
-     * Builds the refusal, so that every path refuses with the same words.
-     *
-     * <p>The configured value is deliberately not quoted back: the message reaches whoever supplied it, and
-     * an endpoint is the one setting most likely to have a credential embedded in it.
-     *
-     * @return the refusal to throw
-     */
-    private static GeneralException metadataRefusal() {
-        return new GeneralException("content.store.s3.endpoint must not name, or resolve to, a cloud instance"
-                + " metadata address; a request sent there would disclose the instance's own role credentials."
-                + " This is refused in every profile and has no override.");
-    }
-
-    /**
-     * Parses a host as a numeric address literal, in any of the forms a resolver accepts, without consulting
-     * DNS.
-     *
-     * <p>The IPv4 forms are the {@code inet_aton} grammar: one to four dot-separated parts, each decimal,
-     * octal when it carries a leading {@code 0}, or hexadecimal when it carries a leading {@code 0x}. Fewer
-     * than four parts means the last part supplies the remaining octets - so {@code 169.254.43518} and
-     * {@code 2852039166} both denote {@code 169.254.169.254}. Reproducing that grammar here is the whole
-     * point: the platform's own {@code InetAddress.getByName} accepts some of these forms and rejects
-     * others depending on the release, and a check that relied on it would silently stop covering the forms
-     * it stopped accepting - while the C resolver inside the HTTP client would go on accepting them.
-     *
-     * @param host the lower-cased host, with any IPv6 brackets already removed
-     * @return the address the host denotes, or {@code null} when it is not a numeric literal and therefore
-     *     has to be resolved
-     */
-    private static InetAddress numericAddress(String host) {
-        if (host.indexOf(':') >= 0) {
-            // An IPv6 literal is the one numeric form with no ambiguity, and getByName parses it without
-            // resolving anything because a name may not contain a colon.
-            try {
-                return InetAddress.getByName(host);
-            } catch (UnknownHostException notALiteral) {
-                Debug.logVerbose(notALiteral, "The content.store.s3.endpoint host is not an IPv6 literal", MODULE);
-                return null;
-            }
-        }
-        String[] parts = host.split("\\.", -1);
-        if (parts.length > MAX_IPV4_PARTS) {
-            return null;
-        }
-        long[] values = new long[parts.length];
-        for (int index = 0; index < parts.length; index++) {
-            long value = numericPart(parts[index]);
-            // The last part carries every octet the earlier parts did not, so its ceiling grows as the
-            // number of parts shrinks; every earlier part is one octet.
-            long ceiling = index == parts.length - 1
-                    ? (MAX_IPV4_VALUE >>> (OCTET_BITS * index))
-                    : 0xFFL;
-            if (value < 0L || value > ceiling) {
-                return null;
-            }
-            values[index] = value;
-        }
-        long address = values[parts.length - 1];
-        for (int index = 0; index < parts.length - 1; index++) {
-            address |= values[index] << (OCTET_BITS * (MAX_IPV4_PARTS - 1 - index));
-        }
-        byte[] octets = {
-            (byte) (address >>> 24), (byte) (address >>> 16), (byte) (address >>> 8), (byte) address,
-        };
-        try {
-            return InetAddress.getByAddress(octets);
-        } catch (UnknownHostException impossible) {
-            // Four bytes is always a valid IPv4 address; this branch exists only because the method declares it.
-            Debug.logWarning("Four octets were rejected as an address, which cannot happen", MODULE);
-            return null;
-        }
-    }
-
-    /**
-     * Parses one part of an IPv4 literal in decimal, octal or hexadecimal.
-     *
-     * @param part the part as written
-     * @return its value, or {@code -1} when it is not a number in any of the three bases
-     */
-    private static long numericPart(String part) {
-        try {
-            if (part.startsWith("0x")) {
-                return part.length() == 2 ? -1L : Long.parseLong(part.substring(2), 16);
-            }
-            if (part.length() > 1 && part.charAt(0) == '0') {
-                return Long.parseLong(part.substring(1), 8);
-            }
-            return part.isEmpty() ? -1L : Long.parseLong(part, 10);
-        } catch (NumberFormatException notANumber) {
-            return -1L;
-        }
-    }
-
-    /**
-     * Installs, or removes, the host resolver this package's test supplies.
-     *
-     * <p>Package-private, and null in every deployment. It exists so the DNS-alias policy above can be
-     * asserted without a name server: a test installs a resolver that answers a chosen name with a chosen
-     * address, or that reports the name as unresolvable, and the endpoint check behaves exactly as it would
-     * against a real resolver that said the same thing.
-     *
-     * @param resolver the resolver to use, or {@code null} to restore the platform resolver
-     */
-    static void installHostResolverForTesting(HostResolver resolver) {
-        HOST_RESOLVER.set(resolver);
-    }
-
-    /**
-     * Installs, or removes, the SDK construction this package's test supplies.
-     *
-     * <p>Package-private, and null in every deployment, so a deployed instance always builds a real
-     * client from a real builder and authenticates through the real default credential chain.
-     *
-     * @param construction the construction to use, or {@code null} to restore the real SDK
-     */
-    static void installSdkConstructionForTesting(SdkConstruction construction) {
-        SDK_CONSTRUCTION.set(construction);
-    }
-
-    /**
-     * Returns the SDK construction in force: the one a test installed, or the real SDK.
-     *
-     * @return the construction to create this provider's client and credential provider with
-     */
-    private static SdkConstruction sdkConstruction() {
-        SdkConstruction installed = SDK_CONSTRUCTION.get();
-        return installed != null ? installed : REAL_SDK;
-    }
-
-    /**
-     * Reports whether an S3 failure means the key holds nothing, as opposed to meaning the store
-     * could not be used at all.
-     *
-     * <p>Decided by error code, never by status code. A missing bucket answers 404 with
-     * {@code NoSuchBucket}, and an endpoint that is not an object store answers 404 with no error
-     * code at all; treating either as absence would report a misconfigured deployment as content
-     * that simply is not there, which turns a loud failure into missing content. So only
-     * {@value #ABSENT_ERROR_CODE} is absence, and a failure that carries no error code is a failure.
-     *
-     * @param e the SDK failure
-     * @return {@code true} only when the store reported that this key holds nothing
-     */
-    private static boolean isAbsence(S3Exception e) {
-        if (e instanceof NoSuchBucketException) {
-            // Named rather than left to the error code, so that a store which reports a missing
-            // bucket with some other code still cannot be mistaken for a missing object.
-            return false;
-        }
-        AwsErrorDetails details = e.awsErrorDetails();
-        return details != null && ABSENT_ERROR_CODE.equals(details.errorCode());
-    }
-
-    /**
-     * Builds the absence report the contract requires, so that a caller never has to know an SDK
-     * type to recognise it.
-     *
-     * <p>The message names the key the caller asked for and nothing else. The bucket and the
-     * prefixed object key are deployment layout, so they go to the log rather than into an exception
-     * that a rendered page could show.
-     *
-     * <p>The SDK failure itself never crosses the boundary, for the reason given on
-     * {@link #storeFailure}: its message can quote the request that produced it, and an absence report
-     * travels back through the content-rendering path. What is attached instead is a
-     * {@link RedactedStoreCause} - the same sanitised description that goes to the log - so that code
-     * which inspects a cause has something to inspect and nothing to leak.
-     *
-     * @param key the key as the caller supplied it
-     * @param objectKey the prefixed object key that holds nothing, for the log
-     * @param cause the SDK failure that reported it
+     * @param key the storage key
+     * @param cause what the SDK reported
      * @return the exception to throw
      */
-    private FileNotFoundException absent(String key, String objectKey, SdkException cause) {
-        Debug.logVerbose("The S3 content store holds no content under " + logReference(objectKey) + ": "
-                + redacted(cause), MODULE);
-        FileNotFoundException absent = new FileNotFoundException("No content is stored under [" + key + "]");
-        // initCause because FileNotFoundException declares no constructor that takes one.
-        absent.initCause(new RedactedStoreCause(cause));
+    private FileNotFoundException absence(String key, SdkException cause) {
+        FileNotFoundException absent = new FileNotFoundException("The content store holds no " + reference(key));
+        absent.initCause(cause);
         return absent;
     }
 
     /**
-     * Translates an SDK failure into the contract's failure without disclosing where this deployment
-     * keeps its content.
+     * Reports a store that could not answer, which is never absence.
      *
-     * <p>The thrown message is fixed text plus an opaque reference. It carries no bucket, no object
-     * key and none of the store's own message, because an {@link IOException} raised while rendering
-     * content can reach the rendered page. The reference is logged beside the bucket, the key and the
-     * sanitised type, status, error code and request id, so an operator joins the report an end user
-     * quotes to the failure that produced it.
-     *
-     * <p><strong>The SDK failure itself crosses no boundary.</strong> It is not attached and it is not
-     * handed to {@code Debug} in any form, not even behind the verbose switch, because both routes
-     * republish whatever the SDK quoted: an SDK message can quote the request it was building, endpoint
-     * and signed headers included, and {@code Debug} given the object writes its message and its whole
-     * stack trace, which is the one route that bypasses the sanitising below.
-     *
-     * <p><strong>A sanitised stand-in IS attached, though.</strong> Detaching the cause outright also
-     * removed every programmatic diagnostic: a caller that wanted to distinguish an expired deadline
-     * from {@code AccessDenied} - to decide whether retrying could ever help, or to raise the right
-     * alert - had only fixed English text and an opaque reference to work from, in an exception whose
-     * cause chain was empty. {@link RedactedStoreCause} closes that gap without reopening the first
-     * one: it carries the type, status, error code and request id as fields and as its message, carries
-     * no stack trace, no suppression and no cause of its own, and quotes nothing of the SDK's own
-     * message. Logging it, or reading {@code getCause().getMessage()}, therefore yields exactly what
-     * the log line under the same reference already says.
-     *
-     * @param operation what was being attempted, for the diagnostic
-     * @param objectKey the key the request named
-     * @param cause the SDK failure
+     * @param operation what was attempted, for the message
+     * @param key the storage key
+     * @param cause what the SDK reported
      * @return the exception to throw
      */
-    private IOException storeFailure(String operation, String objectKey, SdkException cause) {
-        String reference = reference();
-        Debug.logError("Content store failure [" + reference + "]: could not " + operation + " "
-                + logReference(objectKey) + "; " + redacted(cause), MODULE);
-        return new IOException("The content store could not " + operation + " the requested content."
-                + " Reference [" + reference + "].", new RedactedStoreCause(cause));
+    private IOException failed(String operation, String key, SdkException cause) {
+        return new IOException("The content store could not " + operation + " " + reference(key) + ": "
+                + cause.getMessage(), cause);
     }
 
     /**
-     * The only description of an SDK failure that is allowed to travel with a translated exception.
+     * Names an object in a log line or a message, per the logging policy {@link ContentStore} publishes.
      *
-     * <p>It exists so that the outward message can stay fixed text plus a reference while an inspecting
-     * caller still gets something to branch on. Everything it holds comes from {@link #redacted}, which
-     * uses only the fields that IDENTIFY a failure - the type, and for a service failure the HTTP
-     * status, the error code and the request id - and never the SDK's own message, cause or stack.
-     *
-     * <p>Deliberately stack-less, suppression-less and cause-less: it is constructed at the point of
-     * translation rather than where the failure happened, so a stack trace of its own would describe the
-     * translator and mislead, and any cause it carried would be the SDK failure this class exists to
-     * keep out of the chain.
-     *
-     * <p>Nested here rather than given a file of its own because it is a detail of this provider's error
-     * contract and the plan isolates the object-store code to this package.
+     * @param key the storage key
+     * @return the bucket and key
      */
-    static final class RedactedStoreCause extends RuntimeException {
-
-        private static final long serialVersionUID = 1L;
-
-        /** The simple type name of the failure that was translated, always present. */
-        private final String failureType;
-
-        /** The HTTP status a service failure reported, or -1 for a client-side failure. */
-        private final int statusCode;
-
-        /** The service error code, or an empty string when there was none. */
-        private final String errorCode;
-
-        /** The service request id, or an empty string when there was none. */
-        private final String requestId;
-
-        /**
-         * Describes a failure using only the fields that identify it.
-         *
-         * @param cause the failure to describe, an SDK one or one the client builder raised
-         */
-        RedactedStoreCause(RuntimeException cause) {
-            // No cause, no suppression, no stack trace: see the class comment.
-            super(redacted(cause), null, false, false);
-            this.failureType = cause.getClass().getSimpleName();
-            this.statusCode = cause instanceof SdkServiceException service ? service.statusCode() : -1;
-            String code = cause instanceof S3Exception s3 && s3.awsErrorDetails() != null
-                    ? s3.awsErrorDetails().errorCode()
-                    : null;
-            this.errorCode = code == null ? "" : code;
-            String id = cause instanceof SdkServiceException service && service.requestId() != null
-                    ? service.requestId()
-                    : null;
-            this.requestId = id == null ? "" : id;
-        }
-
-        /**
-         * Reports the simple type name of the failure that was translated.
-         *
-         * @return the type name, never null
-         */
-        public String failureType() {
-            return failureType;
-        }
-
-        /**
-         * Reports the HTTP status a service failure carried.
-         *
-         * @return the status, or -1 when the failure was client-side and carried none
-         */
-        public int statusCode() {
-            return statusCode;
-        }
-
-        /**
-         * Reports the service error code the failure carried.
-         *
-         * @return the error code, or an empty string when there was none
-         */
-        public String errorCode() {
-            return errorCode;
-        }
-
-        /**
-         * Reports the service request id the failure carried.
-         *
-         * @return the request id, or an empty string when there was none
-         */
-        public String requestId() {
-            return requestId;
-        }
-    }
-
-    /**
-     * Describes an SDK failure using only fields that identify it without quoting it.
-     *
-     * <p>The type is always named, because it is the only diagnostic a client-side failure - an expired
-     * deadline, a connection that could not be made - carries at all, and because a service failure is
-     * easier to act on when the report says which kind it was. Nothing else of the failure is used: not
-     * its message, not its cause and not its stack trace.
-     *
-     * <p>Declared over {@link RuntimeException} rather than over {@link SdkException} because the client
-     * builder refuses an unusable region or override with an {@code IllegalArgumentException} as readily as
-     * the SDK refuses one with an {@code SdkException}, and that refusal has to be described by exactly the
-     * same rules. Everything below is reached through {@code instanceof}, so an argument that is an SDK
-     * failure is described exactly as it was before.
-     *
-     * @param cause the failure, an SDK one or one the client builder raised
-     * @return the failure's type, with its status, error code and request id where it carries them
-     */
-    private static String redacted(RuntimeException cause) {
-        String type = "failure [" + cause.getClass().getSimpleName() + "]";
-        if (!(cause instanceof SdkServiceException service)) {
-            return type;
-        }
-        String errorCode = cause instanceof S3Exception s3 && s3.awsErrorDetails() != null
-                ? s3.awsErrorDetails().errorCode()
-                : "";
-        return type + ", status [" + service.statusCode() + "], error-code [" + (errorCode == null ? "" : errorCode)
-                + "], request-id [" + (service.requestId() == null ? "" : service.requestId()) + "]";
-    }
-
-    /**
-     * Names one stored object in the log, without naming it.
-     *
-     * <p>Delegates to {@link ContentStore#logReference(String)} - the one implementation the whole
-     * package shares - over the BUCKET AND THE KEY TOGETHER, because that pair is what identifies an
-     * object: two deployments sharing one key in different buckets must not report the same reference,
-     * and neither the key (which carries the uploader's file name and the deployment's directory layout)
-     * nor the bucket may reach the log on its own. The result is stable for the life of the deployment,
-     * so an operator can tell one object's repeated failure from many objects failing once, and it
-     * cannot be turned back into either half. See that method for the diagnostic override.
-     *
-     * @param objectKey the prefixed object key, as sent to the store
-     * @return the reference to write into a log message
-     */
-    private String logReference(String objectKey) {
-        return ContentStore.logReference(bucket + "/" + objectKey);
-    }
-
-    /**
-     * Mints the opaque reference that joins a report an end user can see to the log line that
-     * explains it.
-     *
-     * @return a reference that identifies one failure and describes nothing about the deployment
-     */
-    private static String reference() {
-        return UUID.randomUUID().toString();
-    }
-
-    /**
-     * Reads one of the provider's overridable tunables.
-     *
-     * <p>Read through {@link ContentStoreFactory#propertyValue}, the one accessor this package reads an
-     * overridable {@code content.store.*} value with, so that a value overridden through the
-     * {@code SystemProperty} entity reaches this provider exactly as it reaches the factory.
-     *
-     * @param name the property name; must be a tunable, not one of
-     *     {@link ContentStoreFactory#DEPLOYMENT_PROPERTIES}
-     * @param delegator the delegator the value is read through; may be null, in which case only
-     *     {@code content.properties} is consulted
-     * @return the configured value, trimmed, or an empty string when it is not set
-     */
-    private static String property(String name, Delegator delegator) {
-        return ContentStoreFactory.propertyValue(name, delegator);
-    }
-
-    /**
-     * Reads one of the values that decide where this deployment's content is written and which
-     * principal writes it.
-     *
-     * <p>Read through {@link ContentStoreFactory#deploymentValue}, which consults
-     * {@code content.properties} alone. These are the values the container entry point validates and
-     * renders from the environment, and honouring a {@code SystemProperty} row over them would let a
-     * database row point a fleet at another bucket, another endpoint or another principal in a change
-     * no start-up validation sees. See {@link ContentStoreFactory#DEPLOYMENT_PROPERTIES}.
-     *
-     * @param name the property name; must be one of {@link ContentStoreFactory#DEPLOYMENT_PROPERTIES}
-     * @return the configured value, trimmed, or an empty string when it is not set
-     */
-    private static String deploymentValue(String name) {
-        return ContentStoreFactory.deploymentValue(name);
+    private String reference(String key) {
+        return "[" + bucket + "/" + key + "]";
     }
 }

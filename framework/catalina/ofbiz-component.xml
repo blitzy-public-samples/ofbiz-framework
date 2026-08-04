@@ -33,57 +33,27 @@ under the License.
         <property name="apps-context-reloadable" value="false"/>
         <property name="apps-cross-context" value="false"/>
         <property name="apps-distributable" value="false"/><!-- you must also set all the webapps you want distributable, by adding <distributable/> in their web.xml file -->
-        <!-- SESSION SCOPE OF THIS CONFIGURATION - read this before relying on jvm-route below.
-
-             HTTP sessions in this configuration are INSTANCE-LOCAL. They are held in the memory of the one
-             instance that created them and are neither replicated to another instance nor stored anywhere
-             outside the JVM: apps-distributable is false above, the cluster/session-replication block further
-             down is commented out, and no external session store is configured. The consequence is explicit:
-             if an instance is replaced, scaled in, restarted or lost, every session it was holding is LOST,
-             and the users holding those sessions are logged out and have to sign in again on the instance
-             they land on next.
-
-             jvm-route below does NOT change that. It is sticky-routing metadata only: it appends this
-             instance's id to the session cookie so a load balancer configured for sticky sessions can send a
-             returning request back to the instance that owns the session. It provides no replication and no
-             failover - there is nothing for the balancer to fail over TO. Sticky routing keeps a session
-             usable while its instance is alive; it cannot restore one after that instance is gone.
-
-             WHAT THIS FLEET IS, STATED WITHOUT OVERCLAIMING. It is a STICKY fleet whose instances are
-             replaceable AT THE COST OF LOGGING OUT the users whose sessions they held. It is not a fleet of
-             interchangeable instances that a request can be moved between mid-session, and nothing in this
-             configuration makes it one. Every claim of statelessness in this work is about DURABLE state and
-             only about durable state: the database holds the data, the object store holds file-backed content
-             and uploads, the entity caches are kept coherent by distributed cache clear, and being polled by
-             a load balancer leaves no session behind.
-             That last point has to be stated precisely, because it is NOT achieved by a probe bypassing the
-             webapp's filters. It does not bypass them: ControlFilter and ContextFilter are both mapped to /*
-             and both call getSession() unconditionally, ControlFilter before it even consults its allowedPaths
-             list, so a session IS created for a probe exactly as it is for /ping.txt. What leaves nothing
-             behind is that HealthCheckServlet then invalidates the session created for the request and
-             suppresses its cookie - and it is mapped on the /health/ PREFIX precisely so that it, rather than
-             the container's default servlet, answers a near miss such as /health/live-x and discards that
-             request's session too. The valve exemption described further down is the layer above that, at
-             engine scope.
-             Session state is the one category that is neither durable nor externalised, and its loss is
-             recoverable by signing in again, which is why it is accepted rather than solved here.
-
-             This is a deliberate, documented limitation of the stateless-deployment work rather than an
-             oversight. Adding session replication or an external session store would be a separate change
-             with its own transport, serialization and operational cost; see the "Running more than one
-             instance" section of DOCKER.adoc, which states the same limitation for operators in the same
-             terms. Three practical consequences worth planning around: configure the balancer for sticky
-             sessions or signed-in users will be logged out on their next request rather than on replacement;
-             drain connections before terminating an instance so sessions end at a moment of your choosing;
-             and expect a deployment that rolls every instance to log every signed-in user out. -->
+        <!-- SESSION SCOPE - read this before relying on jvm-route below.
+             HTTP sessions here are INSTANCE-LOCAL: apps-distributable is false, the cluster block further down
+             is commented out and no external session store is configured, so a session is held only in the
+             memory of the instance that created it. If that instance is replaced, scaled in or restarted, its
+             sessions are LOST and the users holding them have to sign in again.
+             jvm-route does not change that. It is sticky-routing metadata only - it appends this instance's id
+             to the session cookie so a balancer configured for sticky sessions can send a returning request
+             back to the instance that owns the session. It is not replication and provides no failover.
+             Every statelessness claim in this work is therefore about DURABLE state: the database holds the
+             data, the content store holds file-backed content and uploads, and the entity caches are kept
+             coherent by distributed cache clear. Session state is the one category that is neither durable nor
+             externalised, and its loss is recoverable by signing in again, which is why it is accepted here
+             rather than solved. Adding replication or an external session store would be a separate change;
+             see "Running more than one instance" in DOCKER.adoc. -->
         <!-- configuration of the Tomcat service that hosts OFBiz applications: the service has one engine and one or more connectors -->
         <property name="default-server" value="engine">
             <property name="default-host" value="0.0.0.0"/>
-            <!-- Per-instance sticky-session route id. Behind a load balancer that uses sticky sessions, give every
-                 instance a DISTINCT value so the balancer can route a session back to the instance that owns it.
-                 An empty value is treated as absent by ContainerConfig, so no JVM route is set at all.
-                 STICKY ROUTING ONLY - it is not session replication and provides no failover. See the session
-                 scope note above: a session does not survive the instance that created it. -->
+            <!-- Per-instance sticky-session route id, set from OFBIZ_JVM_ROUTE by docker-entrypoint.sh.
+                 Behind a balancer using sticky sessions, give every instance a DISTINCT value. An empty value
+                 is treated as absent by ContainerConfig, so no JVM route is set at all. STICKY ROUTING ONLY -
+                 see the session scope note above. -->
             <property name="jvm-route" value="jvm1"/>
             <property name="access-log-pattern">
                 <property-value>%h %l %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"</property-value>
@@ -123,63 +93,24 @@ under the License.
                  Left EMPTY by default, which ContainerConfig treats as absent, so the SslAcceleratorValve is NOT
                  installed and an unconfigured deployment behaves as it does with no such declaration at all.
 
-                 TRUST BOUNDARY - READ BEFORE ENABLING THIS. SslAcceleratorValve grants TLS semantics on the
-                 strength of request.getLocalPort() alone: every request arriving on the configured port is marked
-                 secure, whoever sent it. It does NOT verify that the request came through the load balancer, and
-                 it consults no X-Forwarded-Proto, no Forwarded header and no source address. So the port number
-                 is not the trust decision - the NETWORK is. Enabling this without restricting the port means any
-                 client that can reach the instance directly gets a request that OFBiz, and every control keyed on
-                 request.isSecure(), treats as HTTPS: cookies marked secure are accepted over clear text,
-                 https-only request maps and X.509 gated paths become reachable, and absolute URLs are rebuilt as
-                 https, all over an unencrypted hop.
-                 The port may therefore be enabled only when the forwarded-traffic connector is unreachable except
-                 through the proxy. Bind it to a private interface (uncomment and set the http-connector 'address'
-                 property below, or publish only the loadbalancer-facing address) and restrict it in the network
-                 layer - a security group, firewall rule or private subnet that admits the proxy alone. Do not
-                 enable it on a connector bound to 0.0.0.0 on a routable interface.
-                 The proxy owns the other half: it must strip client supplied X-Forwarded-* and Forwarded headers
-                 and set them itself, so a client cannot forge the forwarded protocol or address. Where the
-                 forwarded values must be honoured inside Tomcat, the RemoteIpValve contract is the mechanism that
-                 does it safely - internalProxies / trustedProxies pinned to the proxy's own addresses plus an
-                 explicit protocolHeader - and it authenticates the hop that this valve cannot. That valve is not
-                 installed by CatalinaContainer, so with this configuration surface that authentication of the
-                 hop has to come from the network restriction and header hygiene described above.
-                 THE ENTRY POINT NOW ENFORCES THAT DECISION RATHER THAN LEAVING IT TO THIS COMMENT. When
-                 OFBIZ_SSL_ACCELERATOR_PORT is supplied, docker-entrypoint.sh looks up the connector that serves
-                 that port and checks whether it declares an explicit, non-wildcard 'address'. If it does, the
-                 port is reachable only where the deployment put it and the start proceeds silently. If it does
-                 not - which is the shipped shape, since the address properties below are commented out and the
-                 connectors therefore bind every interface - the start is REFUSED unless
-                 OFBIZ_SSL_ACCELERATOR_TRUSTED_NETWORK_ACKNOWLEDGED=true records that a security group, firewall
-                 rule or private subnet admits the proxy alone. -->
+                 TRUST BOUNDARY - READ BEFORE ENABLING THIS. SslAcceleratorValve marks every request that
+                 arrives on the configured port as secure on the strength of request.getLocalPort() alone. It
+                 verifies nothing about the sender and consults no X-Forwarded-Proto or Forwarded header, so the
+                 port number is not the trust decision - the NETWORK is. Enable it only when the connector that
+                 serves that port is unreachable except through the proxy: bind it to a private interface (the
+                 http-connector 'address' property below) and restrict it with a security group, firewall rule
+                 or private subnet that admits the proxy alone. The proxy owns the other half - it must strip
+                 client-supplied X-Forwarded-* and Forwarded headers and set them itself.
+                 An empty value is treated as absent by ContainerConfig, so no valve is installed. Set from
+                 OFBIZ_SSL_ACCELERATOR_PORT by docker-entrypoint.sh. -->
             <property name="ssl-accelerator-port" value=""/>
             <!-- Shares the session cookie across sub-domains by installing CrossSubdomainSessionValve. Only the
-                 literal "true" (case-insensitive) enables it; the default is "false". Configurable via
-                 OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS, which the container entry point validates as a boolean.
-                 Enable it only when instances are served under several sub-domains of one parent domain and a
-                 shared session cookie is genuinely required - the valve calls request.getSession(true), so it
-                 forces a session for every request it handles.
-                 The valve exempts the two health probe paths and passes them straight down the pipeline
-                 without touching the session or the cookie. This valve runs at ENGINE scope, above every
-                 context, so without the exemption it would mint a session for a probe before any context saw
-                 it - including for a probe path addressed to a context that neither maps nor allow-lists it,
-                 which is the one case the endpoint itself cannot cover - and would rewrite a domain-widened
-                 session cookie onto a response no probe client reads.
-                 Stated exactly, so it is not read as more than it is: what the exemption removes is the
-                 ENGINE-scope session and the widened cookie. A probe path sent to a context that does not
-                 map it is still refused by that context's own chain, and that chain's unconditional
-                 getSession() still applies to it, exactly as it does to any other path that context
-                 refuses. Point a target group at a context that maps the endpoint.
-                 Inside a webapp the probe is served by HealthCheckServlet through an ordinary servlet
-                 mapping, so the webapp's own filter chain still runs in front of it - and ControlFilter and
-                 ContextFilter both call getSession() unconditionally, so a session IS created there. The
-                 servlet therefore discards the session that was created for the request, and suppresses the
-                 session cookie on its response, which is what keeps a probe from accumulating sessions
-                 whatever chain a webapp registers it behind. This valve's exemption is the layer above that.
-                 The paths this valve exempts are the servlet's own published HealthCheckServlet.isProbePath
-                 contract, not a copy of the literals, so the exemption cannot drift from what the endpoint
-                 serves, and the match is EXACT: a near miss such as /health/live-x is NOT exempt here and is
-                 handled by this valve like any other request. -->
+                 literal "true" (case-insensitive) enables it; the default is "false". Set from
+                 OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS by docker-entrypoint.sh. Enable it only when instances are
+                 served under several sub-domains of one parent domain and a shared session cookie is genuinely
+                 required: the valve calls request.getSession(true), so it forces a session for every request it
+                 handles, health probes included. HealthCheckServlet discards the session created for a probe and
+                 suppresses its cookie, so a probe still leaves no session behind. -->
             <property name="enable-cross-subdomain-sessions" value="false"/>
         </property>
         <property name="ajp-connector" value="connector">
@@ -313,10 +244,7 @@ under the License.
         <!-- one or more tomcat engines (servers); map to this + host -->
         <property name="default-server" value="engine">
             <property name="default-host" value="0.0.0.0"/>
-            <!-- Per-instance sticky-session route id for the test loader, exactly as in the container above.
-                 STICKY ROUTING ONLY - it is not session replication and provides no failover. Sessions are
-                 instance-local here too, so a session does not survive the instance that created it; see the
-                 session scope note in the container above, which applies unchanged. -->
+            <!-- Sticky-session route id for the test loader, as in the container above. -->
             <property name="jvm-route" value="jvm1"/>
             <property name="access-log-pattern">
                 <property-value>%h %l %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"</property-value>

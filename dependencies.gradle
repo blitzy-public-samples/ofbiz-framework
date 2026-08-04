@@ -60,13 +60,6 @@ dependencies {
     implementation 'org.apache.tika:tika-parsers:3.3.1'
     implementation 'org.apache.tika:tika-parser-pdf-module:3.3.1'
     implementation 'org.apache.cxf:cxf-rt-frontend-jaxrs:4.2.0'
-    // Keep the whole embedded Tomcat set on ONE version: catalina-ha drags in tomcat-catalina, -coyote,
-    // -util and -juli transitively, so a split version here silently mixes servlet container internals.
-    // 10.1.57 fixes CVE-2026-59083 (RewriteValve URL decoding) and CVE-2026-59084 (EncryptInterceptor
-    // configuration documentation), both rated low by the Tomcat security team, but neither component
-    // is configured in this deployment: no RewriteValve is installed and no rewrite.config is shipped,
-    // and CatalinaContainer builds its cluster channel with no EncryptInterceptor attached. Revisit this
-    // pin if either component is ever enabled.
     implementation 'org.apache.tomcat:tomcat-catalina-ha:10.1.56' // Remember to change the version number (10 now) in javadoc block if needed.
     implementation 'org.apache.tomcat:tomcat-jasper:10.1.56'
     implementation 'org.apache.axis2:axis2-kernel:1.8.2'
@@ -132,13 +125,11 @@ dependencies {
     runtimeOnly 'org.apache.axis2:axis2-transport-http:1.8.2'
     runtimeOnly 'org.apache.axis2:axis2-transport-local:1.8.2'
     runtimeOnly 'com.h2database:h2:2.4.240'
-    // JDBC driver for the localpostgres* datasources. Bundling it here rather than fetching it at start
-    // up pins the deployed driver version in this file and makes it auditable from the image alone. Note
-    // that the generated start script places lib-extra ahead of lib on the class path (see the CLASSPATH
-    // rewrite in build.gradle), so a copy of this artefact left in the /ofbiz/lib-extra volume would
-    // silently shadow the version declared here and could reintroduce an already fixed vulnerability.
-    // docker/docker-entrypoint.sh therefore refuses to start when it finds one. Keep this on the current
-    // 42.7.x line.
+    // JDBC driver for the localpostgres* datasources. Bundling it here rather than downloading it at
+    // container start pins the deployed driver version in this file and makes it auditable from the image
+    // alone. Note that the generated start script places lib-extra ahead of lib on the class path, so a
+    // copy of this artefact left in the /ofbiz/lib-extra volume would shadow the version declared here.
+    // Keep this on the current 42.7.x line.
     runtimeOnly 'org.postgresql:postgresql:42.7.13'
     runtimeOnly 'org.apache.geronimo.specs:geronimo-jaxrpc_1.1_spec:2.1'
     runtimeOnly 'org.apache.logging.log4j:log4j-1.2-api:2.25.4' // for external jars using the old log4j1.2: routes logging to log4j 2

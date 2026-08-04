@@ -39,9 +39,3 @@ desktop.ini
 *.patch
 node_modules/
 /docs/asciidoc/images/
-
-# Local, operator-supplied secrets for the compose examples under docker/examples. Docker Compose reads
-# a ".env" file next to a compose file for its "${...}" interpolation; ignoring the path keeps the
-# passwords the examples require out of the repository (see DOCKER.adoc, "Credentials of the compose
-# example").
-docker/examples/*/.env
