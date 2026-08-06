@@ -396,7 +396,30 @@ ofbiz_setup_env() {
   # onto content URLs, so it has to be an ABSOLUTE origin. A relative or malformed value produces links
   # that resolve against whatever host served the page, which is how a content URL ends up pointing
   # somewhere the deployment did not choose.
+  #
+  # TRAILING SLASHES ARE REMOVED FIRST, because OFBiz supplies the separator itself and a prefix that ends
+  # in one therefore emits a DOUBLE slash in every content URL the deployment generates. The renderers that
+  # consume these two properties append a location that already begins with "/" - so "https://cdn.example/"
+  # turns every "/images/logo.png" into "https://cdn.example//images/logo.png". Measured on one back-office
+  # page with such a prefix: 40 asset URLs carried the double slash. Most origins normalise "//" and still
+  # answer, which is exactly why it is worth removing rather than leaving to chance: it survives casual
+  # testing and then breaks whatever is stricter - an object-store or CDN origin that reads "//path" as an
+  # empty first path segment, a cache keyed on the raw URL, or a Content-Security-Policy path allow-list.
+  # Normalised rather than refused: a trailing slash is a natural way to write an origin, it names the same
+  # origin, and there is exactly one correct rendering of it. Every trailing slash is removed, not just one,
+  # and the validation below then runs on the normalised value - so a value that is nothing but separators
+  # is refused by the absolute-origin check rather than rendered as an empty prefix, which would silently
+  # restore the relative URLs the committed url.properties emits. Trailing blanks need no handling here:
+  # any whitespace at all is refused a few lines further down.
   if [ -n "$OFBIZ_CONTENT_URL_PREFIX" ]; then
+    contentUrlPrefixSupplied="$OFBIZ_CONTENT_URL_PREFIX"
+    while [ "${OFBIZ_CONTENT_URL_PREFIX%/}" != "$OFBIZ_CONTENT_URL_PREFIX" ]; do
+      OFBIZ_CONTENT_URL_PREFIX="${OFBIZ_CONTENT_URL_PREFIX%/}"
+    done
+    if [ "$OFBIZ_CONTENT_URL_PREFIX" != "$contentUrlPrefixSupplied" ]; then
+      echo "OFBIZ_CONTENT_URL_PREFIX ended with '/'; the trailing separators were removed before rendering. OFBiz appends the separator itself, so a prefix ending in '/' emits a double slash in every content URL of every page. The prefix names the same origin either way." >&2
+    fi
+    unset contentUrlPrefixSupplied
     case "$OFBIZ_CONTENT_URL_PREFIX" in
     https://?*) ;;
     http://?*)
@@ -577,8 +600,31 @@ ofbiz_setup_env() {
     config_fatal "OFBIZ_DISTRIBUTED_CACHE_CLEAR=true requires a message transport, and none is configured. The distributedClear* services are declared engine=\"jms\" location=\"serviceMessenger\", and the jms-service of that name is shipped commented out in $SERVICE_ENGINE_SOURCE, so with the flag on and no transport every cache invalidation would be undeliverable and would mark the caller's transaction rollback-only. Either set OFBIZ_JMS_PROVIDER_URL and OFBIZ_JMS_INITIAL_CONTEXT_FACTORY and mount your broker's JMS client library in /ofbiz/lib-extra - this script then renders the serviceMessenger jms-service and its JNDI server for you - or mount your own serviceengine.xml into the config directory with that jms-service uncommented. See DOCKER.adoc."
   fi
 
+  # Whether the route was SUPPLIED is recorded before the default is applied, because that is the signal
+  # the advisory below reads and the default would erase it.
+  jvmRouteSupplied=${OFBIZ_JVM_ROUTE+yes}
   OFBIZ_JVM_ROUTE=${OFBIZ_JVM_ROUTE-jvm1}
   require_single_line OFBIZ_JVM_ROUTE "$OFBIZ_JVM_ROUTE"
+
+  # A FLEET RUNNING ON SINGLE-NODE CACHING IS INCOHERENT, and nothing said so at start up. The
+  # invalidation flag defaults to false and that default stays: an unconfigured container has to boot with
+  # no broker, and switching invalidation on without a transport makes every entity write that triggers one
+  # roll back. So this warns instead.
+  # WHAT IT COSTS, CONCRETELY: each instance holds its own entity caches, so an update applied through one
+  # is not seen by another until that entry ages out - a peer answers from the value it cached earlier. It
+  # is not confined to screens. Cache-backed metadata decides response HEADERS too, so a content download
+  # can advertise the file name a peer had cached rather than the one just uploaded: correct bytes
+  # described by stale metadata, which no page refresh reveals.
+  # WHY THE ROUTE IS THE SIGNAL: a container cannot know its fleet size - it has no view of its siblings
+  # and no variable states the replica count. OFBIZ_JVM_ROUTE has no purpose on a single node; it exists to
+  # give each instance a distinct session-id suffix so a balancer can route sticky sessions to the instance
+  # that owns them. An operator who SETS it has said this container runs behind a balancer alongside
+  # others, which is the closest thing to a declaration of fleet membership the environment carries. The
+  # shipped default is not that declaration, which is why the supplied-ness is what is tested.
+  if [ -n "$jvmRouteSupplied" ] && [ "$OFBIZ_DISTRIBUTED_CACHE_CLEAR" != "true" ]; then
+    echo "WARNING: OFBIZ_JVM_ROUTE is set, which says this instance runs behind a load balancer alongside others, but OFBIZ_DISTRIBUTED_CACHE_CLEAR is not true - so this instance keeps its entity caches to itself. In a fleet that is not a coherent deployment: an update applied through one instance is not seen by the others until the cached entry ages out, so a peer serves the value it cached earlier, including cache-backed metadata that decides response headers such as the file name a content download advertises, which no page refresh corrects. Set OFBIZ_DISTRIBUTED_CACHE_CLEAR=true on EVERY instance and supply the transport with the OFBIZ_JMS_* variables. Leave it unset only for a single-instance deployment, where there is no peer to be stale. See DOCKER.adoc." >&2
+  fi
+  unset jvmRouteSupplied
 
   OFBIZ_SSL_ACCELERATOR_PORT=${OFBIZ_SSL_ACCELERATOR_PORT:-}
   if [ -n "$OFBIZ_SSL_ACCELERATOR_PORT" ]; then

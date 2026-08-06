@@ -50,6 +50,16 @@ under the License.
  - long as the kernel keeps the connection open. The values below are the ones the committed
  - framework/entity/config/entityengine.xml uses for the same datasources.
  -
+ - The three managed pools below carry test-while-idle without a validation query, deliberately. DBCP
+ - validates with the configured pool-jdbc-test-stmt when there is one and with JDBC Connection.isValid when
+ - there is not, and only the second is safe here: OFBiz returns managed connections with autoCommitOnReturn
+ - and rollbackOnReturn both false, so a SELECT issued by the eviction thread opens a PostgreSQL transaction
+ - that passivation never ends - the backend then sits idle in transaction holding backend_xmin, and so
+ - holding back vacuum, until a later borrower happens to finish it. Connection.isValid needs no transaction
+ - and still discards a connection killed by a failover or an idle-flow reaper, so the validation a fleet
+ - needs is kept without that cost. The embedded H2 datasources further down keep their own validation query:
+ - they serve the test delegator on a single node and H2 has no equivalent behaviour.
+ -
  - TLS is NOT left to the driver's own default. pgJDBC's default, sslmode=prefer, encrypts when the server
  - offers TLS and falls back to PLAINTEXT when it does not, so the entry point inserts sslmode - and
  - sslrootcert when one was given - immediately in front of the connection-timeout parameter of every
@@ -168,7 +178,6 @@ under the License.
                 pool-maxsize="@DB_POOL_MAX@"
                 time-between-eviction-runs-millis="600000"
                 pool-sleeptime="20000"
-                pool-jdbc-test-stmt="SELECT 1"
                 test-while-idle="true"
                 test-on-borrow="false"/>
 
@@ -203,7 +212,6 @@ under the License.
                 pool-maxsize="@DB_POOL_MAX@"
                 time-between-eviction-runs-millis="600000"
                 pool-sleeptime="20000"
-                pool-jdbc-test-stmt="SELECT 1"
                 test-while-idle="true"
                 test-on-borrow="false"/>
 
@@ -238,7 +246,6 @@ under the License.
                 pool-maxsize="@DB_POOL_MAX@"
                 time-between-eviction-runs-millis="600000"
                 pool-sleeptime="20000"
-                pool-jdbc-test-stmt="SELECT 1"
                 test-while-idle="true"
                 test-on-borrow="false"/>
 

@@ -625,6 +625,39 @@ public final class SchemaInitGatingTests {
                 "every managed datasource must carry the transport-security settings");
     }
 
+    /**
+     * No managed PostgreSQL pool validates with a QUERY, in either file, while all three keep idle validation.
+     *
+     * <p>DBCP validates with the configured {@code pool-jdbc-test-stmt} when there is one and with JDBC
+     * {@code Connection.isValid} when there is not. Only the second is safe on this pool: OFBiz returns managed
+     * connections with {@code autoCommitOnReturn} and {@code rollbackOnReturn} both false, so a SELECT issued by
+     * the eviction thread opens a transaction that passivation never ends - the backend then sits idle in
+     * transaction holding {@code backend_xmin}, and so holding back vacuum, until a later borrower finishes it.
+     * The embedded H2 datasources keep their own query, because they are single-node development and test
+     * datasources and H2 has no equivalent behaviour; asserting that too is what keeps this a targeted change.
+     *
+     * @throws Exception if either committed file cannot be parsed
+     */
+    @Test
+    public void theManagedPoolsValidateWithoutOpeningATransaction() throws Exception {
+        for (String file : List.of("framework/entity/config/entityengine.xml", TEMPLATE)) {
+            Document committed = parse(repository().resolve(file));
+            for (String name : MANAGED_DATASOURCES) {
+                Element pool = inlineJdbc(datasource(committed, name));
+                assertEquals("", pool.getAttribute("pool-jdbc-test-stmt"),
+                        name + " in " + file + " must configure NO validation query, so DBCP validates with"
+                                + " Connection.isValid and leaves no backend idle in transaction");
+                assertEquals("true", pool.getAttribute("test-while-idle"),
+                        name + " in " + file + " must still validate while idle, or a connection killed by a"
+                                + " failover would be handed to a request");
+            }
+            for (String name : EMBEDDED_DATASOURCES) {
+                assertEquals("SELECT 1", inlineJdbc(datasource(committed, name)).getAttribute("pool-jdbc-test-stmt"),
+                        name + " in " + file + " must keep the validation query it has always had");
+            }
+        }
+    }
+
     // =============================================================================================
     // Goal 5 - load-balancer readiness and multi-instance coherence.
     // =============================================================================================
@@ -774,6 +807,87 @@ public final class SchemaInitGatingTests {
                 "a recreated container must be rendered again, not vouched for by a marker");
         assertEquals(List.of("8080"), catalinaValues("ssl-accelerator-port"),
                 "a recreated container must keep its TLS-offload setting");
+    }
+
+    /**
+     * A fleet member that keeps its entity caches to itself is flagged at start up. The default cannot be
+     * flipped - an unconfigured container has to boot with no broker - so the only thing left is to say so,
+     * and only when the environment has declared fleet membership by setting a route.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aSuppliedRouteWithoutCacheInvalidationIsFlagged() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_JVM_ROUTE", "instance-a"), "ofbiz_setup_env");
+
+        assertEquals(0, status, "the advisory must never refuse a start");
+        assertTrue(output().contains("OFBIZ_JVM_ROUTE is set")
+                        && output().contains("OFBIZ_DISTRIBUTED_CACHE_CLEAR"),
+                "the advisory must name both variables: " + output());
+    }
+
+    /**
+     * The zero-configuration container stays SILENT. The route carries a shipped default, so an advisory
+     * that read the value rather than whether it was supplied would fire on every single start - including
+     * the single-node development run the plan requires to be unchanged.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void anUnconfiguredContainerIsNotToldAboutCacheInvalidation() throws Exception {
+        requireShellAvailable();
+
+        assertEquals(0, runEntryPoint(Map.of(), "ofbiz_setup_env"), "an unconfigured start must succeed");
+
+        assertFalse(output().contains("OFBIZ_JVM_ROUTE is set"),
+                "a container that never declared fleet membership must not be warned: " + output());
+    }
+
+    // =============================================================================================
+    // Content URL prefix.
+    // =============================================================================================
+
+    /**
+     * A trailing separator is removed before the prefix reaches url.properties. OFBiz appends the separator
+     * itself, so a prefix ending in '/' emits a double slash in EVERY content URL of every page - which most
+     * origins normalise and answer, and a stricter one does not.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aTrailingSeparatorOnTheContentPrefixIsRemovedBeforeItIsRendered() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_CONTENT_URL_PREFIX", "https://cdn.example.test//"),
+                "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration");
+
+        assertEquals(0, status, "a trailing separator must be normalised, not refused");
+        List<String> rendered = Files.readAllLines(containerRoot.resolve("config/url.properties"),
+                StandardCharsets.UTF_8);
+        assertTrue(rendered.contains("content.url.prefix.secure=https://cdn.example.test"),
+                "the rendered secure prefix must carry no trailing separator: " + rendered);
+        assertTrue(rendered.contains("content.url.prefix.standard=https://cdn.example.test"),
+                "the rendered standard prefix must carry no trailing separator: " + rendered);
+        assertTrue(output().contains("OFBIZ_CONTENT_URL_PREFIX ended with"),
+                "a rendered value that differs from the supplied one must never be silent: " + output());
+    }
+
+    /**
+     * A prefix that normalises away is refused rather than rendered empty, because an empty prefix silently
+     * reinstates the relative URLs the committed url.properties emits - which looks like it worked.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aContentPrefixOfNothingButSeparatorsIsRefused() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_CONTENT_URL_PREFIX", "https:///"), "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "a prefix that normalises away must be refused");
+        assertTrue(output().contains("OFBIZ_CONTENT_URL_PREFIX"), "the refusal must name it: " + output());
     }
 
     // =============================================================================================
@@ -1048,6 +1162,21 @@ public final class SchemaInitGatingTests {
         factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
         factory.setNamespaceAware(false);
         return factory.newDocumentBuilder().parse(path.toFile());
+    }
+
+    /**
+     * Answers a datasource's inline-jdbc element.
+     *
+     * @param datasource the datasource element
+     * @return its inline-jdbc child
+     */
+    private static Element inlineJdbc(Element datasource) {
+        NodeList declared = datasource.getElementsByTagName("inline-jdbc");
+        if (declared.getLength() == 0) {
+            throw new AssertionError("the datasource named " + datasource.getAttribute("name")
+                    + " declares no inline-jdbc");
+        }
+        return (Element) declared.item(0);
     }
 
     private static Element named(Document document, String tag, String name) {

@@ -55,6 +55,11 @@ import jakarta.servlet.http.HttpServletResponse;
  * that are easy to regress and invisible in production until they matter: that a probe never allocates an
  * {@code HttpSession}, that readiness is not re-queried on every probe, and that a method other than GET
  * or HEAD is refused with the header saying what is allowed.
+ *
+ * <p>The reserved aliases are asserted for the same reason: {@code /control/health/live} answered 200 with a
+ * rendered error page is a health check that can never report ill health, so the refusal, its absent body and
+ * its absent session are pinned here, along with the fact that no OTHER spelling under the control prefix is
+ * touched.
  */
 public final class HealthCheckServletTests {
 
@@ -269,6 +274,52 @@ public final class HealthCheckServletTests {
 
         verify(otherResponse).setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
         verify(otherResponse, never()).setStatus(HttpServletResponse.SC_OK);
+    }
+
+    @Test
+    public void aProbePathSpelledBehindTheControlServletIsRefused() throws Exception {
+        at("/control" + LIVE);
+
+        probe.doFilter(request, response, chain);
+
+        // Left to the chain this reaches a controller with no request-map for it, and the rendered error view
+        // carries the status the response already had - 200 - which a target group checking for 200 reads as a
+        // healthy instance for as long as it is pointed there. Refused with a status a balancer cannot mistake,
+        // and without entering the chain at all.
+        verify(response).setStatus(HttpServletResponse.SC_NOT_FOUND);
+        verify(response, never()).setStatus(HttpServletResponse.SC_OK);
+        verify(chain, never()).doFilter(any(), any());
+    }
+
+    @Test
+    public void theReadinessAliasIsRefusedWithNoBodyNoCacheAndNoSession() throws Exception {
+        at("/control" + READY);
+
+        probe.doFilter(request, response, chain);
+
+        verify(response).setStatus(HttpServletResponse.SC_NOT_FOUND);
+        // No body at all, and no intermediary may keep the refusal: it is a fact about how this deployment is
+        // mapped, so a cached copy would survive the descriptor being corrected.
+        verify(response).setContentLength(0);
+        verify(response).setHeader("Cache-Control", "no-store");
+        // The whole reason the refusal happens here rather than in the chain: the filters ahead of the control
+        // servlet call getSession() unconditionally, so every misdirected probe would otherwise mint a session
+        // and emit a cookie for a caller that keeps neither.
+        verify(request, never()).getSession();
+        verify(request, never()).getSession(true);
+        verify(chain, never()).doFilter(any(), any());
+    }
+
+    @Test
+    public void aNearMissUnderTheControlPrefixKeepsOrdinaryRouting() throws Exception {
+        at("/control/health/livez");
+
+        probe.doFilter(request, response, chain);
+
+        // Only the two exact aliases are reserved. Nothing else under /control/health is treated as one, so
+        // every other spelling keeps the routing it has always had.
+        verify(chain).doFilter(request, response);
+        verify(response, never()).setStatus(HttpServletResponse.SC_NOT_FOUND);
     }
 
     /**

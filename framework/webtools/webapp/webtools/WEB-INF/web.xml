@@ -92,10 +92,24 @@ under the License.
         <filter-name>SameSiteFilter</filter-name>
         <filter-class>org.apache.ofbiz.webapp.control.SameSiteFilter</filter-class>
     </filter>
+    <!-- The first two patterns are the probe paths, answered here so the rest of the chain never runs for a
+         probe. They are exact, not /health/*, so /health/live/anything and /healthz/live do not match and
+         take the ordinary chain like any other unlisted path.
+
+         The last two patterns are NOT probe paths and are not answered as such: they are the same two paths
+         spelled behind the control servlet, which is the spelling an operator copying a documented
+         /control/... URL is most likely to configure. Left to the chain they reach ControlServlet, whose
+         controller has no request-map for them, so the request handler fails and the error view is rendered
+         with the status the response already had - 200 - while the filters ahead of it mint a session. A
+         target group checking for 200 would then read a rendered error page as a healthy instance
+         indefinitely. The filter answers them 404 with no body instead, so no health-shaped URL in this
+         webapp can return a success status unless it is one of the two real probe paths above. -->
     <filter-mapping>
         <filter-name>HealthCheckFilter</filter-name>
         <url-pattern>/health/live</url-pattern>
         <url-pattern>/health/ready</url-pattern>
+        <url-pattern>/control/health/live</url-pattern>
+        <url-pattern>/control/health/ready</url-pattern>
     </filter-mapping>
     <filter-mapping>
         <filter-name>ControlFilter</filter-name>

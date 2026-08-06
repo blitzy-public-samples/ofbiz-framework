@@ -109,6 +109,15 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  * <p>Any other path that reaches this class - only possible through an internal dispatch, since the
  * mappings are exact - is answered 404 rather than a false 200, so a misconfigured probe cannot keep a
  * broken instance in service. Any method other than GET and HEAD is answered 405.
+ *
+ * <p><strong>One near miss is refused rather than routed.</strong> The filter role is also mapped on
+ * {@code /control/health/live} and {@code /control/health/ready} - the two probe paths spelled behind the
+ * control servlet, which is the spelling an operator copying a documented {@code /control/...} URL is most
+ * likely to configure. Those are NOT probe paths and are not answered as such; they are refused 404. Left
+ * to the chain they would reach a controller with no request-map for them, and the rendered error view
+ * would carry the status the response already had - 200 - which a target group checking for 200 reads as a
+ * healthy instance. See {@link #isReservedProbeAlias}. Every other spelling under {@code /health} keeps
+ * ordinary routing.
  */
 public final class HealthCheckServlet extends HttpServlet implements Filter {
 
@@ -118,6 +127,14 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
 
     private static final String PROBE_LIVE = "/health/live";
     private static final String PROBE_READY = "/health/ready";
+
+    /**
+     * The mount point every OFBiz webapp gives {@code ControlServlet}, and therefore the prefix a probe path
+     * acquires when an operator copies it from one of the documented {@code /control/...} URLs. See
+     * {@link #isReservedProbeAlias} for why that one near miss cannot be left to ordinary routing.
+     */
+    private static final String CONTROL_MOUNT = "/control";
+
     private static final String READINESS_ENTITY = "SequenceValueItem";
 
     private static final String BODY_LIVE_UP = "{\"status\":\"UP\"}";
@@ -186,11 +203,12 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
     }
 
     /**
-     * Answers a probe without running the rest of the filter chain, and passes everything else through.
+     * Answers a probe without running the rest of the filter chain, refuses the one near miss that would
+     * otherwise report false health, and passes everything else through.
      *
      * <p>The chain is deliberately NOT continued for a probe path: continuing it is what would mint a
-     * session. Every request that is not a probe is passed on untouched, so this mapping cannot affect
-     * anything else even if it is widened by mistake.
+     * session. Every request that is neither a probe nor one of the two reserved aliases is passed on
+     * untouched, so this mapping cannot affect anything else even if it is widened by mistake.
      *
      * @param request the request
      * @param response the response
@@ -201,15 +219,72 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
     @Override
     public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
             throws IOException, ServletException {
-        if (request instanceof HttpServletRequest probe && response instanceof HttpServletResponse answer
-                && isProbePath(pathWithinWebapp(probe))) {
-            // service() rather than handleProbe(), so that method handling - GET and HEAD answered, every
-            // other method refused with 405 and an Allow header - is decided in exactly one place for
-            // both roles. See the service() override below.
-            service(probe, answer);
-            return;
+        if (request instanceof HttpServletRequest probe && response instanceof HttpServletResponse answer) {
+            String path = pathWithinWebapp(probe);
+            if (isProbePath(path)) {
+                // service() rather than handleProbe(), so that method handling - GET and HEAD answered, every
+                // other method refused with 405 and an Allow header - is decided in exactly one place for
+                // both roles. See the service() override below.
+                service(probe, answer);
+                return;
+            }
+            if (isReservedProbeAlias(path)) {
+                refuseAlias(answer);
+                return;
+            }
         }
         chain.doFilter(request, response);
+    }
+
+    /**
+     * Reports whether a path within a webapp is a probe path spelled behind the control servlet, which is the
+     * one near miss that must never be answered by the ordinary request handler.
+     *
+     * <p>Every OFBiz webapp mounts {@code ControlServlet} at {@code /control/*}, and almost every documented URL
+     * in the product carries that prefix, so {@code /webtools/control/health/live} is the spelling an operator
+     * configuring a target group is most likely to reach for. It is not a probe path: the controller has no
+     * request-map for it, so the request handler fails and the control servlet serves its error view - and it
+     * serves that view with the status the response already had, which is {@code 200}. A load balancer that
+     * expects {@code 200} therefore reads a rendered error page as a healthy instance, indefinitely, and the one
+     * thing a health check exists to do is the one thing it then cannot do. The filters ahead of that servlet
+     * also call {@code getSession()} unconditionally, so every such request mints a session and emits a cookie
+     * for a caller that keeps neither.
+     *
+     * <p>Derived from the same two literals as {@link #isProbePath}, so an alias cannot drift from the path it
+     * shadows: renaming a probe path renames its alias in the same edit. The match is exact after the prefix,
+     * for the same reason {@link #isProbePath} is exact - no {@code /control/health} space is reserved, so every
+     * other spelling keeps the routing it has always had.
+     *
+     * @param pathWithinWebapp the requested path relative to the webapp's context path; may be null
+     * @return true if the path is a probe path prefixed with the control servlet's mount point
+     */
+    public static boolean isReservedProbeAlias(String pathWithinWebapp) {
+        return pathWithinWebapp != null && pathWithinWebapp.startsWith(CONTROL_MOUNT)
+                && isProbePath(pathWithinWebapp.substring(CONTROL_MOUNT.length()));
+    }
+
+    /**
+     * Refuses a probe path spelled behind the control servlet, with a status a load balancer cannot read as
+     * health.
+     *
+     * <p><strong>Why this is refused rather than answered.</strong> Answering it would make a second spelling of
+     * every probe path real, so a target group could be configured against either and the two would have to keep
+     * agreeing forever, and it would place a probe inside the space a webapp's request handler owns - which is
+     * the space answering in the filter exists to keep probes out of. Refusing states plainly that the path is
+     * not an endpoint, and one look at the target group's health history says so.
+     *
+     * <p>{@code 404} is set with {@code setStatus} rather than {@code sendError}, deliberately:
+     * {@code sendError} hands the response to the container's error-page machinery, which would answer an
+     * anonymous caller with an HTML page and, in a webapp that declares an {@code error-page}, could route the
+     * refusal somewhere that builds a session of its own. What is written instead is a status, the same
+     * no-store directive a real probe answer carries so no intermediary keeps the refusal, and no body at all.
+     *
+     * @param response the response to refuse on
+     */
+    private static void refuseAlias(HttpServletResponse response) {
+        response.setStatus(HttpServletResponse.SC_NOT_FOUND);
+        response.setHeader(CACHE_CONTROL_HEADER, CACHE_CONTROL_VALUE);
+        response.setContentLength(0);
     }
 
     /**

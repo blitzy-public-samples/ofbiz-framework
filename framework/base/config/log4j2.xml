@@ -86,6 +86,37 @@ under the License.
         <logger name="org.apache.ofbiz" level="all"/>
         <logger name="org.apache.ofbiz.base.converter.Converters" level="warn"/>
         <logger name="freemarker" level="warn"/>
+        <!--
+          The bundled AWS SDK, which the "s3" content-store provider uses, is bounded here for exactly the
+          reason the third-party libraries above are: the policy stated at the top of this file is that an
+          external jar logs at warning or greater. Its logger names begin with neither "org.apache" nor
+          "freemarker", so without this declaration they match nothing above and inherit Root level="all" -
+          and that had two consequences, both of which this line removes.
+
+          It wrote the SDK's own request diagnostics into ofbiz.log at debug and trace: whole SigV4 canonical
+          requests, strings to sign, signed header names and per-attempt retry state, for every object-store
+          call. None of that is this application's diagnostic and none of it belongs in an operator's log.
+
+          It also let a throwable that is still being MUTATED reach an appender. The SDK's retry logging emits
+          one exception that aggregates its failed attempts as suppressed throwables, appending to that same
+          instance as further attempts fail, while the Async appender renders the event on its own thread. A
+          throwable whose suppressed list grows during rendering is not something the pattern layout's
+          throwable renderer can follow, so the appender threw ("An exception occurred processing Appender
+          ofbiz") and the event it was writing was discarded. Bounding these loggers keeps such an event out of
+          the appender altogether rather than relying on a renderer to survive it.
+
+          What an operator needs is unaffected, and deliberately so: a content-store failure or refusal is
+          reported by this application's own ERROR line carrying the opaque "Reference [<uuid>]" a user is
+          shown, and those lines pass a message and no throwable, so nothing about them depends on rendering
+          an exception. An SDK warning or error still reaches the log.
+
+          TURNING IT BACK ON. Raise this one declaration to debug when a store problem genuinely needs the
+          wire detail - a signature mismatch, an endpoint or addressing-style question, a TLS handshake
+          failure - where the SDK's own view is the evidence. It is deliberately one line to change, and it is
+          bounded to the investigation rather than left on: at debug the volume grows in proportion to
+          object-store traffic, and the two consequences above come back with it.
+        -->
+        <logger name="software.amazon.awssdk" level="warn"/>
 
         <Root level="all">
             <AppenderRef ref="async"/>

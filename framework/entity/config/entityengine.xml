@@ -467,17 +467,28 @@ access. For a detailed description see the core/docs/entityconfig.html file.
          instance. socketTimeout bounds a SINGLE socket read rather than a statement, so the value is generous
          enough that no normal statement, data load or schema check is affected while still being finite. There
          is deliberately no queryTimeout: it would apply to EVERY statement and abort legitimately long work
-         such as a data load or a large report. pool-jdbc-test-stmt with test-while-idle stops the pool handing
-         out a connection that died while idle, the ordinary outcome of a managed-database failover; without a
-         validation query DBCP performs no validation at all, whichever test-* flag is set. Validating during
-         the eviction runs that already happen costs a request nothing, so test-on-borrow - one extra round trip
-         on every borrow - stays false. The template carries the same deadlines and the same pool settings, so a
+         such as a data load or a large report. test-while-idle stops the pool handing out a connection that
+         died while idle, the ordinary outcome of a managed-database failover, by validating during the eviction
+         runs that already happen every time-between-eviction-runs-millis - which costs a request nothing, so
+         test-on-borrow, one extra round trip on every single borrow, stays false.
+         NO VALIDATION QUERY IS CONFIGURED HERE, and that is the point rather than an omission. DBCP validates
+         with the configured pool-jdbc-test-stmt when there is one and with JDBC Connection.isValid when there is
+         not (commons-dbcp2 PoolableConnection.validate falls through to isValid for an absent or empty
+         statement), and only the second of those is safe on this pool: OFBiz returns managed connections with
+         autoCommitOnReturn and rollbackOnReturn both false, so a SELECT issued by the eviction thread OPENS a
+         PostgreSQL transaction that passivation never ends. The backend then sits idle in transaction, holding
+         backend_xmin and so holding back vacuum, until some later borrower happens to finish it - which is
+         exactly what was measured against a real pool before this attribute was removed. Connection.isValid
+         needs no transaction and still detects a connection killed by a failover or an idle-flow reaper, so the
+         validation the fleet needs is kept and the cost it did not need is gone. The embedded localh2*
+         definitions above keep their own validation query untouched: they are single-node development and test
+         datasources, and H2 has no equivalent behaviour. The template carries the same deadlines and the same pool settings, so a
          rendered deployment and a non-container install that points a delegator at these definitions are
          bounded identically. Only these three managed definitions carry them: the MySQL, Oracle and other
          dialect definitions are preserved exactly as they are for portability.
          RECORDED DEVIATION from the specified change set: the four pgJDBC URI parameters (socketTimeout,
          loginTimeout, cancelSignalTimeout, tcpKeepAlive - connectTimeout aside, which bounds the connect itself)
-         and the four pool attributes (pool-sleeptime, pool-jdbc-test-stmt, test-while-idle, test-on-borrow) are
+         and the three pool attributes (pool-sleeptime, test-while-idle, test-on-borrow) are
          NOT among the changes the specification enumerates for this file, which names only the group-map
          repointing, the de-hardcoding of these three definitions, the two startup-DDL flags and the
          cache-invalidation flag. They are added deliberately and knowingly: the objective these definitions
@@ -536,7 +547,6 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"
                 pool-sleeptime="20000"
-                pool-jdbc-test-stmt="SELECT 1"
                 test-while-idle="true"
                 test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
                 is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
@@ -577,7 +587,6 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"
                 pool-sleeptime="20000"
-                pool-jdbc-test-stmt="SELECT 1"
                 test-while-idle="true"
                 test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
                     is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
@@ -618,7 +627,6 @@ access. For a detailed description see the core/docs/entityconfig.html file.
                 pool-maxsize="250"
                 time-between-eviction-runs-millis="600000"
                 pool-sleeptime="20000"
-                pool-jdbc-test-stmt="SELECT 1"
                 test-while-idle="true"
                 test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
                     is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->

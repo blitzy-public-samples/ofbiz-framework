@@ -259,6 +259,39 @@ under the License.
             <property name="access-log-maxDays" value="30"/>
             <property name="enable-request-dump" value="false"/>
         </property>
+        <!-- THESE CONNECTOR PORTS ARE HOST-GLOBAL, AND ONE ALREADY IN USE IS NOT FATAL. The three
+             connectors below are the ones the test loader opens, so they are also what two checkouts of this
+             repository on one machine - two CI jobs, two agent workspaces - compete for, together with the
+             admin port declared in start.properties.
+
+             The two kinds of collision do NOT behave alike, and which one a run meets depends on the loader,
+             which is worth knowing before trusting a green run. The admin container is declared on the MAIN
+             loader (framework/base/ofbiz-component.xml), so an ordinary start refuses to run at all when the
+             admin port is taken ("Cannot init() admin-container (Couldn't create server socket
+             (/127.0.0.1:10523) (Address already in use))") and never reaches a connector: loud, immediate, and
+             the reason a second full server on one machine stops rather than half starts. The test loader does
+             NOT load that container, so nothing stops the integration tier on its way to these connectors -
+             and a connector that cannot be bound does not stop it either. That half is Tomcat's behaviour
+             rather than this file's: the failure is logged at SEVERE ("Failed to initialize component
+             [Connector[http-nio-8080]]", caused by "java.net.BindException: Address already in use"), the
+             connector that could not be bound is dropped, and the service starts anyway. The integration
+             tier therefore runs to completion and
+             reports its result with no HTTP listener open, so a connector collision costs the listeners
+             SILENTLY, and a check that needed a real connector would simply not have been exercised.
+
+             Nothing in this descriptor can change that half of it. ContainerConfig reads these values
+             literally - there is no environment or system property substitution in a container property - and
+             Tomcat exposes no connector attribute that makes a failed bind fatal. The collision is therefore
+             AVOIDED rather than detected: run one OFBiz at a time per checkout, and give a second one on the
+             same machine a port offset, which shifts every port declared here and the admin port by the same
+             amount. That is the portoffset startup option, short form -o, and it reaches this loader through
+             the ofbiz task, as in: gradlew "ofbiz -t -o 200". The same rule holds for the build itself: one
+             Gradle invocation per checkout, because these ports, the admin port, the embedded H2 database
+             directory and the test-report directory are all shared by every invocation in one directory.
+
+             The values themselves are left exactly as committed, deliberately: the container entry point
+             rewrites the serving container above and never this block, so no environment variable an operator
+             sets changes what the test loader binds. -->
         <property name="ajp-connector" value="connector">
             <!--<property name="address" value=""/>-->
             <property name="port" value="8010"/>
