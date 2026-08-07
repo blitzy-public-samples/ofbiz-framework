@@ -42,6 +42,7 @@ import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 
+import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.sync.RequestBody;
@@ -50,8 +51,11 @@ import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.DeleteObjectResponse;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
+import software.amazon.awssdk.services.s3.model.HeadBucketResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.NoSuchBucketException;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
@@ -338,6 +342,85 @@ public final class ContentStoreFactoryTest {
                 "exists must raise on a server failure rather than answer a false negative");
         assertFalse(existsFailure instanceof FileNotFoundException,
                 "a server failure must not be reported as a key the store does not hold");
+    }
+
+    @Test
+    public void aMissingBucketIsAStoreFaultAndNeverAbsence() throws GeneralException {
+        S3Client client = mock(S3Client.class);
+        ContentStore store = new S3ContentStore(client, BUCKET);
+
+        // The distinction this asserts is the one an operator's alarm depends on. A bucket that has been
+        // renamed, deleted or made inaccessible is a store fault; reported as absence it would make every
+        // object in it look as though it had never been stored - and in a fleet whose only durable copy IS
+        // the object, that is content vanishing silently with nothing in the log to say why.
+        when(client.getObject(any(GetObjectRequest.class))).thenThrow(noSuchBucket());
+        IOException readFailure = assertThrows(IOException.class, () -> store.get(KEY),
+                "a read from a bucket that does not exist must be raised");
+        assertFalse(readFailure instanceof FileNotFoundException,
+                "a missing bucket must NOT be reported as a key the store does not hold");
+        IOException streamFailure = assertThrows(IOException.class, () -> store.openStream(KEY),
+                "openStream must raise for a missing bucket too");
+        assertFalse(streamFailure instanceof FileNotFoundException,
+                "a missing bucket must NOT be reported as absence on the streaming read either");
+
+        // HeadObject cannot say WHICH thing is missing - a HEAD response carries no body to put an error
+        // code in, so both cases arrive as the same typed 404 - which is why the provider confirms the
+        // bucket before it reports absence. The confirmation is what distinguishes the two here.
+        when(client.headObject(any(HeadObjectRequest.class))).thenThrow(NoSuchKeyException.builder().build());
+        when(client.headBucket(any(HeadBucketRequest.class))).thenThrow(noSuchBucket());
+        assertThrows(IOException.class, () -> store.exists(KEY),
+                "exists must raise rather than answer false when the bucket itself is gone");
+        assertThrows(IOException.class, () -> store.describe(KEY),
+                "describe must raise rather than answer empty when the bucket itself is gone");
+    }
+
+    @Test
+    public void absenceIsStillAbsenceWhenTheBucketAnswers() throws GeneralException, IOException {
+        S3Client client = mock(S3Client.class);
+        ContentStore store = new S3ContentStore(client, BUCKET);
+        when(client.headBucket(any(HeadBucketRequest.class))).thenReturn(HeadBucketResponse.builder().build());
+
+        when(client.headObject(any(HeadObjectRequest.class))).thenThrow(NoSuchKeyException.builder().build());
+        assertFalse(store.exists(KEY), "a key a healthy bucket does not hold is absent, not a fault");
+        assertTrue(store.describe(KEY).isEmpty(), "a key a healthy bucket does not hold has no description");
+        // Confirming the bucket must cost one request and only on this path, so a fetch that falls back to
+        // the local copy is not turned into a chain of retries.
+        verify(client, times(2)).headBucket(any(HeadBucketRequest.class));
+
+        // The other spelling of absence: a bare 404 carrying no error code, which several S3-compatible
+        // stores answer for HeadObject. Still absence when the bucket answers.
+        S3Client codeless = mock(S3Client.class);
+        ContentStore other = new S3ContentStore(codeless, BUCKET);
+        when(codeless.headBucket(any(HeadBucketRequest.class))).thenReturn(HeadBucketResponse.builder().build());
+        when(codeless.headObject(any(HeadObjectRequest.class))).thenThrow(status(404));
+        assertFalse(other.exists(KEY), "a codeless 404 with a healthy bucket is absence");
+        assertTrue(other.describe(KEY).isEmpty(), "a codeless 404 with a healthy bucket has no description");
+    }
+
+    @Test
+    public void aBucketTheStoreWillNotDiscussLeavesTheAbsenceVerdictAlone() throws GeneralException, IOException {
+        S3Client client = mock(S3Client.class);
+        ContentStore store = new S3ContentStore(client, BUCKET);
+        when(client.headObject(any(HeadObjectRequest.class))).thenThrow(NoSuchKeyException.builder().build());
+        // A credential allowed to read an object but not to inspect its bucket cannot answer the question,
+        // and 403 is not "the bucket is gone". The absence verdict therefore stands, so a least-privilege
+        // deployment keeps exactly the behaviour it had before the confirmation existed.
+        when(client.headBucket(any(HeadBucketRequest.class))).thenThrow(status(403));
+
+        assertFalse(store.exists(KEY), "an unanswerable bucket question must not turn absence into a fault");
+        assertTrue(store.describe(KEY).isEmpty(), "an unanswerable bucket question must leave describe empty");
+
+        // A store that cannot be reached AT ALL for the confirmation is a different matter: that is an
+        // outage, and an outage is never absence.
+        S3Client unreachable = mock(S3Client.class);
+        ContentStore down = new S3ContentStore(unreachable, BUCKET);
+        when(unreachable.headObject(any(HeadObjectRequest.class))).thenThrow(NoSuchKeyException.builder().build());
+        when(unreachable.headBucket(any(HeadBucketRequest.class)))
+                .thenThrow(SdkClientException.builder().message("connection reset").build());
+        assertThrows(IOException.class, () -> down.exists(KEY),
+                "a store that cannot be asked about its bucket must raise rather than report absence");
+        assertThrows(IOException.class, () -> down.describe(KEY),
+                "describe must raise as well when the bucket cannot be asked about");
     }
 
     @Test
@@ -676,6 +759,23 @@ public final class ContentStoreFactoryTest {
      */
     private static S3Exception status(int code) {
         return (S3Exception) S3Exception.builder().statusCode(code).message("status " + code).build();
+    }
+
+    /**
+     * The answer a store gives for a bucket it does not have: a 404 that names the BUCKET, not the key.
+     *
+     * <p>Built with the status code and the error code an S3-compatible store really sends - verified
+     * against MinIO - because it is exactly those two fields the provider reads to tell a missing bucket
+     * from a missing object.
+     *
+     * @return the exception
+     */
+    private static NoSuchBucketException noSuchBucket() {
+        return NoSuchBucketException.builder()
+                .awsErrorDetails(AwsErrorDetails.builder().errorCode("NoSuchBucket").build())
+                .statusCode(404)
+                .message("The specified bucket does not exist")
+                .build();
     }
 
     private static ResponseInputStream<GetObjectResponse> response(byte[] content) {

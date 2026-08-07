@@ -1022,10 +1022,15 @@ public final class ContentStorePublisher {
         private IllegalStateException refuse(String reference, Throwable failure) {
             String message = "Content [" + reference + "] could not be published to the content store, so the"
                     + " transaction that wrote it is rolled back rather than committing a row that names content"
-                    + " the fleet cannot read";
+                    + " the fleet cannot read.";
             Debug.logError(failure, message, MODULE);
             try {
-                TransactionUtil.setRollbackOnly(message, failure);
+                // The rollback cause is the one copy of this message a USER sees, and it does not travel
+                // alone: TransactionUtil's RollbackOnlyCause appends the cause's own toString() to it with
+                // no separator of its own. So the sentence is terminated above and handed over with one
+                // space after it, which is what makes the rendered banner read as a finished sentence
+                // followed by the cause rather than running the two words together.
+                TransactionUtil.setRollbackOnly(message + " ", failure);
             } catch (GenericTransactionException e) {
                 Debug.logError(e, "The transaction could not be marked for rollback after a content store"
                         + " publication failed", MODULE);

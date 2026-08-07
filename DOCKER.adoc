@@ -1114,15 +1114,28 @@ filters, from minting a session per probe. Leave
 needed, because its valve calls `+getSession(true)+` for every request it
 handles.
 
-One consequence of answering ahead of the chain is worth knowing before a
-security scan reports it: a probe response carries only `+Cache-Control+`,
-`+Content-Type+` and `+Content-Length+`, and *not* the security headers the
-filter chain adds to an ordinary response (`+Strict-Transport-Security+`,
-`+X-Frame-Options+`, `+Content-Security-Policy+` and the rest). Those headers
-instruct a browser about a document; these two responses are constant JSON with
-no markup, no script and no user data, read by a load balancer rather than
-rendered. Running the chain to obtain them is exactly what would mint the
-session.
+Answering ahead of the chain means the chain's response headers are not applied
+either, so the servlet sets them itself. Every response it writes - both probe
+answers, the `+405+` for an unsupported method and both `+404+` refusals -
+carries `+Cache-Control: no-store+` plus `+Strict-Transport-Security:
+max-age=31536000; includeSubDomains+`, `+X-Frame-Options: sameorigin+`,
+`+X-Content-Type-Options: nosniff+`, `+X-XSS-Protection: 1; mode=block+` and
+`+Referrer-Policy: no-referrer-when-downgrade+`, at the same values an ordinary
+response in the deployment gets, so a probe response is not the one response a
+header scan finds different. They are applied directly, not by running the
+chain, so a probe still costs no session, no cookie and no database round trip.
+
+Two details are worth knowing before a scan reports them:
+
+* `+Content-Security-Policy+` is deliberately *not* set. Reading the configured
+policy needs the delegator-backed property lookup a liveness probe must not
+depend on, and the directive tells a browser how to render a document - a
+15-byte JSON literal with no markup, script, link or user data has nothing for
+it to govern.
+* `+Strict-Transport-Security+` is honoured from `+requestHandler.properties+`
+only. Turning `+strict-transport-security+` off in that file turns it off for
+the probes too, but a `+SystemProperty+` row overriding it does not reach them,
+for the same reason: a probe answers without asking the database.
 
 *The probes live in the webtools webapp*, so a deployment that disables webtools
 or blocks it at the network loses its health checks, and the balancer must be

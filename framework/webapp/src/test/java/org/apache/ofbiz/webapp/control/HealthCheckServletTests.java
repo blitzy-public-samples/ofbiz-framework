@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.description;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -243,6 +244,66 @@ public final class HealthCheckServletTests {
         // A cached verdict is a stale verdict: an intermediary that held a 200 would keep answering it for
         // an instance that had since failed.
         verify(response).setHeader("Cache-Control", "no-store");
+    }
+
+    @Test
+    public void everyResponseCarriesTheSameSecurityHeadersAsAnOrdinaryOne() throws Exception {
+        databaseAnswers(1L);
+
+        // All five answers this class can give, each on its own response so the header set can be asserted
+        // per answer: a scan that found one spelling of a probe response without the headers would report
+        // exactly the inconsistency these headers exist to remove.
+        assertHeadersOn(LIVE, "GET", "liveness");
+        assertHeadersOn(READY, "GET", "readiness, database up");
+        assertHeadersOn(LIVE, "POST", "the 405 for an unsupported method");
+        assertHeadersOn("/control" + LIVE, "GET", "the 404 refusing the control-prefixed alias");
+        databaseFails();
+        assertHeadersOn(READY, "GET", "readiness, database down");
+    }
+
+    @Test
+    public void theSecurityHeadersCostNoSessionAndNoDatabaseLookup() throws Exception {
+        at(LIVE);
+
+        probe.doFilter(request, response, chain);
+
+        // The headers are literals applied in the servlet, NOT obtained by running the filter chain, which
+        // is what keeps a probe from allocating a session - and keeps liveness answerable while the database
+        // is unreachable. Liveness must still consult nothing outside the JVM.
+        verify(response).setHeader("x-frame-options", "sameorigin");
+        verify(request, never()).getSession();
+        verify(request, never()).getSession(true);
+        verify(chain, never()).doFilter(any(), any());
+        verify(context, never()).getAttribute(anyString());
+    }
+
+    /**
+     * Asserts that one answer of this servlet carries the full security-header set.
+     *
+     * @param path the path within the webapp to request
+     * @param method the HTTP method to request it with
+     * @param answer what that combination answers, for the assertion message
+     * @throws Exception if the probe cannot be run
+     */
+    private void assertHeadersOn(String path, String method, String answer) throws Exception {
+        HttpServletResponse answered = mock(HttpServletResponse.class);
+        when(answered.getWriter()).thenReturn(new PrintWriter(new StringWriter()));
+        at(path);
+        when(request.getMethod()).thenReturn(method);
+
+        probe.doFilter(request, answered, chain);
+
+        verify(answered, description(answer + " must forbid caching")).setHeader("Cache-Control", "no-store");
+        verify(answered, description(answer + " must carry x-frame-options"))
+                .setHeader("x-frame-options", "sameorigin");
+        verify(answered, description(answer + " must carry x-content-type-options"))
+                .setHeader("x-content-type-options", "nosniff");
+        verify(answered, description(answer + " must carry X-XSS-Protection"))
+                .setHeader("X-XSS-Protection", "1; mode=block");
+        verify(answered, description(answer + " must carry Referrer-Policy"))
+                .setHeader("Referrer-Policy", "no-referrer-when-downgrade");
+        verify(answered, description(answer + " must carry strict-transport-security"))
+                .setHeader("strict-transport-security", "max-age=31536000; includeSubDomains");
     }
 
     @Test

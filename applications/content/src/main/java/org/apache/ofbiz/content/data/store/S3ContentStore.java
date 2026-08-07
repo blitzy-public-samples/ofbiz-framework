@@ -31,6 +31,7 @@ import java.time.Duration;
 import java.util.HexFormat;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.GeneralException;
@@ -49,6 +50,7 @@ import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
@@ -106,6 +108,16 @@ import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
  * {@code FileNotFoundException}. Log lines and messages name the bucket and the key and never the
  * content, per the policy {@link ContentStore} publishes.
  *
+ * <p><strong>A missing BUCKET is a fault, never absence.</strong> Both answers are a 404, so the
+ * distinction is drawn deliberately rather than left to the status code. On a read the store's own error
+ * code decides it, because a {@code GetObject} 404 carries a body: only {@code NoSuchKey} is absence, and
+ * {@code NoSuchBucket} is raised. On the two metadata operations no code is available - a {@code HeadObject}
+ * response has no body, so Amazon S3 and MinIO alike answer both cases with the 404 the SDK types as
+ * {@code NoSuchKeyException} - so absence is CONFIRMED with a {@code HeadBucket} before it is reported. That
+ * costs one extra request on the absence path only, and it is what stops a bucket that has been renamed,
+ * deleted or made inaccessible from making content quietly appear never to have been stored. See
+ * {@link #confirmBucketHolds}.
+ *
  * <p>Thread safe: {@link S3Client} is thread safe and every other field is immutable.
  */
 public final class S3ContentStore implements ContentStore, AutoCloseable {
@@ -133,10 +145,25 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     private static final Duration CALL_TIMEOUT = Duration.ofSeconds(45L);
     private static final int MAX_ATTEMPTS = 3;
 
+    /** The S3 error code that names the KEY as the thing the store does not hold. */
+    private static final String NO_SUCH_KEY_CODE = "NoSuchKey";
+
+    private static final int NOT_FOUND = 404;
+
     private final String bucket;
     private final S3Client client;
     private final String encryption;
     private final String kmsKeyId;
+
+    /**
+     * Whether a bucket the store would not confirm has already been reported.
+     *
+     * <p>Only the ambiguous outcome of {@link #confirmBucketHolds} sets this - a store that answers the
+     * bucket question with neither "it is here" nor "it is gone", which a credential permitted to read an
+     * object but not to inspect its bucket produces. One line per store instance rather than one per read,
+     * because absence is answered on a request path.
+     */
+    private final AtomicBoolean unconfirmableBucketReported = new AtomicBoolean();
 
     S3ContentStore() throws GeneralException {
         this.bucket = required(BUCKET_PROPERTY);
@@ -253,12 +280,16 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
             client.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
             return true;
         } catch (NoSuchKeyException absent) {
+            // Confirmed, not believed: see confirmBucketHolds().
+            confirmBucketHolds(key, absent);
             return false;
         } catch (S3Exception failure) {
             // A store that answers 404 without the NoSuchKey code - which several S3-compatible
             // implementations do for HeadObject, because a HEAD response carries no error body to put a
-            // code in - is reporting absence just as much as NoSuchKeyException is.
-            if (failure.statusCode() == 404) {
+            // code in - is reporting absence just as much as NoSuchKeyException is. A 404 that names
+            // anything else, NoSuchBucket above all, is a store fault and is raised below.
+            if (meansAbsentKey(failure)) {
+                confirmBucketHolds(key, failure);
                 return false;
             }
             throw failed("inspect", key, failure);
@@ -276,11 +307,14 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
             long modifiedAt = held.lastModified() == null ? 0L : held.lastModified().toEpochMilli();
             return Optional.of(new Description(length, modifiedAt, held.eTag()));
         } catch (NoSuchKeyException absent) {
+            confirmBucketHolds(key, absent);
             return Optional.empty();
         } catch (S3Exception failure) {
             // As in exists(): a 404 without the NoSuchKey code - which several S3-compatible stores answer
-            // for HeadObject, because a HEAD response carries no error body to put a code in - is absence.
-            if (failure.statusCode() == 404) {
+            // for HeadObject, because a HEAD response carries no error body to put a code in - is absence,
+            // and a 404 that names something else is a fault.
+            if (meansAbsentKey(failure)) {
+                confirmBucketHolds(key, failure);
                 return Optional.empty();
             }
             throw failed("inspect", key, failure);
@@ -390,10 +424,105 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     }
 
     private IOException notFoundOrFailure(String operation, String key, S3Exception failure) {
-        if (failure.statusCode() == 404) {
+        if (meansAbsentKey(failure)) {
             return absence(key, failure);
         }
         return failed(operation, key, failure);
+    }
+
+    /**
+     * Reports whether a 404 from the store says the KEY is the thing it does not hold.
+     *
+     * <p>A 404 alone does not: {@code NoSuchBucket} is a 404 too, and reading it as absence is what would
+     * make every object in a bucket that has been renamed, deleted or replaced look as though it had never
+     * been stored - the one failure mode a fleet whose only durable copy is the object cannot afford,
+     * because the caller would fall back to a local copy that does not exist and answer 404 to the user
+     * with nothing in the log. So the code is read, and only {@code NoSuchKey} is absence.
+     *
+     * <p>A 404 that carries NO error code at all is absence as well, because a request that names a key
+     * has nothing else to be missing that the store would answer 404 for, and several S3-compatible
+     * implementations answer a {@code HeadObject} that way - a HEAD response has no body to put a code in.
+     * {@link #confirmBucketHolds} is what closes that gap for the two metadata operations.
+     *
+     * @param failure the store's answer
+     * @return true when the failure means this store holds no object under the requested key
+     */
+    private static boolean meansAbsentKey(S3Exception failure) {
+        if (failure.statusCode() != NOT_FOUND) {
+            return false;
+        }
+        String code = errorCode(failure);
+        return code.isEmpty() || NO_SUCH_KEY_CODE.equals(code);
+    }
+
+    /**
+     * Returns the store's own error code for a failure, or the empty string when it reported none.
+     *
+     * @param failure the store's answer
+     * @return the error code, never null
+     */
+    private static String errorCode(S3Exception failure) {
+        var details = failure.awsErrorDetails();
+        if (details == null || details.errorCode() == null) {
+            return "";
+        }
+        return details.errorCode();
+    }
+
+    /**
+     * Confirms the bucket exists before an absence answered by a metadata request is passed on as absence.
+     *
+     * <p><strong>Why this request is worth making.</strong> A {@code HeadObject} cannot say WHICH thing is
+     * missing. Its response carries no body, so there is no error code in it: Amazon S3 and MinIO both
+     * answer a {@code HeadObject} for a key in a bucket that does not exist with the same 404 the SDK
+     * types as {@link NoSuchKeyException} that it uses for a key the bucket really does not hold. Reading
+     * that as absence is how a bucket-level misconfiguration - renamed, deleted, or a credential whose
+     * access to it was revoked - turns into content silently appearing not to exist, with no operational
+     * alarm anywhere. {@code GetObject} does distinguish the two, because its 404 carries a body and
+     * therefore an error code, which is why only the metadata path needs this.
+     *
+     * <p><strong>What it costs.</strong> One {@code HeadBucket} request, and ONLY on the absence path: a
+     * key the store holds is answered by the single {@code HeadObject} as before. Absence is the rare
+     * answer in a store-backed deployment, so this buys the distinction without changing the cost of a
+     * normal read.
+     *
+     * <p><strong>The three outcomes.</strong> The bucket answers - absence is genuine and is passed on.
+     * The bucket is reported gone, or the store cannot be reached at all - raised through
+     * {@link #failed}, so the log names the object and the reason and the caller gets the bounded
+     * operational error. The store answers something else, a 403 above all - the question could not be
+     * answered, which a credential allowed to read an object but not to inspect its bucket produces, so
+     * the original absence stands and one WARNING per store instance records that this deployment cannot
+     * tell the two apart.
+     *
+     * @param key the storage key whose absence is being confirmed
+     * @param absence the store's answer to the metadata request
+     * @throws IOException if the bucket is gone, or the store could not be asked about it
+     */
+    private void confirmBucketHolds(String key, SdkException absence) throws IOException {
+        try {
+            client.headBucket(HeadBucketRequest.builder().bucket(bucket).build());
+        } catch (S3Exception failure) {
+            if (failure.statusCode() == NOT_FOUND) {
+                throw bucketGone(key, failure);
+            }
+            if (unconfirmableBucketReported.compareAndSet(false, true)) {
+                Debug.logWarning("The content store reported no object under " + reference(key) + " and then"
+                        + " answered [" + failure.statusCode() + "] when asked whether the bucket itself exists,"
+                        + " so a missing object and a missing bucket cannot be told apart on this deployment."
+                        + " The object is being reported absent. Allow the credential to inspect the bucket"
+                        + " (s3:ListBucket on the bucket) to have a bucket fault raised instead. This is"
+                        + " reported once per instance.", MODULE);
+            }
+        } catch (SdkException failure) {
+            // The store could not be reached for the second question although it answered the first, which
+            // is a fault however it is read - and never a reason to report content as absent.
+            throw failed("inspect", key, failure);
+        }
+        if (Debug.verboseOn()) {
+            Debug.logVerbose("The content store holds no " + reference(key) + ", and its bucket answered, so"
+                    + " the object is absent rather than the bucket being gone. Original answer: "
+                    + absence.getMessage(), MODULE);
+        }
     }
 
     private FileNotFoundException absence(String key, SdkException cause) {
@@ -419,6 +548,37 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     private IOException failed(String operation, String key, SdkException cause) {
         Debug.logError(cause, "The content store could not " + operation + " " + reference(key) + ": "
                 + cause.getMessage(), MODULE);
+        return bounded(operation);
+    }
+
+    /**
+     * Reports that the BUCKET, not the object, is what the store does not have.
+     *
+     * <p>Logged as its own line rather than through {@link #failed}, because a store that answers a
+     * {@code HeadBucket} with 404 sends no message with it - a HEAD response has no body - so the generic
+     * line would say only "Status Code: 404" and leave an operator to work out which of the two things was
+     * missing. This says which, and what to look at. The caller is given the same bounded message every
+     * other inspection failure produces, so nothing about the deployment reaches a rendered page.
+     *
+     * @param key the storage key that was being inspected
+     * @param cause the store's answer to the bucket question
+     * @return the exception the caller throws
+     */
+    private IOException bucketGone(String key, SdkException cause) {
+        Debug.logError(cause, "The content store bucket [" + bucket + "] does not exist, so nothing can be read"
+                + " from it and " + reference(key) + " is reported as a store fault rather than as content that"
+                + " was never stored. Check content.store.s3.bucket (OFBIZ_S3_BUCKET), the endpoint the"
+                + " instance is configured with, and whether the bucket has been renamed or removed.", MODULE);
+        return bounded("inspect");
+    }
+
+    /**
+     * Returns the message a caller is given for a storage failure, which names nothing about the deployment.
+     *
+     * @param operation what was being attempted
+     * @return the exception the caller throws
+     */
+    private static IOException bounded(String operation) {
         return new IOException("The content store could not " + operation + " the requested content."
                 + " The server log records which object and why.");
     }

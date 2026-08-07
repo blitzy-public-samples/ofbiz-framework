@@ -42,6 +42,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.apache.ofbiz.base.util.Debug;
+import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.entity.Delegator;
 import org.apache.ofbiz.entity.util.EntityQuery;
 import org.apache.ofbiz.webapp.WebAppUtil;
@@ -91,14 +92,17 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  * endpoint, so the two paths still resolve if the filter mapping is ever removed. Neither role ever calls
  * {@code getSession()} itself.
  *
- * <p>One consequence of answering ahead of the chain is worth recording, because it looks like an omission
- * in a scan: a probe response carries only {@code Cache-Control}, {@code Content-Type} and
- * {@code Content-Length}, and NOT the security headers the filter chain adds to an ordinary response
- * ({@code Strict-Transport-Security}, {@code X-Frame-Options}, {@code Content-Security-Policy} and the
- * rest). Those headers instruct a BROWSER about a document; the two responses here are constant JSON with
- * no markup, no script, no link and no user data, read by a load balancer rather than rendered, so there
- * is nothing for them to protect. Running the chain to obtain them is precisely what would mint the
- * session this class exists to avoid.
+ * <p>Answering ahead of the chain means the chain's response headers are not applied either, so this class
+ * sets them itself: every response it writes carries {@code Cache-Control: no-store} plus
+ * {@code Strict-Transport-Security}, {@code X-Frame-Options}, {@code X-Content-Type-Options},
+ * {@code X-XSS-Protection} and {@code Referrer-Policy}, at the same values an ordinary response in this
+ * deployment gets. A probe response is therefore not the one response in the deployment that differs in a
+ * header scan - and it stays free, because the headers are literals applied in
+ * {@link #setCommonHeaders} rather than obtained by running the session-creating chain.
+ * {@code Content-Security-Policy} is the deliberate exception: reading the configured policy needs the
+ * delegator-backed property lookup a liveness probe must not depend on, and the directive governs how a
+ * BROWSER renders a document, of which a 15-byte JSON literal with no markup, script, link or user data
+ * contains nothing.
  *
  * <p>The class holds no per-request state: the delegator is resolved from the servlet context on every
  * readiness evaluation, so a probe reports what the instance can do NOW rather than what it could do when
@@ -149,6 +153,32 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
     private static final String ALLOWED_METHODS = "GET, HEAD";
     private static final String METHOD_GET = "GET";
     private static final String METHOD_HEAD = "HEAD";
+
+    /**
+     * The security headers every other response in the deployment carries, and their framework defaults.
+     *
+     * <p>The values are the ones {@code UtilHttp.setResponseBrowserDefaultSecurityHeaders} applies to an
+     * ordinary response when no view overrides them, so a probe response is not the odd one out in a header
+     * scan. They are literals HERE rather than a call to that method because it resolves its settings
+     * through {@code EntityUtilProperties} and ends by calling {@code SameSiteFilter}: a database lookup and
+     * a cookie decision, neither of which a liveness probe may depend on. What a probe answers has to stay
+     * answerable while the database is unreachable, which is the whole point of the endpoint.
+     *
+     * <p>{@code Content-Security-Policy} is deliberately NOT among them. Its configured value is only
+     * obtainable through the same delegator-backed lookup, and it instructs a browser about a document -
+     * there is no markup, script, style, image or frame in a 15-byte JSON literal for it to govern.
+     */
+    private static final String[][] SECURITY_HEADERS = {
+        {"x-frame-options", "sameorigin"},
+        {"x-content-type-options", "nosniff"},
+        {"X-XSS-Protection", "1; mode=block"},
+        {"Referrer-Policy", "no-referrer-when-downgrade"},
+    };
+
+    private static final String HSTS_HEADER = "strict-transport-security";
+    private static final String HSTS_VALUE = "max-age=31536000; includeSubDomains";
+    private static final String HSTS_RESOURCE = "requestHandler";
+    private static final String HSTS_PROPERTY = "strict-transport-security";
 
     /** How long a readiness verdict is reused before the database is asked again. */
     private static final long READINESS_CACHE_MILLIS = 2000L;
@@ -283,7 +313,7 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
      */
     private static void refuseAlias(HttpServletResponse response) {
         response.setStatus(HttpServletResponse.SC_NOT_FOUND);
-        response.setHeader(CACHE_CONTROL_HEADER, CACHE_CONTROL_VALUE);
+        setCommonHeaders(response);
         response.setContentLength(0);
     }
 
@@ -325,7 +355,7 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
     private static void refuseMethod(HttpServletResponse response) {
         response.setStatus(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
         response.setHeader(ALLOW_HEADER, ALLOWED_METHODS);
-        response.setHeader(CACHE_CONTROL_HEADER, CACHE_CONTROL_VALUE);
+        setCommonHeaders(response);
     }
 
     private static boolean isProbePath(String path) {
@@ -346,7 +376,7 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
             // Not a probe path. Answered without a body, and never with a 200, so a mistyped probe URL
             // cannot report health this class did not establish.
             response.setStatus(HttpServletResponse.SC_NOT_FOUND);
-            response.setHeader(CACHE_CONTROL_HEADER, CACHE_CONTROL_VALUE);
+            setCommonHeaders(response);
         }
     }
 
@@ -495,8 +525,38 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
         response.setStatus(status);
         response.setContentType(CONTENT_TYPE_JSON);
         response.setCharacterEncoding(CHARACTER_ENCODING);
-        response.setHeader(CACHE_CONTROL_HEADER, CACHE_CONTROL_VALUE);
+        setCommonHeaders(response);
         response.getWriter().write(body);
+    }
+
+    /**
+     * Applies the headers every response this class writes carries.
+     *
+     * <p>{@code Cache-Control: no-store}, so that no intermediary keeps a verdict, and the same security
+     * headers an ordinary response in this deployment receives from the filter chain. They are set HERE, in
+     * one place, rather than by letting the chain run: running the chain for a probe is what would mint an
+     * {@code HttpSession} every few seconds forever, which is the reason this class answers ahead of it. One
+     * set for all five answers - liveness, readiness up, readiness down, the 405 and both 404 refusals - so
+     * that no spelling of a probe response differs from another in a header scan.
+     *
+     * <p>Nothing here reads the database or touches a cookie, so a probe stays answerable exactly as long as
+     * the JVM is running.
+     *
+     * @param response the response being written
+     */
+    private static void setCommonHeaders(HttpServletResponse response) {
+        response.setHeader(CACHE_CONTROL_HEADER, CACHE_CONTROL_VALUE);
+        for (String[] header : SECURITY_HEADERS) {
+            response.setHeader(header[0], header[1]);
+        }
+        // Read from the property FILE, deliberately. The framework resolves the same switch through
+        // EntityUtilProperties, which consults the database; a probe must not. An operator who turns HSTS
+        // off in requestHandler.properties turns it off for the probes too, while a SystemProperty row
+        // overriding it does not reach them - stated here because that is the one behavioural difference
+        // between this header set and the chain's.
+        if (UtilProperties.getPropertyAsBoolean(HSTS_RESOURCE, HSTS_PROPERTY, true)) {
+            response.setHeader(HSTS_HEADER, HSTS_VALUE);
+        }
     }
 
     /**
