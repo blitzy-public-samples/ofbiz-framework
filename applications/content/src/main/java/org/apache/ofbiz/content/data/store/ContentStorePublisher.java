@@ -63,9 +63,9 @@ import org.apache.ofbiz.entity.transaction.TransactionUtil;
  *
  * <p>This is the whole of the object-storage behaviour that the content component's file-resolution
  * methods delegate to: deriving a storage key, reading an object onto the instance, streaming one
- * straight through, publishing what a transaction wrote, and erasing content from both places. It lives
- * in the isolated store package rather than in the seam so that every rule below is reachable from a
- * unit test, and so that the seam stays a handful of delegating calls.
+ * straight through, publishing what a transaction wrote, and reaping what a transaction that did not
+ * commit left behind. It lives in the isolated store package rather than in the seam so that every rule
+ * below is reachable from a unit test, and so that the seam stays a handful of delegating calls.
  *
  * <p><strong>Inert by default.</strong> Every entry point begins by resolving the provider and returns
  * immediately when there is none - {@code database} storage, the shipped default - or when it is
@@ -319,66 +319,8 @@ public final class ContentStorePublisher {
             // object the store does not hold.
             return Optional.empty();
         } catch (IOException failure) {
-            throw new GeneralException("The content store could not be read for [" + key + "]", failure);
-        }
-    }
-
-    /**
-     * Erases the content the given location names, from the store and from this instance.
-     *
-     * <p>The authorised erasure entry point. It exists because removing a {@code DataResource} row has
-     * never removed the file it names - the row is deleted by the entity engine and the bytes stay
-     * where they are - so with a store configured the object would stay in it just as the file stays on
-     * disk, and deleting the local file alone would not erase anything, because the next read would
-     * fetch the object again. Erasing both is the only operation that does.
-     *
-     * <p>Idempotent, and safe to call when no store is configured, in which case it removes the local
-     * file alone. DOCKER.adoc carries the bucket retention and purge procedure that goes with it.
-     *
-     * @param file the content's location on this instance, already authorised by the caller
-     * @return true when this instance no longer holds the content and the store no longer holds its
-     *     object
-     * @throws GeneralException if the store is configured but the object could not be removed. The
-     *     local file is removed first only when the object was, so a failure never leaves content
-     *     readable from the store while the row that named it is gone.
-     */
-    public static boolean erase(File file) throws GeneralException {
-        if (file == null) {
-            return false;
-        }
-        return erase(externalStore(), file);
-    }
-
-    /**
-     * Performs the erasure of {@link #erase(File)} against a given store.
-     *
-     * @param store the store to erase from, or null when none is configured, in which case the local
-     *     file alone is removed
-     * @param file the content's location on this instance
-     * @return true when neither this instance nor the store holds the content any longer
-     * @throws GeneralException if the store is configured but the object could not be removed
-     */
-    static boolean erase(ContentStore store, File file) throws GeneralException {
-        if (file == null) {
-            return false;
-        }
-        String key = storeKey(file);
-        if (store != null && key != null) {
-            try {
-                store.delete(key);
-                Debug.logInfo("Content [" + key + "] was erased from the content store", MODULE);
-            } catch (GeneralException | IOException failure) {
-                throw new GeneralException("Content [" + key + "] could not be erased from the content store, so"
-                        + " the local copy is kept: erasing one of the two would leave the content readable from"
-                        + " the other", failure);
-            }
-        }
-        try {
-            Files.deleteIfExists(file.toPath());
-            return true;
-        } catch (IOException failure) {
-            throw new GeneralException("Content [" + file.getAbsolutePath() + "] could not be erased from this"
-                    + " instance", failure);
+            throw fault("The content store could not be read for the requested content.",
+                    "The content store could not be read for [" + key + "]", failure);
         }
     }
 
@@ -440,8 +382,10 @@ public final class ContentStorePublisher {
         String home = System.getProperty("ofbiz.home");
         File shard = new File(absolute ? uploadPath : home + uploadPath);
         if (storeKey(shard) == null) {
-            throw new IllegalStateException("An upload directory outside the OFBiz home directory cannot be"
-                    + " published to the content store: [" + shard.getAbsolutePath() + "]");
+            throw refusal("An upload directory outside the OFBiz home directory cannot be published to the"
+                            + " content store.",
+                    "An upload directory outside the OFBiz home directory cannot be published to the content"
+                            + " store: [" + shard.getAbsolutePath() + "]", null);
         }
         TransactionScope scope = activeScope("An upload directory was resolved outside an active transaction"
                 + " while a content store is configured, so content written into it could not be published"
@@ -451,8 +395,9 @@ public final class ContentStorePublisher {
         try {
             Files.createDirectories(privateDirectory.toPath());
         } catch (IOException unwritable) {
-            throw new IllegalStateException("The upload directory [" + privateDirectory.getAbsolutePath()
-                    + "] could not be created on this instance", unwritable);
+            throw refusal("The upload directory could not be created on this instance.",
+                    "The upload directory [" + privateDirectory.getAbsolutePath() + "] could not be created on"
+                            + " this instance", unwritable);
         }
         bind(privateDirectory, null, true);
         return uploadPath + "/" + scope.uploadDirectoryName();
@@ -496,8 +441,9 @@ public final class ContentStorePublisher {
             if (!writing) {
                 return;
             }
-            throw new IllegalStateException("Content outside the OFBiz home directory cannot be published to the"
-                    + " content store: [" + directory.getAbsolutePath() + "]");
+            throw refusal("Content outside the OFBiz home directory cannot be published to the content store.",
+                    "Content outside the OFBiz home directory cannot be published to the content store: ["
+                            + directory.getAbsolutePath() + "]", null);
         }
         String identity = directory.getAbsolutePath() + (names == null ? "" : names);
         TransactionScope scope;
@@ -547,8 +493,59 @@ public final class ContentStorePublisher {
         try {
             return store.describe(key).orElse(null);
         } catch (IOException failure) {
-            throw new GeneralException("The content store could not be asked about [" + key + "]", failure);
+            throw fault("The content store could not be asked about the requested content.",
+                    "The content store could not be asked about [" + key + "]", failure);
         }
+    }
+
+    /**
+     * Reports a storage failure: what failed and where goes to the operator log, and the caller is given a
+     * sentence naming nothing but an opaque reference that ties the two together.
+     *
+     * <p>A message raised here travels out through {@code GeneralException} into a service error and is
+     * rendered on a content screen, so a storage KEY in it would tell whoever is looking at that screen the
+     * deployment's internal path scheme, the upload directory it shards by and the transaction the content
+     * was written in. The provider already withholds its bucket, endpoint and SDK detail the same way; this
+     * closes the one place that put the key back.
+     *
+     * @param told what the caller is told, which must name nothing about the deployment
+     * @param detail what the operator log records, which names the content
+     * @param cause the failure, or null when there is nothing more to log than the detail
+     * @return the exception the caller throws
+     */
+    private static GeneralException fault(String told, String detail, Throwable cause) {
+        return new GeneralException(told + " Reference [" + reference(detail, cause) + "]");
+    }
+
+    /**
+     * The refusal counterpart of {@link #fault}, for the paths that raise {@code IllegalStateException}
+     * because a write cannot be allowed to proceed.
+     *
+     * @param told what the caller is told, which must name nothing about the deployment
+     * @param detail what the operator log records, which names the content
+     * @param cause the failure, or null when there is nothing more to log than the detail
+     * @return the exception the caller throws
+     */
+    private static IllegalStateException refusal(String told, String detail, Throwable cause) {
+        return new IllegalStateException(told + " Reference [" + reference(detail, cause) + "]");
+    }
+
+    /**
+     * Logs the operator detail under a fresh opaque reference and returns that reference.
+     *
+     * @param detail what the operator log records
+     * @param cause the failure, or null
+     * @return the reference to hand the caller
+     */
+    private static String reference(String detail, Throwable cause) {
+        String reference = UUID.randomUUID().toString();
+        String line = detail + ". Reference [" + reference + "], which is the only detail the caller is shown.";
+        if (cause == null) {
+            Debug.logError(line, MODULE);
+        } else {
+            Debug.logError(cause, line, MODULE);
+        }
+        return reference;
     }
 
     /**
@@ -575,10 +572,12 @@ public final class ContentStorePublisher {
             // a storage failure would send an operator looking in the wrong place. A read-only root
             // filesystem is the usual cause - see DOCKER.adoc, which records that the content directory
             // has to be writable for an instance to take delivery of content it does not already hold.
-            throw new GeneralException("Content [" + key + "] is held by the content store, but this instance"
-                    + " could not place it at [" + target + "]: its own filesystem could not be written."
-                    + " The directory holding content must be writable by the OFBiz user, or the content must"
-                    + " already be present on the instance.", unwritable);
+            throw fault("The requested content is held by the content store, but this instance could not place"
+                            + " it on its own filesystem, which could not be written. The directory holding"
+                            + " content must be writable by the OFBiz user, or the content must already be"
+                            + " present on the instance.",
+                    "Content [" + key + "] is held by the content store, but this instance could not place it at"
+                            + " [" + target + "]: its own filesystem could not be written", unwritable);
         }
         try {
             try (InputStream content = store.openStream(key)) {
@@ -601,7 +600,8 @@ public final class ContentStorePublisher {
         } catch (FileNotFoundException removed) {
             return false;
         } catch (IOException failure) {
-            throw new GeneralException("The content store could not be read for [" + key + "]", failure);
+            throw fault("The content store could not be read for the requested content.",
+                    "The content store could not be read for [" + key + "]", failure);
         } finally {
             removeQuietly(staged);
         }
@@ -842,9 +842,11 @@ public final class ContentStorePublisher {
      * Publishes the content a transaction wrote, before that transaction commits.
      *
      * <p>Registered by {@link #bind} once per watched identity per transaction, and used only by the
-     * transaction that registered it.
+     * transaction that registered it. Package-private, rather than private, only so that a test can
+     * complete a publication directly: the transaction manager that would otherwise call it back is not
+     * running in the unit tier.
      */
-    private static final class ContentPublication implements Synchronization {
+    static final class ContentPublication implements Synchronization {
 
         private final ContentStore store;
         private final File directory;
@@ -854,7 +856,7 @@ public final class ContentStorePublisher {
         private final long registeredAt;
         private final List<String> created = new LinkedList<>();
 
-        private ContentPublication(ContentStore store, File directory, Set<String> names, String identity) {
+        ContentPublication(ContentStore store, File directory, Set<String> names, String identity) {
             this.store = store;
             this.directory = directory;
             this.names = names;
@@ -878,7 +880,7 @@ public final class ContentStorePublisher {
             if (scope != null) {
                 scope.completed(identity);
             }
-            if (status == Status.STATUS_COMMITTED || created.isEmpty()) {
+            if (status == Status.STATUS_COMMITTED) {
                 return;
             }
             // The transaction did not commit, so the objects it CREATED are named by no committed row and
@@ -896,6 +898,75 @@ public final class ContentStorePublisher {
                             + " commit and could not be removed again, so it is now an orphan in the content"
                             + " store", MODULE);
                 }
+            }
+            reapOwnedDirectory();
+        }
+
+        /**
+         * Removes the upload directory this transaction owns, after a transaction that did not commit.
+         *
+         * <p>The point of the whole design is that an instance holds no durable local state, and a
+         * non-commit is exactly where it would otherwise accumulate some: {@link #publishedUploadPath}
+         * created this directory for one transaction, the upload service wrote into it, and the rollback
+         * removed the {@code DataResource} row that named it - so what is left is bytes NOTHING names, on
+         * one instance's disk, which no read will ever ask for and no erasure will ever reach. Left alone
+         * they grow without bound on whichever instance happened to take the failed upload, which is the
+         * local state the fleet is not supposed to have.
+         *
+         * <p>Deliberately narrow, because it deletes files. It runs only for a directory publication -
+         * where the directory belongs to this transaction alone - only when that directory carries the
+         * {@code txn-} name this class gives such a directory, and only on the regular files inside it,
+         * never following a symbolic link and never descending. Anything else it finds, it leaves and
+         * reports, keeping the directory too: an unexpected entry is a sign something outside this class
+         * is writing there, and that is not something to delete on a best-effort path.
+         */
+        private void reapOwnedDirectory() {
+            if (names != null || !directory.getName().startsWith(TRANSACTION_DIRECTORY_PREFIX)) {
+                // A NAMED publication watches files it does not own: they belong to whatever wrote them,
+                // and a non-commit is no licence to delete them.
+                return;
+            }
+            Path root = directory.toPath();
+            if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+                return;
+            }
+            File[] children = directory.listFiles();
+            if (children == null) {
+                Debug.logWarning("The upload directory [" + directory.getAbsolutePath() + "] of a transaction"
+                        + " that did not commit could not be listed, so it is left on this instance", MODULE);
+                return;
+            }
+            boolean emptied = true;
+            for (File child : children) {
+                Path path = child.toPath();
+                if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                    emptied = false;
+                    Debug.logWarning("The upload directory [" + directory.getAbsolutePath() + "] of a"
+                            + " transaction that did not commit holds [" + child.getName() + "], which is not"
+                            + " a regular file, so the directory is left on this instance", MODULE);
+                    continue;
+                }
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException failure) {
+                    emptied = false;
+                    Debug.logWarning(failure, "The upload [" + child.getName() + "] written by a transaction"
+                            + " that did not commit could not be removed from this instance", MODULE);
+                }
+            }
+            if (!emptied) {
+                return;
+            }
+            try {
+                Files.deleteIfExists(root);
+                if (Debug.verboseOn()) {
+                    Debug.logVerbose("The upload directory [" + directory.getAbsolutePath() + "] was removed"
+                            + " from this instance, because the transaction that wrote into it did not commit",
+                            MODULE);
+                }
+            } catch (IOException failure) {
+                Debug.logWarning(failure, "The empty upload directory [" + directory.getAbsolutePath() + "] of"
+                        + " a transaction that did not commit could not be removed from this instance", MODULE);
             }
         }
 
@@ -1015,27 +1086,31 @@ public final class ContentStorePublisher {
          * row naming content the fleet cannot read must never commit, so there is no path here that
          * merely logs.
          *
-         * @param reference what could not be published
+         * @param subject what could not be published, as a storage key or a local path. It is operator
+         *     detail and never reaches the caller
          * @param failure why
          * @return the exception the caller throws
          */
-        private IllegalStateException refuse(String reference, Throwable failure) {
-            String message = "Content [" + reference + "] could not be published to the content store, so the"
-                    + " transaction that wrote it is rolled back rather than committing a row that names content"
-                    + " the fleet cannot read.";
-            Debug.logError(failure, message, MODULE);
+        private IllegalStateException refuse(String subject, Throwable failure) {
+            // The rollback cause is the one copy of this that a USER sees - rendered on the content screen
+            // the upload was made from - so it names the content by REFERENCE only. The key, the path and
+            // the failure go to the log under that same reference. Nor does the cause travel: the store's
+            // own messages are already sanitised, but a local read failure arrives as a NoSuchFileException
+            // whose toString() is the absolute path, and TransactionUtil's RollbackOnlyCause appends the
+            // cause's toString() to whatever message it is handed.
+            String reference = reference("Content [" + subject + "] could not be published to the content store,"
+                    + " so the transaction that wrote it is rolled back rather than committing a row that names"
+                    + " content the fleet cannot read", failure);
+            String message = "The content could not be published to the content store, so the transaction that"
+                    + " wrote it is rolled back rather than committing a row that names content the fleet cannot"
+                    + " read. Reference [" + reference + "]";
             try {
-                // The rollback cause is the one copy of this message a USER sees, and it does not travel
-                // alone: TransactionUtil's RollbackOnlyCause appends the cause's own toString() to it with
-                // no separator of its own. So the sentence is terminated above and handed over with one
-                // space after it, which is what makes the rendered banner read as a finished sentence
-                // followed by the cause rather than running the two words together.
-                TransactionUtil.setRollbackOnly(message + " ", failure);
+                TransactionUtil.setRollbackOnly(message, null);
             } catch (GenericTransactionException e) {
                 Debug.logError(e, "The transaction could not be marked for rollback after a content store"
-                        + " publication failed", MODULE);
+                        + " publication failed. Reference [" + reference + "]", MODULE);
             }
-            return new IllegalStateException(message, failure);
+            return new IllegalStateException(message);
         }
 
         /**

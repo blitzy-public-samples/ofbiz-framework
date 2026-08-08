@@ -282,6 +282,19 @@ written to the container log*: every function that handles one disables shell
 tracing first, and the shutdown helper reports which file it read the admin key
 from, never the value.
 
+*The helper reports whether the shutdown was actually accepted.* OFBiz answers an
+admin request with `+OK+`, with `+IN-PROGRESS+` when a shutdown was already under
+way, or with `+FAIL+` when the key does not match; the helper treats the first two
+as success and *exits non-zero on anything else*, naming the file the key came
+from so the mismatch can be found. It also unescapes the value it reads: a
+property value is written with each backslash doubled, and the running server
+holds the value `+java.util.Properties+` read back, so a key containing a
+backslash has to be collapsed before it is transmitted or the server's exact
+comparison fails. Both matter for the same reason - a stop that did not happen
+must not look like one that did, to an operator or to an orchestrator reading an
+exit status. The helper is POSIX shell, so `+sh /ofbiz/send_ofbiz_stop_signal.sh+`
+works as well as running it directly.
+
 WARNING: Two Gradle tasks write live signing keys into the *tracked* source file
 `+framework/security/config/security.properties+`. `+gradlew generateSecretKeys+`
 does it by design, and `+gradlew loadAll+` *depends on that task*, so the
@@ -346,6 +359,23 @@ recoverable; see _Schema initialisation_ below.
 host, port, database names and user names. Rotating a password or resizing the
 pool leaves the rows where they are and does not re-run a data load, while
 pointing the container at a different database does.
+
+*No credential is in any marker, or in the pre-image any marker digest is taken
+over, and no marker digest reaches the container log.* A digest is not a one-way
+function of a secret when the secret is the only unknown in the pre-image: every
+other field a marker covers is a setting an operator already knows or can read
+out of `+docker inspect+`, so a pre-image containing the database passwords would
+be a persisted, offline-guessable commitment to them - on a volume that outlives
+the container that wrote it, and one that another container may mount. Rotating a
+password therefore leaves `+db_config_applied+` unchanged, which is the intended
+behaviour: what the marker records is which configuration was applied and which
+DDL mode it was rendered with, and a rotated password changes neither. Markers are
+written `+rw-------+`, so a marker cannot be read - or, on a writable mount,
+forged to skip a data load - by anything but the `+ofbiz+` user. The writer takes
+the digest KIND rather than a digest and computes it itself, because a shell
+prints a function's arguments before its body runs: a digest passed in would
+already have been traced into `+docker logs+` by the time the function could
+suppress anything.
 
 Withdrawing a setting works as well as changing one: an override this script
 rendered on an earlier start is REMOVED rather than left behind, so going back
@@ -539,14 +569,20 @@ limit (`+http.upload.max.sizethreshold+`, `+1024000+`, only decides when a part 
 spooled to disk rather than held in memory). A refusal by this bound reports the
 ceiling to the operator log with an opaque reference and tells the caller only
 that the content was too large.
-* *Erasing content* removes the object and the local copy TOGETHER, and only in
-that order - if the object cannot be removed the local copy is kept, because
-erasing one of the two erases nothing: the next read would fetch the object back.
-Note that removing a `+DataResource+` row has never removed the file it names,
-in OFBiz with or without a store, so *objects are retained until something
-deletes them*. Plan bucket retention deliberately: a lifecycle rule, or a
-periodic purge of objects whose `+dataResourceId+` no longer exists. See
-_Retention and purge_ below.
+* *Nothing in OFBiz erases content*, with a store or without one. Removing a
+`+DataResource+` row has never removed the file it names - the row goes and the
+bytes stay where they are - so with a store configured *objects are retained
+until something outside OFBiz deletes them*, exactly as files are. The store
+introduces no erasure path and takes none away. Plan bucket retention
+deliberately: a lifecycle rule, or a periodic purge of objects whose
+`+dataResourceId+` no longer exists. See _Retention and purge_ below.
+* An upload whose transaction does NOT commit leaves nothing behind on the
+instance that took it. The staging directory that transaction owns is removed
+with it, and any object the transaction created is deleted from the store again -
+so a failed upload costs no durable local state and no orphan object. An object
+the transaction merely REPLACED is deliberately left alone: the previous object
+is not held anywhere to restore, and deleting the key would destroy content a
+committed row still names.
 * The `+filesystem+` provider keeps objects under OFBiz's own upload directory,
 `+/ofbiz/runtime/uploads+` - it encapsulates the behaviour that was already
 there rather than adding a second copy elsewhere. That is shared state only if
@@ -595,6 +631,26 @@ for S3 that is `+[bucket/key]+` - and never logs content and never logs a
 credential. Storage keys are OFBiz paths built from the `+dataResourceId+`
 rather than from the name a user uploaded.
 
+*What a failure tells whoever is looking at the screen.* Nothing about the
+deployment. A storage failure is reported in two halves: the operator log records
+what failed, which object, and why, under an opaque
+`+Reference [<uuid>]+`; the caller - a content screen, or the rollback banner on a
+failed upload - is told what went wrong in general terms *and that reference,
+naming no key, no path, no bucket and no endpoint*. Quote the reference when
+reporting a problem, and `+grep+` for it in `+runtime/logs/ofbiz.log+` to find the
+one line that holds the detail.
+
+Content that *neither the store nor the instance holds* is reported the same way,
+and for the same reason: the location a file-backed resource names is what the
+storage key is built from, so with a store configured a message carrying it would
+hand out the key. The screen reads `+The requested content could not be read.
+Reference [<uuid>]+` and the log line under that reference names the location and
+the resource type. This is not a rare state - the object lifecycle belongs to
+whatever manages the bucket (see *Retention and purge* below), so a retention rule
+that removes an object a live row still names arrives here. With *no* store
+configured the location names nothing but a file on this instance and the message
+is the one OFBiz has always given, `+No file found: <path>+`, unchanged.
+
 *Credentials.* Supplying one of `+OFBIZ_S3_ACCESS_KEY_ID+` and
 `+OFBIZ_S3_SECRET_ACCESS_KEY+` without the other is refused at start up. When
 both are supplied they are rendered into `+/ofbiz/config/content.properties+`,
@@ -607,9 +663,12 @@ stays on disk. That is unchanged behaviour, not a regression, but it becomes
 visible when the bytes are billed by the object. Two things to decide
 deliberately:
 
-* *Erasure*, when a deployment does want content gone, must remove the object and
-the local copy together; the store's own erasure entry point does exactly that,
-and refuses to remove one without the other.
+* *Erasure*, when a deployment does want content gone, is *external to OFBiz*, as
+it already is for files: OFBiz offers no operation that erases content, and the
+store adds none, so an object's lifecycle after its row is removed belongs to
+whatever manages the bucket. Deleting the object alone would also not be enough
+on its own if the row still existed - the local copy on the instance that wrote
+it would keep answering reads.
 * *Accumulation*, for content whose rows are gone already. Storage keys are OFBiz
 paths built from the `+dataResourceId+`, so a periodic job can list the bucket
 under `+ofbiz/runtime/uploads/+` and delete objects whose `+dataResourceId+` no
@@ -868,9 +927,30 @@ TCP port and refused unless it matches a connector port declared in
 connector would look configured while marking nothing secure. An empty value
 changes nothing.
 
-|OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS |false |Set to `+true+` to widen the
-session cookie to the parent domain, so that instances served under different
-subdomains share it.
+|OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS |false |Set to `+true+` to issue the
+session cookie for the parent domain, so that instances served under different
+subdomains share one session. It requires `+OFBIZ_COOKIE_DOMAIN+` and is
+*refused* without it, because there would be no domain to share the cookie across
+and the setting would silently do nothing. What it changes is the webapp's
+session-cookie configuration, so *every* session cookie carries the domain -
+including the one issued when the session id is rotated at login, which is the one
+the authenticated session travels in - and every other attribute of the cookie
+(`+Path+`, `+Secure+`, `+HttpOnly+`, `+SameSite+`) is exactly what it would have
+been.
+
+|OFBIZ_COOKIE_DOMAIN |_empty_ |The parent domain the session cookie is issued for,
+rendered into `+cookie.domain+` in `+config/url.properties+`. Give the domain
+alone - `+example.com+` for a fleet served as `+shop.example.com+` and
+`+admin.example.com+` - with no scheme, port, path or wildcard; a leading dot is
+accepted and removed, since RFC 6265 covers subdomains without one and Tomcat
+refuses the dotted spelling. *Every client must reach the fleet under it*: RFC
+6265 requires a client addressing the instance by anything else - another domain,
+or an address - to discard the cookie, which for a browser means no session at
+all. That is why the domain is *not* derived from the host a request arrives with:
+one webapp has one session-cookie configuration, so a domain taken from whichever
+host arrived first would be sent to every other client too. Load-balancer health
+probes are unaffected either way - they carry no cookie, and the health endpoints
+create no session.
 |===
 
 With `+OFBIZ_DISTRIBUTED_CACHE_CLEAR+` left `+false+` each instance caches
@@ -989,9 +1069,9 @@ same check the `+ping+` service performs - a count of the rows in the
 `+sequence_value_item+` table, which the `+SequenceValueItem+` entity maps to -
 and a count of zero is reported as not ready. Nothing else is measured: cache
 coherence, object-store reachability and the health of other instances are not
-part of the verdict. The check runs on every request - the delegator is
-resolved from the servlet context each time and nothing is cached - so a probe
-always reports what the instance can do now.
+part of the verdict. The delegator is resolved from the servlet context on every
+request, and a verdict is reused for at most two seconds (see _What a probe
+costs_ below), so a probe always reports what the instance can do now.
 
 A database holds no such row until an id has been allocated from the sequencer, so a
 schema that has just been created reports *not ready* - exactly as `+ping+` reports
@@ -1109,10 +1189,9 @@ would leave a broken instance in service.
 servlet *and* as a filter on those two exact paths, declared ahead of the other
 filters, so a probe is answered without running the rest of the chain - which is
 what keeps `+ControlFilter+`, which calls `+getSession()+` on every request it
-filters, from minting a session per probe. Leave
-`+OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS+` off unless a shared cookie is really
-needed, because its valve calls `+getSession(true)+` for every request it
-handles.
+filters, from minting a session per probe. That holds with
+`+OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS+` on as well: its valve only configures
+the domain a session cookie is issued for and creates no session of its own.
 
 Answering ahead of the chain means the chain's response headers are not applied
 either, so the servlet sets them itself. Every response it writes - both probe
@@ -1388,6 +1467,25 @@ in a `+passwords.properties+` that is not committed - and change the delegator
 group-maps to them. Their URIs leave `+sslmode+` at the driver default because
 they address the loopback interface; add `+sslmode=verify-full+` and
 `+sslrootcert+` if that install reaches PostgreSQL over a network.
+
+*What a database failure tells whoever sent the request.* Nothing about the
+database. A failure in the datasource layer is reported in two halves, the same
+way object-storage failures are: the operator log records the statement that
+failed and the driver's own exception with its full stack trace, under an opaque
+`+Reference [<uuid>]+`; the caller is told that a database error prevented the
+operation and given *that reference and nothing else* - no SQL, no schema, table
+or column name, no driver or engine text. This is not decoration. Many OFBiz
+pages are reachable *anonymously* - the whole storefront is - and an unhandled
+entity exception is rendered on the page the request came from, so before this
+the statement OFBiz built and the engine's own error text were shown to whoever
+asked for them, together describing the deployment's schema and naming the engine
+to aim at. It matters more with a managed RDBMS than it did with the embedded
+database, because that database is reachable independently of the instance.
+Quote the reference when reporting a problem and `+grep+` it in
+`+runtime/logs/ofbiz.log+` to find the one entry holding the detail. The
+schema-check and DDL messages produced by `+DatabaseUtil+` are deliberately
+unchanged: they are produced by schema initialisation and by the authenticated
+administrative check in webtools, never by serving a visitor's request.
 
 ===== Schema initialisation
 

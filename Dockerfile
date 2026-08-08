@@ -110,6 +110,36 @@ WORKDIR /ofbiz
 RUN --mount=type=bind,from=builder,source=/builder/build/distributions/ofbiz.tar,target=/mnt/ofbiz.tar \
     ["tar", "--extract", "--strip-components=1", "--file=/mnt/ofbiz.tar"]
 
+# Remove the TEST security.properties, then assert that no security.properties left in the image carries a
+# signing key at all.
+#
+# The builder-stage guard above checks framework/security/config/security.properties, the file the run time
+# actually reads - but it is not the only security.properties the image receives. The distribution packages
+# 'framework/**' wholesale (build.gradle), so framework/security/src/test/resources/security.properties comes
+# with it, and that file legitimately carries two filled 64-character keys: it is a test fixture, on the UNIT
+# TEST class path only, and blanking it in the source tree would break the tests that need it. In the image it
+# is a signing key sealed into a layer, world-readable, that every container built from this image shares and
+# no run-time override can remove - which is exactly what the guard exists to prevent. Nothing in a running
+# container reads it (a component's class path is its config directory and its jars, never src/test), so the
+# image simply should not have it.
+#
+# Deleting the fixture alone would be a fix for one file; the assertion is what makes it a rule, so a future
+# test fixture packaged the same way fails the build here instead of shipping. It runs AFTER the deletion and
+# covers every remaining copy, including the config one, so this stage cannot ship a filled key by any route.
+RUN find . -path '*/src/test/*' -name security.properties -print -delete && \
+    filled="$(grep --recursive --files-with-matches --extended-regexp \
+        '^(login\.secret_key_string|security\.token\.key)=.+' --include=security.properties . || true)" && \
+    if [ -n "$filled" ]; then \
+        echo 'ERROR: a security.properties packaged into this image carries a live signing key:' >&2; \
+        echo "$filled" >&2; \
+        echo '       An image layer is permanent and shared by every container built from it, so a key' >&2; \
+        echo '       here cannot be rotated and cannot be overridden at run time. Both properties are' >&2; \
+        echo '       injected from OFBIZ_LOGIN_SECRET_KEY and OFBIZ_JWT_TOKEN_KEY at container start.' >&2; \
+        echo '       If the file above is a TEST fixture, exclude it from the distribution or extend the' >&2; \
+        echo '       deletion in this Dockerfile stage; if it is a real configuration file, blank it.' >&2; \
+        exit 1; \
+    fi
+
 # Create directories for OFBiz volume mountpoints.
 RUN ["mkdir", "/ofbiz/runtime", "/ofbiz/config", "/ofbiz/lib-extra"]
 

@@ -37,9 +37,25 @@ under the License.
     <!-- Below uses Group/HTTP engine
     <service name="distributedClearAllEntityCaches" engine="group" location="distributedClearAllEntityCaches" invoke=""/>
     -->
+    <!-- CACHE INVALIDATION IS AN ADMINISTRATIVE OPERATION, and every service below that performs one requires
+         UTIL_CACHE_EDIT. It is the permission OFBiz already uses for exactly this: the webtools cache screens
+         show their buttons only to a holder of it (FindUtilCache.groovy) and refuse the action without it
+         (UtilCacheEvents.clearAllEvent), so the service layer and the UI now agree instead of the service
+         being the way around the UI's check.
+         WHY IT MATTERS HERE. These services are exported (export="true"), so they are reachable over REST by
+         ANY authenticated principal, and with distribute=true one call invalidates the caches of EVERY
+         instance in the fleet - a cheap, remote, amplified way to make the whole deployment re-read the
+         database. That reach is what distributed cache clear adds, so gating it belongs with it.
+         The distributed path is unaffected: the JMS transport carries the delegator's
+         distributed-cache-clear-user-login-id (default "system") in the message context and the receiving
+         instance runs the service with it, and seed data puts "system" in the SUPER group, which holds
+         UTIL_CACHE_EDIT. -->
     <service name="clearAllEntityCaches" engine="java" export="true"
             location="org.apache.ofbiz.entityext.cache.EntityCacheServices" invoke="clearAllEntityCaches" auth="true">
         <description>Clears all values from all Entity Engine caches. By default does not distribute.</description>
+        <required-permissions join-type="AND">
+            <check-permission permission="UTIL_CACHE_EDIT"/>
+        </required-permissions>
         <attribute name="distribute" type="Boolean" mode="IN" optional="true"/>
     </service>
 
@@ -53,6 +69,9 @@ under the License.
     <service name="clearCacheLineByValue" engine="java" export="true"
             location="org.apache.ofbiz.entityext.cache.EntityCacheServices" invoke="clearCacheLine" auth="true">
         <description>Clear Cache Line with a value (GenericValue); this is the preferred method since the all, by primary key and by and caches will be cleared. By default does not distribute.</description>
+        <required-permissions join-type="AND">
+            <check-permission permission="UTIL_CACHE_EDIT"/>
+        </required-permissions>
         <attribute name="value" type="org.apache.ofbiz.entity.GenericValue" mode="IN" optional="false"/>
         <attribute name="distribute" type="Boolean" mode="IN" optional="true"/>
     </service>
@@ -67,6 +86,9 @@ under the License.
     <service name="clearCacheLineByDummyPK" engine="java" export="true"
             location="org.apache.ofbiz.entityext.cache.EntityCacheServices" invoke="clearCacheLine" auth="true">
         <description>Clear Cache Line with a dummyPK (GenericEntity); clears that all cache entry and depending on whether the dummyPK is a primaryKey or not this clears the by primary key cache or the specified entry in the by and cache. By default does not distribute.</description>
+        <required-permissions join-type="AND">
+            <check-permission permission="UTIL_CACHE_EDIT"/>
+        </required-permissions>
         <attribute name="dummyPK" type="GenericEntity" mode="IN" optional="false"/>
         <attribute name="distribute" type="Boolean" mode="IN" optional="true"/>
     </service>
@@ -82,6 +104,9 @@ under the License.
     <service name="clearCacheLineByPrimaryKey" engine="java" export="true"
             location="org.apache.ofbiz.entityext.cache.EntityCacheServices" invoke="clearCacheLine" auth="true">
         <description>Clear Cache Line with a primaryKey (GenericPK); clears the all and by primary key caches. By default does not distribute.</description>
+        <required-permissions join-type="AND">
+            <check-permission permission="UTIL_CACHE_EDIT"/>
+        </required-permissions>
         <attribute name="primaryKey" type="GenericPK" mode="IN" optional="false"/>
         <attribute name="distribute" type="Boolean" mode="IN" optional="true"/>
     </service>
@@ -95,6 +120,9 @@ under the License.
     <service name="clearCacheLineByCondition" engine="java" export="true"
             location="org.apache.ofbiz.entityext.cache.EntityCacheServices" invoke="clearCacheLine" auth="true">
         <description>Clear Cache Line with a condition; By default does not distribute.</description>
+        <required-permissions join-type="AND">
+            <check-permission permission="UTIL_CACHE_EDIT"/>
+        </required-permissions>
         <attribute name="entityName" type="String" mode="IN" optional="false"/>
         <attribute name="condition" type="org.apache.ofbiz.entity.condition.EntityCondition" mode="IN" optional="false"/>
         <attribute name="distribute" type="Boolean" mode="IN" optional="true"/>

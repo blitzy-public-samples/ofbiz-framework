@@ -45,6 +45,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -706,7 +707,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
         if ("LOCAL_FILE".equals(dataResourceTypeId) || "LOCAL_FILE_BIN".equals(dataResourceTypeId)) {
             file = FileUtil.getFile(objectInfo);
             if (!fetchFromStore(dataResourceTypeId, file, contextRoot) && !file.exists()) {
-                throw new FileNotFoundException("No file found: " + (objectInfo));
+                throw contentAbsent(dataResourceTypeId, objectInfo);
             }
             if (!file.isAbsolute()) {
                 throw new GeneralException("File (" + objectInfo + ") is not absolute");
@@ -721,7 +722,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
             file = FileUtil.getFile(prefix + sep + objectInfo);
             if (!fetchFromStore(dataResourceTypeId, file, contextRoot) && !file.exists()) {
-                throw new FileNotFoundException("No file found: " + (prefix + sep + objectInfo));
+                throw contentAbsent(dataResourceTypeId, prefix + sep + objectInfo);
             }
             SecurityUtil.checkOfbizFileAllowList(file);
         } else if ("CONTEXT_FILE".equals(dataResourceTypeId) || "CONTEXT_FILE_BIN".equals(dataResourceTypeId)) {
@@ -736,7 +737,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             file = FileUtil.getFile(contextRoot + sep + objectInfo);
             assertInsideContextRoot(file, contextRoot);
             if (!fetchFromStore(dataResourceTypeId, file, contextRoot) && !file.exists()) {
-                throw new FileNotFoundException("No file found: " + (contextRoot + sep + objectInfo));
+                throw contentAbsent(dataResourceTypeId, contextRoot + sep + objectInfo);
             }
         }
 
@@ -848,8 +849,8 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     // Content-store seam
     //
     // The whole of it. Everything about how content moves to and from a configured store - keys, the
-    // read model, publication, erasure - lives in org.apache.ofbiz.content.data.store, so that it is
-    // reachable from a unit test and so that this class keeps only what is its own: WHICH locations this
+    // read model, publication, rollback reaping - lives in org.apache.ofbiz.content.data.store, so that it
+    // is reachable from a unit test and so that this class keeps only what is its own: WHICH locations this
     // deployment allows content to be read from and written to. Both methods below do nothing at all
     // unless a store is configured, which is not the shipped default.
     // ------------------------------------------------------------------------------------------------
@@ -896,34 +897,6 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
     }
 
     /**
-     * Erases the content a file-backed resource names, from this instance and from a configured store.
-     *
-     * <p>The authorised erasure entry point, and the counterpart of {@link #getContentFile}: it resolves
-     * the same location, applies the same allow lists, and then removes the content from both places.
-     *
-     * <p>It exists because removing a {@code DataResource} row has never removed the file it names -
-     * {@code removeDataResource} is an entity-auto delete, so the bytes stay where they are - which means
-     * that with a store configured, deleting the local file alone erases nothing: the next read fetches
-     * the object again. Whoever removes a row and means to erase its content calls this. DOCKER.adoc
-     * carries the bucket retention and purge procedure that goes with it.
-     *
-     * @param dataResourceTypeId the resource type: one of the file-backed types
-     * @param objectInfo the resource's recorded path
-     * @param contextRoot the webapp root for a CONTEXT_FILE, otherwise ignored
-     * @return true when the content was erased, false when this type or these arguments name no location
-     *     this deployment allows content at, in which case nothing was removed
-     * @throws GeneralException if the content could not be erased from the store or from this instance
-     */
-    public static boolean eraseContentFile(String dataResourceTypeId, String objectInfo, String contextRoot)
-            throws GeneralException {
-        File file = resolveContentFile(dataResourceTypeId, objectInfo, contextRoot);
-        if (file == null || !authorisedLocation(dataResourceTypeId, file, contextRoot)) {
-            return false;
-        }
-        return ContentStorePublisher.erase(file);
-    }
-
-    /**
      * Reports whether this deployment allows content to be read from, or written at, the given location.
      *
      * <p>The same allow-list check the read applies to the file afterwards, applied BEFORE the store is
@@ -966,6 +939,54 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                         + refused.getMessage(), MODULE);
             }
             return false;
+        }
+    }
+
+    /**
+     * Reports file-backed content as absent, naming the location it was looked for at only when that
+     * location is this instance's own.
+     *
+     * <p>With a store configured the location IS the storage key - {@link ContentStorePublisher#storeKey}
+     * derives the key from it - so a caller-visible message carrying it hands out the store's layout: the
+     * key namespace, the upload shard and the transaction id that owns the directory. That is precisely
+     * what {@code ContentStorePublisher} keeps out of its own caller-visible messages, and content the
+     * store no longer holds is an ORDINARY state rather than an exotic one, because the object lifecycle
+     * belongs to the bucket: a retention rule that removes an object arrives here. So the caller is given
+     * a reference and the log is given the location, correlated by the same id.
+     *
+     * <p>With no store configured the message is the one this class has always produced, character for
+     * character, because the location then names nothing but a file on this instance and nothing about the
+     * shipped default should change - including what an existing caller reads out of it.
+     *
+     * @param dataResourceTypeId the resource type, recorded in the log line
+     * @param location the location the content was looked for at
+     * @return the exception the caller should throw
+     */
+    private static FileNotFoundException contentAbsent(String dataResourceTypeId, String location) {
+        if (!externalStoreConfigured()) {
+            return new FileNotFoundException("No file found: " + location);
+        }
+        String reference = UUID.randomUUID().toString();
+        Debug.logError("No file found: " + location + " for a [" + dataResourceTypeId + "] resource, and the"
+                + " configured content store holds no object for it either. Reference [" + reference + "], which"
+                + " is the only detail the caller is shown.", MODULE);
+        return new FileNotFoundException("The requested content could not be read. Reference [" + reference + "]");
+    }
+
+    /**
+     * Reports whether content moves to and from a store somewhere other than this instance.
+     *
+     * <p>A provider that is named but unusable answers true: a location must not be disclosed while the
+     * store's own configuration is in doubt, and the read that follows raises for that configuration
+     * anyway, having already reported it.
+     *
+     * @return true when an external content store is configured
+     */
+    private static boolean externalStoreConfigured() {
+        try {
+            return ContentStorePublisher.externalStore() != null;
+        } catch (GeneralException unusable) {
+            return true;
         }
     }
 
@@ -1380,7 +1401,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 throw new GeneralException("File (" + objectInfo + ") is not absolute");
             }
             if (!fetchFromStore(dataResourceTypeId, file, rootDir) && !file.exists()) {
-                throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
+                throw contentAbsent(dataResourceTypeId, file.getAbsolutePath());
             }
             SecurityUtil.checkLocalFileAllowList(file);
             if (!renderFromStore(dataResourceTypeId, file, rootDir, out)) {
@@ -1396,7 +1417,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             }
             File file = FileUtil.getFile(prefix + sep + objectInfo);
             if (!fetchFromStore(dataResourceTypeId, file, rootDir) && !file.exists()) {
-                throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
+                throw contentAbsent(dataResourceTypeId, file.getAbsolutePath());
             }
             SecurityUtil.checkOfbizFileAllowList(file);
             if (!renderFromStore(dataResourceTypeId, file, rootDir, out)) {
@@ -1413,7 +1434,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             File file = FileUtil.getFile(prefix + sep + objectInfo);
             assertInsideContextRoot(file, rootDir);
             if (!fetchFromStore(dataResourceTypeId, file, rootDir) && !file.exists()) {
-                throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
+                throw contentAbsent(dataResourceTypeId, file.getAbsolutePath());
             }
             if (renderFromStore(dataResourceTypeId, file, rootDir, out)) {
                 return;
@@ -1556,7 +1577,7 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
                 }
                 file = DataResourceWorker.getContentFile(dataResourceTypeId, objectInfo, contextRoot);
                 if (!file.exists()) {
-                    throw new FileNotFoundException("No file found: " + file.getAbsolutePath());
+                    throw contentAbsent(dataResourceTypeId, file.getAbsolutePath());
                 }
                 return UtilMisc.toMap("stream", Files.newInputStream(file.toPath(), StandardOpenOption.READ), "length", file.length());
             }

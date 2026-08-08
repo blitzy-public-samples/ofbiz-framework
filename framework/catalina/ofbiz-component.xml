@@ -108,13 +108,20 @@ under the License.
                  An empty value is treated as absent by ContainerConfig, so no valve is installed. Set from
                  OFBIZ_SSL_ACCELERATOR_PORT by docker-entrypoint.sh. -->
             <property name="ssl-accelerator-port" value=""/>
-            <!-- Shares the session cookie across sub-domains by installing CrossSubdomainSessionValve. Only the
-                 literal "true" (case-insensitive) enables it; the default is "false". Set from
-                 OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS by docker-entrypoint.sh. Enable it only when instances are
-                 served under several sub-domains of one parent domain and a shared session cookie is genuinely
-                 required: the valve calls request.getSession(true), so it forces a session for every request it
-                 handles, health probes included - the same thing ControlFilter already does for every path it
-                 admits, and one more reason to keep this off unless a shared cookie is actually needed. -->
+            <!-- Issues the session cookie for a parent domain, so that instances served under several
+                 sub-domains of it share one session. Installs CrossSubdomainSessionValve; only the literal
+                 "true" (case-insensitive) enables it, and the default is "false". Set from
+                 OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS by docker-entrypoint.sh.
+                 It needs cookie.domain in framework/webapp/config/url.properties (OFBIZ_COOKIE_DOMAIN in a
+                 container), which is the deployment's statement of that parent domain; without it there is
+                 nothing to widen a cookie to, so the valve reports it once and leaves cookies host-only, and
+                 the entry point refuses the combination outright. The domain is deliberately NOT derived from
+                 the host a request arrives with: one webapp has ONE session-cookie configuration, so a domain
+                 taken from whichever host arrived first would be sent to every other client too, and RFC 6265
+                 obliges a client under a different parent domain to discard that cookie.
+                 The valve configures the domain and leaves the cookie to Tomcat, so every attribute the cookie
+                 would have carried is kept and the session id rotated at login is covered as well. It creates
+                 no session of its own, so health probes still cost nothing. -->
             <property name="enable-cross-subdomain-sessions" value="false"/>
         </property>
         <property name="ajp-connector" value="connector">

@@ -31,10 +31,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+
+import javax.transaction.Status;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.GeneralException;
 import org.apache.ofbiz.base.util.UtilProperties;
+import org.apache.ofbiz.content.data.DataResourceWorker;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -546,19 +550,95 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
-    public void erasureRemovesTheObjectAndTheLocalCopyTogether() throws GeneralException, IOException {
+    public void aStorageFailureTellsTheCallerAReferenceAndNotTheKey() throws IOException {
+        Path home = localHome();
+        File target = home.resolve("runtime/uploads/shard/10020.txt").toFile();
+        write(target, "local", 1000L);
+        ContentStore unreachable = new UnreachableStore();
+
+        GeneralException raised = assertThrows(GeneralException.class, () -> ContentStorePublisher.open(
+                unreachable, target), "a store that cannot be reached must raise rather than answer empty");
+
+        String told = raised.getMessage();
+        assertFalse(told.contains("ofbiz/runtime/uploads/shard/10020.txt"),
+                "the storage key must not reach the caller: the message is rendered on a content screen, and"
+                        + " the key would disclose the deployment's internal path scheme. Was: " + told);
+        assertFalse(told.contains(target.getAbsolutePath()),
+                "the local path must not reach the caller either. Was: " + told);
+        assertTrue(told.matches(".*Reference \\[[0-9a-f-]{36}\\].*"),
+                "the caller must be given an opaque reference that ties the message to the log line holding"
+                        + " the detail. Was: " + told);
+    }
+
+    @Test
+    public void aTransactionThatDoesNotCommitLeavesNoUploadDirectoryBehind() throws GeneralException, IOException {
         Path home = localHome();
         CountingStore store = objectStore();
-        File target = home.resolve("runtime/uploads/shard/1.txt").toFile();
-        write(target, "gone", 1000L);
-        hold(store, "ofbiz/runtime/uploads/shard/1.txt", "gone", 1000L);
+        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef").toFile();
+        File upload = new File(owned, "10020.txt");
+        write(upload, "rolled back", 1000L);
 
-        assertTrue(ContentStorePublisher.erase(store, target));
+        // What the transaction manager calls back when the transaction rolls back. A directory publication
+        // carries no file names, which is what marks the directory as this transaction's own.
+        new ContentStorePublisher.ContentPublication(store, owned, null, owned.getAbsolutePath())
+                .afterCompletion(Status.STATUS_ROLLEDBACK);
 
-        assertFalse(target.exists(), "the local copy must be gone");
-        assertFalse(store.exists("ofbiz/runtime/uploads/shard/1.txt"),
-                "the object must be gone: erasing only one of the two erases nothing, because the next read"
-                        + " would fetch the object back");
+        assertFalse(upload.exists(), "an upload no committed row names must not be left on the instance");
+        assertFalse(owned.exists(), "the transaction's own upload directory must be removed with it, or a"
+                + " failed upload leaves durable local state behind on whichever instance took it");
+    }
+
+    @Test
+    public void aTransactionThatDoesNotCommitLeavesNoObjectBehindEither() throws GeneralException, IOException {
+        Path home = localHome();
+        CountingStore store = objectStore();
+        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef").toFile();
+        File upload = new File(owned, "10020.txt");
+        write(upload, "published then rolled back", 1000L);
+        String key = "ofbiz/runtime/uploads/1700000000000/txn-0123456789abcdef/10020.txt";
+
+        ContentStorePublisher.ContentPublication publication =
+                new ContentStorePublisher.ContentPublication(store, owned, null, owned.getAbsolutePath());
+        // The transaction publishes what it wrote, and then does not commit: the row naming the content is
+        // gone, so both halves of what the upload left - the object and the staging directory - have to go
+        // with it.
+        publication.beforeCompletion();
+        assertTrue(store.exists(key), "the publication must have written the object before the rollback");
+
+        publication.afterCompletion(Status.STATUS_ROLLEDBACK);
+
+        assertFalse(store.exists(key), "an object no committed row names must be removed from the store again");
+        assertFalse(owned.exists(), "and the staging directory must go with it");
+    }
+
+    @Test
+    public void aTransactionThatCommitsKeepsItsUploadDirectory() throws GeneralException, IOException {
+        Path home = localHome();
+        CountingStore store = objectStore();
+        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef").toFile();
+        File upload = new File(owned, "10020.txt");
+        write(upload, "committed", 1000L);
+
+        new ContentStorePublisher.ContentPublication(store, owned, null, owned.getAbsolutePath())
+                .afterCompletion(Status.STATUS_COMMITTED);
+
+        assertTrue(upload.exists(), "a committed upload's local copy is what this instance serves and must stay");
+    }
+
+    @Test
+    public void aNonCommitLeavesFilesTheTransactionDoesNotOwnAlone() throws GeneralException, IOException {
+        Path home = localHome();
+        CountingStore store = objectStore();
+        File shared = home.resolve("runtime/uploads/shard").toFile();
+        File other = new File(shared, "1.txt");
+        write(other, "not mine", 1000L);
+
+        // A NAMED publication watches a file it did not create, in a directory it does not own.
+        new ContentStorePublisher.ContentPublication(store, shared, Set.of("1.txt"), shared.getAbsolutePath())
+                .afterCompletion(Status.STATUS_ROLLEDBACK);
+
+        assertTrue(other.exists(), "content the transaction does not own must never be deleted by its rollback");
+        assertTrue(shared.exists(), "a directory the transaction does not own must never be removed");
     }
 
     @Test
@@ -633,6 +713,49 @@ public final class ContentStoreFactoryTest {
                 "the filesystem provider must refuse an object beyond the shared bound");
         assertThrows(IOException.class, () -> s3.put(KEY, tooLarge),
                 "the s3 provider must refuse an object beyond the shared bound");
+    }
+
+    @Test
+    public void absentContentIsReportedWithItsLocationWhenNoExternalStoreIsConfigured() {
+        select("");
+        String location = workspace.resolve("absent-content.txt").toAbsolutePath().toString();
+
+        Executable resolve = () -> DataResourceWorker.getContentFile("LOCAL_FILE", location, null);
+
+        FileNotFoundException absent = assertThrows(FileNotFoundException.class, resolve,
+                "content that is not on this instance must be reported as absent");
+
+        // Character for character what this has always said: with no store the location names nothing but a
+        // file here, and the shipped default must not change - including what a caller reads out of it.
+        assertEquals("No file found: " + location, absent.getMessage(),
+                "without an external store the absence must still name the location");
+    }
+
+    @Test
+    public void absentContentIsReportedWithoutItsLocationWhenAnExternalStoreIsConfigured() {
+        configureS3();
+        select("s3");
+        String location = workspace.resolve("absent-content.txt").toAbsolutePath().toString();
+
+        Executable resolve = () -> DataResourceWorker.getContentFile("LOCAL_FILE", location, null);
+
+        FileNotFoundException absent = assertThrows(FileNotFoundException.class, resolve,
+                "content held by neither the store nor this instance must still be reported as absent");
+
+        // With a store configured the location IS the storage key, so the caller gets a reference and the
+        // log gets the location. The whole message is asserted, not just the absence of the path: a message
+        // that stopped naming the location but started naming the bucket would pass a containment check.
+        String opaque = "The requested content could not be read\\. Reference \\[[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+                + "-[0-9a-f]{4}-[0-9a-f]{12}\\]";
+        assertTrue(absent.getMessage().matches(opaque),
+                "the caller must be given an opaque reference and nothing else, but was given: "
+                        + absent.getMessage());
+        assertFalse(absent.getMessage().contains(location),
+                "the location must not reach the caller, because it is the storage key");
+        assertFalse(absent.getMessage().contains("absent-content"),
+                "no part of the location may reach the caller");
+        assertFalse(absent.getMessage().contains(BUCKET),
+                "the bucket must not reach the caller either");
     }
 
     /**
@@ -734,6 +857,45 @@ public final class ContentStoreFactoryTest {
         @Override
         public void delete(String key) throws GeneralException, IOException {
             delegate.delete(key);
+        }
+    }
+
+    /**
+     * A store that cannot be reached, for the disclosure tests.
+     *
+     * <p>Answers every request with an {@code IOException} whose own message names nothing, so what the
+     * caller is told can only have come from the publisher's own message building.
+     */
+    private static final class UnreachableStore implements ContentStore {
+
+        @Override
+        public void put(String key, byte[] data) throws IOException {
+            throw new IOException("unreachable");
+        }
+
+        @Override
+        public byte[] get(String key) throws IOException {
+            throw new IOException("unreachable");
+        }
+
+        @Override
+        public InputStream openStream(String key) throws IOException {
+            throw new IOException("unreachable");
+        }
+
+        @Override
+        public boolean exists(String key) throws IOException {
+            throw new IOException("unreachable");
+        }
+
+        @Override
+        public Optional<Description> describe(String key) throws IOException {
+            throw new IOException("unreachable");
+        }
+
+        @Override
+        public void delete(String key) throws IOException {
+            throw new IOException("unreachable");
         }
     }
 

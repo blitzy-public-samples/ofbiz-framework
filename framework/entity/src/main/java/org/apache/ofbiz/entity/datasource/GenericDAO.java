@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.ofbiz.base.util.Debug;
@@ -170,7 +171,15 @@ public class GenericDAO {
             }
             return retVal;
         } catch (GenericEntityException | SQLException e) {
-            throw new GenericEntityException("Error while inserting: " + sqlB, e);
+            // The statement goes to the operator log under an opaque reference, not into the message: this
+            // one travels out to whatever called the delegator, which on the storefront can be a page an
+            // anonymous visitor is looking at. See SQLProcessor.datasourceFault(), which withholds the same
+            // detail one frame down, and which this must not undo by re-adding the statement here.
+            String reference = UUID.randomUUID().toString();
+            Debug.logError(e, "Error while inserting: " + sqlB + " Reference [" + reference + "], which is the"
+                    + " only detail the caller is shown.", MODULE);
+            throw new GenericEntityException("A database error prevented the records from being inserted. The"
+                    + " server log records the statement and the reason. Reference [" + reference + "]");
         }
     }
 

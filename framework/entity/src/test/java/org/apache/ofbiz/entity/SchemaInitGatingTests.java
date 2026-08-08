@@ -349,6 +349,78 @@ public final class SchemaInitGatingTests {
     }
 
     /**
+     * A marker is written {@code rw-------} and its digest never reaches the container's output.
+     *
+     * <p>A marker is container state on a PERSISTED volume, so both halves matter. World-readable state on a
+     * volume another container may mount is state anything can read and, with a writable mount, forge - and a
+     * forged data marker makes the next start skip the data load. Tracing it repeats it into {@code docker
+     * logs} and from there into every log collector reading that stream, which is the same CWE-532 exposure
+     * the rendered secrets are kept out of. Suppressing tracing INSIDE the writer cannot achieve the second
+     * half, because a shell prints an invocation before the function body runs, so the digest must not be an
+     * argument at all - which is why the writer takes the digest KIND and computes the digest itself.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aMarkerIsPrivateAndItsDigestIsNeverTraced() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST),
+                "ofbiz_setup_env", "create_ofbiz_runtime_directories", "configure_database");
+
+        assertEquals(0, status, "the database configuration must be applied");
+        Path marker = marker("db_config_applied");
+        String digest = Files.readString(marker, StandardCharsets.UTF_8);
+        assertEquals(64, digest.length(), "the marker must hold a sha256 digest: " + digest);
+        assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(marker)),
+                "the marker must be readable and writable by the OFBiz user alone");
+        assertFalse(output().contains(digest),
+                "the digest must not appear in the container's output, which docker logs keeps: " + output());
+    }
+
+    /**
+     * Rotating a database PASSWORD leaves the marker digest untouched, because no credential is in the
+     * pre-image it is computed from.
+     *
+     * <p>A digest is not a one-way function of a secret when the secret is the only unknown in the
+     * pre-image. Every other field the database marker covers is a container setting an operator already
+     * knows or can read out of {@code docker inspect}, so a pre-image containing the three database
+     * passwords would be a persisted, offline-guessable commitment to them - on a volume that outlives the
+     * container that wrote it. Passwords rarely carry the entropy that makes such a commitment safe.
+     *
+     * <p>Nothing is lost by leaving them out: this marker records which configuration was applied and, in
+     * particular, the startup-DDL mode it was rendered with, and a rotated password changes neither. The
+     * markers that are actually READ - data and admin - are keyed on database IDENTITY and were already
+     * credential-free.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void rotatingADatabasePasswordDoesNotChangeTheMarkerDigest() throws Exception {
+        requireShellAvailable();
+        Map<String, String> before = new LinkedHashMap<>(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST,
+                "OFBIZ_POSTGRES_OFBIZ_PASSWORD", "first-ofbiz-password",
+                "OFBIZ_POSTGRES_OLAP_PASSWORD", "first-olap-password",
+                "OFBIZ_POSTGRES_TENANT_PASSWORD", "first-tenant-password"));
+        assertEquals(0, runEntryPoint(before, "ofbiz_setup_env", "create_ofbiz_runtime_directories",
+                "configure_database"), "the first start must succeed");
+        String first = Files.readString(marker("db_config_applied"), StandardCharsets.UTF_8);
+
+        Map<String, String> after = new LinkedHashMap<>(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST,
+                "OFBIZ_POSTGRES_OFBIZ_PASSWORD", "second-ofbiz-password",
+                "OFBIZ_POSTGRES_OLAP_PASSWORD", "second-olap-password",
+                "OFBIZ_POSTGRES_TENANT_PASSWORD", "second-tenant-password"));
+        assertEquals(0, runEntryPoint(after, "ofbiz_setup_env", "create_ofbiz_runtime_directories",
+                "configure_database"), "the start after a password rotation must succeed");
+
+        assertEquals(first, Files.readString(marker("db_config_applied"), StandardCharsets.UTF_8),
+                "a rotated password must not be observable in the marker, which means it must not be in the"
+                        + " pre-image the digest is taken over");
+        assertFalse(output().contains("second-ofbiz-password"),
+                "a password must never reach the container's output: " + output());
+    }
+
+    /**
      * A volume carrying the EMPTY markers an image bakes in cannot vouch for an external database, so a
      * container pointed at one loads its data instead of trusting them.
      *
@@ -674,7 +746,8 @@ public final class SchemaInitGatingTests {
 
         int status = runEntryPoint(Map.of("OFBIZ_JVM_ROUTE", "instance-a",
                 "OFBIZ_SSL_ACCELERATOR_PORT", "8080",
-                "OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS", "true"),
+                "OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS", "true",
+                "OFBIZ_COOKIE_DOMAIN", "example.com"),
                 "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration");
 
         assertEquals(0, status, "the load-balancer settings must be applied");
@@ -686,6 +759,52 @@ public final class SchemaInitGatingTests {
                 "the TLS-offload port must be applied");
         assertEquals(List.of("true"), catalinaValues("enable-cross-subdomain-sessions"),
                 "cross-subdomain sessions must be applied");
+        assertTrue(Files.readAllLines(containerRoot.resolve("config/url.properties"), StandardCharsets.UTF_8)
+                        .contains("cookie.domain=example.com"),
+                "the domain the session cookie is widened to must be rendered with the flag, because the valve"
+                        + " reads it from url.properties and does nothing without it");
+    }
+
+    /**
+     * Cross-subdomain sessions WITHOUT a domain to widen to is refused rather than started.
+     *
+     * <p>The valve takes the domain from {@code cookie.domain} alone - never from the request host, because
+     * one webapp has one session-cookie configuration and a host-derived domain would pin whichever host
+     * arrived first onto every later client. So the flag on its own installs a valve that has nothing to
+     * apply: the operator would see the setting accepted, the sub-domains would each keep their own session,
+     * and nothing would say why. Refusing at start up is the only outcome that cannot be mistaken for
+     * working.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void crossSubdomainSessionsWithoutADomainToWidenToIsRefused() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS", "true"), "ofbiz_setup_env");
+
+        assertNotEquals(0, status, "the flag without a domain must be refused");
+        assertTrue(output().contains("OFBIZ_COOKIE_DOMAIN"),
+                "the refusal must name the setting that is missing: " + output());
+    }
+
+    /**
+     * A domain that is not a domain is refused before it reaches Tomcat, which would otherwise reject it per
+     * request: RFC 6265 admits no scheme, no port, no path, no wildcard and no empty label.
+     *
+     * @throws Exception if the entry point cannot be run
+     */
+    @Test
+    public void aCookieDomainThatBreaksTheGrammarIsRefused() throws Exception {
+        requireShellAvailable();
+
+        for (String hostile : List.of("https://example.com", "example.com:8443", "*.example.com",
+                "example.com/path", "-example.com", "example..com")) {
+            assertNotEquals(0, runEntryPoint(Map.of("OFBIZ_COOKIE_DOMAIN", hostile), "ofbiz_setup_env"),
+                    "[" + hostile + "] is not a cookie domain and must be refused");
+            assertTrue(output().contains("OFBIZ_COOKIE_DOMAIN"),
+                    "the refusal must name it for [" + hostile + "]: " + output());
+        }
     }
 
     /**
@@ -715,7 +834,8 @@ public final class SchemaInitGatingTests {
         requireShellAvailable();
         assertEquals(0, runEntryPoint(Map.of("OFBIZ_JVM_ROUTE", "instance-a",
                 "OFBIZ_SSL_ACCELERATOR_PORT", "8080",
-                "OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS", "true"),
+                "OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS", "true",
+                "OFBIZ_COOKIE_DOMAIN", "example.com"),
                 "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration"));
 
         int status = runEntryPoint(Map.of(), "ofbiz_setup_env", "create_ofbiz_runtime_directories", "apply_configuration");
@@ -726,6 +846,9 @@ public final class SchemaInitGatingTests {
                 "an empty value is treated as absent, so no valve is installed");
         assertEquals(List.of("false"), catalinaValues("enable-cross-subdomain-sessions"),
                 "cross-subdomain sessions must be off again");
+        assertFalse(Files.exists(containerRoot.resolve("config/url.properties")),
+                "the url.properties override rendered by the earlier start must be gone, or a withdrawn"
+                        + " cookie domain would keep widening cookies with nothing declaring that it does");
     }
 
     /**

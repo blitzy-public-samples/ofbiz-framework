@@ -196,13 +196,31 @@ configuration_digest() {
     payload="db-identity/1|$1|$OFBIZ_POSTGRES_HOST|$OFBIZ_POSTGRES_PORT|$OFBIZ_POSTGRES_OFBIZ_DB|$OFBIZ_POSTGRES_OFBIZ_USER|$OFBIZ_POSTGRES_OLAP_DB|$OFBIZ_POSTGRES_OLAP_USER|$OFBIZ_POSTGRES_TENANT_DB|$OFBIZ_POSTGRES_TENANT_USER"
     ;;
   *)
-    payload="db/1|$1|$OFBIZ_POSTGRES_HOST|$OFBIZ_POSTGRES_PORT|$OFBIZ_POSTGRES_SSLMODE|$OFBIZ_POSTGRES_SSLROOTCERT|$OFBIZ_DB_POOL_MIN|$OFBIZ_DB_POOL_MAX|$OFBIZ_DISTRIBUTED_CACHE_CLEAR|$OFBIZ_POSTGRES_OFBIZ_DB|$OFBIZ_POSTGRES_OFBIZ_USER|$OFBIZ_POSTGRES_OFBIZ_PASSWORD|$OFBIZ_POSTGRES_OLAP_DB|$OFBIZ_POSTGRES_OLAP_USER|$OFBIZ_POSTGRES_OLAP_PASSWORD|$OFBIZ_POSTGRES_TENANT_DB|$OFBIZ_POSTGRES_TENANT_USER|$OFBIZ_POSTGRES_TENANT_PASSWORD"
+    # NO CREDENTIAL MATERIAL, deliberately. A digest is not a one-way function of a SECRET when the
+    # secret is the only unknown in the pre-image: every other field here is either a container setting
+    # an operator already knows or is visible in "docker inspect", so a pre-image containing the three
+    # database passwords is a persisted, offline-guessable commitment to them - and this file survives on
+    # the runtime volume long after the container that wrote it. Passwords are usually far below the
+    # entropy that makes such a commitment safe, so they are simply not in it.
+    #
+    # Nothing is lost. This marker is WRITE-ONLY: it is written here and nowhere read (the data and admin
+    # markers, which ARE read, use the credential-free db-identity payload above). What it exists to
+    # record is which configuration a container last applied and, in "$1", the startup-DDL mode it was
+    # rendered with - which is what makes an interrupted schema init visible to the next start - and a
+    # rotated password changes neither. Salting instead would mean persisting a salt beside the digest on
+    # the same volume, which is more moving parts for no real gain.
+    payload="db/2|$1|$OFBIZ_POSTGRES_HOST|$OFBIZ_POSTGRES_PORT|$OFBIZ_POSTGRES_SSLMODE|$OFBIZ_POSTGRES_SSLROOTCERT|$OFBIZ_DB_POOL_MIN|$OFBIZ_DB_POOL_MAX|$OFBIZ_DISTRIBUTED_CACHE_CLEAR|$OFBIZ_POSTGRES_OFBIZ_DB|$OFBIZ_POSTGRES_OFBIZ_USER|$OFBIZ_POSTGRES_OLAP_DB|$OFBIZ_POSTGRES_OLAP_USER|$OFBIZ_POSTGRES_TENANT_DB|$OFBIZ_POSTGRES_TENANT_USER"
     ;;
   esac
   local digest
   digest=$(printf '%s' "$payload" | sha256sum | cut --delimiter=' ' --fields=1)
-  set -x
+  # The digest is emitted BEFORE tracing is restored. Restoring it first traces the printf that emits it -
+  # "+ printf %s <digest>" - which put the digest into the container's stderr, and so into "docker logs" and
+  # every collector behind it, on every start. Tracing is restored afterwards for callers that invoke this
+  # without a command substitution; inside one it makes no difference either way, because a subshell cannot
+  # change the caller's tracing state.
   printf '%s' "$digest"
+  set -x
 }
 
 ###############################################################################
@@ -212,10 +230,31 @@ configuration_digest() {
 # /ofbiz/runtime hides it, and then the redirection below would fail with "No such file or directory" and
 # take the whole start-up down with it under "set -e" - after the configuration had already been rendered.
 # Creating the directory costs nothing and makes an empty bind mount behave like a fresh named volume.
-# $1 - the marker path, $2 - the digest it must hold
+#
+# Tracing is suppressed for the whole function, and the marker is written 0600. The digest is not a secret
+# now that no credential is in its pre-image, but a marker is container STATE on a shared, persisted volume:
+# tracing it repeats it into "docker logs" and into every log collector reading that stream (CWE-532), and
+# world-readable state on a volume that other containers may mount is state anything can read and, with a
+# writable mount, forge - a forged data marker skips the data load. Neither is anything to leave to a
+# default umask. The explicit chmod matters as much as the umask: a marker left behind 0644 by an older
+# image is corrected the next time it is written, rather than staying open forever.
+# It takes the digest KIND rather than a digest, and computes the digest itself, so that no digest value is
+# ever an ARGUMENT on a traced command line. Suppressing tracing inside a function cannot help with that:
+# bash prints the expanded invocation before the function body runs, so a digest passed in has already been
+# printed by then. This is why the marker digest appeared repeatedly in "docker logs".
+# $1 - the marker path, $2 - the digest kind: "data", "admin", or the rendered startup-DDL mode
 mark_applied() {
+  { set +x; } 2>/dev/null
+  local digest
+  digest=$(configuration_digest "$2")
+  { set +x; } 2>/dev/null
   mkdir --parents "$(dirname "$1")"
-  printf '%s' "$2" >"$1"
+  (
+    umask 077
+    printf '%s' "$digest" >"$1"
+  )
+  chmod 600 "$1"
+  set -x
 }
 
 ###############################################################################
@@ -225,19 +264,29 @@ mark_applied() {
 # into the demo image, which loaded that data into the EMBEDDED database it also ships, so it counts only
 # while no external database is configured. Pointing the demo image at a managed PostgreSQL server must
 # not be able to skip loading data into that server.
-# $1 - the marker path, $2 - the digest it must hold
+# Takes the digest KIND, not a digest, for the same reason mark_applied does: a digest passed as an argument
+# is printed by the caller's own trace before this function can suppress anything.
+# $1 - the marker path, $2 - the digest kind: "data" or "admin"
 data_marker_covers() {
+  { set +x; } 2>/dev/null
+  local expected
+  expected=$(configuration_digest "$2")
+  { set +x; } 2>/dev/null
   if [ ! -f "$1" ]; then
+    set -x
     return 1
   fi
   local held
   held=$(cat "$1")
-  if [ "$held" = "$2" ]; then
+  if [ "$held" = "$expected" ]; then
+    set -x
     return 0
   fi
   if [ -z "$held" ] && [ -z "$OFBIZ_POSTGRES_HOST" ]; then
+    set -x
     return 0
   fi
+  set -x
   return 1
 }
 
@@ -668,6 +717,30 @@ ofbiz_setup_env() {
   OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS=${OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS:-false}
   require_enum OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS "$OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS" true false
 
+  # The domain the session cookie is issued for. It is what makes cross-subdomain sessions work, and it is
+  # required with them rather than derived, because one webapp has ONE session-cookie configuration shared by
+  # every client: a domain taken from whichever host happened to arrive first would then be sent to every
+  # other client too, and RFC 6265 requires a client under a different parent domain to DISCARD that cookie -
+  # a silent session outage. The deployment states the parent domain instead. A leading dot is accepted and
+  # removed, because it is the spelling operators are used to and the one RFC 6265 refuses.
+  OFBIZ_COOKIE_DOMAIN=${OFBIZ_COOKIE_DOMAIN:-}
+  if [ -n "$OFBIZ_COOKIE_DOMAIN" ]; then
+    require_single_line OFBIZ_COOKIE_DOMAIN "$OFBIZ_COOKIE_DOMAIN"
+    OFBIZ_COOKIE_DOMAIN="${OFBIZ_COOKIE_DOMAIN#.}"
+    # Refused rather than escaped: this value becomes a cookie attribute, and everything a domain may not
+    # contain - a scheme, a port, a path, a wildcard, a space - would either be rejected by Tomcat's cookie
+    # processor at run time, inside the webapp where nothing contains it, or widen the cookie past what was
+    # asked for.
+    case "$OFBIZ_COOKIE_DOMAIN" in
+    *[!A-Za-z0-9.-]* | -* | *- | .* | *. | *..*)
+      config_fatal "OFBIZ_COOKIE_DOMAIN=$OFBIZ_COOKIE_DOMAIN is not a domain a cookie may name. RFC 6265 allows letters, digits and hyphens in dot-separated labels, each starting and ending with a letter or a digit: give the parent domain alone, such as example.com, with no scheme, port, path or wildcard."
+      ;;
+    esac
+  fi
+  if [ "$OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS" = "true" ] && [ -z "$OFBIZ_COOKIE_DOMAIN" ]; then
+    config_fatal "OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS=true also needs OFBIZ_COOKIE_DOMAIN, the parent domain the session cookie is issued for - for instance example.com when this fleet is served as shop.example.com and admin.example.com. Without it there is no domain to share the cookie across and the setting would do nothing at all, so it is refused here rather than starting an instance whose sessions stay host-only while its configuration says otherwise."
+  fi
+
   OFBIZ_CONTENT_STORE_PROVIDER=${OFBIZ_CONTENT_STORE_PROVIDER:-database}
   require_enum OFBIZ_CONTENT_STORE_PROVIDER "$OFBIZ_CONTENT_STORE_PROVIDER" database filesystem s3
 
@@ -888,10 +961,7 @@ run_init_hooks() {
 
 ###############################################################################
 load_data() {
-  local dataDigest adminDigest
-  dataDigest=$(configuration_digest data)
-  adminDigest=$(configuration_digest admin)
-  if ! data_marker_covers "$CONTAINER_DATA_LOADED" "$dataDigest"; then
+  if ! data_marker_covers "$CONTAINER_DATA_LOADED" data; then
     run_init_hooks before-data-load /docker-entrypoint-hooks/before-data-load.d/*
 
     case "$OFBIZ_DATA_LOAD" in
@@ -903,7 +973,7 @@ load_data() {
 
     demo)
       "$OFBIZ_CONTAINER_ROOT"/bin/ofbiz --load-data
-      mark_applied "$CONTAINER_ADMIN_LOADED" "$adminDigest"
+      mark_applied "$CONTAINER_ADMIN_LOADED" admin
       ;;
     esac
 
@@ -911,7 +981,7 @@ load_data() {
       "$OFBIZ_CONTAINER_ROOT"/bin/ofbiz --load-data dir=/docker-entrypoint-hooks/additional-data.d
     fi
 
-    mark_applied "$CONTAINER_DATA_LOADED" "$dataDigest"
+    mark_applied "$CONTAINER_DATA_LOADED" data
 
     run_init_hooks after-data-load /docker-entrypoint-hooks/after-data-load.d/*
   fi
@@ -919,9 +989,7 @@ load_data() {
 
 ###############################################################################
 load_admin_user() {
-  local adminDigest
-  adminDigest=$(configuration_digest admin)
-  if ! data_marker_covers "$CONTAINER_ADMIN_LOADED" "$adminDigest"; then
+  if ! data_marker_covers "$CONTAINER_ADMIN_LOADED" admin; then
     { set +x; } 2>/dev/null
     TMPFILE=$(mktemp)
 
@@ -951,7 +1019,7 @@ load_admin_user() {
 
     rm "$TMPFILE"
 
-    mark_applied "$CONTAINER_ADMIN_LOADED" "$adminDigest"
+    mark_applied "$CONTAINER_ADMIN_LOADED" admin
   fi
 }
 
@@ -1246,10 +1314,12 @@ apply_configuration() {
     disown_override "$JNDI_SERVERS_OVERRIDE"
   fi
 
-  if [ -n "$OFBIZ_CONTENT_URL_PREFIX" ]; then
+  # One override for both settings this file carries, so neither write can undo the other.
+  if [ -n "$OFBIZ_CONTENT_URL_PREFIX" ] || [ -n "$OFBIZ_COOKIE_DOMAIN" ]; then
     sed \
       --expression="s|^content.url.prefix.secure=.*|content.url.prefix.secure=$(property_substitution "$OFBIZ_CONTENT_URL_PREFIX")|" \
       --expression="s|^content.url.prefix.standard=.*|content.url.prefix.standard=$(property_substitution "$OFBIZ_CONTENT_URL_PREFIX")|" \
+      --expression="s|^cookie.domain=.*|cookie.domain=$(property_substitution "$OFBIZ_COOKIE_DOMAIN")|" \
       "$URL_PROPERTIES_SOURCE" >config/url.properties
     own_override "config/url.properties"
   else
@@ -1325,7 +1395,7 @@ render_entity_engine() {
 
   # The marker records the mode that was just rendered. An interrupted initialisation therefore leaves a
   # marker a serving start cannot match, and that start re-renders with startup DDL disabled.
-  mark_applied "$CONTAINER_DB_CONFIG_APPLIED" "$(configuration_digest "$checkOnStart $addMissingOnStart")"
+  mark_applied "$CONTAINER_DB_CONFIG_APPLIED" "$checkOnStart $addMissingOnStart"
   echo "Rendered $ENTITY_ENGINE_OVERRIDE with startup DDL check-on-start=$checkOnStart add-missing-on-start=$addMissingOnStart"
 }
 
@@ -1346,7 +1416,7 @@ configure_database() {
     render_entity_engine false false
   else
     disown_override "$ENTITY_ENGINE_OVERRIDE"
-    mark_applied "$CONTAINER_DB_CONFIG_APPLIED" "$(configuration_digest "false false")"
+    mark_applied "$CONTAINER_DB_CONFIG_APPLIED" "false false"
   fi
 }
 
@@ -1439,6 +1509,7 @@ _main() {
   unset OFBIZ_JVM_ROUTE
   unset OFBIZ_SSL_ACCELERATOR_PORT
   unset OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS
+  unset OFBIZ_COOKIE_DOMAIN
   unset OFBIZ_CONTENT_STORE_PROVIDER
   unset OFBIZ_S3_BUCKET
   unset OFBIZ_S3_REGION
