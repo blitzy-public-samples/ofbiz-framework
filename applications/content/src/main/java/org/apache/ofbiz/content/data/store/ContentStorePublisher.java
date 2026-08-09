@@ -1,0 +1,1434 @@
+/*******************************************************************************
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *******************************************************************************/
+package org.apache.ofbiz.content.data.store;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
+
+import javax.transaction.Status;
+import javax.transaction.Synchronization;
+import javax.transaction.SystemException;
+import javax.transaction.TransactionManager;
+
+import org.apache.ofbiz.base.util.Debug;
+import org.apache.ofbiz.base.util.GeneralException;
+import org.apache.ofbiz.base.util.UtilValidate;
+import org.apache.ofbiz.content.data.store.ContentStore.Description;
+import org.apache.ofbiz.entity.transaction.GenericTransactionException;
+import org.apache.ofbiz.entity.transaction.TransactionFactoryLoader;
+import org.apache.ofbiz.entity.transaction.TransactionUtil;
+
+/**
+ * Moves file-backed content between an instance and the configured {@link ContentStore}.
+ *
+ * <p>This is the whole of the object-storage behaviour that the content component's file-resolution
+ * methods delegate to: deriving a storage key, reading an object onto the instance, streaming one
+ * straight through, publishing what a transaction wrote, and reaping what a transaction that did not
+ * commit left behind. It lives in the isolated store package rather than in the seam so that every rule
+ * below is reachable from a unit test, and so that the seam stays a handful of delegating calls.
+ *
+ * <p><strong>Inert by default.</strong> Every entry point begins by resolving the provider and returns
+ * immediately when there is none - {@code database} storage, the shipped default - or when it is
+ * {@link FileSystemContentStore}, whose root already IS the directory the content lives in, so there is
+ * nothing to move. No storage client is constructed and no behaviour changes in either case.
+ *
+ * <p><strong>Keys.</strong> A key is {@value #KEY_NAMESPACE} followed by the content's own
+ * {@code ofbiz.home}-relative POSIX path, so one key names the same content on every instance. Content
+ * outside {@code ofbiz.home} has no key and is neither published nor looked up. A key carries no tenant
+ * scope, which is why {@link ContentStoreFactory} refuses to activate a store at all in a multi-tenant
+ * deployment.
+ *
+ * <h2>Reading</h2>
+ *
+ * <p>The store is authoritative, and the read is arranged so that it costs one metadata request and
+ * touches the local filesystem only when it genuinely has to:
+ *
+ * <ol>
+ *   <li>{@link ContentStore#describe} - a {@code HeadObject}, no content transferred. An object the
+ *       store does not hold ends the read here, with NO local side effect whatsoever: no directory is
+ *       created and no temporary file is written, so a pure read of local-only content leaves the
+ *       filesystem exactly as it was.</li>
+ *   <li>A local copy LATER than the store's object is kept, and the store's object is NOT written over
+ *       it. That is the one case where the local file may hold a write this seam never published - the
+ *       create-file and update-file services compose their own path and never reach the seam - and
+ *       silently replacing it would destroy it. The retention is reported once per key.</li>
+ *   <li>A local copy whose size and modification time match the object is already the object: nothing
+ *       is transferred and nothing is written. This is what lets an instance whose filesystem is
+ *       read-only, or whose content directory is a read-only shared mount, serve content it holds.</li>
+ *   <li>Otherwise the object is staged in the destination's own directory and moved onto the
+ *       destination atomically, and the local modification time is then set to the object's own. That
+ *       stamp is what makes step 3 hit on every subsequent read, and what keeps a read from looking
+ *       like a write to the publication below.</li>
+ * </ol>
+ *
+ * <p>A caller that only needs the bytes - serving a download, rendering a text resource - uses
+ * {@link #open} instead, which streams the object straight out of the store and writes nothing locally
+ * at all.
+ *
+ * <h2>Writing</h2>
+ *
+ * <p>Content is published to the store by the transaction that wrote it, in its
+ * {@code beforeCompletion} callback, so a row can never commit while naming content the fleet cannot
+ * read: a publication that fails rolls the transaction back. Two kinds of publication exist, and
+ * neither of them ever watches storage shared with another transaction:
+ *
+ * <ul>
+ *   <li>A NAMED publication watches exactly the file a caller resolved and is about to write. Whether
+ *       it changed is decided by comparing its length and modification time with the ones recorded when
+ *       the publication was registered, so a read - which resolves a file too, and cannot be told apart
+ *       from a write here - publishes nothing.</li>
+ *   <li>A TRANSACTION-OWNED DIRECTORY publication watches a directory created for one transaction
+ *       alone. The upload services resolve an upload directory and then write into it through a path
+ *       they compose themselves, so the file name cannot be known when the directory is resolved; with
+ *       a store configured, {@link #publishedUploadPath} therefore hands the caller a private
+ *       sub-directory of the upload shard instead of the shard itself. Every file in it at commit was
+ *       written by this transaction, so all of them are published - and no file of a concurrent
+ *       transaction can be published, refused or deleted by this one.</li>
+ * </ul>
+ *
+ * <p>A transaction that does not commit deletes the objects it CREATED, on a best-effort basis. An
+ * object that REPLACED one an earlier committed row still names is deliberately not in that list: this
+ * publication holds no copy of the previous object, so deleting the key would destroy content instead
+ * of restoring it.
+ *
+ * <p>Thread safe: it holds no mutable static state other than per-thread transaction scope, which is
+ * created for one transaction, validated against the transaction it belongs to on every use, and
+ * discarded when that transaction completes.
+ *
+ * @see ContentStore
+ * @see ContentStoreFactory
+ */
+public final class ContentStorePublisher {
+
+    /** The prefix every storage key carries, so one bucket can hold unrelated objects beside content. */
+    public static final String KEY_NAMESPACE = "ofbiz";
+
+    private static final String MODULE = ContentStorePublisher.class.getName();
+
+    private static final String STAGING_SUFFIX = ".ofbizfetch";
+    private static final String TRANSACTION_DIRECTORY_PREFIX = "txn-";
+    private static final int DIGEST_BUFFER = 8192;
+
+    /**
+     * A transaction-owned upload directory's name, exactly as {@code uploadDirectoryName} composes it.
+     *
+     * <p>Matched strictly rather than by prefix, because matching decides what a storage key does NOT
+     * contain: a directory a deployment happens to have named {@code txn-something} keeps its place in
+     * the key, and only the directories this class creates are left out of one.
+     */
+    private static final Pattern TRANSACTION_DIRECTORY =
+            Pattern.compile(TRANSACTION_DIRECTORY_PREFIX + "[0-9a-f]{32}");
+
+    /**
+     * The transaction scope of the calling thread: the private upload directory the transaction was
+     * given, and the publications already bound to it.
+     */
+    private static final ThreadLocal<TransactionScope> SCOPE = new ThreadLocal<>();
+
+    /** Keys whose local retention has already been reported, so the warning is one per key per JVM. */
+    private static final Set<String> RETENTION_REPORTED =
+            Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    /**
+     * The local files this JVM wrote as a CACHE of a store object, by absolute path.
+     *
+     * <p>What it is for: telling a cached copy apart from a local WRITE. When the store reports that it
+     * holds no object for a key, a local file at that location is one of two very different things - a
+     * write this seam has not published yet, which must be served, or the leftovers of an earlier read of
+     * an object that has since been removed, which must NOT be, because every other instance answers that
+     * the content is gone. Only this class can tell them apart, and only for copies it made itself, so it
+     * records them.
+     *
+     * <p>Per JVM and in memory, deliberately: it is a cache index, it is only ever consulted for a file
+     * that still exists, and being empty after a restart is safe - a restarted instance simply materialises
+     * again, exactly as a fresh instance does. Entries are removed when the file they name is discarded.
+     */
+    private static final Set<String> MATERIALISED =
+            Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    private ContentStorePublisher() { }
+
+    /**
+     * What the store holds for one key, as an open stream and its length.
+     *
+     * @param stream the object's bytes, which the caller closes
+     * @param length the object's length in bytes
+     */
+    public record StoredContent(InputStream stream, long length) { }
+
+    /**
+     * Returns the configured store when it holds content somewhere other than where the instance keeps
+     * it, or null when there is nothing to move.
+     *
+     * @return the external store, or null for {@code database} and {@code filesystem} storage
+     * @throws GeneralException if a provider is named but its configuration is unusable
+     */
+    public static ContentStore externalStore() throws GeneralException {
+        ContentStore store = ContentStoreFactory.getContentStore();
+        // A FileSystemContentStore's root IS the upload directory the content already lives in, so
+        // publishing to it and reading from it would copy a file onto itself.
+        return store instanceof FileSystemContentStore ? null : store;
+    }
+
+    /**
+     * Returns the storage key naming the given content, or null when it cannot have one.
+     *
+     * <p>The key is the content's location relative to {@code ofbiz.home}, under {@link #KEY_NAMESPACE},
+     * with one deliberate omission: the transaction-owned upload directory
+     * ({@value #TRANSACTION_DIRECTORY_PREFIX}<em>uuid</em>) named by
+     * {@link #publishedUploadPath} is NOT part of the key.
+     *
+     * <p><strong>Why that directory is left out of the key.</strong> That directory exists to tell one
+     * transaction's writes apart from another's while the transaction runs - see
+     * {@link #publishedUploadPath} - and for nothing else. If it were part of the key, every update of a
+     * file-backed {@code DataResource} would name a NEW object: the upload service composes the same file
+     * name each time ({@code <dataResourceId>.<extension>}), so the only part of the location that
+     * changes between one update and the next is the transaction directory. The row would move to the new
+     * object and the previous object would stay in the bucket, named by nothing - a durable generation
+     * per update, growing without bound, and, because it is content, one that an erasure request would
+     * have to find. Omitting the directory makes the key what the CONTENT is rather than which
+     * transaction happened to write it, so an update REPLACES the object it supersedes and the store
+     * holds exactly the current one. Reads are unaffected: this method is the only thing that maps a
+     * location to a key, so a read of a location that carries a transaction directory - which every
+     * {@code objectInfo} recorded by an upload does - computes the same key the write used.
+     *
+     * <p>Two uploads for one {@code DataResource} in flight at once therefore write one key, last writer
+     * wins - exactly what two such uploads do to the local file when no store is configured, so the
+     * behaviour is the one OFBiz has always had rather than a new one.
+     *
+     * @param file the content's location on this instance
+     * @return the storage key, or null when the location is not inside {@code ofbiz.home}
+     */
+    public static String storeKey(File file) {
+        String home = System.getProperty("ofbiz.home");
+        if (file == null || UtilValidate.isEmpty(home)) {
+            return null;
+        }
+        Path root = Paths.get(home).toAbsolutePath().normalize();
+        Path target = file.toPath().toAbsolutePath().normalize();
+        if (!target.startsWith(root) || target.equals(root)) {
+            return null;
+        }
+        StringBuilder key = new StringBuilder(KEY_NAMESPACE);
+        for (Path segment : root.relativize(target)) {
+            String name = segment.toString();
+            if (TRANSACTION_DIRECTORY.matcher(name).matches()) {
+                continue;
+            }
+            key.append('/').append(name);
+        }
+        // A location that is nothing BUT a transaction directory names no content, so it has no key.
+        return key.length() == KEY_NAMESPACE.length() ? null : key.toString();
+    }
+
+    /**
+     * Makes the store's copy of the given content available at the given location on this instance.
+     *
+     * <p>The read described in the class comment. Absence is not failure: content the store does not
+     * hold answers false and the caller falls back to the local copy exactly as it did before a store
+     * existed. A store that cannot answer, or a local copy that cannot be written, raises instead -
+     * reporting a fault as missing content would turn an outage into a 404 and hide it from the
+     * operator.
+     *
+     * @param file the location the content would be read from on this instance, already authorised by
+     *     the caller for this deployment
+     * @return true when the content this location names is now readable on this instance
+     * @throws GeneralException if a store is configured but could not be resolved, could not answer, or
+     *     holds content this instance could not place
+     */
+    public static boolean fetch(File file) throws GeneralException {
+        ContentStore store = externalStore();
+        if (store == null) {
+            return false;
+        }
+        return fetch(store, file);
+    }
+
+    /**
+     * Performs the read of {@link #fetch(File)} against a given store.
+     *
+     * <p>Resolving which store is configured is separated from acting on it so that the read can be
+     * driven against any {@link ContentStore} - which is how {@code ContentStoreFactoryTest} exercises
+     * this engine, including the counting store that proves a matching local copy transfers nothing.
+     * The public entry point resolves the store and calls this.
+     *
+     * @param store the store to read from, never null
+     * @param file the location the content would be read from on this instance
+     * @return true when the content this location names is now readable on this instance
+     * @throws GeneralException if the store could not answer, or holds content this instance could not
+     *     place
+     */
+    static boolean fetch(ContentStore store, File file) throws GeneralException {
+        String key = storeKey(file);
+        if (key == null) {
+            return false;
+        }
+        Description held = describe(store, key);
+        if (held == null) {
+            discardStaleCache(key, file.toPath().toAbsolutePath());
+            return false;
+        }
+        Path target = file.toPath().toAbsolutePath();
+        FileFacts local = facts(target);
+        if (local != null) {
+            if (local.modifiedAt() > held.modifiedAt()) {
+                reportLocalRetention(key, target);
+                return true;
+            }
+            if (local.length() == held.length() && local.modifiedAt() == held.modifiedAt()) {
+                if (Debug.verboseOn()) {
+                    Debug.logVerbose("Content [" + key + "] on this instance is already the object the content"
+                            + " store holds, so nothing was transferred", MODULE);
+                }
+                return true;
+            }
+        }
+        return materialise(store, key, held, target);
+    }
+
+    /**
+     * Opens the store's copy of the given content, without writing anything on this instance.
+     *
+     * <p>For a caller that needs the bytes and not a file: serving a download, or rendering a text
+     * resource into a writer. Nothing is staged, no directory is created and no local copy is made, so
+     * this path works unchanged on an instance whose filesystem is read-only.
+     *
+     * @param file the location that names the content, already authorised by the caller for this
+     *     deployment
+     * @return the object's stream and length, or {@link Optional#empty()} when no store is configured or
+     *     the store holds no object for this content, in which case the caller reads the local copy
+     * @throws GeneralException if a store is configured but could not be resolved or could not answer
+     */
+    public static Optional<StoredContent> open(File file) throws GeneralException {
+        ContentStore store = externalStore();
+        if (store == null) {
+            return Optional.empty();
+        }
+        return open(store, file);
+    }
+
+    /**
+     * Performs the read of {@link #open(File)} against a given store.
+     *
+     * @param store the store to read from, never null
+     * @param file the location that names the content
+     * @return the object's stream and length, or {@link Optional#empty()} when the store holds no object
+     *     for this content or a later local copy is preferred
+     * @throws GeneralException if the store could not answer
+     */
+    static Optional<StoredContent> open(ContentStore store, File file) throws GeneralException {
+        String key = storeKey(file);
+        if (key == null) {
+            return Optional.empty();
+        }
+        Description held = describe(store, key);
+        if (held == null) {
+            discardStaleCache(key, file.toPath().toAbsolutePath());
+            return Optional.empty();
+        }
+        FileFacts local = facts(file.toPath().toAbsolutePath());
+        if (local != null && local.modifiedAt() > held.modifiedAt()) {
+            // As in fetch(): a later local copy may hold an unpublished write, and it is what this
+            // instance serves. Reported there, so it is not reported twice here.
+            reportLocalRetention(key, file.toPath().toAbsolutePath());
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(new StoredContent(store.openStream(key), held.length()));
+        } catch (FileNotFoundException removed) {
+            // Deleted between the metadata request and the read. The local copy answers, as for any
+            // object the store does not hold.
+            return Optional.empty();
+        } catch (IOException failure) {
+            throw fault("The content store could not be read for the requested content.",
+                    "The content store could not be read for [" + key + "]", failure);
+        }
+    }
+
+    /**
+     * Binds the one file a caller has just resolved, and is about to write, to its transaction.
+     *
+     * <p>A read resolves a file too and cannot be told apart from a write here, so the publication is
+     * registered either way: at commit the file is published only if it actually changed, and neither a
+     * read nor a fetch changes it - {@link #fetch} sets the fetched file's modification time to the
+     * object's own, so the state it leaves behind is recognisably not a write.
+     *
+     * @param file the file that was resolved, may be null when the resource type is not file backed
+     */
+    public static void bindWrittenFile(File file) {
+        if (file == null || file.getParentFile() == null) {
+            return;
+        }
+        bind(file.getParentFile(), Set.of(file.getName()), false);
+    }
+
+    /**
+     * Returns the directory an upload should be written into, scoped to the calling transaction when a
+     * store is configured, and binds its content to that transaction.
+     *
+     * <p>With no store configured the resolved upload directory is answered UNCHANGED, so nothing about
+     * where an upload lands differs from the shipped behaviour.
+     *
+     * <p>With a store configured the answer is a private sub-directory of that directory, created for
+     * this transaction alone. That is what makes the publication safe: the upload services write a file
+     * whose name this method cannot know, so the publication has to watch a directory, and a directory
+     * shared with concurrent transactions would let this transaction publish - or, on rollback, delete -
+     * another transaction's content. The sub-directory name becomes part of the {@code objectInfo} the
+     * caller stores and therefore part of the storage key, so it is stable for the life of the content.
+     *
+     * <p>It is deliberately FAIL-FAST: an upload that cannot be bound to a transaction would commit a
+     * row naming content only this instance can read.
+     *
+     * @param uploadPath the upload directory that was resolved
+     * @param absolute whether that value is absolute rather than {@code ofbiz.home}-relative
+     * @return the directory to write into, in the same form as {@code uploadPath}
+     * @throws IllegalStateException if a store is configured and the upload cannot be published to it:
+     *     the store could not be resolved, the upload directory is outside {@code ofbiz.home}, the
+     *     private sub-directory could not be created, or no transaction is active to publish in
+     */
+    public static String publishedUploadPath(String uploadPath, boolean absolute) {
+        if (UtilValidate.isEmpty(uploadPath)) {
+            return uploadPath;
+        }
+        ContentStore store;
+        try {
+            store = externalStore();
+        } catch (GeneralException e) {
+            throw new IllegalStateException("An upload directory cannot be prepared: the configured content store"
+                    + " could not be resolved, so content written into it could not be published to it", e);
+        }
+        if (store == null) {
+            return uploadPath;
+        }
+        String home = System.getProperty("ofbiz.home");
+        File shard = new File(absolute ? uploadPath : home + uploadPath);
+        if (storeKey(shard) == null) {
+            throw refusal("An upload directory outside the OFBiz home directory cannot be published to the"
+                            + " content store.",
+                    "An upload directory outside the OFBiz home directory cannot be published to the content"
+                            + " store: [" + shard.getAbsolutePath() + "]", null);
+        }
+        TransactionScope scope = activeScope("An upload directory was resolved outside an active transaction"
+                + " while a content store is configured, so content written into it could not be published"
+                + " before the row naming it commits. Resolve the upload path inside the transaction that"
+                + " writes the file.");
+        File privateDirectory = new File(shard, scope.uploadDirectoryName());
+        try {
+            Files.createDirectories(privateDirectory.toPath());
+        } catch (IOException unwritable) {
+            throw refusal("The upload directory could not be created on this instance.",
+                    "The upload directory [" + privateDirectory.getAbsolutePath() + "] could not be created on"
+                            + " this instance", unwritable);
+        }
+        bind(privateDirectory, null, true);
+        return uploadPath + "/" + scope.uploadDirectoryName();
+    }
+
+    /**
+     * Drops the calling thread's transaction scope.
+     *
+     * <p>Called by a completed publication, and available to a test that has to leave no per-thread
+     * state behind.
+     */
+    static void clearScope() {
+        SCOPE.remove();
+    }
+
+    /**
+     * Registers a publication with the current transaction.
+     *
+     * @param directory the directory to watch
+     * @param names the file names to watch, or null to watch every direct child of a directory this
+     *     transaction owns
+     * @param writing whether this is a write path, where the absence of a usable transaction is a fault.
+     *     A read path reports and carries on, because it has nothing to publish
+     */
+    private static void bind(File directory, Set<String> names, boolean writing) {
+        ContentStore store;
+        try {
+            store = externalStore();
+        } catch (GeneralException e) {
+            if (!writing) {
+                Debug.logError(e, "The configured content store could not be resolved", MODULE);
+                return;
+            }
+            throw new IllegalStateException("Content cannot be written: the configured content store could not"
+                    + " be resolved, so what is written could not be published to it", e);
+        }
+        if (store == null) {
+            return;
+        }
+        if (storeKey(directory) == null) {
+            if (!writing) {
+                return;
+            }
+            throw refusal("Content outside the OFBiz home directory cannot be published to the content store.",
+                    "Content outside the OFBiz home directory cannot be published to the content store: ["
+                            + directory.getAbsolutePath() + "]", null);
+        }
+        String identity = directory.getAbsolutePath() + (names == null ? "" : names);
+        TransactionScope scope;
+        try {
+            if (TransactionUtil.getStatus() != Status.STATUS_ACTIVE) {
+                if (!writing) {
+                    // A resolution outside a transaction is a read: there is no write to publish, and
+                    // nothing to bind a publication to.
+                    return;
+                }
+                throw new IllegalStateException("Content was resolved outside an active transaction while a"
+                        + " content store is configured, so it could not be published before the row naming it"
+                        + " commits.");
+            }
+            scope = scope();
+            if (!scope.claim(identity)) {
+                // Already bound in this transaction. Two resolutions of one target are one piece of work,
+                // and it is the state at commit that decides what that work is, so the first binding
+                // covers the second.
+                return;
+            }
+            TransactionUtil.registerSynchronization(new ContentPublication(store, directory, names, identity));
+        } catch (GenericTransactionException e) {
+            TransactionScope held = SCOPE.get();
+            if (held != null) {
+                held.release(identity);
+            }
+            if (!writing) {
+                Debug.logError(e, "A content store publication could not be bound to the current transaction",
+                        MODULE);
+                return;
+            }
+            throw new IllegalStateException("Content cannot be written: a publication to the content store could"
+                    + " not be bound to the transaction that resolved it", e);
+        }
+    }
+
+    /**
+     * Asks the store what it holds, translating a failure into the caller's exception type.
+     *
+     * @param store the store
+     * @param key the storage key
+     * @return what the store holds, or null when it holds no object under that key
+     * @throws GeneralException if the store could not answer
+     */
+    private static Description describe(ContentStore store, String key) throws GeneralException {
+        try {
+            return store.describe(key).orElse(null);
+        } catch (IOException failure) {
+            throw fault("The content store could not be asked about the requested content.",
+                    "The content store could not be asked about [" + key + "]", failure);
+        }
+    }
+
+    /**
+     * Reports a storage failure: what failed and where goes to the operator log, and the caller is given a
+     * sentence naming nothing but an opaque reference that ties the two together.
+     *
+     * <p>A message raised here travels out through {@code GeneralException} into a service error and is
+     * rendered on a content screen, so a storage KEY in it would tell whoever is looking at that screen the
+     * deployment's internal path scheme, the upload directory it shards by and the transaction the content
+     * was written in. The provider already withholds its bucket, endpoint and SDK detail the same way; this
+     * closes the one place that put the key back.
+     *
+     * @param told what the caller is told, which must name nothing about the deployment
+     * @param detail what the operator log records, which names the content
+     * @param cause the failure, or null when there is nothing more to log than the detail
+     * @return the exception the caller throws
+     */
+    private static GeneralException fault(String told, String detail, Throwable cause) {
+        return new GeneralException(told + " Reference [" + reference(detail, cause) + "]");
+    }
+
+    /**
+     * The refusal counterpart of {@link #fault}, for the paths that raise {@code IllegalStateException}
+     * because a write cannot be allowed to proceed.
+     *
+     * @param told what the caller is told, which must name nothing about the deployment
+     * @param detail what the operator log records, which names the content
+     * @param cause the failure, or null when there is nothing more to log than the detail
+     * @return the exception the caller throws
+     */
+    private static IllegalStateException refusal(String told, String detail, Throwable cause) {
+        return new IllegalStateException(told + " Reference [" + reference(detail, cause) + "]");
+    }
+
+    /**
+     * Logs the operator detail under a fresh opaque reference and returns that reference.
+     *
+     * @param detail what the operator log records
+     * @param cause the failure, or null
+     * @return the reference to hand the caller
+     */
+    private static String reference(String detail, Throwable cause) {
+        String reference = UUID.randomUUID().toString();
+        String line = detail + ". Reference [" + reference + "], which is the only detail the caller is shown.";
+        if (cause == null) {
+            Debug.logError(line, MODULE);
+        } else {
+            Debug.logError(cause, line, MODULE);
+        }
+        return reference;
+    }
+
+    /**
+     * Writes the store's object onto this instance, without destroying a local copy that differs from it
+     * only because the store replaced its own object.
+     *
+     * @param store the store
+     * @param key the storage key
+     * @param held what the store reported holding
+     * @param target the location to place the content at
+     * @return true when the content is now readable at that location, false when the object was removed
+     *     from the store between the metadata request and the read
+     * @throws GeneralException if the store could not be read or this instance could not be written
+     */
+    private static boolean materialise(ContentStore store, String key, Description held, Path target)
+            throws GeneralException {
+        Path directory = target.getParent();
+        Path staged;
+        try {
+            Files.createDirectories(directory);
+            staged = Files.createTempFile(directory, target.getFileName().toString(), STAGING_SUFFIX);
+        } catch (IOException unwritable) {
+            // Attributed to the LOCAL filesystem, deliberately: the store answered, and reporting this as
+            // a storage failure would send an operator looking in the wrong place. A read-only root
+            // filesystem is the usual cause - see DOCKER.adoc, which records that the content directory
+            // has to be writable for an instance to take delivery of content it does not already hold.
+            throw fault("The requested content is held by the content store, but this instance could not place"
+                            + " it on its own filesystem, which could not be written. The directory holding"
+                            + " content must be writable by the OFBiz user, or the content must already be"
+                            + " present on the instance.",
+                    "Content [" + key + "] is held by the content store, but this instance could not place it at"
+                            + " [" + target + "]: its own filesystem could not be written", unwritable);
+        }
+        try {
+            try (InputStream content = store.openStream(key)) {
+                Files.copy(content, staged, StandardCopyOption.REPLACE_EXISTING);
+            }
+            // OWNER-ONLY, RE-APPLIED AFTER THE COPY. createTempFile above makes the staging file 0600, but
+            // Files.copy(InputStream, Path, REPLACE_EXISTING) DELETES it and creates it again through
+            // newOutputStream, which uses the process umask - 0644 in this image - and the atomic move then
+            // carries that mode onto the target. The result was user-uploaded content, materialised from the
+            // object store, readable by every account on the instance, while the files the upload path wrote
+            // in the same directory were 0600.
+            restrictToOwner(staged);
+            if (sameContent(staged, target)) {
+                // The store holds exactly what is already here; only the recorded time differed. The local
+                // file is left in place - keeping its inode, its permissions and any hard link to it - and
+                // only its modification time is aligned, so the next read needs no transfer at all.
+                stamp(target, held.modifiedAt());
+                return true;
+            }
+            Files.move(staged, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            restrictToOwner(target);
+            // Recorded as a CACHE of the object, which is what lets a later read tell it apart from a local
+            // write when the store no longer holds the object. See discardStaleCache.
+            MATERIALISED.add(target.toString());
+            stamp(target, held.modifiedAt());
+            if (Debug.verboseOn()) {
+                Debug.logVerbose("Content [" + key + "] was read from the content store onto this instance",
+                        MODULE);
+            }
+            return true;
+        } catch (FileNotFoundException removed) {
+            return false;
+        } catch (IOException failure) {
+            throw fault("The content store could not be read for the requested content.",
+                    "The content store could not be read for [" + key + "]", failure);
+        } finally {
+            removeQuietly(staged);
+        }
+    }
+
+    /**
+     * Restricts a file to its owner, where the platform has POSIX permissions.
+     *
+     * <p>Applied to user content this instance writes for itself, so a materialised object is no more
+     * readable than the upload that produced it. A platform without POSIX permissions, and a filesystem
+     * that refuses the change, are logged at verbose and otherwise tolerated: the alternative would be to
+     * fail a read over a permission bit, and the read itself is what the caller asked for.
+     *
+     * @param file the file to restrict
+     */
+    private static void restrictToOwner(Path file) {
+        try {
+            if (Files.getFileAttributeView(file, PosixFileAttributeView.class) == null) {
+                return;
+            }
+            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+        } catch (IOException | UnsupportedOperationException refused) {
+            if (Debug.verboseOn()) {
+                Debug.logVerbose("The permissions of [" + file + "] could not be restricted to its owner: "
+                        + refused.getMessage(), MODULE);
+            }
+        }
+    }
+
+    /**
+     * Sets a local file's modification time to the store object's own.
+     *
+     * <p>This is what makes the whole read model cheap and non-destructive at the same time: a later
+     * read recognises the local copy AS the object and transfers nothing, and a local file that is
+     * NEWER than the object is therefore recognisable as a write this seam never published. Failing to
+     * set it is not an error - the next read simply compares content again - so a filesystem that
+     * refuses is logged at verbose and nothing else.
+     *
+     * @param target the local file
+     * @param modifiedAt the object's modification time, in epoch milliseconds
+     */
+    private static void stamp(Path target, long modifiedAt) {
+        if (modifiedAt <= 0L) {
+            return;
+        }
+        try {
+            Files.setLastModifiedTime(target, FileTime.fromMillis(modifiedAt));
+        } catch (IOException refused) {
+            if (Debug.verboseOn()) {
+                Debug.logVerbose("The modification time of [" + target + "] could not be aligned with the"
+                        + " content store's object, so the next read compares content again: "
+                        + refused.getMessage(), MODULE);
+            }
+        }
+    }
+
+    /**
+     * Discards a cached copy of an object the store no longer holds, so that every instance answers the
+     * same way.
+     *
+     * <p><strong>The defect this closes.</strong> A read that finds no object falls back to the local file,
+     * which is right for content that was never published - a deployment migrating into the store, or a
+     * write this seam has not seen - and wrong for a copy this class MADE from an object that has since
+     * been removed. In the second case the instance that happens to hold the cache serves HTTP 200 while
+     * every other instance answers that the content is gone: one database row with two different answers,
+     * and the missing object hidden from exactly the instance an operator is most likely to test.
+     *
+     * <p><strong>What counts as a cache, and why nothing else does.</strong> Two things mark a local file
+     * as this class's own copy of an object rather than content in its own right:
+     * <ul>
+     *   <li>This JVM materialised it - see {@link #MATERIALISED}.</li>
+     *   <li>It sits inside a TRANSACTION-OWNED upload directory. Only {@link #publishedUploadPath} creates
+     *       those, only with a store configured, and everything written into one is published and then
+     *       discarded locally, so a file found in one afterwards can only be a copy read back from the
+     *       store. This second test is what makes the behaviour survive a RESTART: the in-memory index does
+     *       not, and an instance that restarted holding a materialised copy would otherwise go back to
+     *       serving it as though it were a local write.</li>
+     * </ul>
+     *
+     * <p>Anything else is left exactly where it is: content written by a path this seam never saw - a
+     * deployment migrating into the store, or a create-file call that composed its own location - lives
+     * outside a transaction-owned directory, is not in the index, and stays readable, which is the
+     * migration boundary DOCKER.adoc records. Removing a cache also means the next read on this instance
+     * asks the store again rather than answering from bytes nothing else can produce.
+     *
+     * @param key the storage key the store holds nothing for
+     * @param target the local location that names it
+     */
+    private static void discardStaleCache(String key, Path target) {
+        if (!MATERIALISED.contains(target.toString()) && !insideTransactionDirectory(target)) {
+            return;
+        }
+        try {
+            if (Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS) && Files.deleteIfExists(target)) {
+                Debug.logWarning("The content store holds no object for [" + key + "] any more, so the copy this"
+                        + " instance had cached at [" + target + "] was discarded: the store is what every"
+                        + " instance reads, and serving a cached copy here would answer differently from every"
+                        + " other instance. The content is now reported absent, as it is elsewhere.", MODULE);
+            }
+        } catch (IOException failure) {
+            Debug.logWarning(failure, "The cached copy [" + target + "] of content the store no longer holds"
+                    + " could not be discarded, so this instance may still answer with it while its peers"
+                    + " report the content absent", MODULE);
+        } finally {
+            MATERIALISED.remove(target.toString());
+        }
+    }
+
+    /**
+     * Reports whether a location sits inside a transaction-owned upload directory.
+     *
+     * <p>Only {@link #publishedUploadPath} creates such a directory, and only with a content store
+     * configured, so a location inside one was composed by this class for one transaction's upload.
+     *
+     * @param target the location to test
+     * @return true when one of its parent directories is a transaction-owned upload directory
+     */
+    private static boolean insideTransactionDirectory(Path target) {
+        for (Path segment : target) {
+            if (TRANSACTION_DIRECTORY.matcher(segment.toString()).matches()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Reports, once per key, that a local copy later than the store's object was kept.
+     *
+     * @param key the storage key
+     * @param target the local file that was kept
+     */
+    private static void reportLocalRetention(String key, Path target) {
+        if (!RETENTION_REPORTED.add(key)) {
+            return;
+        }
+        Debug.logWarning("Content [" + target + "] on this instance is NEWER than the object the content store"
+                + " holds for [" + key + "], so the local copy is served and the object is not written over it."
+                + " A local write that the content-store seam never saw - a create-file or update-file service"
+                + " call that composed its own path - is the usual cause, and that content is not in the store,"
+                + " so another instance cannot serve it. Publish it with the migration procedure in DOCKER.adoc."
+                + " This is reported once per object for the life of the instance.", MODULE);
+    }
+
+    /**
+     * Reports whether two files hold the same bytes.
+     *
+     * @param staged the freshly downloaded object
+     * @param target the local file, which may not exist
+     * @return true when both exist and hold identical content
+     */
+    private static boolean sameContent(Path staged, Path target) {
+        try {
+            if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)
+                    || Files.size(staged) != Files.size(target)) {
+                return false;
+            }
+            return Arrays.equals(digest(staged), digest(target));
+        } catch (IOException unreadable) {
+            return false;
+        }
+    }
+
+    /**
+     * Returns a SHA-256 digest of a file's content.
+     *
+     * <p>Used to compare two local files, never as a security control.
+     *
+     * @param path the file
+     * @return the digest
+     * @throws IOException if the file cannot be read
+     */
+    private static byte[] digest(Path path) throws IOException {
+        MessageDigest sha256;
+        try {
+            sha256 = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException unavailable) {
+            // SHA-256 is mandatory on every Java platform.
+            throw new IOException("SHA-256 is required to compare content", unavailable);
+        }
+        try (InputStream content = Files.newInputStream(path)) {
+            byte[] buffer = new byte[DIGEST_BUFFER];
+            for (int read = content.read(buffer); read >= 0; read = content.read(buffer)) {
+                sha256.update(buffer, 0, read);
+            }
+        }
+        return sha256.digest();
+    }
+
+    /**
+     * Returns what a local file holds, or null when it is not a regular file.
+     *
+     * @param path the file
+     * @return its length and modification time, or null
+     */
+    private static FileFacts facts(Path path) {
+        try {
+            BasicFileAttributes held = Files.readAttributes(path, BasicFileAttributes.class);
+            return held.isRegularFile()
+                    ? new FileFacts(held.size(), held.lastModifiedTime().toMillis())
+                    : null;
+        } catch (NoSuchFileException absent) {
+            return null;
+        } catch (IOException unreadable) {
+            return null;
+        }
+    }
+
+    private static void removeQuietly(Path staged) {
+        if (staged == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(staged);
+        } catch (IOException e) {
+            Debug.logWarning(e, "A staging file left by a content store read could not be removed: " + staged,
+                    MODULE);
+        }
+    }
+
+    /**
+     * Returns the calling thread's scope for the transaction that is active now, creating it if needed.
+     *
+     * @return the scope
+     */
+    private static TransactionScope scope() {
+        Object current = currentTransaction();
+        TransactionScope held = SCOPE.get();
+        // Identity, not merely presence: a suspended or abandoned transaction leaves its scope on a
+        // pooled thread, and a later transaction that inherited the thread must not be able to reuse it
+        // and skip binding a publication of its own.
+        if (held != null && held.belongsTo(current)) {
+            return held;
+        }
+        TransactionScope fresh = new TransactionScope(current);
+        SCOPE.set(fresh);
+        return fresh;
+    }
+
+    /**
+     * Returns the scope of the active transaction, refusing when there is none.
+     *
+     * @param refusal the message to fail with when no transaction is active
+     * @return the scope
+     * @throws IllegalStateException with the given message when no transaction is active
+     */
+    private static TransactionScope activeScope(String refusal) {
+        try {
+            if (TransactionUtil.getStatus() != Status.STATUS_ACTIVE) {
+                throw new IllegalStateException(refusal);
+            }
+        } catch (GenericTransactionException unavailable) {
+            throw new IllegalStateException(refusal, unavailable);
+        }
+        return scope();
+    }
+
+    /**
+     * Returns the transaction the calling thread is in, as an identity to compare scopes against.
+     *
+     * @return the transaction, or null when it cannot be established
+     */
+    private static Object currentTransaction() {
+        try {
+            TransactionManager manager = TransactionFactoryLoader.getInstance().getTransactionManager();
+            if (manager == null) {
+                return null;
+            }
+            return manager.getTransaction();
+        } catch (SystemException | RuntimeException unavailable) {
+            if (Debug.verboseOn()) {
+                Debug.logVerbose("The current transaction could not be identified for a content store"
+                        + " publication scope: " + unavailable.getMessage(), MODULE);
+            }
+            return null;
+        }
+    }
+
+    /** What a watched file held, for the change comparison. */
+    private record FileFacts(long length, long modifiedAt) { }
+
+    /**
+     * The per-thread state of one transaction: its private upload directory and its bound publications.
+     */
+    private static final class TransactionScope {
+
+        private final Object transaction;
+        private final Set<String> bound = new HashSet<>();
+        private String uploadDirectory;
+
+        private TransactionScope(Object owner) {
+            this.transaction = owner;
+        }
+
+        private boolean belongsTo(Object candidate) {
+            return transaction != null && transaction == candidate;
+        }
+
+        /**
+         * Returns the name of this transaction's private upload directory, creating it on first use so
+         * that two uploads in one transaction share one directory.
+         *
+         * @return the directory name
+         */
+        private String uploadDirectoryName() {
+            if (uploadDirectory == null) {
+                uploadDirectory = TRANSACTION_DIRECTORY_PREFIX
+                        + UUID.randomUUID().toString().replace("-", "");
+            }
+            return uploadDirectory;
+        }
+
+        private boolean claim(String identity) {
+            return bound.add(identity);
+        }
+
+        private void release(String identity) {
+            bound.remove(identity);
+        }
+
+        private void completed(String identity) {
+            bound.remove(identity);
+            if (bound.isEmpty()) {
+                // Removed rather than left empty, so a pooled thread does not carry the scope for the life
+                // of the JVM.
+                clearScope();
+            }
+        }
+    }
+
+    /**
+     * Publishes the content a transaction wrote, before that transaction commits.
+     *
+     * <p>Registered by {@link #bind} once per watched identity per transaction, and used only by the
+     * transaction that registered it. Package-private, rather than private, only so that a test can
+     * complete a publication directly: the transaction manager that would otherwise call it back is not
+     * running in the unit tier.
+     */
+    static final class ContentPublication implements Synchronization {
+
+        private final ContentStore store;
+        private final File directory;
+        private final Set<String> names;
+        private final String identity;
+        private final Map<String, FileFacts> before;
+        private final long registeredAt;
+        private final List<String> created = new LinkedList<>();
+        /** Keys this transaction wrote OVER an object an earlier committed row already named. */
+        private final List<String> replaced = new LinkedList<>();
+        /** The local files this transaction published, which a commit no longer needs on this instance. */
+        private final List<File> published = new LinkedList<>();
+
+        ContentPublication(ContentStore store, File directory, Set<String> names, String identity) {
+            this.store = store;
+            this.directory = directory;
+            this.names = names;
+            this.identity = identity;
+            this.registeredAt = System.currentTimeMillis();
+            this.before = snapshot(directory, names);
+        }
+
+        @Override
+        public void beforeCompletion() {
+            for (File candidate : candidates()) {
+                if (changed(candidate)) {
+                    publish(candidate);
+                }
+            }
+        }
+
+        @Override
+        public void afterCompletion(int status) {
+            TransactionScope scope = SCOPE.get();
+            if (scope != null) {
+                scope.completed(identity);
+            }
+            if (status == Status.STATUS_COMMITTED) {
+                discardPublishedUpload();
+                return;
+            }
+            // The transaction did not commit, so the objects it CREATED are named by no committed row and
+            // are removed again, on a best-effort basis, rather than left as orphans. A key that REPLACED
+            // an object an earlier committed row still names is deliberately not in this list: this
+            // publication holds no copy of the previous object, so deleting the key would destroy that
+            // content instead of restoring it - it is REPORTED instead, below.
+            for (String key : created) {
+                try {
+                    store.delete(key);
+                    Debug.logInfo("Content [" + key + "] was removed from the content store, because the"
+                            + " transaction that wrote it did not commit", MODULE);
+                } catch (GeneralException | IOException failure) {
+                    Debug.logError(failure, "Content [" + key + "] was published by a transaction that did not"
+                            + " commit and could not be removed again, so it is now an orphan in the content"
+                            + " store", MODULE);
+                }
+            }
+            reportReplacedAfterNonCommit();
+            reapOwnedDirectory();
+        }
+
+        /**
+         * Reports content this transaction wrote over before failing to commit.
+         *
+         * <p>An update publishes over the object its row names - the key is what the content IS, not which
+         * transaction wrote it - so a transaction that fails AFTER its content was published leaves the
+         * newer bytes under that key while the row goes back to naming the previous generation. This is
+         * exactly what an update does to the local file when no store is configured, so the behaviour is
+         * the one OFBiz has always had rather than a new one, and it cannot be undone here: this
+         * publication holds no copy of the bytes it replaced. It is reported so that the operator can see
+         * it happened, with the key, instead of it being silent.
+         */
+        private void reportReplacedAfterNonCommit() {
+            for (String key : replaced) {
+                Debug.logWarning("The transaction that wrote content [" + key + "] did not commit, and the"
+                        + " object it wrote OVER cannot be restored - this publication holds no copy of it. The"
+                        + " content store therefore holds the bytes of the upload that failed, under the key the"
+                        + " previous generation of that content is named by. Re-upload the content to settle it."
+                        + " An update without a content store writes over the local file the same way.", MODULE);
+            }
+        }
+
+        /**
+         * Removes the local copy of an upload this transaction published, after it COMMITTED.
+         *
+         * <p><strong>Why a committed upload's local file is deleted.</strong> With an external store
+         * configured the object IS the content: it is what every instance reads, and it is what an
+         * erasure or a retention rule acts on. The local file the upload service wrote is, from the
+         * moment the publication succeeds, a CACHE of that object - and leaving it behind caused two
+         * distinct defects.
+         *
+         * <ul>
+         *   <li>It made instances disagree. When the object was removed from the bucket, the instance
+         *       that had written it went on serving HTTP 200 from its own disk while every other
+         *       instance answered 500 for the same database row - one row, two answers, and the missing
+         *       object invisible from the instance most likely to be looked at.</li>
+         *   <li>It accumulated. Every update of one {@code DataResource} writes into a NEW
+         *       transaction-owned directory, so a file-backed content item that was updated four times
+         *       left four local generations, of which at most one was current, on whichever instances
+         *       happened to take those writes.</li>
+         * </ul>
+         *
+         * <p>A read materialises the object again when it needs a local file ({@link #fetch}), so nothing
+         * is lost but the local copy, and the instance is left holding no durable state a peer cannot
+         * reconstruct - which is the point of the object store.
+         *
+         * <p><strong>Deliberately narrow, because it deletes files.</strong> Only a TRANSACTION-OWNED
+         * upload directory qualifies: {@link #publishedUploadPath} created it for this transaction alone,
+         * its name matches EXACTLY the {@code txn-}uuid form {@code uploadDirectoryName} composes - a
+         * directory a deployment happens to have named {@code txn-something} is not one of ours and is
+         * left alone - and every file in it was written by this transaction. A NAMED publication is never touched - it watches a file some
+         * caller composed the path of, which may be a file that existed in the deployment before this
+         * transaction rewrote it, and deleting that would remove content the store was never asked to own.
+         * Only regular files are removed, symbolic links are not followed, and every failure is logged and
+         * tolerated: the object is safe, so a local copy that survives is at worst a stale cache.
+         *
+         * <p>It runs even when the transaction published NOTHING, because an upload that carried no bytes
+         * - a submitted form with an empty file field - still had a directory prepared for it, and an
+         * empty directory nothing will ever write into again is local state the fleet is not supposed to
+         * accumulate. Only the emptiness is acted on: {@link #pruneOwnedDirectory} removes the directory
+         * only when nothing is left in it, so an upload whose file was written but not published - the
+         * same bytes already in the store - keeps both its file and its directory.
+         */
+        private void discardPublishedUpload() {
+            if (names != null || !TRANSACTION_DIRECTORY.matcher(directory.getName()).matches()) {
+                return;
+            }
+            for (File copy : published) {
+                Path path = copy.toPath();
+                try {
+                    if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                        Files.deleteIfExists(path);
+                        if (Debug.verboseOn()) {
+                            Debug.logVerbose("The local copy of published content [" + storeKey(copy) + "] was"
+                                    + " removed from this instance: the content store holds it, and a read"
+                                    + " materialises it again when a local file is needed", MODULE);
+                        }
+                    }
+                } catch (IOException failure) {
+                    Debug.logWarning(failure, "The local copy [" + copy.getAbsolutePath() + "] of content that"
+                            + " was published to the content store could not be removed from this instance, so"
+                            + " this instance keeps a cached copy of it", MODULE);
+                } finally {
+                    // Whatever the outcome, this location is no longer a cache of an object this JVM read:
+                    // either it is gone, or it holds a local write. Leaving the entry would let a later read
+                    // of a removed object delete a file this class did not materialise.
+                    MATERIALISED.remove(path.toString());
+                }
+            }
+            pruneOwnedDirectory("its content was published to the content store");
+        }
+
+        /**
+         * Removes the transaction-owned upload directory once nothing is left in it.
+         *
+         * @param because what to say in the log about why it was emptied
+         */
+        private void pruneOwnedDirectory(String because) {
+            File[] remaining = directory.listFiles();
+            if (remaining == null || remaining.length > 0) {
+                return;
+            }
+            try {
+                Files.deleteIfExists(directory.toPath());
+                if (Debug.verboseOn()) {
+                    Debug.logVerbose("The upload directory [" + directory.getAbsolutePath() + "] was removed from"
+                            + " this instance, because " + because, MODULE);
+                }
+            } catch (IOException failure) {
+                Debug.logWarning(failure, "The empty upload directory [" + directory.getAbsolutePath() + "] could"
+                        + " not be removed from this instance", MODULE);
+            }
+        }
+
+        /**
+         * Removes the upload directory this transaction owns, after a transaction that did not commit.
+         *
+         * <p>The point of the whole design is that an instance holds no durable local state, and a
+         * non-commit is exactly where it would otherwise accumulate some: {@link #publishedUploadPath}
+         * created this directory for one transaction, the upload service wrote into it, and the rollback
+         * removed the {@code DataResource} row that named it - so what is left is bytes NOTHING names, on
+         * one instance's disk, which no read will ever ask for and no erasure will ever reach. Left alone
+         * they grow without bound on whichever instance happened to take the failed upload, which is the
+         * local state the fleet is not supposed to have.
+         *
+         * <p>Deliberately narrow, because it deletes files. It runs only for a directory publication -
+         * where the directory belongs to this transaction alone - only when that directory's name matches
+         * EXACTLY the {@code txn-}uuid form this class gives such a directory, and only on the regular
+         * files inside it,
+         * never following a symbolic link and never descending. Anything else it finds, it leaves and
+         * reports, keeping the directory too: an unexpected entry is a sign something outside this class
+         * is writing there, and that is not something to delete on a best-effort path.
+         */
+        private void reapOwnedDirectory() {
+            if (names != null || !TRANSACTION_DIRECTORY.matcher(directory.getName()).matches()) {
+                // A NAMED publication watches files it does not own: they belong to whatever wrote them,
+                // and a non-commit is no licence to delete them.
+                return;
+            }
+            Path root = directory.toPath();
+            if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+                return;
+            }
+            File[] children = directory.listFiles();
+            if (children == null) {
+                Debug.logWarning("The upload directory [" + directory.getAbsolutePath() + "] of a transaction"
+                        + " that did not commit could not be listed, so it is left on this instance", MODULE);
+                return;
+            }
+            boolean emptied = true;
+            for (File child : children) {
+                Path path = child.toPath();
+                if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                    emptied = false;
+                    Debug.logWarning("The upload directory [" + directory.getAbsolutePath() + "] of a"
+                            + " transaction that did not commit holds [" + child.getName() + "], which is not"
+                            + " a regular file, so the directory is left on this instance", MODULE);
+                    continue;
+                }
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException failure) {
+                    emptied = false;
+                    Debug.logWarning(failure, "The upload [" + child.getName() + "] written by a transaction"
+                            + " that did not commit could not be removed from this instance", MODULE);
+                }
+            }
+            if (!emptied) {
+                return;
+            }
+            try {
+                Files.deleteIfExists(root);
+                if (Debug.verboseOn()) {
+                    Debug.logVerbose("The upload directory [" + directory.getAbsolutePath() + "] was removed"
+                            + " from this instance, because the transaction that wrote into it did not commit",
+                            MODULE);
+                }
+            } catch (IOException failure) {
+                Debug.logWarning(failure, "The empty upload directory [" + directory.getAbsolutePath() + "] of"
+                        + " a transaction that did not commit could not be removed from this instance", MODULE);
+            }
+        }
+
+        /**
+         * Returns the files this publication is responsible for.
+         *
+         * <p>For a named publication that is the named files. For a directory publication the directory
+         * belongs to this transaction alone - {@link #publishedUploadPath} created it for one transaction
+         * and nothing else writes into it - so every regular file in it was written here.
+         *
+         * @return the candidate files
+         */
+        private List<File> candidates() {
+            if (names != null) {
+                List<File> named = new ArrayList<>(names.size());
+                for (String name : names) {
+                    named.add(new File(directory, name));
+                }
+                return named;
+            }
+            File[] children = directory.listFiles();
+            if (children == null) {
+                // Being unable to inspect the directory is a publication FAILURE and never a quiet
+                // success: returning here would let the transaction commit rows naming content that was
+                // never published.
+                throw refuse(directory.getAbsolutePath(),
+                        new IOException("the upload directory could not be listed"));
+            }
+            return Arrays.asList(children);
+        }
+
+        /**
+         * Reports whether a candidate holds content this transaction has to publish.
+         *
+         * @param candidate the candidate file
+         * @return true when it must be published
+         */
+        private boolean changed(File candidate) {
+            if (!candidate.isFile()) {
+                return false;
+            }
+            if (names == null) {
+                // A directory this transaction owns started out empty, so every file in it is this
+                // transaction's own write. No comparison is needed, and none would be sound: the file was
+                // created after the snapshot by definition.
+                return true;
+            }
+            FileFacts earlier = before.get(candidate.getName());
+            // A HEURISTIC, deliberately, rather than a digest: a named file counts as written when it was
+            // not there when the publication was registered, or its length changed, or its modification
+            // time changed, or it was touched at or after the instant the publication was registered.
+            // Hashing it instead would make every resolution pay for reading the whole file inside the
+            // transaction.
+            // A READ does not trip it: a fetch from the store sets the local modification time to the
+            // object's own, which is in the past, so neither the recorded facts nor the registration
+            // instant sees a change. Its limit: on a filesystem that refuses to set a modification time,
+            // a fetched file keeps the time of the fetch and is republished once - the same bytes, under
+            // the same key.
+            return earlier == null
+                    || earlier.length() != candidate.length()
+                    || earlier.modifiedAt() != candidate.lastModified()
+                    || candidate.lastModified() >= registeredAt;
+        }
+
+        /**
+         * Publishes one file, refusing the transaction when the store will not take it, and records
+         * whether the object was created rather than replaced.
+         *
+         * @param file the file to publish
+         */
+        private void publish(File file) {
+            String key = storeKey(file);
+            if (key == null) {
+                throw refuse(file.getAbsolutePath(),
+                        new IOException("the file is not inside the OFBiz home directory"));
+            }
+            if (Files.isSymbolicLink(file.toPath())) {
+                throw refuse(key, new IOException("the file is a symbolic link, and only a regular file inside the"
+                        + " deployment is published to the content store"));
+            }
+            long length = file.length();
+            if (length > ContentStore.MAX_OBJECT_BYTES) {
+                throw refuse(key, new IOException("the file holds " + length + " bytes, more than the "
+                        + ContentStore.MAX_OBJECT_BYTES + " bytes one content store object may hold"));
+            }
+            // Asked before the write, because only an object this transaction created may be removed
+            // again after a non-commit. A store that cannot answer is treated as already holding the key,
+            // so the cleanup errs towards leaving an object behind rather than deleting content an
+            // earlier committed row may still name.
+            boolean replacement = true;
+            try {
+                replacement = store.exists(key);
+            } catch (GeneralException | IOException unknown) {
+                Debug.logWarning(unknown, "The content store could not report whether it already held ["
+                        + key + "], so it is left in place if this transaction does not commit", MODULE);
+            }
+            try {
+                // Streamed from the file rather than read into memory: an upload at the size ceiling
+                // would otherwise cost MAX_OBJECT_BYTES of heap for every concurrent publication, which
+                // is the same defect on the write path that collapsing a read into a byte array was on
+                // the read path.
+                store.put(key, file.toPath());
+                if (replacement) {
+                    replaced.add(key);
+                } else {
+                    created.add(key);
+                }
+                published.add(file);
+                // The local copy and the object are the same content from here on, and the object's
+                // recorded time is the moment of the write, so the local time is left where it is: a read
+                // compares content, finds it identical, and aligns the time without transferring again.
+                Debug.logInfo("Content [" + key + "] was published to the content store", MODULE);
+            } catch (GeneralException | IOException failure) {
+                throw refuse(key, failure);
+            }
+        }
+
+        /**
+         * Refuses the transaction, because content it wrote is not in the store.
+         *
+         * <p>The transaction is both marked for rollback and failed by throwing. Marking it is the
+         * explicit request; throwing is what still rolls it back if the mark could not be set, because a
+         * transaction manager rolls back a transaction whose {@code beforeCompletion} callback threw. A
+         * row naming content the fleet cannot read must never commit, so there is no path here that
+         * merely logs.
+         *
+         * @param subject what could not be published, as a storage key or a local path. It is operator
+         *     detail and never reaches the caller
+         * @param failure why
+         * @return the exception the caller throws
+         */
+        private IllegalStateException refuse(String subject, Throwable failure) {
+            // The rollback cause is the one copy of this that a USER sees - rendered on the content screen
+            // the upload was made from - so it names the content by REFERENCE only. The key, the path and
+            // the failure go to the log under that same reference. Nor does the cause travel: the store's
+            // own messages are already sanitised, but a local read failure arrives as a NoSuchFileException
+            // whose toString() is the absolute path, and TransactionUtil's RollbackOnlyCause appends the
+            // cause's toString() to whatever message it is handed.
+            String reference = reference("Content [" + subject + "] could not be published to the content store,"
+                    + " so the transaction that wrote it is rolled back rather than committing a row that names"
+                    + " content the fleet cannot read", failure);
+            String message = "The content could not be published to the content store, so the transaction that"
+                    + " wrote it is rolled back rather than committing a row that names content the fleet cannot"
+                    + " read. Reference [" + reference + "]";
+            try {
+                TransactionUtil.setRollbackOnly(message, null);
+            } catch (GenericTransactionException e) {
+                Debug.logError(e, "The transaction could not be marked for rollback after a content store"
+                        + " publication failed. Reference [" + reference + "]", MODULE);
+            }
+            return new IllegalStateException(message);
+        }
+
+        /**
+         * Records what the watched files held before anything was written.
+         *
+         * @param directory the watched directory
+         * @param names the watched file names, or null for a directory this transaction owns, which
+         *     starts out empty and therefore needs no snapshot
+         * @return what each watched file held, by file name
+         */
+        private static Map<String, FileFacts> snapshot(File directory, Set<String> names) {
+            Map<String, FileFacts> held = new LinkedHashMap<>();
+            if (names == null) {
+                return held;
+            }
+            for (String name : names) {
+                File child = new File(directory, name);
+                if (child.isFile()) {
+                    held.put(name, new FileFacts(child.length(), child.lastModified()));
+                }
+            }
+            return held;
+        }
+    }
+}

@@ -34,8 +34,23 @@ under the License.
         <property name="apps-cross-context" value="false"/>
         <property name="apps-distributable" value="false"/><!-- you must also set all the webapps you want distributable, by adding <distributable/> in their web.xml file -->
         <!-- configuration of the Tomcat service that hosts OFBiz applications: the service has one engine and one or more connectors -->
+        <!-- SESSION SCOPE - read this before relying on jvm-route below.
+             HTTP sessions here are INSTANCE-LOCAL: apps-distributable is false, no session-replication cluster
+             is declared and no external session store is configured, so a session is held only in the memory
+             of the instance that created it. If that instance is replaced, scaled in or restarted, its
+             sessions are LOST and the users holding them have to sign in again.
+             jvm-route does not change that. It is sticky-routing metadata only - it appends this instance's id
+             to the session cookie so a balancer configured for sticky sessions can send a returning request
+             back to the instance that owns the session. It is not replication and provides no failover.
+             Losing a session is recoverable by signing in again, which is why this limitation is accepted here
+             rather than solved. Adding replication or an external session store would be a separate change;
+             see "Running more than one instance" in DOCKER.adoc. -->
         <property name="default-server" value="engine">
             <property name="default-host" value="0.0.0.0"/>
+            <!-- Per-instance sticky-session route id, set from OFBIZ_JVM_ROUTE by docker-entrypoint.sh.
+                 Behind a balancer using sticky sessions, give every instance a DISTINCT value. An empty value
+                 is treated as absent by ContainerConfig, so no JVM route is set at all. STICKY ROUTING ONLY -
+                 see the session scope note above. -->
             <property name="jvm-route" value="jvm1"/>
             <property name="access-log-pattern">
                 <property-value>%h %l %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"</property-value>
@@ -63,7 +78,50 @@ under the License.
                 <property name="mcast-drop-time" value="3000"/>
             </property>
             -->
-            <!-- <property name="ssl-accelerator-port" value="8443"/> -->
+            <!-- TLS-terminating proxy trust boundary: when a load balancer or reverse proxy
+                 terminates TLS and forwards plain HTTP to this instance, set this to the LOCAL port on which this
+                 instance receives that forwarded traffic - i.e. the port of the plain http-connector below, 8080
+                 out of the box. It is therefore NOT the public HTTPS port of the load balancer.
+                 Configurable via OFBIZ_SSL_ACCELERATOR_PORT; the container entry point validates the value as a
+                 plain integer between 1 and 65535 and refuses a value that does not match a connector port
+                 declared in this file, because CatalinaContainer parses it with Integer.valueOf and an
+                 unparseable value would otherwise abort startup with a NumberFormatException, while a value
+                 matching no connector would silently mark nothing secure.
+                 Left EMPTY by default, which ContainerConfig treats as absent, so the SslAcceleratorValve is NOT
+                 installed and an unconfigured deployment behaves as it does with no such declaration at all.
+                 Before this became configurable the property shipped commented out with an example value of
+                 8443. That example is not carried over deliberately: 8443 is the port of the https-connector
+                 below, on which Tomcat terminates TLS itself and marks the request secure without any valve, and
+                 it is also the port a proxy typically PUBLISHES - neither of which is what this setting means.
+                 The value has to be the local plain-HTTP port the proxy forwards to, so it is left empty and set
+                 deliberately rather than defaulted to a number that looks plausible and is wrong.
+
+                 TRUST BOUNDARY - READ BEFORE ENABLING THIS. SslAcceleratorValve marks every request that
+                 arrives on the configured port as secure on the strength of request.getLocalPort() alone. It
+                 verifies nothing about the sender and consults no X-Forwarded-Proto or Forwarded header, so the
+                 port number is not the trust decision - the NETWORK is. Enable it only when the connector that
+                 serves that port is unreachable except through the proxy: bind it to a private interface (the
+                 http-connector's 'address' property below, which ships commented out, so Tomcat binds every
+                 interface until you uncomment it) and restrict it with a security group, firewall rule
+                 or private subnet that admits the proxy alone. The proxy owns the other half - it must strip
+                 client-supplied X-Forwarded-* and Forwarded headers and set them itself.
+                 An empty value is treated as absent by ContainerConfig, so no valve is installed. Set from
+                 OFBIZ_SSL_ACCELERATOR_PORT by docker-entrypoint.sh. -->
+            <property name="ssl-accelerator-port" value=""/>
+            <!-- Issues the session cookie for a parent domain, so that instances served under several
+                 sub-domains of it share one session. Installs CrossSubdomainSessionValve; only the literal
+                 "true" (case-insensitive) enables it, and the default is "false". Set from
+                 OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS by docker-entrypoint.sh.
+                 It needs cookie.domain in framework/webapp/config/url.properties (OFBIZ_COOKIE_DOMAIN in a
+                 container), which is the deployment's statement of that parent domain; without it there is
+                 nothing to widen a cookie to, so the valve reports it once and leaves cookies host-only, and
+                 the entry point refuses the combination outright. The domain is deliberately NOT derived from
+                 the host a request arrives with: one webapp has ONE session-cookie configuration, so a domain
+                 taken from whichever host arrived first would be sent to every other client too, and RFC 6265
+                 obliges a client under a different parent domain to discard that cookie.
+                 The valve configures the domain and leaves the cookie to Tomcat, so every attribute the cookie
+                 would have carried is kept and the session id rotated at login is covered as well. It creates
+                 no session of its own, so health probes still cost nothing. -->
             <property name="enable-cross-subdomain-sessions" value="false"/>
         </property>
         <property name="ajp-connector" value="connector">
@@ -91,6 +149,16 @@ under the License.
                  So if you want to use AJP you need to set the values depending on your configuration.
                  Using ".*" to allowedRequestAttributesPattern put you at risk.
             -->
+            <!-- CONTAINER DEPLOYMENTS: THE BIND ADDRESS IS THE TRUST DECISION FOR THIS CONNECTOR.
+                 With secretRequired false and no secret declared above, this connector is UNAUTHENTICATED -
+                 whoever can open a socket to the port speaks AJP and can set the request attributes OFBiz
+                 reads - which is exactly why Tomcat's own default for it is to bind localhost only, as the
+                 note above records.
+                 docker-entrypoint.sh therefore refuses to enable it without being told where to bind:
+                 OFBIZ_ENABLE_AJP_PORT inserts an 'address' property here from OFBIZ_AJP_BIND_ADDRESS, that
+                 variable is required, every wildcard spelling (0.0.0.0, ::, *) is refused, and the rendered
+                 value is read back and compared with the validated one. Withdrawing OFBIZ_ENABLE_AJP_PORT
+                 removes the inserted line again, restoring Tomcat's localhost-only default. -->
             <property name="secretRequired" value="false"/>
             <!-- <property name="allowedRequestAttributesPattern" value=".*"/> -->
             <!-- commented out because the values match the Tomcat defaults:
@@ -187,6 +255,7 @@ under the License.
         <!-- one or more tomcat engines (servers); map to this + host -->
         <property name="default-server" value="engine">
             <property name="default-host" value="0.0.0.0"/>
+            <!-- Sticky-session route id for the test loader, as in the container above. -->
             <property name="jvm-route" value="jvm1"/>
             <property name="access-log-pattern">
                 <property-value>%h %l %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"</property-value>
@@ -197,6 +266,39 @@ under the License.
             <property name="access-log-maxDays" value="30"/>
             <property name="enable-request-dump" value="false"/>
         </property>
+        <!-- THESE CONNECTOR PORTS ARE HOST-GLOBAL, AND ONE ALREADY IN USE IS NOT FATAL. The three
+             connectors below are the ones the test loader opens, so they are also what two checkouts of this
+             repository on one machine - two CI jobs, two agent workspaces - compete for, together with the
+             admin port declared in start.properties.
+
+             The two kinds of collision do NOT behave alike, and which one a run meets depends on the loader,
+             which is worth knowing before trusting a green run. The admin container is declared on the MAIN
+             loader (framework/base/ofbiz-component.xml), so an ordinary start refuses to run at all when the
+             admin port is taken ("Cannot init() admin-container (Couldn't create server socket
+             (/127.0.0.1:10523) (Address already in use))") and never reaches a connector: loud, immediate, and
+             the reason a second full server on one machine stops rather than half starts. The test loader does
+             NOT load that container, so nothing stops the integration tier on its way to these connectors -
+             and a connector that cannot be bound does not stop it either. That half is Tomcat's behaviour
+             rather than this file's: the failure is logged at SEVERE ("Failed to initialize component
+             [Connector[http-nio-8080]]", caused by "java.net.BindException: Address already in use"), the
+             connector that could not be bound is dropped, and the service starts anyway. The integration
+             tier therefore runs to completion and
+             reports its result with no HTTP listener open, so a connector collision costs the listeners
+             SILENTLY, and a check that needed a real connector would simply not have been exercised.
+
+             Nothing in this descriptor can change that half of it. ContainerConfig reads these values
+             literally - there is no environment or system property substitution in a container property - and
+             Tomcat exposes no connector attribute that makes a failed bind fatal. The collision is therefore
+             AVOIDED rather than detected: run one OFBiz at a time per checkout, and give a second one on the
+             same machine a port offset, which shifts every port declared here and the admin port by the same
+             amount. That is the portoffset startup option, short form -o, and it reaches this loader through
+             the ofbiz task, as in: gradlew "ofbiz -t -o 200". The same rule holds for the build itself: one
+             Gradle invocation per checkout, because these ports, the admin port, the embedded H2 database
+             directory and the test-report directory are all shared by every invocation in one directory.
+
+             The values themselves are left exactly as committed, deliberately: the container entry point
+             rewrites the serving container above and never this block, so no environment variable an operator
+             sets changes what the test loader binds. -->
         <property name="ajp-connector" value="connector">
             <!--<property name="address" value=""/>-->
             <property name="port" value="8010"/>

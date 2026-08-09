@@ -28,8 +28,10 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Properties;
 
 import org.apache.ofbiz.base.util.GeneralException;
+import org.apache.ofbiz.base.util.UtilProperties;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -38,10 +40,15 @@ public final class SecurityUtilTest {
 
     private static final List<String> FRAMEWORK_ADMIN_PERMISSIONS = Arrays.asList(
             "SECURITY", "COMMON", "ENTITY_DATA");
+    private static final String LOCAL_FILE_ALLOWED_PATHS = "content.data.local.file.allowed.paths";
+    private static final String UPLOAD_AND_TEMP_ALLOWED_PATHS =
+            "${ofbiz.home}/runtime/tmp/,${ofbiz.home}/runtime/uploads/";
 
     private Path tempHome;
     private Path tempExternal;
     private String previousOfbizHome;
+    private String previousLocalFileAllowedPaths;
+    private boolean localFileAllowedPathsWasDefined;
 
     @BeforeEach
     public void setUpTempDirs() throws Exception {
@@ -49,10 +56,21 @@ public final class SecurityUtilTest {
         tempExternal = Files.createTempDirectory("ofbiz-ext-test");
         previousOfbizHome = System.getProperty("ofbiz.home");
         System.setProperty("ofbiz.home", tempHome.toString());
+        Properties securityProperties = UtilProperties.getProperties("security");
+        localFileAllowedPathsWasDefined = securityProperties.containsKey(LOCAL_FILE_ALLOWED_PATHS);
+        previousLocalFileAllowedPaths = securityProperties.getProperty(LOCAL_FILE_ALLOWED_PATHS);
+        UtilProperties.setPropertyValueInMemory("security", LOCAL_FILE_ALLOWED_PATHS,
+                UPLOAD_AND_TEMP_ALLOWED_PATHS);
     }
 
     @AfterEach
     public void tearDownTempDirs() throws Exception {
+        if (localFileAllowedPathsWasDefined) {
+            UtilProperties.setPropertyValueInMemory("security", LOCAL_FILE_ALLOWED_PATHS,
+                    previousLocalFileAllowedPaths);
+        } else {
+            UtilProperties.getProperties("security").remove(LOCAL_FILE_ALLOWED_PATHS);
+        }
         if (previousOfbizHome != null) {
             System.setProperty("ofbiz.home", previousOfbizHome);
         } else {
@@ -65,6 +83,41 @@ public final class SecurityUtilTest {
     private static void deleteDirRecursively(Path dir) throws Exception {
         if (dir != null && Files.exists(dir)) {
             Files.walk(dir).sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+        }
+    }
+
+    @Test
+    public void checkLocalFileAllowListAcceptsTheConfiguredUploadAndTemporaryRoots() throws Exception {
+        Path uploaded = Files.createDirectories(tempHome.resolve("runtime/uploads"))
+                .resolve("uploaded.bin");
+        Path temporary = Files.createDirectories(tempHome.resolve("runtime/tmp"))
+                .resolve("temporary.bin");
+
+        SecurityUtil.checkLocalFileAllowList(uploaded.toFile());
+        SecurityUtil.checkLocalFileAllowList(temporary.toFile());
+    }
+
+    @Test
+    public void checkLocalFileAllowListStillRejectsOtherDeploymentDirectories() throws Exception {
+        Path output = Files.createDirectories(tempHome.resolve("runtime/output"))
+                .resolve("not-uploaded.bin");
+        try {
+            SecurityUtil.checkLocalFileAllowList(output.toFile());
+            fail("Expected GeneralException for a LOCAL_FILE outside the configured upload and temporary roots");
+        } catch (GeneralException e) {
+            assertTrue(e.getMessage().contains("not within an allowed directory"));
+        }
+    }
+
+    @Test
+    public void checkLocalFileAllowListRejectsTraversalOutOfTheUploadRoot() throws Exception {
+        Path uploads = Files.createDirectories(tempHome.resolve("runtime/uploads"));
+        File traversalFile = new File(uploads.toFile(), "../../forbidden/secret.bin");
+        try {
+            SecurityUtil.checkLocalFileAllowList(traversalFile);
+            fail("Expected GeneralException for traversal out of the configured upload root");
+        } catch (GeneralException e) {
+            assertTrue(e.getMessage().contains("not within an allowed directory"));
         }
     }
 

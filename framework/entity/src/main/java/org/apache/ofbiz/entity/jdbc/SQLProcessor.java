@@ -35,6 +35,7 @@ import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.UUID;
 
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.entity.Delegator;
@@ -171,7 +172,9 @@ public class SQLProcessor implements AutoCloseable {
                 } catch (GenericDataSourceException rbsqle) {
                     Debug.logError(rbsqle, "Got another error when trying to rollback after error committing transaction: " + sqle.toString());
                 }
-                throw new GenericDataSourceException("SQL Exception occurred on commit", sqle);
+                throw new GenericDataSourceException(datasourceFault("A database error prevented the"
+                        + " transaction from committing. The server log records the reason.",
+                        "SQL Exception occurred on commit", sqle));
             }
         }
     }
@@ -285,7 +288,9 @@ public class SQLProcessor implements AutoCloseable {
                 Debug.logVerbose("SQLProcessor:connection() : manualTx=" + manualTx, MODULE);
             }
         } catch (SQLException sqle) {
-            throw new GenericDataSourceException("Unable to establish a connection with the database.", sqle);
+            throw new GenericDataSourceException(datasourceFault("Unable to establish a connection with the"
+                    + " database. The server log records the reason.",
+                    "Unable to establish a connection with the database", sqle));
         }
 
         // make sure we actually did get a connection
@@ -396,7 +401,7 @@ public class SQLProcessor implements AutoCloseable {
             }
             this.setFetchSize(ps, fetchSize);
         } catch (SQLException sqle) {
-            throw new GenericDataSourceException("SQL Exception while executing the following:" + this.sql, sqle);
+            throw new GenericDataSourceException(datasourceFault(this.sql, sqle));
         }
     }
 
@@ -411,7 +416,7 @@ public class SQLProcessor implements AutoCloseable {
             resultSet = ps.executeQuery();
         } catch (SQLException sqle) {
             this.checkLockWaitInfo(sqle);
-            throw new GenericDataSourceException("SQL Exception while executing the following:" + this.sql, sqle);
+            throw new GenericDataSourceException(datasourceFault(this.sql, sqle));
         }
 
         return resultSet;
@@ -443,7 +448,7 @@ public class SQLProcessor implements AutoCloseable {
             this.checkLockWaitInfo(sqle);
             // don't display this here, may not be critical, allow handling further up...
             // Debug.logError(sqle, "SQLProcessor.executeUpdate() : ERROR : ", MODULE);
-            throw new GenericDataSourceException("SQL Exception while executing the following:" + this.sql, sqle);
+            throw new GenericDataSourceException(datasourceFault(this.sql, sqle));
         }
     }
 
@@ -457,9 +462,9 @@ public class SQLProcessor implements AutoCloseable {
         try (Statement stmt = connection.createStatement()) {
             return stmt.executeUpdate(sql);
         } catch (SQLException sqle) {
-            // passing on this exception as nested, no need to log it here:
-            // Debug.logError(sqle, "SQLProcessor.executeUpdate(sql) : ERROR : ", MODULE);
-            throw new GenericDataSourceException("SQL Exception while executing the following:" + sql, sqle);
+            // The statement is logged with the driver's exception rather than nested into the message:
+            // see datasourceFault().
+            throw new GenericDataSourceException(datasourceFault(sql, sqle));
         }
     }
 
@@ -472,7 +477,7 @@ public class SQLProcessor implements AutoCloseable {
         try {
             return resultSet.next();
         } catch (SQLException sqle) {
-            throw new GenericDataSourceException("SQL Exception while executing the following:" + this.sql, sqle);
+            throw new GenericDataSourceException(datasourceFault(this.sql, sqle));
         }
     }
 
@@ -523,10 +528,7 @@ public class SQLProcessor implements AutoCloseable {
             }
 
         } catch (SQLException sqle) {
-            Debug.logWarning("[SQLProcessor.execQuery]: SQL Exception while executing the following:\n"
-                    + sql + "\nError was:", MODULE);
-            Debug.logWarning(sqle.getMessage(), MODULE);
-            throw new GenericEntityException("SQL Exception while executing the following:" + sql, sqle);
+            throw new GenericEntityException(datasourceFault(sql, sqle));
         } finally {
             close();
         }
@@ -862,6 +864,61 @@ public class SQLProcessor implements AutoCloseable {
     }
 
     /**
+     * Reports a datasource failure: the statement and the driver's own message go to the operator log under
+     * an opaque reference, and the caller is given a message naming nothing but that reference.
+     *
+     * <p>A message raised here does NOT stay inside the entity engine. It travels out through
+     * {@code GenericEntityException} to whatever called the delegator, and OFBiz renders an unhandled one on
+     * the page the request came from - including pages an ANONYMOUS visitor can reach, such as the
+     * storefront's keyword search. Handing that page the statement discloses the schema and table names it
+     * was built from, and the driver's text discloses the engine and often its version: together they
+     * describe the deployment's database to whoever asked for it. This matters more now than it did on the
+     * embedded database, because a managed RDBMS is reachable independently of the instance.
+     *
+     * <p>Withholding the statement alone would not be enough, because the driver's message follows the
+     * exception on its own: {@link org.apache.ofbiz.base.util.GeneralException#getMessage()} appends a nested
+     * exception's message in parentheses, and {@code TransactionUtil}'s rollback-only cause appends the
+     * cause's {@code toString()} to the banner it renders - which is how the observed disclosure arrived on a
+     * page whose own code had already swallowed the exception. So the exception built from this message
+     * carries NO nested cause. Nothing is lost: the {@code SQLException} is logged here with its full stack
+     * trace, under the reference the caller is shown, and no OFBiz code inspects a nested
+     * {@code SQLException} for anything but logging (verified across framework, applications and plugins).
+     *
+     * <p>{@code DatabaseUtil}'s own DDL and schema-check messages are deliberately left as they are: they
+     * are produced by the schema-init and the authenticated administrative check, never by serving a
+     * visitor's request.
+     *
+     * @param statement the statement that failed. Operator detail, and it never reaches the caller
+     * @param sqle the driver's exception, logged in full
+     * @return the message for the caller: a generic sentence and the opaque reference
+     */
+    private String datasourceFault(String statement, SQLException sqle) {
+        return datasourceFault("A database error prevented this operation from completing. The server log"
+                        + " records the statement and the reason.",
+                "SQL Exception while executing the following:" + statement, sqle);
+    }
+
+    /**
+     * Reports a datasource failure that has no statement of its own - establishing a connection, or
+     * committing - where the disclosure is the driver's own message rather than any SQL.
+     *
+     * <p>It matters for the same reason and is withheld the same way. A connection failure reported by
+     * pgjdbc names the host, the port and the database it could not reach, so a caller shown the nested
+     * message would be told where the managed database lives.
+     *
+     * @param told what the caller is told, which must name nothing about the deployment
+     * @param detail what the operator log records
+     * @param sqle the driver's exception, logged in full
+     * @return the message for the caller: the given sentence and the opaque reference
+     */
+    private String datasourceFault(String told, String detail, SQLException sqle) {
+        String reference = UUID.randomUUID().toString();
+        Debug.logError(sqle, detail + " Reference [" + reference + "], which is the only detail the caller"
+                + " is shown.", MODULE);
+        return told + " Reference [" + reference + "]";
+    }
+
+    /**
      * Ask the processor to execute the batch and return the number of rows updated
      * @return The number of rows updated
      * @throws GenericDataSourceException
@@ -871,7 +928,7 @@ public class SQLProcessor implements AutoCloseable {
             return Arrays.stream(ps.executeBatch()).sum();
         } catch (SQLException sqle) {
             this.checkLockWaitInfo(sqle);
-            throw new GenericDataSourceException("SQL Exception while executing the following:" + sql, sqle);
+            throw new GenericDataSourceException(datasourceFault(sql, sqle));
         }
     }
 

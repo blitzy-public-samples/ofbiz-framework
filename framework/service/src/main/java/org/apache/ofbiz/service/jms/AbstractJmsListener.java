@@ -43,7 +43,16 @@ public abstract class AbstractJmsListener implements GenericMessageListener, Exc
     private static final String MODULE = AbstractJmsListener.class.getName();
 
     private LocalDispatcher dispatcher;
-    private boolean isConnected = false;
+    /**
+     * Whether a live connection to the message bus is held.
+     *
+     * <p>Volatile because it is written and read by different threads and always has been: the JMS provider's
+     * own thread clears it from {@link #onException} when the broker goes, the listener-factory thread sets it
+     * when a connection is established, and - since the readiness probe reports message-bus connectivity - a
+     * probe thread reads it. Without the barrier a reader could keep observing a stale value indefinitely,
+     * which for the probe would mean reporting an instance able to carry cache invalidations when it is not.
+     */
+    private volatile boolean isConnected = false;
 
     /**
      * Initializes the LocalDispatcher for this service listener.

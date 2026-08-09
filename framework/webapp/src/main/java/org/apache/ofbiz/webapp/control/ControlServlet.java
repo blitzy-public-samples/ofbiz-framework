@@ -378,6 +378,15 @@ public class ControlServlet extends HttpServlet {
                     + request.getServerName() + ")] Request Done", MODULE);
         }
 
+        // The staging files of a multipart request are deleted HERE, at the end of the request that
+        // created them, because this is the point at which every consumer of the parsed items has run:
+        // they are handed to callers through the request and, for an upload, the content is stored during
+        // the request that carried it. Nothing deleted them before, so each upload left a complete copy
+        // of its body in the temporary directory for the life of the deployment - durable local state on
+        // an instance meant to be freely replaceable, and an unbounded disk requirement for ordinary
+        // upload traffic. It runs for every outcome, success or failure, and never throws.
+        UtilHttp.releaseMultiPartStaging(request);
+
         // sanity check 2: make sure there are no user or session infos in the delegator, ie clear the thread
         GenericDelegator.clearUserIdentifierStack();
         GenericDelegator.clearSessionIdentifierStack();

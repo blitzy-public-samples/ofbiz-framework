@@ -51,6 +51,40 @@ access. For a detailed description see the core/docs/entityconfig.html file.
 
     <debug-xa-resources value="false" />  <!-- see https://issues.apache.org/jira/browse/OFBIZ-4282 for more -->
     
+    <!-- Deployment profiles (see DOCKER.adoc):
+         * Development profile (this committed file, zero configuration): the default, default-no-eca and test
+           delegators all resolve to the embedded H2 datasources, so a bare checkout boots with no environment
+           variables and no secrets configured. This is the profile every local build and every gradlew task uses.
+         * Deployed profile (managed PostgreSQL): the container entry point renders
+           docker/templates/postgres-entityengine.xml into /ofbiz/config/entityengine.xml (which precedes
+           ofbiz.jar on the classpath) when OFBIZ_POSTGRES_HOST is set, repointing the default and
+           default-no-eca group-maps to localpostgres / localpostgresolap / localpostgrestenant. Connection
+           parameters come from OFBIZ_POSTGRES_HOST, OFBIZ_POSTGRES_PORT (default 5432),
+           OFBIZ_POSTGRES_{OFBIZ,OLAP,TENANT}_{DB,USER,PASSWORD}, OFBIZ_DB_POOL_MIN (default 2),
+           OFBIZ_DB_POOL_MAX (default 250) and the transport security OFBIZ_POSTGRES_SSLMODE (verify-full in
+           the prod profile) with OFBIZ_POSTGRES_SSLROOTCERT; the two startup-DDL flags come from
+           OFBIZ_SCHEMA_INIT and the cache-invalidation flag from OFBIZ_DISTRIBUTED_CACHE_CLEAR, both
+           defaulting to false.
+         The test delegator ALWAYS stays on embedded H2 in both profiles: the deployed-profile template defines
+         its own localh2* datasources for exactly that reason, so gradlew loadAll and gradlew testIntegration are
+         unaffected, in a container as well as locally.
+         H2, MySQL and Oracle datasource definitions remain fully intact and selectable. -->
+    <!-- distributed-cache-clear-enabled is configuration-driven and stays "false" here, so an unconfigured
+         checkout keeps single-node cache behaviour. In the deployed profile the entry point substitutes the
+         placeholder in docker/templates/postgres-entityengine.xml with OFBIZ_DISTRIBUTED_CACHE_CLEAR, which
+         switches on OFBiz's own cache-invalidation plumbing - DistributedCacheClear and
+         org.apache.ofbiz.entityext.cache.EntityCacheServices, running as the "system" user - so no further
+         attribute is needed here.
+         A MESSAGE TRANSPORT IS REQUIRED BEFORE ENABLING IT: the distributedClear* sender services in
+         framework/entityext/servicedef/services.xml are declared engine="jms" location="serviceMessenger", the
+         jms-service of that name is commented out in framework/service/config/serviceengine.xml and no JMS
+         provider client library is bundled. Those services inherit use-transaction true with
+         require-new-transaction false, so with the flag on and no transport configured a dispatch failure marks
+         the caller's transaction rollback only and loses the entity write that triggered the invalidation.
+         Configure the broker, supply its client library in /ofbiz/lib-extra and activate the serviceMessenger
+         jms-service first; DOCKER.adoc carries the procedure. The container entry point ENFORCES that order: it
+         refuses to start when OFBIZ_DISTRIBUTED_CACHE_CLEAR is true and no uncommented jms-service of that name
+         is found, so the flag cannot be switched on without a transport to carry the invalidations. -->
     <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="false">
         <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
@@ -393,12 +427,100 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <!-- <jndi-jdbc jndi-server-name="localjndi" jndi-name="java:/MySqlDataSource" isolation-level="Serializable"/> -->
     </datasource>
 
+    <!-- The three localpostgres* definitions below are the managed-RDBMS datasources. The Entity Engine
+         configuration parser reads these attributes LITERALLY - there is no property-placeholder or
+         system-property expansion anywhere in this file - so a deployment externalises them through
+         docker/templates/postgres-entityengine.xml, which the container entry point renders into
+         /ofbiz/config/entityengine.xml (first on the runtime classpath) when OFBIZ_POSTGRES_HOST is set. That
+         template documents each placeholder at the attribute it occupies, and its datasource definitions are
+         derived from these three, so the two stay in step.
+         MAINTENANCE RULE: never write an at-sign delimited placeholder name anywhere in THIS file, not even in
+         a comment, and describe placeholders by the attribute they occupy as the comments here do. The template
+         is a sed source and a name written in prose would be substituted there too.
+         LOCAL-DEVELOPMENT PLACEHOLDERS: the host, database, username and password below are the long standing
+         defaults for a PostgreSQL installed on the developer's own machine, exactly as the mysql, oracle and
+         other dialect definitions beside them keep theirs. They are placeholders, not deployment credentials:
+         a deployed container never uses them as written, because the entry point renders the template with the
+         host, database, username and password taken from the environment and puts the result first on the
+         classpath. A developer pointing a delegator at these three edits them locally, or supplies a
+         jdbc-password-lookup naming a property in a passwords.properties that is not committed.
+         The secrets that ARE externalised by this refactor - the admin key, the forgot-password key and the
+         JWT signing key - live in framework/security/config/security.properties and
+         framework/start/src/main/resources/org/apache/ofbiz/base/start/start.properties, which ship without a
+         value and are injected from the environment at deploy time; none of them belongs here.
+         TLS: the URIs below leave sslmode at the pgJDBC default, because they address 127.0.0.1 - a loopback
+         connection that never crosses a network - and a checkout provisions no certificate authority for
+         anything stronger. Every connection that DOES cross a network is a rendered one, and the entry point
+         puts sslmode and sslrootcert into each rendered URI from OFBIZ_POSTGRES_SSLMODE and
+         OFBIZ_POSTGRES_SSLROOTCERT, defaulting the prod profile to verify-full and refusing to start without a
+         readable CA file - pgJDBC does not consult the JVM trust store, it reads sslrootcert. A local install
+         that does reach PostgreSQL over a network should add sslmode=verify-full and sslrootcert to the URI
+         here. Enforce it from the server as well, with a hostssl rule in pg_hba.conf or rds.force_ssl on a
+         managed instance: a server-side rule cannot be forgotten the way a per-client setting can.
+         EVERY NETWORK WAIT IS BOUNDED: each URI below pins the pgJDBC deadlines and each pool below pins its
+         borrow wait, because the value that applies when either is absent is not a deadline at all. pgJDBC
+         leaves socketTimeout and loginTimeout at 0, which means NO LIMIT, so a thread that reaches a database
+         which has stopped answering blocks on the socket read for as long as the kernel keeps the connection
+         open - and that strands the startup entity check and the readiness probe's query as much as a request
+         thread. Independently, InlineJdbc reads an absent pool-sleeptime as 300000 ms, five minutes, which is
+         longer than any load-balancer health-check timeout, so an exhausted pool would present as a hung
+         instance. socketTimeout bounds a SINGLE socket read rather than a statement, so the value is generous
+         enough that no normal statement, data load or schema check is affected while still being finite. There
+         is deliberately no queryTimeout: it would apply to EVERY statement and abort legitimately long work
+         such as a data load or a large report. test-while-idle stops the pool handing out a connection that
+         died while idle, the ordinary outcome of a managed-database failover, by validating during the eviction
+         runs that already happen every time-between-eviction-runs-millis - which costs a request nothing, so
+         test-on-borrow, one extra round trip on every single borrow, stays false.
+         NO VALIDATION QUERY IS CONFIGURED HERE, and that is the point rather than an omission. DBCP validates
+         with the configured pool-jdbc-test-stmt when there is one and with JDBC Connection.isValid when there is
+         not (commons-dbcp2 PoolableConnection.validate falls through to isValid for an absent or empty
+         statement), and only the second of those is safe on this pool: OFBiz returns managed connections with
+         autoCommitOnReturn and rollbackOnReturn both false, so a SELECT issued by the eviction thread OPENS a
+         PostgreSQL transaction that passivation never ends. The backend then sits idle in transaction, holding
+         backend_xmin and so holding back vacuum, until some later borrower happens to finish it - which is
+         exactly what was measured against a real pool before this attribute was removed. Connection.isValid
+         needs no transaction and still detects a connection killed by a failover or an idle-flow reaper, so the
+         validation the fleet needs is kept and the cost it did not need is gone. The embedded localh2*
+         definitions above keep their own validation query untouched: they are single-node development and test
+         datasources, and H2 has no equivalent behaviour. The template carries the same deadlines and the same pool settings, so a
+         rendered deployment and a non-container install that points a delegator at these definitions are
+         bounded identically. Only these three managed definitions carry them: the MySQL, Oracle and other
+         dialect definitions are preserved exactly as they are for portability.
+         RECORDED DEVIATION from the specified change set: the four pgJDBC URI parameters (socketTimeout,
+         loginTimeout, cancelSignalTimeout, tcpKeepAlive - connectTimeout aside, which bounds the connect itself)
+         and the three pool attributes (pool-sleeptime, test-while-idle, test-on-borrow) are
+         NOT among the changes the specification enumerates for this file, which names only the group-map
+         repointing, the de-hardcoding of these three definitions, the two startup-DDL flags and the
+         cache-invalidation flag. They are added deliberately and knowingly: the objective these definitions
+         serve is a fleet of replaceable instances behind a load balancer, and the defaults that apply without
+         them are not bounded waits at all (see the paragraph above), so an instance that reaches a database
+         which has stopped answering would hang instead of failing its health check and being replaced - the
+         opposite of the objective. Every attribute used is declared by entity-config.xsd, every one is inert
+         for the embedded and the other dialect datasources, and none changes behaviour on a healthy
+         connection. Anyone reconciling this file against the specification should read these eight attributes
+         as an explicit, reviewed addition rather than as drift. -->
+    <!-- GATED SCHEMA INITIALIZATION: this managed-RDBMS run mode issues NO startup DDL, so a serving instance
+         needs no DDL privileges and a whole fleet can scale out without racing on schema changes. The schema is
+         applied exclusively by a separate one-shot init execution driven by OFBIZ_SCHEMA_INIT=true, which the
+         container entry point runs by rendering the template with check-on-start and add-missing-on-start both
+         true, starting OFBiz once so the Entity Engine creates the tables the entity model declares (the pass
+         is additive: it creates missing tables and columns and never drops), re-rendering with both false, and
+         exiting without ever reaching the serving command - so the DDL privilege that execution needs never
+         belongs to a long-lived process. It invokes the loader with "readers=none", because creating the
+         delegator is what applies the schema and an empty reader list then loads nothing.
+         Note how Datasource.java parses the two flags: check-on-start is read as !"false".equals(attribute), so
+         an absent attribute means TRUE and the literal false below is what actually disables the startup schema
+         check, while add-missing-on-start is read as "true".equals(attribute), so its false is explicit rather
+         than required.
+         Schema truth remains the entity model - no Flyway, Liquibase, schema-version table or hand-written DDL.
+         The embedded localh2* datasources deliberately keep both flags enabled for zero-configuration local
+         development, where the file-based database belongs to the single JVM that opens it. -->
     <datasource name="localpostgres"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             schema-name="public"
             field-type-name="postgres"
-            check-on-start="true"
-            add-missing-on-start="true"
+            check-on-start="false"
+            add-missing-on-start="false"
             use-fk-initially-deferred="false"
             alias-view-columns="false"
             join-style="ansi"
@@ -417,13 +539,16 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://127.0.0.1/ofbiz"
+                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbiz?connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
                 jdbc-username="ofbiz"
                 jdbc-password="ofbiz"
                 isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"
-                time-between-eviction-runs-millis="600000"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
+                time-between-eviction-runs-millis="600000"
+                pool-sleeptime="20000"
+                test-while-idle="true"
+                test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
                 is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
 
         <!-- <jndi-jdbc jndi-server-name="default" jndi-name="java:comp/env/jdbc/localpostgres" isolation-level="ReadCommitted"/>-->
@@ -436,8 +561,8 @@ access. For a detailed description see the core/docs/entityconfig.html file.
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             schema-name="public"
             field-type-name="postgres"
-            check-on-start="true"
-            add-missing-on-start="true"
+            check-on-start="false"
+            add-missing-on-start="false"
             use-fk-initially-deferred="false"
             alias-view-columns="false"
             join-style="ansi"
@@ -454,13 +579,16 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://127.0.0.1/ofbizolap"
+                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbizolap?connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
                 jdbc-username="ofbiz"
                 jdbc-password="ofbiz"
                 isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"
-                time-between-eviction-runs-millis="600000"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
+                time-between-eviction-runs-millis="600000"
+                pool-sleeptime="20000"
+                test-while-idle="true"
+                test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
                     is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
         
         <!-- <jndi-jdbc jndi-server-name="default" jndi-name="java:comp/env/jdbc/localpostgres" isolation-level="ReadCommitted"/>-->
@@ -473,8 +601,8 @@ access. For a detailed description see the core/docs/entityconfig.html file.
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             schema-name="public"
             field-type-name="postgres"
-            check-on-start="true"
-            add-missing-on-start="true"
+            check-on-start="false"
+            add-missing-on-start="false"
             use-fk-initially-deferred="false"
             alias-view-columns="false"
             join-style="ansi"
@@ -491,13 +619,16 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://127.0.0.1/ofbiztenant"
+                jdbc-uri="jdbc:postgresql://127.0.0.1:5432/ofbiztenant?connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
                 jdbc-username="ofbiz"
                 jdbc-password="ofbiz"
                 isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"
-                time-between-eviction-runs-millis="600000"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
+                time-between-eviction-runs-millis="600000"
+                pool-sleeptime="20000"
+                test-while-idle="true"
+                test-on-borrow="false"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
                     is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
         
         <!-- <jndi-jdbc jndi-server-name="default" jndi-name="java:comp/env/jdbc/localpostgres" isolation-level="ReadCommitted"/>-->

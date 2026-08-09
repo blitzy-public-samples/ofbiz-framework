@@ -92,6 +92,37 @@ dependencies {
       exclude group: 'pull-parser', module: 'pull-parser'
       exclude group: 'xpp3', module: 'xpp3'
     }
+    // S3 client for the content-store provider (S3ContentStore). Its two default transports are replaced
+    // by the SDK's own URLConnection one, because each of them would otherwise CHANGE THE VERSION of a
+    // third-party library already on the runtime class path, which this addition must not do:
+    // netty-nio-client (async only - S3ContentStore never builds an async client) moves
+    // io.netty:netty-common from 4.1.80.Final to 4.1.136.Final for the LDAP/CAS plugin, and apache5-client
+    // moves httpclient5 from 5.4.4 to 5.6.2 and httpcore5/httpcore5-h2 from 5.3.4 to 5.4.3 for
+    // esapi/antisamy. url-connection-client depends on nothing outside the SDK, the SDK discovers it
+    // through the service loader as the single HTTP implementation present - so no code names it and it is
+    // needed at run time only - and it supports every request S3ContentStore makes. With these three lines
+    // the resolved runtime class path gains the SDK and the driver and changes NO existing version.
+    //
+    // THE THREE LINES BELOW ARE ONE UNIT - DO NOT REMOVE THE url-connection-client LINE. Excluding both
+    // default transports leaves the SDK with no HTTP implementation of its own, so that runtimeOnly line is
+    // the ONLY transport object storage has. Nothing references it by name: it is found through the service
+    // loader, so removing it compiles and every test that does not reach a live store still passes, and the
+    // failure appears only when a request is made - SdkClientException "Unable to load an HTTP implementation
+    // from any provider in the chain". If it ever has to be replaced, put another sync transport in its place
+    // in the same commit and check that the replacement does not move io.netty, httpclient5 or httpcore5.
+    //
+    // ISOLATION, PRECISELY. The specification asks for this dependency to be "isolated to the components that
+    // use them". OFBiz is a SINGLE Gradle project, so there is no per-component configuration to scope it to:
+    // 'implementation' here means the SDK is on the one runtime class path the whole application shares, and
+    // any component could import it. The isolation that does hold is at the source level - S3ContentStore is
+    // the sole importer of software.amazon.awssdk, and the SDK is inert unless content.store.provider is set
+    // to s3 - and it is enforced by review rather than by the build. Splitting the build into per-component
+    // configurations to enforce it mechanically would be a far larger change than this refactor allows.
+    implementation('software.amazon.awssdk:s3:2.49.1') {
+      exclude group: 'software.amazon.awssdk', module: 'netty-nio-client'
+      exclude group: 'software.amazon.awssdk', module: 'apache5-client'
+    }
+    runtimeOnly 'software.amazon.awssdk:url-connection-client:2.49.1'
 
     testImplementation 'org.junit.jupiter:junit-jupiter-api:6.1.0'
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:6.1.0'
@@ -107,6 +138,9 @@ dependencies {
     runtimeOnly 'org.apache.axis2:axis2-transport-http:1.8.2'
     runtimeOnly 'org.apache.axis2:axis2-transport-local:1.8.2'
     runtimeOnly 'com.h2database:h2:2.4.240'
+    // JDBC driver for the localpostgres* datasources, bundled here instead of downloaded at container
+    // start so the deployed version is pinned in this file. Keep it on the current 42.7.x line.
+    runtimeOnly 'org.postgresql:postgresql:42.7.13'
     runtimeOnly 'org.apache.geronimo.specs:geronimo-jaxrpc_1.1_spec:2.1'
     runtimeOnly 'org.apache.logging.log4j:log4j-1.2-api:2.25.4' // for external jars using the old log4j1.2: routes logging to log4j 2
     runtimeOnly 'org.apache.logging.log4j:log4j-jul:2.25.4' // for external jars using the java.util.logging: routes logging to log4j 2

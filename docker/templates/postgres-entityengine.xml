@@ -18,8 +18,75 @@ specific language governing permissions and limitations
 under the License.
 -->
 <!--
- - This file configures the Entity Engine JDBC (or other DataSource) and JTA
-access. For a detailed description see the core/docs/entityconfig.html file.
+ - The Entity Engine configuration a CONTAINER uses when it is pointed at a managed PostgreSQL database.
+ -
+ - docker/docker-entrypoint.sh renders this file into /ofbiz/config/entityengine.xml - a directory that
+ - precedes ofbiz.jar on the class path - when OFBIZ_POSTGRES_HOST is set. Every attribute value below
+ - that reads as an upper-case name delimited by two "at" signs is a placeholder the entry point
+ - substitutes. Those placeholder names are deliberately NOT spelled out in this comment: the
+ - substitution is a global one, so naming them here would copy live database passwords into the
+ - comments of the rendered file. What is substituted, and from where:
+ -
+ -   jdbc-uri host and port      OFBIZ_POSTGRES_HOST, OFBIZ_POSTGRES_PORT (default 5432)
+ -   jdbc-uri database name,     OFBIZ_POSTGRES_OFBIZ_{DB,USER,PASSWORD} for localpostgres, and the
+ -   jdbc-username,              matching OFBIZ_POSTGRES_OLAP_* and OFBIZ_POSTGRES_TENANT_* triples for
+ -   jdbc-password               localpostgresolap and localpostgrestenant
+ -   check-on-start,             both false for a serving instance; both true for the one-shot
+ -   add-missing-on-start        OFBIZ_SCHEMA_INIT=true run
+ -   distributed-cache-clear-    OFBIZ_DISTRIBUTED_CACHE_CLEAR (default false). The entry point refuses
+ -   enabled                     to start with it on unless a jms-service named serviceMessenger really
+ -                               is configured: the distributedClear* services are declared
+ -                               engine="jms" location="serviceMessenger", and that jms-service ships
+ -                               commented out, so with the flag on and no transport every cache
+ -                               invalidation would be undeliverable and would mark the calling
+ -                               transaction rollback-only.
+ -   pool-minsize,               OFBIZ_DB_POOL_MIN (default 2), OFBIZ_DB_POOL_MAX (default 250). Both
+ -   pool-maxsize                are PER-INSTANCE bounds, so a fleet of n instances can open up to
+ -                               n * max connections per entity group; keep that within the server's
+ -                               max_connections.
+ -
+ - Every network wait is bounded, because pgJDBC leaves socketTimeout and loginTimeout at 0 - NO LIMIT -
+ - when they are absent, so a thread that reaches a database which has stopped answering would block for as
+ - long as the kernel keeps the connection open. The values below are the ones the committed
+ - framework/entity/config/entityengine.xml uses for the same datasources.
+ -
+ - The three managed pools below carry test-while-idle without a validation query, deliberately. DBCP
+ - validates with the configured pool-jdbc-test-stmt when there is one and with JDBC Connection.isValid when
+ - there is not, and only the second is safe here: OFBiz returns managed connections with autoCommitOnReturn
+ - and rollbackOnReturn both false, so a SELECT issued by the eviction thread opens a PostgreSQL transaction
+ - that passivation never ends - the backend then sits idle in transaction holding backend_xmin, and so
+ - holding back vacuum, until a later borrower happens to finish it. Connection.isValid needs no transaction
+ - and still discards a connection killed by a failover or an idle-flow reaper, so the validation a fleet
+ - needs is kept without that cost. The embedded H2 datasources further down keep their own validation query:
+ - they serve the test delegator on a single node and H2 has no equivalent behaviour.
+ -
+ - TLS is NOT left to the driver's own default. pgJDBC's default, sslmode=prefer, encrypts when the server
+ - offers TLS and falls back to PLAINTEXT when it does not, so the entry point inserts sslmode - and
+ - sslrootcert when one was given - immediately in front of the connection-timeout parameter of every
+ - PostgreSQL jdbc-uri below, from OFBIZ_POSTGRES_SSLMODE and OFBIZ_POSTGRES_SSLROOTCERT. The prod profile
+ - defaults to verify-full and refuses to start without a readable certificate authority file, because
+ - pgJDBC does not consult the JVM trust store; a development profile keeps prefer. That insertion anchors
+ - on the connection-timeout parameter that opens each query string, so that parameter has to stay first
+ - in every PostgreSQL jdbc-uri here; the embedded H2 URIs separate their parameters with ';' and are left
+ - alone. See DOCKER.adoc.
+ -
+ - The committed framework/entity/config/entityengine.xml is unchanged by rendering: a checkout with no
+ - database environment variables still boots on embedded H2.
+ -
+ - DIALECT AVAILABILITY IS NARROWER IN A RENDERED CONTAINER, deliberately. This file declares 6 of the 23
+ - datasource definitions and 2 of the 12 field-type definitions the committed
+ - framework/entity/config/entityengine.xml declares: the three localpostgres* the delegators resolve to,
+ - the three localh2* the test delegator keeps, and the "postgres" and "h2" field-types those six name.
+ - Because a rendered /ofbiz/config/entityengine.xml REPLACES the committed file rather than merging with
+ - it, the definitions absent here are absent from the running container - so a container cannot be
+ - repointed at MySQL, Oracle, MSSQL, DB2 or any other dialect by setting a group-map alone.
+ - Nothing is lost from the product: all 23 definitions and all 12 field-type files remain in the source
+ - tree and in ofbiz.jar, and a non-container install still selects any of them. A container that needs a
+ - dialect other than PostgreSQL leaves OFBIZ_POSTGRES_HOST unset - which suppresses rendering entirely and
+ - keeps the committed file, with every dialect available - and mounts its own /ofbiz/config/entityengine.xml,
+ - or extends this template with the definition it needs. Adding a datasource here requires nothing but the
+ - definition and its field-type: the entry point substitutes placeholders textually and neither counts nor
+ - enumerates the datasources. DOCKER.adoc records this in the database section.
 -->
 <entity-config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="https://ofbiz.apache.org/dtds/entity-config.xsd">
@@ -27,7 +94,6 @@ access. For a detailed description see the core/docs/entityconfig.html file.
             prepend-env="ofbiz.home" prefix="/framework/entity/fieldtype/"/>
 
     <!-- the transaction factory class to use, one is needed for each way of getting JTA interfaces -->
-    <!-- Use this one for Geronimo -->
     <transaction-factory class="org.apache.ofbiz.entity.transaction.GeronimoTransactionFactory"/>
 
     <!-- the connection factory class to use, one is needed for obtaining connections/pools for defined resources -->
@@ -35,37 +101,37 @@ access. For a detailed description see the core/docs/entityconfig.html file.
 
     <debug-xa-resources value="false" />  <!-- see https://issues.apache.org/jira/browse/OFBIZ-4282 for more -->
 
-    <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="false">
+    <!-- The two SERVING delegators resolve to the managed PostgreSQL datasources. Their
+         distributed-cache-clear-enabled placeholder comes from OFBIZ_DISTRIBUTED_CACHE_CLEAR: more than one
+         instance sharing one database has to invalidate the others' entity caches, and it stays false for a
+         single instance, which is the default. The entry point refuses to start with it on unless a
+         serviceMessenger jms-service is configured to carry those invalidations. -->
+    <delegator name="default" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" distributed-cache-clear-enabled="@DISTRIBUTED_CACHE_CLEAR@">
         <group-map group-name="org.apache.ofbiz" datasource-name="localpostgres"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localpostgresolap"/>
         <group-map group-name="org.apache.ofbiz.tenant" datasource-name="localpostgrestenant"/>
     </delegator>
-
     <!-- May be used when you create a service that manages many data for massive imports, this for performance reason or to escape functional cases -->
-    <delegator name="default-no-eca" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" entity-eca-enabled="false" distributed-cache-clear-enabled="false">
+    <delegator name="default-no-eca" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main" entity-eca-enabled="false" distributed-cache-clear-enabled="@DISTRIBUTED_CACHE_CLEAR@">
         <group-map group-name="org.apache.ofbiz" datasource-name="localpostgres"/>
         <group-map group-name="org.apache.ofbiz.olap" datasource-name="localpostgresolap"/>
         <group-map group-name="org.apache.ofbiz.tenant" datasource-name="localpostgrestenant"/>
     </delegator>
 
-    <!-- Be sure that your default delegator (or the one you use) uses the same datasource for test. You must run "gradlew loadAll" before running "gradlew testIntegration" -->
+    <!-- The TEST delegator stays on embedded H2, exactly as the committed configuration has it, so that
+         "gradlew testIntegration" keeps running against H2 and never against the deployment's own database. -->
     <delegator name="test" entity-model-reader="main" entity-group-reader="main" entity-eca-reader="main">
-        <group-map group-name="org.apache.ofbiz" datasource-name="localpostgres"/>
-        <group-map group-name="org.apache.ofbiz.olap" datasource-name="localpostgresolap"/>
-        <group-map group-name="org.apache.ofbiz.tenant" datasource-name="localpostgrestenant"/>
+        <group-map group-name="org.apache.ofbiz" datasource-name="localh2"/>
+        <group-map group-name="org.apache.ofbiz.olap" datasource-name="localh2olap"/>
+        <group-map group-name="org.apache.ofbiz.tenant" datasource-name="localh2tenant"/>
     </delegator>
 
-
-    <!-- need to at least define a name for each component to use -->
     <entity-model-reader name="main"/>
 
-    <!-- need to at least define a name for each component to use -->
     <entity-group-reader name="main"/>
 
-    <!-- need to at least define a name for each component to use -->
     <entity-eca-reader name="main"/>
 
-    <!-- need to at least define a name for each component to use -->
     <entity-data-reader name="tenant"/>
     <entity-data-reader name="seed"/>
     <entity-data-reader name="seed-initial"/>
@@ -75,22 +141,26 @@ access. For a detailed description see the core/docs/entityconfig.html file.
     <entity-data-reader name="ext-demo"/>
 
     <field-type name="postgres" loader="fieldfile" location="fieldtypepostgres.xml"/>
+    <field-type name="h2" loader="fieldfile" location="fieldtypeh2.xml"/>
 
+    <!-- The managed PostgreSQL datasources. check-on-start and add-missing-on-start are placeholders
+         because a serving instance must issue NO startup DDL and needs no DDL privilege: the schema is
+         created once by the OFBIZ_SCHEMA_INIT=true run, which renders both true, and every serving start
+         renders both false. -->
     <datasource name="localpostgres"
             helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
             schema-name="public"
             field-type-name="postgres"
-            check-on-start="true"
-            add-missing-on-start="true"
+            check-on-start="@CHECK_ON_START@"
+            add-missing-on-start="@ADD_MISSING_ON_START@"
             use-fk-initially-deferred="false"
             alias-view-columns="false"
             join-style="ansi"
             use-binary-type-for-blob="true"
             use-order-by-nulls="true"
             offset-style="limit"
-            result-fetch-size="50"> <!-- Comment out the result-fetch-size attribute for jdbc driver versions older than 8.0.
-            Not recommended to use those though. They are archived unsupported versions: http://jdbc.postgresql.org/download.html -->
-        
+            result-fetch-size="50">
+
         <read-data reader-name="tenant"/>
         <read-data reader-name="seed"/>
         <read-data reader-name="seed-initial"/>
@@ -100,29 +170,31 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://@HOST@/@OFBIZ_DB@"
+                jdbc-uri="jdbc:postgresql://@HOST@:@PORT@/@OFBIZ_DB@?connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
                 jdbc-username="@OFBIZ_USERNAME@"
                 jdbc-password="@OFBIZ_PASSWORD@"
                 isolation-level="ReadCommitted"
-                pool-minsize="2"
-                pool-maxsize="250"
-                time-between-eviction-runs-millis="600000"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
-                is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
-    </datasource>
+                pool-minsize="@DB_POOL_MIN@"
+                pool-maxsize="@DB_POOL_MAX@"
+                time-between-eviction-runs-millis="600000"
+                pool-sleeptime="20000"
+                test-while-idle="true"
+                test-on-borrow="false"/>
 
+    </datasource>
     <datasource name="localpostgresolap"
-                helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
-                schema-name="public"
-                field-type-name="postgres"
-                check-on-start="true"
-                add-missing-on-start="true"
-                use-fk-initially-deferred="false"
-                alias-view-columns="false"
-                join-style="ansi"
-                result-fetch-size="50"
-                use-binary-type-for-blob="true"
-                use-order-by-nulls="true"
-                offset-style="limit">
+            helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
+            schema-name="public"
+            field-type-name="postgres"
+            check-on-start="@CHECK_ON_START@"
+            add-missing-on-start="@ADD_MISSING_ON_START@"
+            use-fk-initially-deferred="false"
+            alias-view-columns="false"
+            join-style="ansi"
+            result-fetch-size="50"
+            use-binary-type-for-blob="true"
+            use-order-by-nulls="true"
+            offset-style="limit">
         <read-data reader-name="tenant"/>
         <read-data reader-name="seed"/>
         <read-data reader-name="seed-initial"/>
@@ -132,29 +204,31 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://@HOST@/@OLAP_DB@"
+                jdbc-uri="jdbc:postgresql://@HOST@:@PORT@/@OLAP_DB@?connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
                 jdbc-username="@OLAP_USERNAME@"
                 jdbc-password="@OLAP_PASSWORD@"
                 isolation-level="ReadCommitted"
-                pool-minsize="2"
-                pool-maxsize="250"
-                time-between-eviction-runs-millis="600000"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
-                    is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
-    </datasource>
+                pool-minsize="@DB_POOL_MIN@"
+                pool-maxsize="@DB_POOL_MAX@"
+                time-between-eviction-runs-millis="600000"
+                pool-sleeptime="20000"
+                test-while-idle="true"
+                test-on-borrow="false"/>
 
+    </datasource>
     <datasource name="localpostgrestenant"
-                helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
-                schema-name="public"
-                field-type-name="postgres"
-                check-on-start="true"
-                add-missing-on-start="true"
-                use-fk-initially-deferred="false"
-                alias-view-columns="false"
-                join-style="ansi"
-                result-fetch-size="50"
-                use-binary-type-for-blob="true"
-                use-order-by-nulls="true"
-                offset-style="limit">
+            helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
+            schema-name="public"
+            field-type-name="postgres"
+            check-on-start="@CHECK_ON_START@"
+            add-missing-on-start="@ADD_MISSING_ON_START@"
+            use-fk-initially-deferred="false"
+            alias-view-columns="false"
+            join-style="ansi"
+            result-fetch-size="50"
+            use-binary-type-for-blob="true"
+            use-order-by-nulls="true"
+            offset-style="limit">
         <read-data reader-name="tenant"/>
         <read-data reader-name="seed"/>
         <read-data reader-name="seed-initial"/>
@@ -164,13 +238,115 @@ access. For a detailed description see the core/docs/entityconfig.html file.
         <read-data reader-name="ext-demo"/>
         <inline-jdbc
                 jdbc-driver="org.postgresql.Driver"
-                jdbc-uri="jdbc:postgresql://@HOST@/@TENANT_DB@"
+                jdbc-uri="jdbc:postgresql://@HOST@:@PORT@/@TENANT_DB@?connectTimeout=10&amp;socketTimeout=60&amp;loginTimeout=30&amp;cancelSignalTimeout=10&amp;tcpKeepAlive=true"
                 jdbc-username="@TENANT_USERNAME@"
                 jdbc-password="@TENANT_PASSWORD@"
                 isolation-level="ReadCommitted"
+                pool-minsize="@DB_POOL_MIN@"
+                pool-maxsize="@DB_POOL_MAX@"
+                time-between-eviction-runs-millis="600000"
+                pool-sleeptime="20000"
+                test-while-idle="true"
+                test-on-borrow="false"/>
+
+    </datasource>
+
+    <!-- The embedded H2 datasources, identical to the committed configuration. They back the test
+         delegator above; they keep both DDL flags enabled because the file-based database belongs to the
+         single JVM that opens it. -->
+    <datasource name="localh2"
+            helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
+            schema-name="OFBIZ"
+            field-type-name="h2"
+            check-on-start="true"
+            add-missing-on-start="true"
+            max-worker-pool-size="1"
+            use-pk-constraint-names="false"
+            use-indices-unique="false"
+            alias-view-columns="false"
+            use-order-by-nulls="true"
+            offset-style="fetch">
+        <read-data reader-name="tenant"/>
+        <read-data reader-name="seed"/>
+        <read-data reader-name="seed-initial"/>
+        <read-data reader-name="demo"/>
+        <read-data reader-name="ext"/>
+        <read-data reader-name="ext-test"/>
+        <read-data reader-name="ext-demo"/>
+        <inline-jdbc
+                jdbc-driver="org.h2.Driver"
+                jdbc-uri="jdbc:h2:file:./runtime/data/h2/ofbiz;DB_CLOSE_ON_EXIT=FALSE;CACHE_SIZE=65536;INIT=CREATE SCHEMA IF NOT EXISTS OFBIZ\;SET SCHEMA OFBIZ"
+                jdbc-username="ofbiz"
+                jdbc-password-lookup="h2-ofbiz"
+                isolation-level="ReadCommitted"
                 pool-minsize="2"
                 pool-maxsize="250"
-                time-between-eviction-runs-millis="600000"/><!-- Be warned that at this date (2009-09-20) the max_connections parameters in postgresql.conf
-                    is set by default to 100 by the initdb process see http://www.postgresql.org/docs/8.4/static/runtime-config-connection.html#GUC-MAX-CONNECTIONS-->
+                pool-sleeptime="300000"
+                test-on-borrow="true"
+                pool-jdbc-test-stmt="SELECT 1"
+                soft-min-evictable-idle-time-millis="600000"
+                time-between-eviction-runs-millis="600000"/>
+    </datasource>
+    <datasource name="localh2olap"
+            helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
+            schema-name="OLAP"
+            field-type-name="h2"
+            check-on-start="true"
+            add-missing-on-start="true"
+            max-worker-pool-size="1"
+            use-pk-constraint-names="false"
+            use-indices-unique="false"
+            alias-view-columns="false"
+            use-order-by-nulls="true">
+        <read-data reader-name="tenant"/>
+        <read-data reader-name="seed"/>
+        <read-data reader-name="seed-initial"/>
+        <read-data reader-name="demo"/>
+        <read-data reader-name="ext"/>
+        <read-data reader-name="ext-test"/>
+        <read-data reader-name="ext-demo"/>
+        <inline-jdbc
+                jdbc-driver="org.h2.Driver"
+                jdbc-uri="jdbc:h2:file:./runtime/data/h2/ofbiz;DB_CLOSE_ON_EXIT=FALSE;CACHE_SIZE=65536;INIT=CREATE SCHEMA IF NOT EXISTS OLAP\;SET SCHEMA OLAP"
+                jdbc-username="ofbiz"
+                jdbc-password-lookup="h2-ofbizolap"
+                isolation-level="ReadCommitted"
+                pool-minsize="2"
+                pool-maxsize="250"
+                pool-sleeptime="300000"
+                test-on-borrow="true"
+                pool-jdbc-test-stmt="SELECT 1"
+                time-between-eviction-runs-millis="600000"/>
+    </datasource>
+    <datasource name="localh2tenant"
+        helper-class="org.apache.ofbiz.entity.datasource.GenericHelperDAO"
+        schema-name="TENANT"
+        field-type-name="h2"
+        check-on-start="true"
+        add-missing-on-start="true"
+        max-worker-pool-size="1"
+        use-pk-constraint-names="false"
+        use-indices-unique="false"
+        alias-view-columns="false"
+        use-order-by-nulls="true">
+        <read-data reader-name="tenant"/>
+        <read-data reader-name="seed"/>
+        <read-data reader-name="seed-initial"/>
+        <read-data reader-name="demo"/>
+        <read-data reader-name="ext"/>
+        <read-data reader-name="ext-test"/>
+        <read-data reader-name="ext-demo"/>
+        <inline-jdbc
+            jdbc-driver="org.h2.Driver"
+            jdbc-uri="jdbc:h2:file:./runtime/data/h2/ofbiz;DB_CLOSE_ON_EXIT=FALSE;CACHE_SIZE=65536;INIT=CREATE SCHEMA IF NOT EXISTS TENANT\;SET SCHEMA TENANT"
+            jdbc-username="ofbiz"
+            jdbc-password-lookup="h2-ofbiztenant"
+            isolation-level="ReadCommitted"
+            pool-minsize="2"
+            pool-maxsize="250"
+            pool-sleeptime="300000"
+            test-on-borrow="true"
+            pool-jdbc-test-stmt="SELECT 1"
+            time-between-eviction-runs-millis="600000"/>
     </datasource>
 </entity-config>
