@@ -19,6 +19,8 @@
 package org.apache.ofbiz.webapp.control;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -31,6 +33,8 @@ import static org.mockito.Mockito.when;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.ofbiz.entity.Delegator;
 import org.junit.jupiter.api.BeforeEach;
@@ -142,19 +146,22 @@ public final class HealthCheckServletTests {
     }
 
     @Test
-    public void anEmptySequencerIsNotReadyEither() throws Exception {
+    public void anEmptySequencerIsStillReady() throws Exception {
         databaseAnswers(0L);
         at(READY);
 
         probe.doFilter(request, response, chain);
 
-        // A schema that has just been created answers this query successfully and finds nothing, because no
-        // identifier has been allocated from the sequencer yet. The instance genuinely cannot serve, so the
-        // probe must say 503 - and it must say so in the log too, or an operator watching a rollout could
-        // not tell an empty schema from an unreachable database.
-        verify(response).setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
-        assertEquals("{\"status\":\"DOWN\",\"database\":\"DOWN\"}", body.toString(),
-                "an empty sequencer must report not ready");
+        // A newly provisioned deployment carrying only seed data has an empty sequencer: nothing writes to
+        // SequenceValueItem until a request causes an identifier to be sequenced. The instance is nonetheless
+        // able to serve, and reporting it unready deadlocks it behind a load balancer - the target group sends
+        // no request until readiness answers 200, and readiness would not answer 200 until a request arrived.
+        // Measured on a fresh seed-only database: 503 indefinitely, then 200 after one direct request. What the
+        // probe asks is whether the query RUNS; a schema that has not been created fails it, because the
+        // entity's own table is absent, and that case is the test above.
+        verify(response).setStatus(HttpServletResponse.SC_OK);
+        assertEquals("{\"status\":\"UP\",\"database\":\"UP\"}", body.toString(),
+                "an instance whose schema exists but has sequenced nothing yet must be reported ready");
     }
 
     @Test
@@ -189,6 +196,119 @@ public final class HealthCheckServletTests {
         // so an unbounded probe would add a database round trip per probe per instance for no information.
         verify(delegator, times(1)).findCountByCondition(eq("SequenceValueItem"), any(), any(), any(), any());
         verify(response, times(5)).setStatus(HttpServletResponse.SC_OK);
+    }
+
+    @Test
+    public void readinessReportsOnlyTheDependenciesThisDeploymentIsConfiguredWith() {
+        // The key that is ABSENT is the assertion. A deployment storing content in the database and
+        // publishing no cache invalidations has exactly one dependency, and its readiness body is the two-key
+        // one this endpoint has always answered - which is what a target group, a monitoring check or an
+        // operator's eye has been configured against.
+        assertEquals("{\"status\":\"UP\",\"database\":\"UP\"}", HealthCheckServlet.render(true, null, null),
+                "a database-only deployment must report on the database alone");
+        assertEquals("{\"status\":\"UP\",\"database\":\"UP\",\"contentStore\":\"UP\"}",
+                HealthCheckServlet.render(true, "", null),
+                "a deployment with an external content store must report on it");
+        assertEquals("{\"status\":\"UP\",\"database\":\"UP\",\"messaging\":\"UP\"}",
+                HealthCheckServlet.render(true, null, ""),
+                "a deployment publishing cache invalidations must report on the bus carrying them");
+        assertEquals("{\"status\":\"UP\",\"database\":\"UP\",\"contentStore\":\"UP\",\"messaging\":\"UP\"}",
+                HealthCheckServlet.render(true, "", ""), "and one with both must report both");
+    }
+
+    @Test
+    public void aConfiguredDependencyThatCannotBeUsedTakesTheInstanceOutOfRotation() {
+        // The finding this closes: an instance whose object store had gone answered its probe 200/UP seven
+        // milliseconds before failing a content read, so a load balancer kept sending it content requests.
+        assertEquals("{\"status\":\"DOWN\",\"database\":\"UP\",\"contentStore\":\"DOWN\"}",
+                HealthCheckServlet.render(true, "the bucket did not answer", null),
+                "a store that cannot be used must make the instance not ready even though the database is up");
+        assertEquals("{\"status\":\"DOWN\",\"database\":\"UP\",\"messaging\":\"DOWN\"}",
+                HealthCheckServlet.render(true, null, "the listeners are not connected"),
+                "and so must a message bus that cannot carry invalidations, because writes then roll back");
+        assertEquals("{\"status\":\"DOWN\",\"database\":\"DOWN\",\"contentStore\":\"UP\"}",
+                HealthCheckServlet.render(false, "", null),
+                "each dependency reports its own state, so the body says which one is at fault");
+    }
+
+    @Test
+    public void theBodyNamesTheDependencyButNeverTheInfrastructureBehindIt() {
+        String body = HealthCheckServlet.render(true,
+                "The content store answered [403] when asked about the bucket [acme-customer-content]", null);
+
+        // This endpoint is unauthenticated by design - a target group presents no credential - so the body is
+        // a status and nothing else. The reason names buckets, endpoints, mount points and broker addresses,
+        // and belongs in the log.
+        assertEquals("{\"status\":\"DOWN\",\"database\":\"UP\",\"contentStore\":\"DOWN\"}", body,
+                "the readiness body must carry the verdict alone");
+        assertFalse(body.contains("acme-customer-content"), "a bucket name must not reach an anonymous caller");
+        assertFalse(body.contains("403"), "nor the store's own answer");
+    }
+
+    @Test
+    public void readinessSaysNothingAboutAMessageBusThisDeploymentDoesNotDeclare() throws Exception {
+        databaseAnswers(1L);
+        // Distributed cache clear ON, but this configuration declares no listening JMS server - the
+        // serviceMessenger example in serviceengine.xml is commented out and the entrypoint renders a real one
+        // only when a broker is configured. A dependency that does not exist is not reported and cannot make
+        // an instance unready.
+        when(delegator.useDistributedCacheClear()).thenReturn(true);
+        at(READY);
+
+        probe.doFilter(request, response, chain);
+
+        verify(response).setStatus(HttpServletResponse.SC_OK);
+        assertEquals("{\"status\":\"UP\",\"database\":\"UP\"}", body.toString(),
+                "an undeclared message bus must add no key and no verdict");
+    }
+
+    @Test
+    public void aDependencyVerdictIsReusedRatherThanReaskedOnEveryProbe() {
+        AtomicInteger asked = new AtomicInteger();
+        HealthCheckServlet.DependencyCheck check =
+                new HealthCheckServlet.DependencyCheck("the test dependency", () -> {
+                    asked.incrementAndGet();
+                    return "";
+                });
+
+        for (int attempt = 0; attempt < 5; attempt++) {
+            assertEquals("", check.evaluate(), "a reachable dependency must be reported usable");
+        }
+
+        // Five probes, one question. A probe runs every few seconds from every instance, and a dependency
+        // asked once per probe per instance is load the dependency did not ask for.
+        assertEquals(1, asked.get(), "the verdict must be cached rather than re-asked on every probe");
+    }
+
+    @Test
+    public void aDependencyThatStopsAnsweringIsReportedDownWithoutQueueingMoreWork() throws Exception {
+        AtomicInteger asked = new AtomicInteger();
+        CountDownLatch hang = new CountDownLatch(1);
+        HealthCheckServlet.DependencyCheck check =
+                new HealthCheckServlet.DependencyCheck("the test dependency", () -> {
+                    asked.incrementAndGet();
+                    hang.await();
+                    return "";
+                });
+
+        try {
+            long startedAt = System.nanoTime();
+            String first = check.evaluate();
+            long waitedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+            String second = check.evaluate();
+
+            // Bounded: no client bounds a probe usefully on its own - the object store's own API call timeout
+            // is 45 s - and a probe that hung would be read by a target group as a lost one rather than as an
+            // unready instance.
+            assertFalse(first.isEmpty(), "a dependency that did not answer must be reported down");
+            assertFalse(second.isEmpty(), "and must go on being reported down while it does not answer");
+            assertTrue(waitedMillis < 5000L, "the probe must not wait past its deadline, waited " + waitedMillis);
+            // And it is asked ONCE: re-submitting every probe interval during an outage is how a probe turns a
+            // dependency outage into a thread per interval, forever.
+            assertEquals(1, asked.get(), "a question that has not come back must not have another queued behind it");
+        } finally {
+            hang.countDown();
+        }
     }
 
     @Test

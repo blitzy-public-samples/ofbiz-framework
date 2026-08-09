@@ -127,6 +127,136 @@ require_single_line() {
 }
 
 ###############################################################################
+# Refuse a value that is NOT the value it appears to be once it has been rendered.
+#
+# A Java .properties value has its LEADING whitespace stripped when the file is read back, so a variable
+# holding nothing but spaces or tabs renders a property that loads as the EMPTY STRING - and every
+# presence and length check upstream of the render is satisfied by it, because the shell counts those
+# characters. That is how a whitespace-only signing key passed a 64-character floor and then produced a
+# zero-length key, and how a whitespace-only object-store credential pair rendered as empty and let the
+# AWS SDK fall back to whatever ambient credentials the host offers. The same reasoning applies to a
+# trailing blank, which the reader KEEPS: the value the deployment holds would then differ from the value
+# the operator supplied by an invisible character, which for a secret means a value nothing can reproduce.
+#
+# So a value is required to be MEANINGFUL: not blank once normalised, and carrying no leading or trailing
+# whitespace. An empty value is left to the caller, which decides whether an unset variable is allowed;
+# this refuses only a value that was supplied and cannot survive the round trip. It never echoes the
+# value, so it is safe to call with tracing off, on a secret.
+# $1 - variable name, for the message. $2 - the value.
+require_meaningful_value() {
+  if [ -z "$2" ]; then
+    return 0
+  fi
+  local squeezed
+  squeezed=$(printf '%s' "$2" | LC_ALL=C tr --delete '[:space:]')
+  if [ -z "$squeezed" ]; then
+    config_fatal "$1 holds nothing but whitespace. A Java properties reader strips a value's leading whitespace, so this would be rendered and then read back as an EMPTY value - passing every presence and length check on the way - and the deployment would run with no value at all. Supply a real value, or leave the variable unset."
+  fi
+  case "$2" in
+  [[:space:]]* | *[[:space:]])
+    config_fatal "$1 begins or ends with whitespace. A Java properties reader strips the leading whitespace and keeps the trailing whitespace, so the value the deployment would use is not the value supplied here - and for a secret that is a value nothing can reproduce. Remove the surrounding whitespace."
+    ;;
+  esac
+}
+
+###############################################################################
+# Refuse a value that is not a TCP port.
+#
+# One validator for every port this script handles, so no port is held to a weaker rule than another:
+# the PostgreSQL port accepted 65536 - which is not a port at all - while the accelerator port next to
+# it enforced the upper bound inline.
+# $1 - variable name, for the message. $2 - the value.
+require_tcp_port() {
+  require_positive_integer "$1" "$2"
+  if [ "$2" -gt 65535 ]; then
+    config_fatal "$1=$2 is not a TCP port: it must be between 1 and 65535."
+  fi
+}
+
+###############################################################################
+# Refuse a value that is not an absolute http or https origin.
+#
+# Used for the two settings that name a remote origin - the content URL prefix rendered into
+# url.properties and the object-store endpoint the S3 client is built from. Both were previously checked
+# only for their scheme prefix, which accepted forms that are not an origin at all: "https://?x=1" (no
+# host), "https://user:secret@host" (credentials, which are then rendered into a world-readable
+# configuration file and emitted into browser content URLs), a fragment, or a port that is not a number.
+# Each of those either fails much later, in the JVM or in a browser, or silently publishes a credential.
+#
+# A path is ALLOWED - a content prefix may legitimately name a directory on a CDN - but a query string,
+# a fragment and userinfo are refused, and the host and port are validated. The value is echoed in the
+# messages because neither of these two settings is a secret; the userinfo case is the exception and
+# names no value at all, precisely because the value would carry a password.
+# $1 - variable name, for the message. $2 - the value.
+require_absolute_origin() {
+  local name="$1" value="$2" rest authority hostport host port
+  case "$value" in
+  http://?* | https://?*) ;;
+  *)
+    config_fatal "$name=$value must be an absolute origin beginning http:// or https://, for example https://content.example.com."
+    ;;
+  esac
+  rest="${value#*://}"
+  case "$rest" in
+  *'?'*)
+    config_fatal "$name=$value must not carry a query string: it names an origin, and the parameters would be prefixed onto every path built from it."
+    ;;
+  *'#'*)
+    config_fatal "$name=$value must not carry a fragment: it names an origin, and a fragment is never sent to a server."
+    ;;
+  esac
+  authority="${rest%%/*}"
+  case "$authority" in
+  *'@'*)
+    config_fatal "$name must not carry credentials in its authority (the 'user:password@host' form). This value is rendered into a configuration file and, for a content prefix, into every content URL a browser receives, so the credential would be published. Give the host alone."
+    ;;
+  esac
+  if [ -z "$authority" ]; then
+    config_fatal "$name=$value names no host. Give an absolute origin such as https://content.example.com."
+  fi
+  hostport="$authority"
+  case "$hostport" in
+  '['*)
+    # An IPv6 literal, which RFC 3986 requires to be bracketed. The brackets are what separate the
+    # address from the optional port, so they are stripped before either is validated.
+    host="${hostport#\[}"
+    host="${host%%\]*}"
+    port="${hostport#*\]}"
+    port="${port#:}"
+    case "$host" in
+    '' | *[!0-9A-Fa-f:.]*)
+      config_fatal "$name=$value carries a bracketed authority that is not an IPv6 address."
+      ;;
+    esac
+    ;;
+  *:*)
+    host="${hostport%%:*}"
+    port="${hostport#*:}"
+    ;;
+  *)
+    host="$hostport"
+    port=""
+    ;;
+  esac
+  case "$hostport" in
+  '['*) ;;
+  *)
+    # A registered name or an IPv4 address: letters, digits, hyphens and dots, each label starting and
+    # ending with a letter or a digit. Anything else is either not a host or is a spelling a browser and
+    # the JDK would resolve differently from one another.
+    case "$host" in
+    '' | *[!A-Za-z0-9.-]* | -* | *- | .* | *. | *..*)
+      config_fatal "$name=$value does not name a valid host. Use letters, digits and hyphens in dot-separated labels, or a bracketed IPv6 literal."
+      ;;
+    esac
+    ;;
+  esac
+  if [ -n "$port" ]; then
+    require_tcp_port "$name port" "$port"
+  fi
+}
+
+###############################################################################
 # Escape a value for use as a java.util.Properties VALUE, where a backslash starts an escape sequence.
 # Nothing else is special in a property value: ':' and '=' only separate a key from its value, and '#'
 # and '!' only start a comment at the beginning of a line.
@@ -277,7 +407,12 @@ data_marker_covers() {
     return 1
   fi
   local held
-  held=$(cat "$1")
+  # The FIRST LINE only. The admin marker carries a second line - the credential commitment
+  # record_admin_credential writes, which is what lets a rotated admin password be noticed - and reading
+  # the whole file would compare the digest against digest+commitment and never match again. Reading one
+  # line is also correct for a marker written by an older image, which has no newline at all, and for the
+  # empty marker the demo image bakes in.
+  held=$(head --lines=1 "$1")
   if [ "$held" = "$expected" ]; then
     set -x
     return 0
@@ -421,6 +556,13 @@ ofbiz_setup_env() {
     ;;
   esac
 
+  # Whether this container was GIVEN an admin credential is recorded before either half of it is
+  # defaulted, because that is what decides whether a reused database's admin login is left as the data
+  # load created it or is brought in line with what the environment asks for. See
+  # admin_provisioning_needed. Not a deployment setting - it is internal to this script, and _main unsets
+  # it before the serving command runs.
+  adminCredentialSupplied="${OFBIZ_ADMIN_USER+yes}${OFBIZ_ADMIN_PASSWORD+yes}"
+
   OFBIZ_ADMIN_USER=${OFBIZ_ADMIN_USER:-admin}
   # Validated as well as escaped. It is substituted into the admin-user data template, and the template is
   # a SINGLE-LINE sed program, so a value able to introduce a ';' or a '#' could end one expression and
@@ -470,25 +612,28 @@ ofbiz_setup_env() {
     fi
     unset contentUrlPrefixSupplied
     case "$OFBIZ_CONTENT_URL_PREFIX" in
-    https://?*) ;;
-    http://?*)
+    *[[:space:]]* | *'"'* | *"'"*)
+      config_fatal "OFBIZ_CONTENT_URL_PREFIX must not contain whitespace or a quote character."
+      ;;
+    esac
+    # The full origin grammar rather than the scheme prefix alone. DOCKER.adoc promises that a value
+    # carrying credentials, a query string, a fragment, a malformed port or no host at all is refused, and
+    # before this it was not: all of those were accepted and rendered, and the credential form was written
+    # into config/url.properties and would have been emitted into every content URL a browser receives.
+    require_absolute_origin OFBIZ_CONTENT_URL_PREFIX "$OFBIZ_CONTENT_URL_PREFIX"
+    case "$OFBIZ_CONTENT_URL_PREFIX" in
+    http://*)
       if [ "$OFBIZ_PROFILE" = "prod" ]; then
         config_fatal "OFBIZ_CONTENT_URL_PREFIX=$OFBIZ_CONTENT_URL_PREFIX is plain http, which is refused in the prod profile: every content URL built from it would be fetched unencrypted. Use an https origin."
       fi
-      ;;
-    *)
-      config_fatal "OFBIZ_CONTENT_URL_PREFIX=$OFBIZ_CONTENT_URL_PREFIX must be an absolute origin beginning http:// or https://, for example https://content.example.com. It is prefixed onto content URLs, so a relative value resolves against whichever host served the page."
-      ;;
-    esac
-    case "$OFBIZ_CONTENT_URL_PREFIX" in
-    *[[:space:]]* | *'"'* | *"'"*)
-      config_fatal "OFBIZ_CONTENT_URL_PREFIX must not contain whitespace or a quote character."
       ;;
     esac
   fi
 
   OFBIZ_POSTGRES_PORT=${OFBIZ_POSTGRES_PORT:-5432}
-  require_positive_integer OFBIZ_POSTGRES_PORT "$OFBIZ_POSTGRES_PORT"
+  # The bounded validator, the same one the accelerator port uses: 65536 is not a TCP port, and it was
+  # accepted here while being refused a few dozen lines below.
+  require_tcp_port OFBIZ_POSTGRES_PORT "$OFBIZ_POSTGRES_PORT"
 
   # Tracing off while the database credentials are defaulted, so that a supplied password is not echoed
   # into the container log by "set -x" and from there into "docker logs" and any log collector (CWE-532).
@@ -519,6 +664,15 @@ ofbiz_setup_env() {
   require_uri_component OFBIZ_POSTGRES_TENANT_DB "$OFBIZ_POSTGRES_TENANT_DB" database
   require_single_line OFBIZ_POSTGRES_TENANT_USER "$OFBIZ_POSTGRES_TENANT_USER"
   require_single_line OFBIZ_POSTGRES_TENANT_PASSWORD "$OFBIZ_POSTGRES_TENANT_PASSWORD"
+  # Every one of the nine also has to survive the round trip through the file it is rendered into: a
+  # whitespace-only or whitespace-padded database password renders a property that loads as a DIFFERENT
+  # value, and the connection then fails for a reason nothing in the configuration shows.
+  local coordinate
+  for coordinate in OFBIZ_POSTGRES_OFBIZ_DB OFBIZ_POSTGRES_OFBIZ_USER OFBIZ_POSTGRES_OFBIZ_PASSWORD \
+    OFBIZ_POSTGRES_OLAP_DB OFBIZ_POSTGRES_OLAP_USER OFBIZ_POSTGRES_OLAP_PASSWORD \
+    OFBIZ_POSTGRES_TENANT_DB OFBIZ_POSTGRES_TENANT_USER OFBIZ_POSTGRES_TENANT_PASSWORD; do
+    require_meaningful_value "$coordinate" "${!coordinate}"
+  done
   refuse_published_credential OFBIZ_POSTGRES_OFBIZ_PASSWORD "$OFBIZ_POSTGRES_OFBIZ_PASSWORD"
   refuse_published_credential OFBIZ_POSTGRES_OLAP_PASSWORD "$OFBIZ_POSTGRES_OLAP_PASSWORD"
   refuse_published_credential OFBIZ_POSTGRES_TENANT_PASSWORD "$OFBIZ_POSTGRES_TENANT_PASSWORD"
@@ -594,6 +748,13 @@ ofbiz_setup_env() {
   # jms-service - which OFBiz ships commented out - and the JNDI server it names, into the config
   # directory, which precedes ofbiz.jar on the class path. Nothing is rendered when it is unset, and an
   # operator who prefers to mount their own descriptors is still free to.
+  # TRACING OFF FOR THE WHOLE JMS BLOCK, not only for the password. A broker URL is a place operators put
+  # a credential - "tcp://user:secret@broker:61616", or a "?password=" parameter - and every validation
+  # call below takes its value as an ARGUMENT, which "set -x" prints before the function can suppress
+  # anything. The URL was therefore repeated into "docker logs" on every start. Credentials in the URL are
+  # refused a few lines further down, but the refusal must not be the first thing that publishes them, so
+  # the value is never traced at all. The username is covered too: it is half of a credential.
+  { set +x; } 2>/dev/null
   OFBIZ_JMS_PROVIDER_URL=${OFBIZ_JMS_PROVIDER_URL:-}
   OFBIZ_JMS_INITIAL_CONTEXT_FACTORY=${OFBIZ_JMS_INITIAL_CONTEXT_FACTORY:-}
   OFBIZ_JMS_TOPIC_CONNECTION_FACTORY=${OFBIZ_JMS_TOPIC_CONNECTION_FACTORY:-TopicConnectionFactory}
@@ -604,9 +765,29 @@ ofbiz_setup_env() {
   require_single_line OFBIZ_JMS_TOPIC_CONNECTION_FACTORY "$OFBIZ_JMS_TOPIC_CONNECTION_FACTORY"
   require_single_line OFBIZ_JMS_TOPIC "$OFBIZ_JMS_TOPIC"
   require_single_line OFBIZ_JMS_USERNAME "$OFBIZ_JMS_USERNAME"
-  { set +x; } 2>/dev/null
+  require_meaningful_value OFBIZ_JMS_PROVIDER_URL "$OFBIZ_JMS_PROVIDER_URL"
+  require_meaningful_value OFBIZ_JMS_INITIAL_CONTEXT_FACTORY "$OFBIZ_JMS_INITIAL_CONTEXT_FACTORY"
+  require_meaningful_value OFBIZ_JMS_TOPIC_CONNECTION_FACTORY "$OFBIZ_JMS_TOPIC_CONNECTION_FACTORY"
+  require_meaningful_value OFBIZ_JMS_TOPIC "$OFBIZ_JMS_TOPIC"
+  require_meaningful_value OFBIZ_JMS_USERNAME "$OFBIZ_JMS_USERNAME"
+  # A credential in the URL is REFUSED rather than carried. The URL is rendered into
+  # config/jndiservers.xml as an attribute and is logged by the JNDI provider itself when it reports a
+  # connection, so a credential inside it is a credential in a file and in the log - which is exactly what
+  # the dedicated OFBIZ_JMS_USERNAME and OFBIZ_JMS_PASSWORD fields exist to avoid. The message names no
+  # value, because the value is the credential.
+  case "$OFBIZ_JMS_PROVIDER_URL" in
+  *"://"*"@"*)
+    config_fatal "OFBIZ_JMS_PROVIDER_URL carries credentials in its authority (the 'user:password@host' form). The URL is rendered into a configuration file and is reported by the JNDI provider in its own log lines, so the credential would be published. Give the broker URL alone and supply OFBIZ_JMS_USERNAME and OFBIZ_JMS_PASSWORD, which are rendered as separate attributes of the JMS server descriptor."
+    ;;
+  esac
+  case "$OFBIZ_JMS_PROVIDER_URL" in
+  *[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]=* | *[Ss][Ee][Cc][Rr][Ee][Tt]=* | *[Tt][Oo][Kk][Ee][Nn]=*)
+    config_fatal "OFBIZ_JMS_PROVIDER_URL carries what looks like a credential parameter (a 'password=', 'secret=' or 'token=' query parameter). The URL is rendered into a configuration file and reported in provider log lines, so it must not hold a secret. Supply OFBIZ_JMS_USERNAME and OFBIZ_JMS_PASSWORD instead."
+    ;;
+  esac
   OFBIZ_JMS_PASSWORD=${OFBIZ_JMS_PASSWORD:-}
   require_single_line OFBIZ_JMS_PASSWORD "$OFBIZ_JMS_PASSWORD"
+  require_meaningful_value OFBIZ_JMS_PASSWORD "$OFBIZ_JMS_PASSWORD"
   refuse_published_credential OFBIZ_JMS_PASSWORD "$OFBIZ_JMS_PASSWORD"
   # The broker credential is a PAIR, exactly as the object-store credential is. The rendered descriptor
   # carries both attributes or neither, so a password supplied without a username would be silently
@@ -654,6 +835,29 @@ ofbiz_setup_env() {
   jvmRouteSupplied=${OFBIZ_JVM_ROUTE+yes}
   OFBIZ_JVM_ROUTE=${OFBIZ_JVM_ROUTE-jvm1}
   require_single_line OFBIZ_JVM_ROUTE "$OFBIZ_JVM_ROUTE"
+  # AN ALLOW-LIST, because this value ends up inside a COOKIE, not only inside XML. Tomcat appends it to
+  # every session id as ".<route>" and writes that as the JSESSIONID cookie value, and RFC 6265 cookie-octets
+  # exclude a space, a comma, a semicolon, a backslash and a double quote - so Tomcat's cookie processor
+  # rejects them at RUN TIME, inside the request, long after start-up has succeeded. That is what a route
+  # containing an ASCII space did: the container started, /webtools/health/live answered 200 for as long as it
+  # was asked, and every request that created a session answered HTTP 500 "An invalid character [32] was
+  # present in the Cookie value" - a target that stayed in service and could serve nothing. XML escaping
+  # cannot help: the value was rendered perfectly correctly and was still not a cookie value.
+  # Letters, digits, '.', '_' and '-' only, which is what a route needs (it names an instance) and what every
+  # balancer that parses a sticky-session suffix accepts. Length is bounded too: the route is appended to
+  # every session id, and Tomcat's own session-id length plus a long suffix is not worth discovering in a
+  # header limit somewhere. An EMPTY value stays legal - ContainerConfig treats it as absent, which is how a
+  # deployment says "no route at all".
+  if [ -n "$OFBIZ_JVM_ROUTE" ]; then
+    case "$OFBIZ_JVM_ROUTE" in
+    *[!A-Za-z0-9._-]*)
+      config_fatal "OFBIZ_JVM_ROUTE=$OFBIZ_JVM_ROUTE must contain only letters, digits, '.', '_' and '-'. Tomcat appends the route to every session id and writes it into the JSESSIONID cookie, where RFC 6265 forbids a space, a comma, a semicolon, a backslash and a quote: such a route starts and answers health probes, and then fails every request that creates a session with 'An invalid character was present in the Cookie value'. Name the instance, for example jvm1 or app-2."
+      ;;
+    esac
+    if [ "${#OFBIZ_JVM_ROUTE}" -gt 64 ]; then
+      config_fatal "OFBIZ_JVM_ROUTE is longer than 64 characters. It is appended to every session id and therefore to every session cookie; keep it to a short instance name."
+    fi
+  fi
 
   # A FLEET RUNNING ON SINGLE-NODE CACHING IS INCOHERENT, and nothing said so at start up. The
   # invalidation flag defaults to false and that default stays: an unconfigured container has to boot with
@@ -677,10 +881,7 @@ ofbiz_setup_env() {
 
   OFBIZ_SSL_ACCELERATOR_PORT=${OFBIZ_SSL_ACCELERATOR_PORT:-}
   if [ -n "$OFBIZ_SSL_ACCELERATOR_PORT" ]; then
-    require_positive_integer OFBIZ_SSL_ACCELERATOR_PORT "$OFBIZ_SSL_ACCELERATOR_PORT"
-    if [ "$OFBIZ_SSL_ACCELERATOR_PORT" -gt 65535 ]; then
-      config_fatal "OFBIZ_SSL_ACCELERATOR_PORT=$OFBIZ_SSL_ACCELERATOR_PORT is not a TCP port: it must be between 1 and 65535."
-    fi
+    require_tcp_port OFBIZ_SSL_ACCELERATOR_PORT "$OFBIZ_SSL_ACCELERATOR_PORT"
     # It is the LOCAL port this instance receives forwarded traffic on, never the public HTTPS port of
     # the load balancer, so it has to be one of the connector ports this image actually listens on. A
     # value matching no connector would install a valve that marks nothing secure, and would look
@@ -741,6 +942,19 @@ ofbiz_setup_env() {
     config_fatal "OFBIZ_ENABLE_CROSS_SUBDOMAIN_SESSIONS=true also needs OFBIZ_COOKIE_DOMAIN, the parent domain the session cookie is issued for - for instance example.com when this fleet is served as shop.example.com and admin.example.com. Without it there is no domain to share the cookie across and the setting would do nothing at all, so it is refused here rather than starting an instance whose sessions stay host-only while its configuration says otherwise."
   fi
 
+  # ONE provider-name contract, normalised HERE so that this script and ContentStoreFactory cannot
+  # disagree about it. The factory trims its property value and lower-cases it (ContentStoreFactory
+  # resolve()), so "Database" and " s3 " are the same provider to the JVM - and this script used to refuse
+  # both before the JVM ever saw them, which made a documented, tested, working value fail at container
+  # start. The normalisation is applied first and the CANONICAL value is what gets rendered.
+  # An UNRECOGNISED value is still refused here rather than normalised away. The factory falls back to
+  # database storage for one, because a hand-mounted content.properties must not stop content working; a
+  # container, on the other hand, was given the value by its deployment, and starting an instance on
+  # database storage when the deployment asked for s3 is a silent data-placement change. Failing at start
+  # is the whole point of the profile's fail-fast. DOCKER.adoc states both halves of this contract.
+  OFBIZ_CONTENT_STORE_PROVIDER=${OFBIZ_CONTENT_STORE_PROVIDER:-database}
+  OFBIZ_CONTENT_STORE_PROVIDER=$(printf '%s' "$OFBIZ_CONTENT_STORE_PROVIDER" \
+    | LC_ALL=C tr --delete '[:space:]' | LC_ALL=C tr '[:upper:]' '[:lower:]')
   OFBIZ_CONTENT_STORE_PROVIDER=${OFBIZ_CONTENT_STORE_PROVIDER:-database}
   require_enum OFBIZ_CONTENT_STORE_PROVIDER "$OFBIZ_CONTENT_STORE_PROVIDER" database filesystem s3
 
@@ -756,10 +970,24 @@ ofbiz_setup_env() {
   require_single_line OFBIZ_S3_REGION "$OFBIZ_S3_REGION"
   require_single_line OFBIZ_S3_ENDPOINT "$OFBIZ_S3_ENDPOINT"
   require_single_line OFBIZ_S3_KMS_KEY_ID "$OFBIZ_S3_KMS_KEY_ID"
+  # A whitespace-only bucket, region or endpoint used to pass every check here and then render a property
+  # that the JVM reads back as EMPTY - an s3 deployment that reported itself configured and had no bucket.
+  require_meaningful_value OFBIZ_S3_BUCKET "$OFBIZ_S3_BUCKET"
+  require_meaningful_value OFBIZ_S3_REGION "$OFBIZ_S3_REGION"
+  require_meaningful_value OFBIZ_S3_ENDPOINT "$OFBIZ_S3_ENDPOINT"
+  require_meaningful_value OFBIZ_S3_KMS_KEY_ID "$OFBIZ_S3_KMS_KEY_ID"
   if [ "$OFBIZ_CONTENT_STORE_PROVIDER" = "s3" ]; then
     if [ -z "$OFBIZ_S3_BUCKET" ] || [ -z "$OFBIZ_S3_REGION" ]; then
       config_fatal "OFBIZ_CONTENT_STORE_PROVIDER=s3 requires OFBIZ_S3_BUCKET and OFBIZ_S3_REGION."
     fi
+  fi
+  # VALIDATED AT CONTAINER START, not on the first content operation. S3ContentStore refuses an endpoint
+  # that is not an absolute http or https URI, but it is constructed lazily by the first file-backed
+  # content read or write - so a deployment given "not-a-uri" started, passed its readiness probe and
+  # then failed for the first user who touched content. The same grammar is applied here, before the JVM
+  # runs, so a malformed endpoint stops the container instead.
+  if [ -n "$OFBIZ_S3_ENDPOINT" ]; then
+    require_absolute_origin OFBIZ_S3_ENDPOINT "$OFBIZ_S3_ENDPOINT"
   fi
   # Refused here as well as in the provider, so a deployment that asked for KMS encryption without naming
   # a key is told at container start rather than on the first content operation.
@@ -793,6 +1021,12 @@ ofbiz_setup_env() {
 # variables the launcher appends to the JVM command line itself.
 # $@ - the command this container will execute
 refuse_secret_command_line() {
+  # TRACING OFF FIRST, AND NOTHING TRACED HOLDS THE SECRET. This function's whole purpose is to refuse a
+  # secret that must never be seen, so it may not be the thing that publishes it: with tracing on, the
+  # assignment below printed "+ local haystack=... -Dsecurity.token.key=<secret> ..." into the container
+  # log, and the refusal that followed was too late. Tracing is left OFF on the way out; _main turns it
+  # back on once the inspection is done, which is also why this is the FIRST thing _main does.
+  { set +x; } 2>/dev/null
   local names='ofbiz.admin.key login.secret_key_string security.token.key content.store.s3.access.key.id content.store.s3.secret.access.key'
   local haystack="$* ${JAVA_OPTS:-} ${OFBIZ_OPTS:-}"
   local name
@@ -803,6 +1037,7 @@ refuse_secret_command_line() {
       ;;
     esac
   done
+  unset haystack
 }
 
 ###############################################################################
@@ -826,6 +1061,10 @@ resolve_deployment_secrets() {
 
   OFBIZ_ADMIN_PASSWORD=${OFBIZ_ADMIN_PASSWORD:-ofbiz}
   require_single_line OFBIZ_ADMIN_PASSWORD "$OFBIZ_ADMIN_PASSWORD"
+  # Before the length floor, deliberately: a floor counts characters, and whitespace has characters. A
+  # 64-space value satisfied every floor in this function and then rendered a property that Java reads
+  # back as empty, so the deployment ran with no secret while reporting that it had one.
+  require_meaningful_value OFBIZ_ADMIN_PASSWORD "$OFBIZ_ADMIN_PASSWORD"
   refuse_published_credential OFBIZ_ADMIN_PASSWORD "$OFBIZ_ADMIN_PASSWORD"
   if [ "$OFBIZ_PROFILE" = "prod" ]; then
     # A floor as well as a presence check. The presence check above proves a value was supplied; it says
@@ -848,6 +1087,7 @@ resolve_deployment_secrets() {
     ;;
   esac
   require_single_line OFBIZ_ADMIN_KEY "$OFBIZ_ADMIN_KEY"
+  require_meaningful_value OFBIZ_ADMIN_KEY "$OFBIZ_ADMIN_KEY"
   refuse_published_credential OFBIZ_ADMIN_KEY "$OFBIZ_ADMIN_KEY"
   # 16 characters, which is what the generated per-container key already has 32 of. The key authenticates
   # a request that can shut the instance down, and it is checked with no rate limit at all.
@@ -858,8 +1098,31 @@ resolve_deployment_secrets() {
   OFBIZ_JWT_TOKEN_KEY=${OFBIZ_JWT_TOKEN_KEY:-}
   require_single_line OFBIZ_LOGIN_SECRET_KEY "$OFBIZ_LOGIN_SECRET_KEY"
   require_single_line OFBIZ_JWT_TOKEN_KEY "$OFBIZ_JWT_TOKEN_KEY"
+  require_meaningful_value OFBIZ_LOGIN_SECRET_KEY "$OFBIZ_LOGIN_SECRET_KEY"
+  require_meaningful_value OFBIZ_JWT_TOKEN_KEY "$OFBIZ_JWT_TOKEN_KEY"
   refuse_published_credential OFBIZ_LOGIN_SECRET_KEY "$OFBIZ_LOGIN_SECRET_KEY"
   refuse_published_credential OFBIZ_JWT_TOKEN_KEY "$OFBIZ_JWT_TOKEN_KEY"
+  # GENERATED IN THE DEV PROFILE, exactly as OFBIZ_ADMIN_KEY above is, and for the same kind of reason:
+  # both properties are committed BLANK so that no key is ever packaged, and with them blank the features
+  # that need them do not merely stay idle - they FAIL. JWTManager refuses a key shorter than 512 bits, so
+  # the authenticated REST API answered "POST /rest/auth/token" with HTTP 500 in the zero-configuration H2
+  # development mode the documentation offers, while the UI login worked; a developer trying the API had no
+  # way to know a secret was the reason. A per-container random key restores that path with no key in the
+  # source tree, in the image or in the log.
+  # It is RUN-TIME ONLY and PER CONTAINER: a token or a reset link minted by this container is not valid
+  # for the next one, and would not be valid on a second instance - which is why it is confined to the dev
+  # profile. The prod profile has already refused to start above unless both keys were supplied, so a
+  # deployment behind a load balancer still has to give every instance the same explicit key.
+  if [ "$OFBIZ_PROFILE" != "prod" ]; then
+    if [ -z "$OFBIZ_LOGIN_SECRET_KEY" ]; then
+      OFBIZ_LOGIN_SECRET_KEY=$(tr --delete --complement A-Za-z0-9 </dev/urandom | head --bytes=64)
+      echo "OFBIZ_LOGIN_SECRET_KEY was not supplied, so a random per-container forgot-password key was generated for this development run. A password-reset link it signs is not valid for any other container. Supply OFBIZ_LOGIN_SECRET_KEY for anything beyond development; the prod profile requires it."
+    fi
+    if [ -z "$OFBIZ_JWT_TOKEN_KEY" ]; then
+      OFBIZ_JWT_TOKEN_KEY=$(tr --delete --complement A-Za-z0-9 </dev/urandom | head --bytes=64)
+      echo "OFBIZ_JWT_TOKEN_KEY was not supplied, so a random per-container JWT signing key was generated for this development run. Tokens it signs are not valid for any other container, and the authenticated REST API would have been unusable without it. Supply OFBIZ_JWT_TOKEN_KEY for anything beyond development; the prod profile requires it."
+    fi
+  fi
   if [ -n "$OFBIZ_JWT_TOKEN_KEY" ] && [ ${#OFBIZ_JWT_TOKEN_KEY} -lt 64 ]; then
     config_fatal "OFBIZ_JWT_TOKEN_KEY must be at least 64 characters: JWTManager rejects a shorter key."
   fi
@@ -874,6 +1137,12 @@ resolve_deployment_secrets() {
   OFBIZ_S3_SECRET_ACCESS_KEY=${OFBIZ_S3_SECRET_ACCESS_KEY:-}
   require_single_line OFBIZ_S3_ACCESS_KEY_ID "$OFBIZ_S3_ACCESS_KEY_ID"
   require_single_line OFBIZ_S3_SECRET_ACCESS_KEY "$OFBIZ_S3_SECRET_ACCESS_KEY"
+  # THE PAIR CHECK BELOW IS ONLY AS GOOD AS THIS ONE. A whitespace-only access key satisfies "-n" here and
+  # renders a property Java reads back as empty, so the provider saw an EMPTY pair and used the AWS SDK's
+  # default credential chain - whatever ambient role or profile the host offers - for a deployment that
+  # believed it had supplied explicit credentials. Refusing the value is what closes that fallback.
+  require_meaningful_value OFBIZ_S3_ACCESS_KEY_ID "$OFBIZ_S3_ACCESS_KEY_ID"
+  require_meaningful_value OFBIZ_S3_SECRET_ACCESS_KEY "$OFBIZ_S3_SECRET_ACCESS_KEY"
   refuse_published_credential OFBIZ_S3_SECRET_ACCESS_KEY "$OFBIZ_S3_SECRET_ACCESS_KEY"
   if { [ -n "$OFBIZ_S3_ACCESS_KEY_ID" ] && [ -z "$OFBIZ_S3_SECRET_ACCESS_KEY" ]; } \
     || { [ -z "$OFBIZ_S3_ACCESS_KEY_ID" ] && [ -n "$OFBIZ_S3_SECRET_ACCESS_KEY" ]; }; then
@@ -927,6 +1196,35 @@ create_ofbiz_runtime_directories() {
   # cannot be given different lifetimes by a volume change.
   if [ ! -d "$CONTAINER_CONFIG_STATE_DIR" ]; then
     mkdir --parents "$CONTAINER_CONFIG_STATE_DIR"
+  fi
+}
+
+###############################################################################
+# Prepare the directory multipart request bodies are staged in, and clear anything an EARLIER process
+# left in it.
+#
+# Two problems this addresses, both of them state an instance is not supposed to keep. The bodies staged
+# here are user content in transit: until an upload has been stored, its staging file must be no more
+# readable than the content it becomes, so the directory is owner-only. And a process that was killed
+# mid-request - an OOM, a SIGKILL, a rescheduled container reusing a writable layer or a mounted
+# volume - cannot delete what it staged, so those files are left for the next start to remove. The
+# application itself now deletes its own staging files at the end of each request, so anything found
+# here at startup belongs to no live request by definition.
+#
+# Deliberately narrow, because it deletes files: only the upload staging directory, only regular files
+# whose names carry the staging prefix the upload library uses, never recursing, and never following a
+# symbolic link. Anything else in the directory is left alone.
+prepare_upload_staging_directory() {
+  local staging="$OFBIZ_CONTAINER_ROOT/runtime/tmp"
+  if [ ! -d "$staging" ]; then
+    mkdir --parents "$staging"
+  fi
+  chmod 700 "$staging" || echo "WARNING: the upload staging directory $staging could not be made owner-only, so the bodies of uploads in progress may be readable by other accounts in this container."
+  local abandoned
+  abandoned=$(find "$staging" -maxdepth 1 -type f -name 'upload_*.tmp' -print 2>/dev/null | wc --lines)
+  if [ "$abandoned" -gt 0 ]; then
+    find "$staging" -maxdepth 1 -type f -name 'upload_*.tmp' -delete 2>/dev/null || true
+    echo "Removed $abandoned abandoned multipart upload staging file(s) from $staging. They were left by a process that did not finish its request - this container start owns none of them."
   fi
 }
 
@@ -988,8 +1286,87 @@ load_data() {
 }
 
 ###############################################################################
-load_admin_user() {
+# The salted hash of the admin password this container would provision, in the form the UserLogin row
+# holds it: "<salt>|<sha1 hex of salt+password>". Never echoes the password.
+# $1 - the salt to use.
+admin_credential_hash() {
+  { set +x; } 2>/dev/null
+  printf '%s' "$1$OFBIZ_ADMIN_PASSWORD" | sha1sum | cut --delimiter=' ' --fields=1
+}
+
+###############################################################################
+# Record WHICH admin credential this container provisioned, alongside the database-identity digest.
+#
+# WHY THIS EXISTS. The admin marker records the identity of the database, deliberately and only that, so
+# that a rotated database password or a resized pool cannot invalidate it and re-run a load against a
+# database that is already populated. But it made the admin credential itself invisible: restarting on the
+# same database with a NEW OFBIZ_ADMIN_PASSWORD matched the marker, skipped the user load, and left the
+# OLD password working while the operator believed it had been rotated - and a demo-data start marked the
+# admin loaded before load_admin_user ran at all, so a supplied user name or password was ignored outright.
+#
+# WHAT IS PERSISTED, AND WHY IT IS SAFE. A salt and the SHA-1 of salt+password: EXACTLY the value OFBiz
+# stores in UserLogin.currentPassword for this account. It is written into the same 0600 marker, on the
+# container-private runtime volume, and anyone who can read that file can also read config/entityengine.xml
+# (also 0600) on the same instance and ask the database for the very same hash - so it discloses nothing
+# the deployment does not already hold. That is what makes it different from putting a credential in the
+# configuration digest, which is a commitment to a secret that is NOT otherwise stored here.
+# The salt is stored rather than derived so that the SAME password verifies as unchanged on the next start.
+record_admin_credential() {
+  { set +x; } 2>/dev/null
+  local salt hash
+  salt=$(tr --delete --complement A-Za-z0-9 </dev/urandom | head --bytes=16)
+  hash=$(admin_credential_hash "$salt")
+  # The marker's first line is the digest data_marker_covers reads; this is appended as a second line.
+  printf '\n%s\n' "admin-credential/1|$OFBIZ_ADMIN_USER|$salt|$hash" >>"$CONTAINER_ADMIN_LOADED"
+  chmod 600 "$CONTAINER_ADMIN_LOADED"
+  set -x
+}
+
+###############################################################################
+# Report whether the admin user has to be created or updated on this start.
+#
+# Three answers, in order:
+#  - the marker does not cover this database at all: provision, exactly as before.
+#  - it covers it and NO admin credential was supplied to this container: skip, exactly as before. An
+#    operator who named neither a user nor a password has not asked for a particular credential, so the
+#    account the data load created is left alone and no start pays for a data load it does not need.
+#  - it covers it and a credential WAS supplied: provision only when that credential is not already the
+#    active one, which the commitment above is what makes answerable. A missing commitment - an older
+#    marker, or the one a demo data load wrote - counts as "not proven", so the supplied credential is
+#    applied rather than assumed.
+admin_provisioning_needed() {
   if ! data_marker_covers "$CONTAINER_ADMIN_LOADED" admin; then
+    return 0
+  fi
+  if [ -z "${adminCredentialSupplied:-}" ]; then
+    return 1
+  fi
+  { set +x; } 2>/dev/null
+  local record recordedUser recordedSalt recordedHash
+  record=$(grep --max-count=1 '^admin-credential/1|' "$CONTAINER_ADMIN_LOADED" 2>/dev/null || true)
+  if [ -z "$record" ]; then
+    set -x
+    echo "OFBIZ_ADMIN_USER or OFBIZ_ADMIN_PASSWORD was supplied, and this database's admin marker records no credential this container can compare against, so the admin login is (re)provisioned with the supplied values rather than left as whatever loaded it."
+    return 0
+  fi
+  recordedUser=${record#admin-credential/1|}
+  recordedSalt=${recordedUser#*|}
+  recordedUser=${recordedUser%%|*}
+  recordedHash=${recordedSalt#*|}
+  recordedSalt=${recordedSalt%%|*}
+  if [ "$recordedUser" = "$OFBIZ_ADMIN_USER" ] && [ "$recordedHash" = "$(admin_credential_hash "$recordedSalt")" ]; then
+    { set +x; } 2>/dev/null
+    set -x
+    return 1
+  fi
+  set -x
+  echo "The supplied admin credential differs from the one this container last provisioned for this database, so the admin login is updated. The previous password stops working once this start completes."
+  return 0
+}
+
+###############################################################################
+load_admin_user() {
+  if admin_provisioning_needed; then
     { set +x; } 2>/dev/null
     TMPFILE=$(mktemp)
 
@@ -1020,6 +1397,9 @@ load_admin_user() {
     rm "$TMPFILE"
 
     mark_applied "$CONTAINER_ADMIN_LOADED" admin
+    # Written AFTER the load, so a load that failed under set -e leaves no record claiming the credential
+    # is active. The next start then provisions again rather than trusting a commitment nothing applied.
+    record_admin_credential
   fi
 }
 
@@ -1206,6 +1586,11 @@ render_jms_transport() {
   sed \
     --expression="s|^\( *\)</jndi-config>|\1<jndi-server name=\"$jndiServer\" context-provider-url=\"$(xml_substitution "$OFBIZ_JMS_PROVIDER_URL")\" initial-context-factory=\"$(xml_substitution "$OFBIZ_JMS_INITIAL_CONTEXT_FACTORY")\"/>\n\1</jndi-config>|" \
     "$JNDI_SERVERS_SOURCE" >"$JNDI_SERVERS_OVERRIDE"
+  # Readable by the ofbiz user alone, exactly as the service engine override above is. This file holds the
+  # broker's provider URL, which identifies the message bus of the whole fleet, and the config volume may
+  # be shared with another container or inspected on the host; DOCKER.adoc says both rendered JMS
+  # descriptors are owner-readable, and until this chmod existed only one of them was.
+  chmod 600 "$JNDI_SERVERS_OVERRIDE"
   set -x
   own_override "$SERVICE_ENGINE_OVERRIDE"
   own_override "$JNDI_SERVERS_OVERRIDE"
@@ -1321,6 +1706,11 @@ apply_configuration() {
       --expression="s|^content.url.prefix.standard=.*|content.url.prefix.standard=$(property_substitution "$OFBIZ_CONTENT_URL_PREFIX")|" \
       --expression="s|^cookie.domain=.*|cookie.domain=$(property_substitution "$OFBIZ_COOKIE_DOMAIN")|" \
       "$URL_PROPERTIES_SOURCE" >config/url.properties
+    # Readable by the ofbiz user alone, like every other file this script renders. It is not a secret
+    # store, but it is deployment configuration on a volume that may be shared or inspected, and treating
+    # one rendered file differently from the rest is how a value nobody expected to be readable ends up
+    # readable.
+    chmod 600 config/url.properties
     own_override "config/url.properties"
   else
     disown_override "config/url.properties"
@@ -1433,6 +1823,8 @@ run_schema_init() {
   fi
 
   echo "OFBIZ_SCHEMA_INIT=true: creating the database schema from the entity model, then exiting."
+  local report started groups loaderStatus failures
+
   # Whatever ends this process next - the initialisation failing, set -e, or a signal - the run mode is
   # put back first. Without this an interrupted initialisation would leave config/entityengine.xml with
   # startup DDL ENABLED on a persisted volume, and a serving start would then issue DDL and need DDL
@@ -1440,10 +1832,58 @@ run_schema_init() {
   # so even a kill that outruns this trap leaves a marker no serving start can match.
   trap 'render_entity_engine false false' EXIT
   render_entity_engine true true
-  "$OFBIZ_CONTAINER_ROOT"/bin/ofbiz --load-data readers=none
+
+  # THE OUTCOME IS AGGREGATED, NOT INFERRED FROM THE EXIT STATUS.
+  #
+  # "bin/ofbiz --load-data" returns 0 whenever the JVM itself completed, and the Entity Engine's start-up
+  # schema check is deliberately non-fatal: GenericDelegator logs a warning and carries on when a group's
+  # datasource cannot be checked, and DatabaseUtil LOGS "Unable to establish a connection with the
+  # database", "Could not get table name information ... aborting" and "Could not create table [...]"
+  # rather than raising. A one-shot job that reports only that status therefore printed a success banner
+  # and exited 0 after creating NOTHING - measured twice: valid main and OLAP credentials with a wrong
+  # tenant password produced 852/7/0 tables and 51 authentication failures, and a DML-only role on three
+  # empty databases produced 0/0/0 tables and thousands of permission denials. An orchestrator reads that
+  # as a completed migration and rolls a fleet out onto a schema that is absent or half-built.
+  #
+  # So the run is judged on three things, all of which must hold:
+  #   1. the loader's own exit status, taken from PIPESTATUS so that "tee" cannot mask it;
+  #   2. no line matching a definitive datasource or DDL failure - each string below is emitted by
+  #      DatabaseUtil, GenericDelegator or the data loader itself and means the operation did not happen;
+  #   3. every entity group the rendered configuration points at PostgreSQL was actually checked. The
+  #      count comes from the rendered file rather than a literal, so adding or removing a group-map
+  #      cannot silently lower the bar.
+  # The output is teed rather than swallowed, so "docker logs" still carries the whole init.
+  report=$(mktemp)
+  set +e
+  "$OFBIZ_CONTAINER_ROOT"/bin/ofbiz --load-data readers=none 2>&1 | tee "$report"
+  loaderStatus=${PIPESTATUS[0]}
+  set -e
+
+  groups=$(awk '
+    /<delegator name="default"[ >]/ { inside = 1 }
+    inside && /datasource-name="localpostgres/ { found++ }
+    inside && /<\/delegator>/ { inside = 0 }
+    END { print found + 0 }' "$ENTITY_ENGINE_OVERRIDE")
+  started=$(grep --count 'Doing database check as requested in entityengine.xml' "$report" || true)
+  failures=$(grep --extended-regexp --count \
+    'Unable to establish a connection with the database|SQL Error obtaining JDBC connection|Could not get table name information from the database|Could not get column information from the database|Could not create table \[|Could not add column \[|Could not create primary key|Error loading data file|permission denied for|password authentication failed|no pg_hba\.conf entry' \
+    "$report" || true)
+
+  # The run mode is restored BEFORE the verdict, so a failed initialisation cannot leave startup DDL
+  # enabled in the config volume for a serving start to inherit - exactly as the EXIT trap would.
   render_entity_engine false false
   trap - EXIT
-  echo "Schema initialisation is complete. Start the serving instances now; they issue no DDL and need no DDL privilege."
+
+  if [ "$loaderStatus" -ne 0 ] || [ "$failures" -ne 0 ] || [ "$started" -ne "$groups" ]; then
+    echo "ERROR: schema initialisation FAILED. The loader exited $loaderStatus, $failures datasource or DDL failure line(s) were logged, and $started of $groups configured entity group(s) were checked. Startup DDL has been switched back off in the rendered configuration. Do NOT start serving instances against this database: its schema is absent or incomplete. The first failure lines were:" >&2
+    grep --extended-regexp --max-count=10 \
+      'Unable to establish a connection with the database|SQL Error obtaining JDBC connection|Could not get table name information from the database|Could not get column information from the database|Could not create table \[|Could not add column \[|Could not create primary key|Error loading data file|permission denied for|password authentication failed|no pg_hba\.conf entry' \
+      "$report" >&2 || true
+    rm --force "$report"
+    exit 1
+  fi
+  rm --force "$report"
+  echo "Schema initialisation is complete: all $groups configured entity group(s) were checked and no datasource or DDL failure was logged. Start the serving instances now; they issue no DDL and need no DDL privilege."
   exit 0
 }
 
@@ -1458,8 +1898,21 @@ _main() {
   # user - on a container whose volumes already carry them. It must not be able to skip the fail-fast that
   # refuses to start a prod deployment with a missing secret, nor the validation that refuses an unusable
   # port, address, TLS mode or cache-clear configuration.
-  ofbiz_setup_env
+  # THE COMMAND LINE IS INSPECTED FIRST, WITH TRACING OFF. This script is invoked with tracing already
+  # disabled (see the bottom of the file), because bash prints a function's expanded invocation - here
+  # "+ _main <every argument>" - BEFORE the function body runs, so any secret passed as an argument was
+  # already in the container log by the time the refusal below could reject it. refuse_secret_command_line
+  # leaves tracing off; it is turned back on immediately afterwards, so everything from the environment
+  # resolution onwards is traced exactly as before, minus the secrets each of those functions suppresses
+  # for itself.
   refuse_secret_command_line "$@"
+  set -x
+  ofbiz_setup_env
+  # Outside the OFBIZ_SKIP_INIT branch deliberately: this neither renders configuration nor loads data,
+  # it only makes the multipart staging directory owner-only and removes staging files an earlier process
+  # was killed before it could delete. A skip-init container is exactly the one that reuses a volume, so
+  # it is the one that most needs the sweep.
+  prepare_upload_staging_directory
 
   if [ -z "$OFBIZ_SKIP_INIT" ]; then
     create_ofbiz_runtime_directories
@@ -1519,17 +1972,24 @@ _main() {
   unset OFBIZ_S3_PATH_STYLE
   unset OFBIZ_S3_ENCRYPTION
   unset OFBIZ_S3_KMS_KEY_ID
-  # Not secrets, but not the JVM's business either: these three are read by this script alone, and one of
-  # them - OFBIZ_CONTAINER_ROOT - is internal to it and its tests.
+  # Not secrets, but not the JVM's business either: these are read by this script alone, and two of
+  # them - OFBIZ_CONTAINER_ROOT and adminCredentialSupplied - are internal to it and its tests.
   unset OFBIZ_POSTGRES_HOST
   unset OFBIZ_DISABLE_COMPONENTS
   unset OFBIZ_CONTAINER_ROOT
+  unset adminCredentialSupplied
 
   exec "$@"
 }
 
 # Only run when this script is EXECUTED. When it is SOURCED the functions above are defined and nothing
 # is run, so an individual step can be invoked on its own.
+#
+# Tracing is disabled for the INVOCATION ITSELF. bash prints the expanded call before the function body
+# runs, so "_main $@" traced the container's whole command line - and a secret an operator passed as
+# "-Dsecurity.token.key=..." was therefore printed into "docker logs" before refuse_secret_command_line
+# could refuse it. _main turns tracing back on as soon as that inspection is done.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  { set +x; } 2>/dev/null
   _main "$@"
 fi

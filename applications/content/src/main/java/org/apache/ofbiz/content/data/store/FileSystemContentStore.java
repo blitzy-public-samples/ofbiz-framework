@@ -143,6 +143,28 @@ public final class FileSystemContentStore implements ContentStore {
     }
 
     @Override
+    public void put(String key, Path file) throws GeneralException, IOException {
+        long length = Files.size(file);
+        if (length > MAX_OBJECT_BYTES) {
+            throw new IOException("Content of [" + key + "] holds " + length + " bytes, more than the "
+                    + MAX_OBJECT_BYTES + " bytes one object may hold; stream it instead");
+        }
+        Path target = resolve(key, true);
+        Path directory = target.getParent();
+        Files.createDirectories(directory);
+        Path staged = Files.createTempFile(directory, target.getFileName().toString(), STAGING_SUFFIX);
+        try {
+            // Copied rather than read into memory first, and still staged-then-moved, so replacement stays
+            // atomic for a reader while the write itself costs no heap.
+            Files.copy(file, staged, StandardCopyOption.REPLACE_EXISTING);
+            applyStoredObjectPermissions(staged);
+            Files.move(staged, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } finally {
+            Files.deleteIfExists(staged);
+        }
+    }
+
+    @Override
     public byte[] get(String key) throws GeneralException, IOException {
         // Read through the bounded stream rather than checking the size first: a size check followed by
         // a separate read can be defeated by a file that grows between the two, which would let an
@@ -194,6 +216,49 @@ public final class FileSystemContentStore implements ContentStore {
     }
 
     /**
+     * Confirms the storage root - or, on an instance that has stored nothing yet, the nearest existing
+     * directory above it - is a directory this process can write into.
+     *
+     * <p><strong>Why not simply require the root to exist.</strong> The root is created on the first write,
+     * so a freshly started instance that has stored nothing has no root - and is perfectly able to serve.
+     * Demanding the root itself would report every new instance unready until its first upload, which for a
+     * fleet behind a load balancer means an instance that never enters service. The walk upwards is what
+     * distinguishes "nothing has been written yet", which is ready, from "the directory this store lives in
+     * is not there", which is not.
+     *
+     * <p><strong>What this catches.</strong> The failure mode this provider actually has in a fleet is a
+     * shared mount: {@code content.store.provider=filesystem} makes an instance stateless only while
+     * {@code content.upload.path.prefix} names a filesystem every instance shares, and a mount that has
+     * gone away leaves the path resolvable, absent and silent - every read reports content missing and
+     * every write lands on the container's own disk, where the next instance will not find it. An
+     * unmounted path answers this check with a missing or unwritable ancestor, and a hung mount answers it
+     * by not returning at all, which the caller's deadline turns into "not ready".
+     *
+     * @throws GeneralException if the configured storage root is unusable
+     * @throws IOException if neither the root nor any directory above it is a writable directory
+     */
+    @Override
+    public void requireReachable() throws GeneralException, IOException {
+        Path existing = root;
+        while (existing != null && !Files.exists(existing)) {
+            existing = existing.getParent();
+        }
+        if (existing == null) {
+            throw new IOException("The filesystem content store cannot be used: neither its storage root ["
+                    + root + "] nor any directory above it exists. Check " + UPLOAD_PREFIX_PROPERTY
+                    + " and that the filesystem holding it is mounted.");
+        }
+        if (!Files.isDirectory(existing)) {
+            throw new IOException("The filesystem content store cannot be used: [" + existing + "], which is"
+                    + " where its storage root [" + root + "] would be created, is not a directory.");
+        }
+        if (!Files.isWritable(existing)) {
+            throw new IOException("The filesystem content store cannot be used: [" + existing + "], which"
+                    + " holds its storage root [" + root + "], is not writable by this process.");
+        }
+    }
+
+    /**
      * Returns the absolute path of the directory an upload should be written into.
      *
      * @param absolute whether to answer an absolute path rather than an {@code ofbiz.home}-relative one
@@ -218,11 +283,42 @@ public final class FileSystemContentStore implements ContentStore {
     }
 
     /**
+     * Reports whether content is published to a store somewhere other than this instance.
+     *
+     * <p>Asked here so that the upload path does not depend on local filesystem state in a deployment
+     * whose instances keep none - see {@link #getUploadPath(String, double, boolean)}. A provider that is
+     * named but unusable answers false: the upload resolution that follows raises for that configuration
+     * anyway, with the configuration's own message, and answering true here would change the path first.
+     *
+     * @return true when an external content store is configured and usable
+     */
+    private static boolean externalStoreConfigured() {
+        try {
+            return ContentStorePublisher.externalStore() != null;
+        } catch (GeneralException unusable) {
+            return false;
+        }
+    }
+
+    /**
      * Handles creating sub-directories for file storage, using a maximum number of files per directory.
      *
      * <p>This is the sharding rule OFBiz has always applied to uploads, unchanged: the most recently
      * modified sub-directory of the upload prefix is reused until it holds {@code maxFiles} entries,
      * at which point a new sub-directory named after the current epoch millisecond is created.
+     *
+     * <p><strong>With an EXTERNAL store configured the upload prefix is answered unsharded</strong>, and
+     * that is deliberate. The rule above reads the LOCAL filesystem to choose the sub-directory, so its
+     * answer depends on what this instance happens to hold - and with an external store an instance holds
+     * nothing durable: a published upload's local copy is discarded once it commits. A replaced or
+     * scaled-out instance therefore starts with an empty upload directory, creates a sub-directory named
+     * after ITS current millisecond, and every subsequent update of a content item lands under a
+     * different storage key than the update before it, leaving the object it superseded in the store
+     * named by nothing. Unsharded, the key of a content item is a function of the item alone - the upload
+     * prefix and {@code <dataResourceId>.<extension>} - so an update REPLACES the object it supersedes on
+     * any instance, and an operator can compute the object key of any {@code DataResource} row from the
+     * row itself. Sharding exists to keep a local DIRECTORY from growing without bound, which is a
+     * problem an object store does not have and which the discarded local copies remove here as well.
      *
      * @param initialPath the top level location where all files should be stored
      * @param maxFiles the maximum number of files to place in a directory
@@ -235,6 +331,15 @@ public final class FileSystemContentStore implements ContentStore {
 
         if (!prefix.startsWith("/")) {
             prefix = "/" + prefix;
+        }
+        if (externalStoreConfigured()) {
+            File unsharded = FileUtil.getFile(ofbizHome + prefix);
+            if (!unsharded.exists() && !unsharded.mkdirs() && !unsharded.isDirectory()) {
+                throw new IllegalStateException("The upload directory [" + unsharded.getAbsolutePath()
+                        + "] does not exist and could not be created. Check that it is writable by the OFBiz"
+                        + " user.");
+            }
+            return absolute ? unsharded.getAbsolutePath().replace('\\', '/') : prefix;
         }
 
         Comparator<Object> desc = (o1, o2) -> {

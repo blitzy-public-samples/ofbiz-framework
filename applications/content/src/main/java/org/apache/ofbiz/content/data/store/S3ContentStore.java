@@ -25,6 +25,8 @@ import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
@@ -215,17 +217,47 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
             throw new IOException("Content of " + reference(key) + " holds " + data.length + " bytes, more than"
                     + " the " + MAX_OBJECT_BYTES + " bytes one object may hold");
         }
-        PutObjectRequest.Builder request = PutObjectRequest.builder().bucket(bucket).key(key);
-        // Server-side encryption is requested ON THE REQUEST rather than left to the bucket's default, so
-        // that content is encrypted at rest whether or not the bucket carries one - and so that a bucket
-        // policy which REQUIRES the header does not reject the write.
+        try {
+            client.putObject(encrypted(PutObjectRequest.builder().bucket(bucket).key(key)).build(),
+                    RequestBody.fromBytes(data));
+        } catch (SdkException failure) {
+            throw failed("store", key, failure);
+        }
+    }
+
+    /**
+     * Applies this deployment's server-side encryption mode to a write request.
+     *
+     * <p>Requested ON THE REQUEST rather than left to the bucket's default, so that content is encrypted
+     * at rest whether or not the bucket carries one - and so that a bucket policy which REQUIRES the
+     * header does not reject the write.
+     *
+     * @param request the request under construction
+     * @return the same builder, for chaining
+     */
+    private PutObjectRequest.Builder encrypted(PutObjectRequest.Builder request) {
         if (ENCRYPTION_SSE_S3.equals(encryption)) {
             request.serverSideEncryption(ServerSideEncryption.AES256);
         } else if (ENCRYPTION_SSE_KMS.equals(encryption)) {
             request.serverSideEncryption(ServerSideEncryption.AWS_KMS).ssekmsKeyId(kmsKeyId);
         }
+        return request;
+    }
+
+    @Override
+    public void put(String key, Path file) throws GeneralException, IOException {
+        ContentStoreFactory.requireUsableKey(key);
+        long length = Files.size(file);
+        if (length > MAX_OBJECT_BYTES) {
+            throw new IOException("Content of " + reference(key) + " holds " + length + " bytes, more than"
+                    + " the " + MAX_OBJECT_BYTES + " bytes one object may hold");
+        }
         try {
-            client.putObject(request.build(), RequestBody.fromBytes(data));
+            // RequestBody.fromFile sends the bytes from the file as the request is written, so an upload
+            // at the size ceiling no longer costs 64 MiB of heap per concurrent write. The content length
+            // is taken from the file, so the request is not chunked.
+            client.putObject(encrypted(PutObjectRequest.builder().bucket(bucket).key(key)).build(),
+                    RequestBody.fromFile(file));
         } catch (SdkException failure) {
             throw failed("store", key, failure);
         }
@@ -263,7 +295,16 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
     public InputStream openStream(String key) throws GeneralException, IOException {
         ContentStoreFactory.requireUsableKey(key);
         try {
-            return client.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build());
+            // WRAPPED IN A DEADLINE. The SDK's apiCallTimeout bounds the call that RETURNS this stream, not
+            // the reading of the body through it - the body is transferred lazily, one read at a time, on
+            // whatever thread the caller is on. So a store that answered quickly and then delivered slowly
+            // held a request, its transaction and its servlet thread for as long as the caller was prepared
+            // to wait: with 400 ms of injected latency, reads that the configuration says are bounded at 45
+            // seconds occupied requests for 180 seconds and none of them completed. A storage fault has to
+            // fail in a predictable interval, so the whole body read carries the same bound the call does.
+            return new DeadlineInputStream(
+                    client.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build()),
+                    reference(key), CALL_TIMEOUT.toMillis());
         } catch (NoSuchKeyException absent) {
             throw absence(key, absent);
         } catch (S3Exception failure) {
@@ -333,6 +374,41 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
                     + " remove", MODULE);
         } catch (SdkException failure) {
             throw failed("remove", key, failure);
+        }
+    }
+
+    /**
+     * Confirms the store answers for this deployment's bucket, with one {@code HeadBucket} request.
+     *
+     * <p><strong>Why {@code HeadBucket}.</strong> It is the one request that answers the readiness question
+     * completely and names no object: it reaches the endpoint, presents the credential, and asks about the
+     * exact container this instance would read and write. A store that is unreachable, an endpoint that
+     * resolves to nothing, a credential that has expired or been revoked, and a bucket that has been renamed
+     * or removed each fail it - and each of those makes every content operation on this instance fail, which
+     * is precisely what a readiness probe exists to keep out of a load balancer's rotation. It transfers no
+     * content and needs no object to exist, so it costs one round trip whatever this deployment holds.
+     *
+     * <p><strong>A 403 is a failure here, unlike on the read path.</strong> Where {@code HeadBucket} is used
+     * to disambiguate an absent object, a credential permitted to read objects but not to inspect the bucket
+     * answers 403 and the absence is passed on unchanged - see {@code confirmBucketHolds}. A readiness probe
+     * cannot do that: it has no object to fall back on, and a store this instance cannot ask about is one it
+     * cannot report as usable. The message says so, so that an operator whose credential is deliberately
+     * object-only knows to grant {@code s3:ListBucket} on the bucket rather than to hunt an outage.
+     *
+     * @throws IOException if the store did not confirm the bucket
+     */
+    @Override
+    public void requireReachable() throws IOException {
+        try {
+            client.headBucket(HeadBucketRequest.builder().bucket(bucket).build());
+        } catch (S3Exception failure) {
+            throw new IOException("The content store answered [" + failure.statusCode() + "] when asked about"
+                    + " the bucket [" + bucket + "]. Check content.store.s3.bucket (OFBIZ_S3_BUCKET), the"
+                    + " endpoint, and that the credential may inspect the bucket (s3:ListBucket on it).",
+                    failure);
+        } catch (SdkException failure) {
+            throw new IOException("The content store could not be reached to confirm the bucket [" + bucket
+                    + "]: " + failure.getMessage(), failure);
         }
     }
 
@@ -627,6 +703,89 @@ public final class S3ContentStore implements ContentStore, AutoCloseable {
                         + " stored at that endpoint. Set " + ENDPOINT_PROPERTY + " (OFBIZ_S3_ENDPOINT) to the"
                         + " endpoint this deployment intends to use, or unset " + variable + ".", MODULE);
                 return;
+            }
+        }
+    }
+
+    /**
+     * A stream over a store object whose WHOLE READ is bounded, not only the request that opened it.
+     *
+     * <p><strong>Why it exists.</strong> The SDK's {@code apiCallTimeout} covers the exchange that returns
+     * the response stream. The body arrives lazily afterwards, read by read, on the caller's own thread, so
+     * a store that answers promptly and then delivers slowly is not bounded by anything the client was
+     * configured with: measured against an object store with 400 ms of added latency, eight concurrent
+     * reads of an 8 MiB object each occupied a request for 180 seconds - the CALLER's deadline, not the
+     * store client's - and none of them finished. A request, its transaction and its servlet thread were
+     * held for minutes by a dependency the configuration claimed was bounded at 45 seconds.
+     *
+     * <p><strong>What it does.</strong> Every read checks the elapsed time against the deadline first. Past
+     * it, the underlying SDK stream is ABORTED rather than closed - {@code close()} drains the rest of the
+     * object to keep the connection reusable, which is the opposite of giving up - and an
+     * {@link IOException} is thrown, so the caller fails in a predictable interval and its transaction
+     * unwinds. The deadline starts when the stream is opened, which is what makes it a bound on the whole
+     * read rather than on any one read call.
+     *
+     * <p>It deliberately does NOT re-implement anything else: reads delegate, and {@code close} closes.
+     */
+    private static final class DeadlineInputStream extends InputStream {
+
+        private final InputStream delegate;
+        private final String reference;
+        private final long deadlineMillis;
+        private final long startedAt;
+
+        DeadlineInputStream(InputStream delegate, String reference, long deadlineMillis) {
+            this.delegate = delegate;
+            this.reference = reference;
+            this.deadlineMillis = deadlineMillis;
+            this.startedAt = System.nanoTime();
+        }
+
+        @Override
+        public int read() throws IOException {
+            requireTime();
+            return delegate.read();
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            requireTime();
+            return delegate.read(buffer, offset, length);
+        }
+
+        @Override
+        public int available() throws IOException {
+            return delegate.available();
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
+
+        private void requireTime() throws IOException {
+            long elapsed = (System.nanoTime() - startedAt) / 1_000_000L;
+            if (elapsed < deadlineMillis) {
+                return;
+            }
+            abort();
+            throw new IOException("Reading " + reference + " from the content store passed its " + deadlineMillis
+                    + " ms deadline after " + elapsed + " ms and was abandoned. The store is answering, but too"
+                    + " slowly to serve this request.");
+        }
+
+        private void abort() {
+            if (delegate instanceof ResponseInputStream<?> response) {
+                // abort() rather than close(): close() DRAINS the remainder of the object so the connection
+                // can be reused, which would go on transferring the very bytes this deadline gave up on.
+                response.abort();
+                return;
+            }
+            try {
+                delegate.close();
+            } catch (IOException ignored) {
+                Debug.logWarning("The content store stream for " + reference + " could not be closed after its"
+                        + " read deadline passed: " + ignored.getMessage(), MODULE);
             }
         }
     }

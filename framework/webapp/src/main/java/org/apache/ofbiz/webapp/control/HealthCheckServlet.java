@@ -19,16 +19,19 @@
 package org.apache.ofbiz.webapp.control;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
@@ -45,6 +48,7 @@ import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.UtilProperties;
 import org.apache.ofbiz.entity.Delegator;
 import org.apache.ofbiz.entity.util.EntityQuery;
+import org.apache.ofbiz.service.jms.JmsListenerFactory;
 import org.apache.ofbiz.webapp.WebAppUtil;
 
 /**
@@ -57,11 +61,36 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  *       {@code {"status":"UP"}}. It signals only that the servlet container is serving, and deliberately
  *       depends on nothing outside it: an instance whose database is briefly unreachable still answers
  *       200 here.</li>
- *   <li>{@code /health/ready} - can this instance serve a request that touches the database? 200 with
- *       {@code {"status":"UP","database":"UP"}} when a query against the base delegator succeeds, and
- *       503 with {@code {"status":"DOWN","database":"DOWN"}} when it does not. It signals only whether
- *       this instance is currently fit to receive a request.</li>
+ *   <li>{@code /health/ready} - can this instance serve a request? 200 with
+ *       {@code {"status":"UP","database":"UP"}} when a query against the base delegator RUNS, and 503 with
+ *       {@code {"status":"DOWN","database":"DOWN"}} when it does not - which covers an unreachable
+ *       database, a datasource whose credentials are refused, and a schema that has not been created,
+ *       because the query's own entity is then absent. It signals only whether this instance is currently
+ *       fit to receive a request, so a schema that exists but has sequenced nothing yet is ready.</li>
  * </ul>
+ *
+ * <p><strong>Readiness reports on every dependency this deployment has CONFIGURED, not only the
+ * database.</strong> A serving instance depends on whatever it has been pointed at, and the two things
+ * this deployment can be pointed at are an external content store and a message bus:
+ *
+ * <ul>
+ *   <li>{@code contentStore} - reported only when {@code content.store.provider} names a store rather
+ *       than the default {@code database}. An instance whose object store or shared mount cannot be
+ *       reached serves a 500 for every file-backed content read and cannot durably accept an upload, so
+ *       it is not fit to receive that request - and until this was reported, such an instance stayed in
+ *       rotation answering 200 to its probe seven milliseconds before failing a content read.</li>
+ *   <li>{@code messaging} - reported only when the delegator has distributed cache clear enabled, which
+ *       is the configuration that puts the message bus on the WRITE path: with it on, an entity write
+ *       publishes an invalidation, and a broker that has gone makes that write roll back after its
+ *       timeout. With it off a broker is nobody's dependency and nothing is reported.</li>
+ * </ul>
+ *
+ * <p>A key appears in the body only when its dependency is configured, so the readiness contract of a
+ * database-only deployment - the zero-configuration local run and any deployment storing content in the
+ * database without a bus - is byte for byte what it always was. The body carries {@code UP} or
+ * {@code DOWN} per dependency and never the REASON: this endpoint is unauthenticated, and a reason names
+ * buckets, endpoints, mount points and broker addresses. The reason goes to the log, rate limited per
+ * dependency.
  *
  * <p>What a probe result is used for is the caller's policy, not this class's: a load balancer decides
  * target health and routing from it, and an orchestrator may decide replacement from it.
@@ -69,18 +98,25 @@ import org.apache.ofbiz.webapp.WebAppUtil;
  * <p><strong>A probe is cheap, and bounded.</strong> The readiness query mirrors the {@code ping} service
  * in {@code org.apache.ofbiz.common.CommonServices} - it counts rows in {@code SequenceValueItem}, a seed
  * entity every deployment has, so the check exercises the connection pool, the JDBC driver, the datasource
- * credentials and the schema without touching business data or writing anything - but two limits are
- * applied on top of it, because a probe runs every few seconds on every instance forever:
+ * credentials and the schema without touching business data or writing anything; each configured
+ * dependency is asked the cheapest question that distinguishes a dependency it can use from one it cannot,
+ * which transfers nothing and needs nothing to exist. Two limits are applied on top of every one of them,
+ * because a probe runs every few seconds on every instance forever:
  *
  * <ul>
  *   <li>The result is CACHED for {@value #READINESS_CACHE_MILLIS} ms, so a probe interval shorter than
  *       that cannot multiply into database load. The cache is deliberately far shorter than any
  *       target-group interval, so the verdict is still current.</li>
- *   <li>The query is run with a DEADLINE of {@value #READINESS_TIMEOUT_MILLIS} ms. Neither the driver nor
- *       the pool bounds a probe usefully - the datasource's socket timeout is 60 s and its pool wait 20 s,
- *       both far above a typical 5 s target-group timeout - so a degraded database would otherwise make
- *       probes HANG rather than fail, and a hung probe is indistinguishable from a lost one. Passing the
- *       deadline is reported as not ready.</li>
+ *   <li>Every question is run with a DEADLINE - {@value #READINESS_TIMEOUT_MILLIS} ms for the database,
+ *       {@value #DEPENDENCY_TIMEOUT_MILLIS} ms for each configured dependency, so the whole readiness
+ *       evaluation stays inside a typical 5 s target-group timeout even when everything it depends on has
+ *       stopped answering. No client bounds a probe usefully on its own - the datasource's socket timeout
+ *       is 60 s and its pool wait 20 s, the object store's API call timeout 45 s - so a degraded
+ *       dependency would otherwise make probes HANG rather than fail, and a hung probe is
+ *       indistinguishable from a lost one. Passing the deadline is reported as not ready.</li>
+ *   <li>At most ONE question of each kind is ever outstanding. A dependency check that passed its deadline
+ *       is left running rather than abandoned and re-submitted, and the next probe waits on the same
+ *       one - so an outage cannot accumulate a queue of probe work or a thread per probe interval.</li>
  * </ul>
  *
  * <p><strong>It is registered as a FILTER as well as a servlet</strong>, mapped to the same two exact
@@ -142,8 +178,13 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
     private static final String READINESS_ENTITY = "SequenceValueItem";
 
     private static final String BODY_LIVE_UP = "{\"status\":\"UP\"}";
-    private static final String BODY_READY_UP = "{\"status\":\"UP\",\"database\":\"UP\"}";
-    private static final String BODY_READY_DOWN = "{\"status\":\"DOWN\",\"database\":\"DOWN\"}";
+
+    private static final String STATUS_KEY = "status";
+    private static final String DATABASE_KEY = "database";
+    private static final String CONTENT_STORE_KEY = "contentStore";
+    private static final String MESSAGING_KEY = "messaging";
+    private static final String UP = "UP";
+    private static final String DOWN = "DOWN";
 
     private static final String CONTENT_TYPE_JSON = "application/json";
     private static final String CHARACTER_ENCODING = "UTF-8";
@@ -184,6 +225,18 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
     private static final long READINESS_CACHE_MILLIS = 2000L;
     /** How long a probe waits for the readiness query before reporting not ready. */
     private static final long READINESS_TIMEOUT_MILLIS = 2000L;
+    /**
+     * How long a probe waits for one configured dependency before reporting it not ready.
+     *
+     * <p>Shorter than the database's deadline, deliberately. The database is the dependency without which
+     * nothing at all works, so it is worth waiting the longer time for; the sum of every deadline is what a
+     * target group's own timeout has to accommodate, and this keeps that sum - {@value
+     * #READINESS_TIMEOUT_MILLIS} ms plus one of these per configured dependency - under the 5 s a target
+     * group is typically given. It is also two orders of magnitude above what a reachable dependency
+     * actually takes: a {@code HeadBucket} against a store in the same network answers in single-digit
+     * milliseconds, and the message-bus question is a field read.
+     */
+    private static final long DEPENDENCY_TIMEOUT_MILLIS = 1000L;
     /** The shortest interval between two logged readiness failures. */
     private static final long FAILURE_LOG_INTERVAL_MILLIS = 60000L;
 
@@ -202,6 +255,46 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
     });
 
     /**
+     * Runs the configured dependencies' readiness questions away from the request thread, for the same
+     * reason the database's runs away from it, and away from the database's thread as well.
+     *
+     * <p>Its own executor so that one dependency which has stopped answering cannot delay another, nor the
+     * database check - a store whose API call timeout is 45 s would otherwise sit in front of everything
+     * behind it on a single thread. The pool grows on demand and is bounded not by a thread limit but by
+     * the checks themselves: {@link DependencyCheck} keeps at most one question of its kind outstanding, so
+     * at most one thread per configured dependency is ever in use, and each is reclaimed after 60 s idle.
+     * Daemon threads, so none of them keeps the JVM alive.
+     */
+    private static final ExecutorService DEPENDENCY_EXECUTOR = Executors.newCachedThreadPool(runnable -> {
+        Thread worker = new Thread(runnable, "ofbiz-readiness-dependency");
+        worker.setDaemon(true);
+        return worker;
+    });
+
+    /**
+     * The content store's readiness hook, resolved reflectively, or null when this deployment has no content
+     * component.
+     *
+     * <p><strong>Reflection, deliberately.</strong> {@code ContentStoreFactory} lives in the content
+     * APPLICATION component and this class lives in the framework: the one-way dependency direction from
+     * applications to framework is part of the architecture, and an import here would invert it. What is
+     * needed of it is one static method returning one string, so the reflective boundary is a single
+     * {@link Method} resolved once at class load and invoked with no arguments - not a per-probe lookup.
+     *
+     * <p>Null when the class or the method is absent, which is how a deployment whose component set does not
+     * include the content component reports nothing about content storage rather than failing its probe.
+     */
+    private static final Method CONTENT_STORE_READINESS = resolveContentStoreReadiness();
+
+    /** The configured content store, asked whether it can be reached at all. */
+    private static final DependencyCheck CONTENT_STORE = new DependencyCheck("the configured content store",
+            HealthCheckServlet::askContentStore);
+
+    /** The message bus carrying entity-cache invalidations, asked whether its listeners are connected. */
+    private static final DependencyCheck MESSAGING = new DependencyCheck(
+            "the message bus carrying entity-cache invalidations", JmsListenerFactory::readinessFailure);
+
+    /**
      * The last verdict for each delegator, and when it was reached.
      *
      * <p>Static, so that the two instances of this class one webapp has - the servlet registration and the
@@ -218,6 +311,16 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
 
     /** When a readiness failure was last logged, so an outage cannot flood the log. */
     private static final AtomicLong FAILURE_LAST_LOGGED = new AtomicLong();
+
+    /**
+     * When the empty-sequencer note was last logged.
+     *
+     * <p>Kept apart from {@link #FAILURE_LAST_LOGGED} on purpose. That state is not a failure - the
+     * instance is reported ready - so it must neither be logged as an error nor consume the window that
+     * rates real database failures, or a freshly provisioned instance could silently swallow the one line
+     * saying its database had become unreachable.
+     */
+    private static final AtomicLong SEQUENCER_EMPTY_LAST_LOGGED = new AtomicLong();
 
     /** The servlet context, when this instance is running as a filter rather than as a servlet. */
     private transient ServletContext filterContext;
@@ -367,11 +470,9 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
         if (PROBE_LIVE.equals(path)) {
             writeResponse(response, HttpServletResponse.SC_OK, BODY_LIVE_UP);
         } else if (PROBE_READY.equals(path)) {
-            if (isDatabaseReachable()) {
-                writeResponse(response, HttpServletResponse.SC_OK, BODY_READY_UP);
-            } else {
-                writeResponse(response, HttpServletResponse.SC_SERVICE_UNAVAILABLE, BODY_READY_DOWN);
-            }
+            Readiness readiness = assessReadiness();
+            writeResponse(response, readiness.up() ? HttpServletResponse.SC_OK
+                    : HttpServletResponse.SC_SERVICE_UNAVAILABLE, readiness.body());
         } else {
             // Not a probe path. Answered without a body, and never with a 200, so a mistyped probe URL
             // cannot report health this class did not establish.
@@ -381,21 +482,113 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
     }
 
     /**
-     * Reports whether this instance can reach its database, reusing a recent verdict.
+     * Assesses everything this instance's readiness depends on and renders the answer.
      *
-     * <p>The delegator is resolved on every probe, before the cache is consulted, so that the verdict
-     * reused is one about THIS webapp's database and a webapp whose delegator changes is not answered from
-     * the previous one's verdict. Resolving it is a servlet-context attribute lookup, not a connection.
+     * <p>The database always; each of the two possible external dependencies only when this deployment has
+     * been configured with it. The instance is ready when every dependency that WAS asked answered - a
+     * dependency that is not configured is not a dependency, and contributes neither a key to the body nor a
+     * vote to the verdict.
      *
-     * @return true when the readiness query succeeded and found the seed entity populated
+     * <p>All of them are assessed even once one has already failed, rather than short-circuiting on the
+     * first: the body is what an operator reads to find out WHICH dependency took the instance out, and one
+     * that stopped at the first failure would name only the first. Each has its own deadline and its own
+     * cached verdict, so assessing all of them costs no more than the slowest.
+     *
+     * @return the verdict and the JSON body reporting it
      */
-    private boolean isDatabaseReachable() {
+    private Readiness assessReadiness() {
         ServletContext context = servletContext();
         Delegator delegator = context == null ? null : WebAppUtil.getDelegator(context);
         if (delegator == null) {
-            reportFailure("Readiness probe found no delegator for this webapp", null);
+            reportFailure("Readiness probe found no delegator for this webapp", null, FAILURE_LAST_LOGGED);
+            return new Readiness(false, render(false, null, null));
+        }
+        boolean databaseUp = isDatabaseReachable(delegator);
+        String store = CONTENT_STORE.evaluate();
+        // Asked only when the delegator publishes entity-cache invalidations, because that is the
+        // configuration under which an ordinary WRITE waits for the broker and rolls back without it. With
+        // distributed cache clear off, a broker outage costs this instance nothing and must not remove it
+        // from the load balancer's rotation.
+        String messaging = usesDistributedCacheClear(delegator) ? MESSAGING.evaluate() : null;
+        boolean up = databaseUp && answered(store) && answered(messaging);
+        return new Readiness(up, render(databaseUp, store, messaging));
+    }
+
+    /**
+     * Reports whether a dependency check's outcome means the dependency is fit to serve.
+     *
+     * @param outcome null when the dependency is not configured, the empty string when it answered,
+     *     otherwise the reason it did not
+     * @return true when nothing is wrong with it, which includes it not being configured at all
+     */
+    private static boolean answered(String outcome) {
+        return outcome == null || outcome.isEmpty();
+    }
+
+    /**
+     * Reports whether this delegator publishes entity-cache invalidations over the message bus.
+     *
+     * @param delegator the delegator this webapp uses, never null
+     * @return true when distributed cache clear is enabled for it
+     */
+    private static boolean usesDistributedCacheClear(Delegator delegator) {
+        try {
+            return delegator.useDistributedCacheClear();
+        } catch (RuntimeException unavailable) {
+            // A readiness probe answers; it never propagates. Read as "not configured", so that a delegator
+            // which cannot say leaves the body exactly as a deployment without a bus.
+            reportFailure("Readiness probe could not establish whether distributed cache clear is enabled",
+                    unavailable, FAILURE_LAST_LOGGED);
             return false;
         }
+    }
+
+    /**
+     * Renders the readiness body: the overall status, the database, and a key per CONFIGURED dependency.
+     *
+     * <p>Assembled rather than answered from a constant, because which keys belong in it is a property of
+     * the deployment. The order is fixed and the values are {@code UP} or {@code DOWN} alone - never a
+     * reason, because this endpoint is unauthenticated and a reason names infrastructure. A deployment with
+     * neither dependency configured renders exactly the two-key body this endpoint has always answered.
+     *
+     * @param databaseUp whether the database answered
+     * @param store the content store's outcome, null when content is stored in the database
+     * @param messaging the message bus's outcome, null when no bus is on the write path
+     * @return the JSON body
+     */
+    static String render(boolean databaseUp, String store, String messaging) {
+        boolean up = databaseUp && answered(store) && answered(messaging);
+        StringBuilder body = new StringBuilder(96);
+        body.append('{');
+        append(body, STATUS_KEY, up ? UP : DOWN);
+        body.append(',');
+        append(body, DATABASE_KEY, databaseUp ? UP : DOWN);
+        if (store != null) {
+            body.append(',');
+            append(body, CONTENT_STORE_KEY, answered(store) ? UP : DOWN);
+        }
+        if (messaging != null) {
+            body.append(',');
+            append(body, MESSAGING_KEY, answered(messaging) ? UP : DOWN);
+        }
+        return body.append('}').toString();
+    }
+
+    private static void append(StringBuilder body, String key, String value) {
+        body.append('"').append(key).append("\":\"").append(value).append('"');
+    }
+
+    /**
+     * Reports whether this instance can reach its database, reusing a recent verdict.
+     *
+     * <p>The delegator is resolved before the cache is consulted, so that the verdict reused is one about
+     * THIS webapp's database and a webapp whose delegator changes is not answered from the previous one's
+     * verdict.
+     *
+     * @param delegator the delegator this webapp uses, never null
+     * @return true when the readiness query succeeded and found the seed entity populated
+     */
+    private boolean isDatabaseReachable(Delegator delegator) {
         // A delegator with no name would be unusual; keyed under the empty string rather than risking a
         // null key, so that an odd configuration cannot turn a probe into an exception.
         String scope = Objects.requireNonNullElse(delegator.getDelegatorName(), "");
@@ -410,6 +603,37 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
     }
 
     /**
+     * Invokes the content store's readiness hook, when this deployment has one.
+     *
+     * @return null when there is no content component or content is stored in the database, the empty string
+     *     when the configured store is usable, otherwise the reason it is not
+     * @throws ReflectiveOperationException if the hook cannot be invoked
+     */
+    private static String askContentStore() throws ReflectiveOperationException {
+        if (CONTENT_STORE_READINESS == null) {
+            return null;
+        }
+        return (String) CONTENT_STORE_READINESS.invoke(null);
+    }
+
+    /**
+     * Resolves the content store's readiness hook once, at class load.
+     *
+     * @return the hook, or null when this deployment has no content component
+     */
+    private static Method resolveContentStoreReadiness() {
+        try {
+            return Class.forName("org.apache.ofbiz.content.data.store.ContentStoreFactory")
+                    .getMethod("readinessFailure");
+        } catch (ClassNotFoundException | NoSuchMethodException | LinkageError absent) {
+            Debug.logInfo("No content-store readiness hook is available in this deployment (" + absent
+                    + "), so readiness reports on the database alone unless a message bus is configured.",
+                    MODULE);
+            return null;
+        }
+    }
+
+    /**
      * Runs the readiness query under a deadline.
      *
      * <p>Both a checked {@code GenericEntityException} and an unchecked failure from the pool or the
@@ -417,8 +641,22 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
      * so it never propagates. An abandoned query is cancelled with an interrupt, so a driver that honours
      * one gives up its connection rather than holding it for the socket timeout.
      *
+     * <p><strong>What counts as success, and why it is not a row count.</strong> The query has to RUN, not
+     * to find anything. It reads a seed entity every deployment has, so running it exercises the connection
+     * pool, the driver, the datasource credentials and the schema - and on a database whose schema has not
+     * been created the entity's table does not exist, so the query FAILS and the instance is correctly
+     * reported not ready. Requiring a row on top of that is what a load balancer cannot survive: nothing
+     * writes to {@value #READINESS_ENTITY} until some request causes an identifier to be sequenced, so a
+     * newly provisioned deployment carrying only seed data has an empty sequencer, and demanding a row makes
+     * readiness answer 503 until a request arrives while the target group sends no request until readiness
+     * answers 200. Measured on a fresh seed-only PostgreSQL database: the sequencer stayed empty
+     * indefinitely and readiness stayed 503, and one ordinary request - which only a direct caller
+     * bypassing the load balancer could make - allocated two identifiers and flipped it to 200. An instance
+     * in that state is fit to serve, so it is reported ready; an empty sequencer is still noted in the log,
+     * because it is worth knowing during a rollout.
+     *
      * @param delegator the delegator to query, never null
-     * @return true when the query succeeded within the deadline and found the seed entity populated
+     * @return true when the readiness query ran successfully within the deadline
      */
     private boolean evaluateReadiness(Delegator delegator) {
         Callable<Boolean> statement = () -> EntityQuery.use(delegator).from(READINESS_ENTITY).queryCount() > 0;
@@ -427,26 +665,28 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
             if (Boolean.TRUE.equals(query.get(READINESS_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS))) {
                 return true;
             }
-            // The query SUCCEEDED and found nothing. Reported, because otherwise this is the one way to
-            // answer 503 with nothing in the log to say why, and an operator watching a rollout could not
-            // tell an empty schema from an unreachable database. It is the expected state of a database
-            // whose schema has just been created: no identifier has been allocated from the sequencer yet.
-            reportFailure("Readiness probe reached the database but found no allocated identifier in "
-                    + READINESS_ENTITY + ", so this instance cannot serve yet. Load the seed data, or wait"
-                    + " for the first sequenced record to be written", null);
-            return false;
+            // The query RAN and found no row. Ready, and noted at info level on its own rated window: an
+            // operator watching a rollout should be able to tell this state - a schema that exists but has
+            // sequenced nothing yet - from an unreachable database, and the two are otherwise
+            // indistinguishable from the outside.
+            noteReadyState("Readiness probe reached the database and found no allocated identifier in "
+                    + READINESS_ENTITY + " yet, which is the expected state of a schema that has just been"
+                    + " created or loaded with seed data only. This instance is reported READY, because it"
+                    + " can serve: the first request that sequences an identifier will populate it",
+                    SEQUENCER_EMPTY_LAST_LOGGED);
+            return true;
         } catch (TimeoutException slow) {
             query.cancel(true);
             reportFailure("Readiness probe gave up after " + READINESS_TIMEOUT_MILLIS
-                    + " ms waiting for the database", null);
+                    + " ms waiting for the database", null, FAILURE_LAST_LOGGED);
             return false;
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             query.cancel(true);
             return false;
-        } catch (RuntimeException | java.util.concurrent.ExecutionException failed) {
+        } catch (RuntimeException | ExecutionException failed) {
             reportFailure("Readiness probe could not reach the database", failed.getCause() == null
-                    ? failed : failed.getCause());
+                    ? failed : failed.getCause(), FAILURE_LAST_LOGGED);
             return false;
         }
     }
@@ -458,13 +698,18 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
      * outage - exactly when the log has to stay readable - into unbounded log volume. The interval is
      * enough to keep the outage visible while a single instance contributes at most one line a minute.
      *
+     * <p>The window is passed in rather than shared, so that each dependency rates its own log independently:
+     * one shared window would let a database outage suppress the one line saying the object store had gone
+     * too, which is the line an operator needs to stop looking at the database.
+     *
      * @param message what happened
      * @param cause the failure, or null when there is no exception to report
+     * @param window when this kind of failure was last logged
      */
-    private static void reportFailure(String message, Throwable cause) {
+    private static void reportFailure(String message, Throwable cause, AtomicLong window) {
         long now = System.currentTimeMillis();
-        long last = FAILURE_LAST_LOGGED.get();
-        if (now - last < FAILURE_LOG_INTERVAL_MILLIS || !FAILURE_LAST_LOGGED.compareAndSet(last, now)) {
+        long last = window.get();
+        if (now - last < FAILURE_LOG_INTERVAL_MILLIS || !window.compareAndSet(last, now)) {
             return;
         }
         if (cause == null) {
@@ -477,6 +722,27 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
                     + FAILURE_LOG_INTERVAL_MILLIS + " ms.", MODULE);
         }
     }
+
+    /**
+     * Logs a noteworthy but healthy readiness state at most once per {@value #FAILURE_LOG_INTERVAL_MILLIS} ms.
+     *
+     * <p>The counterpart to {@link #reportFailure}: same rating, information level, and always a window of
+     * its own. A state that leaves the instance ready is not an error, and an operator scanning the log for
+     * errors during a rollout should not have to decide which of them mean the instance is refusing traffic.
+     *
+     * @param message what was observed
+     * @param window when this state was last logged
+     */
+    private static void noteReadyState(String message, AtomicLong window) {
+        long now = System.currentTimeMillis();
+        long last = window.get();
+        if (now - last < FAILURE_LOG_INTERVAL_MILLIS || !window.compareAndSet(last, now)) {
+            return;
+        }
+        Debug.logInfo(message + ". This note is logged at most once every " + FAILURE_LOG_INTERVAL_MILLIS
+                + " ms.", MODULE);
+    }
+
 
     /**
      * Returns the servlet context of the webapp this instance belongs to, in either role.
@@ -566,4 +832,119 @@ public final class HealthCheckServlet extends HttpServlet implements Filter {
      * @param up whether the database answered
      */
     private record Verdict(long at, boolean up) { }
+
+    /**
+     * One readiness answer: the verdict a target group acts on, and the body reporting it.
+     *
+     * @param up whether every configured dependency answered
+     * @param body the JSON body to write
+     */
+    private record Readiness(boolean up, String body) { }
+
+    /**
+     * One configured dependency's readiness question, with the cache, the deadline and the rated log that
+     * make it safe to ask on every probe.
+     *
+     * <p>The question answers in the three-state encoding both hooks share - null when the dependency is not
+     * configured, the empty string when it answered, otherwise the reason it did not - and this class adds
+     * nothing to that answer except the ability to ask it cheaply:
+     *
+     * <ul>
+     *   <li><strong>Cached</strong> for {@value #READINESS_CACHE_MILLIS} ms, so a probe interval shorter than
+     *       that cannot multiply into requests against the dependency.</li>
+     *   <li><strong>Bounded</strong> at {@value #DEPENDENCY_TIMEOUT_MILLIS} ms, because a dependency's own
+     *       client bounds a probe far too generously - 45 s for the object store - and a probe that hung
+     *       would be read by a target group as a lost one.</li>
+     *   <li><strong>At most one outstanding.</strong> A question that passed its deadline is deliberately NOT
+     *       cancelled and NOT re-submitted: the next probe waits on the same one. Cancelling would not stop a
+     *       socket read that is already in progress, and submitting another every probe interval during an
+     *       outage is how a probe turns a dependency outage into a thread leak.</li>
+     * </ul>
+     *
+     * <p>One instance per dependency, held statically, so the servlet registration and the filter
+     * registration of this class share one cache and one outstanding question rather than each keeping their
+     * own.
+     *
+     * <p>Package private, along with {@link #evaluate}, so that the cache, the deadline and the
+     * one-outstanding-question rule can be asserted directly against a question the test controls. None of
+     * the three is observable from outside this class otherwise, and each of them is a property a probe's
+     * correctness rests on.
+     */
+    static final class DependencyCheck {
+
+        private final String label;
+        private final Callable<String> question;
+        private final AtomicReference<Future<String>> outstanding = new AtomicReference<>();
+        private final AtomicLong lastLogged = new AtomicLong();
+        private volatile Answer held;
+
+        DependencyCheck(String label, Callable<String> question) {
+            this.label = label;
+            this.question = question;
+        }
+
+        /**
+         * Answers what this dependency's state is, from a recent answer when there is one.
+         *
+         * @return null when the dependency is not configured, the empty string when it answered, otherwise
+         *     the reason it did not
+         */
+        String evaluate() {
+            long now = System.currentTimeMillis();
+            Answer recent = held;
+            if (recent != null && now - recent.at() < READINESS_CACHE_MILLIS) {
+                return recent.outcome();
+            }
+            Future<String> running = outstanding.get();
+            if (running == null || running.isDone()) {
+                Future<String> submitted = DEPENDENCY_EXECUTOR.submit(question);
+                if (outstanding.compareAndSet(running, submitted)) {
+                    running = submitted;
+                } else {
+                    // Another probe submitted first. Cancelling one that has not started removes it from the
+                    // queue, so two concurrent probes still cost one question.
+                    submitted.cancel(true);
+                    running = outstanding.get();
+                }
+            }
+            if (running == null) {
+                return "";
+            }
+            try {
+                // An answer that arrives from a question submitted during an outage may be seconds old by
+                // now, and is cached as though it were current for one cache window. That is deliberate: it
+                // is the outage's own answer, it says DOWN, and the probe after it asks again.
+                String outcome = running.get(DEPENDENCY_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+                held = new Answer(System.currentTimeMillis(), outcome);
+                if (!answered(outcome)) {
+                    reportFailure("Readiness probe reports " + label + " unusable: " + outcome, null,
+                            lastLogged);
+                }
+                return outcome;
+            } catch (TimeoutException slow) {
+                // Not cached, and not cancelled: the next probe waits on this same question rather than
+                // starting another, and the moment it completes a probe reports its answer.
+                String reason = label + " did not answer within " + DEPENDENCY_TIMEOUT_MILLIS + " ms";
+                reportFailure("Readiness probe gave up waiting for " + reason, null, lastLogged);
+                return reason;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return label + " could not be asked: the probe was interrupted";
+            } catch (RuntimeException | ExecutionException failed) {
+                Throwable cause = failed.getCause() == null ? failed : failed.getCause();
+                String reason = label + " could not be asked: " + cause;
+                held = new Answer(System.currentTimeMillis(), reason);
+                reportFailure("Readiness probe could not ask about " + label, cause, lastLogged);
+                return reason;
+            }
+        }
+
+        /**
+         * One dependency answer and the instant it was reached.
+         *
+         * @param at the epoch millisecond the answer was reached
+         * @param outcome null when not configured, the empty string when usable, otherwise the reason
+         */
+        private record Answer(long at, String outcome) { }
+    }
 }

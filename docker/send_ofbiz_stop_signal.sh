@@ -142,7 +142,49 @@ echo "Sending shutdown signal..."
 # shutdown printed "FAIL" followed by "Done" and exited 0 - and every caller that trusts an exit status,
 # from a container stop hook to an orchestrator's preStop, was told the server had been asked to stop when
 # it had not. A stop that did not happen must not look like one that did.
-shutdownResponse=$(printf '%s:SHUTDOWN\n' "$OFBIZ_ADMIN_KEY" | curl --silent --show-error "telnet://localhost:$OFBIZ_ADMIN_PORT")
+#
+# THE REPLY IS READ AS SOON AS IT ARRIVES, not when curl exits. This is the whole of the fix for the
+# accepted-stop-with-no-verdict behaviour: AdminServerContainer prints its answer on an auto-flushing
+# writer and then shuts the JVM down, so the answer is on the socket within milliseconds - but the socket
+# does not reach END OF FILE until the JVM is gone, and a command substitution waits for exactly that. When
+# this script is reached through "docker exec", the JVM is the container's main process, so its exit tears
+# the container down and Docker SIGKILLs the exec session: curl was killed before it returned, the
+# substitution never completed, and the caller saw exit 137 with no "Response:" and no "Done" for a stop
+# that had in fact been accepted. So curl writes to a file in the background and the FIRST LINE is picked up
+# as soon as it appears, which is before the JVM can finish stopping.
+# Written for any POSIX shell, as the rest of this script is: a background job, "kill -0" to see whether it
+# is still running, and a bounded polling loop - no bashisms, no /dev/tcp.
+shutdownResponseFile=$(mktemp)
+shutdownErrorFile=$(mktemp)
+#
+# "--no-buffer" is what makes the file readable while curl is still running: without it curl holds the
+# three-byte answer in its own output buffer until the transfer ends, and the transfer does not end until
+# the socket does - AdminServerContainer answers and then runs the shutdown INSIDE the try-with-resources
+# that owns the client socket, so end of file arrives only once the JVM is gone. Polling an unflushed file
+# would therefore have waited for exactly the event that kills this exec session.
+printf '%s:SHUTDOWN\n' "$OFBIZ_ADMIN_KEY" \
+  | curl --silent --show-error --no-buffer --max-time 30 "telnet://localhost:$OFBIZ_ADMIN_PORT" \
+    >"$shutdownResponseFile" 2>"$shutdownErrorFile" &
+requestPid=$!
+
+shutdownResponse=""
+waited=0
+while [ "$waited" -lt 150 ]; do
+  shutdownResponse=$(tr --delete '\r' <"$shutdownResponseFile" | head -n 1)
+  if [ -n "$shutdownResponse" ]; then
+    break
+  fi
+  # curl has finished and left nothing: there is no more to wait for, and the error file says why.
+  if ! kill -0 "$requestPid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.2
+  waited=$((waited + 1))
+done
+if [ -z "$shutdownResponse" ] && [ -s "$shutdownErrorFile" ]; then
+  echo "ERROR: the shutdown request could not be sent: $(tr '\n' ' ' <"$shutdownErrorFile")" >&2
+fi
+rm --force "$shutdownResponseFile" "$shutdownErrorFile"
 
 case "$shutdownResponse" in
 *OK* | *IN-PROGRESS*)

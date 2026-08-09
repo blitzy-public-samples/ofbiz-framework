@@ -18,6 +18,7 @@
  *******************************************************************************/
 package org.apache.ofbiz.content.data.store;
 
+import java.io.IOException;
 import java.util.Locale;
 
 import org.apache.ofbiz.base.util.Debug;
@@ -124,6 +125,64 @@ public final class ContentStoreFactory {
             return resolve(onFile);
         }
         return resolve(configured);
+    }
+
+    /**
+     * Reports whether this instance can currently use the content store it is configured with, for a
+     * readiness probe.
+     *
+     * <p><strong>Three answers, encoded in one string</strong>, because this is called reflectively from
+     * {@code org.apache.ofbiz.webapp.control.HealthCheckServlet}: the framework layer may not depend on this
+     * one - the one-way component dependency direction is part of the architecture - so a single static
+     * method returning a plain {@code String} is the whole of the boundary, and it carries the three states
+     * a probe has to tell apart:
+     *
+     * <ul>
+     *   <li>{@code null} - <strong>not applicable.</strong> This deployment stores content in the database,
+     *       so there is no external store to be ready. The probe reports nothing about content storage, and
+     *       the readiness body of a database-mode deployment is exactly what it has always been.</li>
+     *   <li>the empty string - <strong>usable.</strong> The configured store confirmed it can be reached and
+     *       that the container holding this deployment's content is there.</li>
+     *   <li>anything else - <strong>not usable</strong>, and the string says why, for the log.</li>
+     * </ul>
+     *
+     * <p><strong>It answers about the FILES, not about a database row.</strong> The no-argument
+     * {@link #getContentStore()} is used deliberately: {@link #getContentStore(Delegator)} lets a
+     * {@code SystemProperty} row override the selector, which costs a database lookup that a probe should not
+     * make - readiness reports on the database separately - and in a container deployment the store is
+     * configured from the environment into the property files, which is the source this reads.
+     *
+     * <p><strong>Nothing propagates.</strong> A readiness question answers; it never throws. A provider that
+     * cannot even be built is as unusable as one that cannot be reached, and both are reported as a reason.
+     *
+     * <p>It is neither cached nor bounded here - the caller does both, because how long a probe may wait and
+     * how long a verdict stays current are properties of the probe, not of the store.
+     *
+     * @return null when content is stored in the database, the empty string when the configured store is
+     *     usable, otherwise the reason it is not
+     */
+    public static String readinessFailure() {
+        ContentStore store;
+        try {
+            store = getContentStore();
+        } catch (GeneralException misconfigured) {
+            return "the configured content store cannot be built: " + misconfigured.getMessage();
+        }
+        if (store == null) {
+            return null;
+        }
+        try {
+            store.requireReachable();
+            return "";
+        } catch (GeneralException | IOException unreachable) {
+            return unreachable.getMessage();
+        } catch (RuntimeException unexpected) {
+            // Broad on purpose. A client library can fail in ways its own contract does not declare - an
+            // expired credential provider raising an SdkClientException, say - and a readiness probe that
+            // propagated one would answer 500 through the container's error machinery instead of 503, which
+            // is the one answer a target group cannot act on.
+            return "the configured content store failed unexpectedly: " + unexpected;
+        }
     }
 
     /**

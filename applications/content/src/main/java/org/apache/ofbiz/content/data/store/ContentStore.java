@@ -20,12 +20,14 @@ package org.apache.ofbiz.content.data.store;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Optional;
 
 import org.apache.ofbiz.base.util.GeneralException;
 
 /**
- * The six-method storage contract for file-backed {@code DataResource} content - {@code LOCAL_FILE},
+ * The storage contract for file-backed {@code DataResource} content - {@code LOCAL_FILE},
  * {@code OFBIZ_FILE} and {@code CONTEXT_FILE} together with their {@code _BIN} variants - with one
  * implementation per storage backend.
  *
@@ -105,6 +107,25 @@ public interface ContentStore {
     void put(String key, byte[] data) throws GeneralException, IOException;
 
     /**
+     * Stores the content of the given FILE under the given key, replacing any object already held there.
+     *
+     * <p>The size-bounded write. {@link #put(String, byte[])} requires its caller to hold the whole
+     * object in memory first, which for content at the {@link #MAX_OBJECT_BYTES} ceiling is 64 MiB per
+     * concurrent write; this overload lets a provider send the bytes from where they already are. The
+     * default implementation reads the file and delegates, so a provider that cannot stream still works
+     * and behaves identically.
+     *
+     * @param key the storage key
+     * @param file the file whose content to store, no larger than {@link #MAX_OBJECT_BYTES}
+     * @throws GeneralException if the key breaks the key grammar or the provider is misconfigured
+     * @throws IOException if the file cannot be read, the store cannot be written, or the content
+     *     exceeds {@link #MAX_OBJECT_BYTES}
+     */
+    default void put(String key, Path file) throws GeneralException, IOException {
+        put(key, Files.readAllBytes(file));
+    }
+
+    /**
      * Returns the whole object held under the given key.
      *
      * <p>The object is read into memory, so this is the bounded accessor: an object larger than
@@ -166,4 +187,28 @@ public interface ContentStore {
      * @throws IOException if the store cannot be written
      */
     void delete(String key) throws GeneralException, IOException;
+
+    /**
+     * Confirms that this store can be reached and used right now, for a readiness probe.
+     *
+     * <p><strong>Why the contract needs this at all.</strong> Every other method here names an object, and
+     * a readiness probe has no object to name: it asks whether the instance is fit to receive a request
+     * that WOULD name one. Asking with {@link #exists} on a made-up key cannot answer that - a filesystem
+     * provider reports a missing key as absent whether its storage root is mounted or gone - so each
+     * provider answers the question with the cheapest request that actually distinguishes a store it can
+     * use from one it cannot: a bucket-level request for an object store, an inspection of the storage root
+     * for a filesystem.
+     *
+     * <p><strong>The contract.</strong> Returning normally means this instance could serve a content
+     * operation now. Throwing means it could not, and the exception message says why in terms an operator
+     * can act on - it names the container, root or endpoint at fault and never a credential. Nothing here
+     * transfers content, writes anything, or depends on any particular object existing, so it stays cheap
+     * enough to run on every probe interval; the caller is nonetheless expected to cache the answer and
+     * bound the call, because a store that has stopped answering will make this HANG rather than fail.
+     *
+     * @throws GeneralException if this provider's own configuration is unusable
+     * @throws IOException if the store cannot be reached, or reports that the container holding this
+     *     deployment's content is gone
+     */
+    void requireReachable() throws GeneralException, IOException;
 }

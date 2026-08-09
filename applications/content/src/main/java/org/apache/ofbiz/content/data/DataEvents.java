@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -30,7 +31,6 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpSession;
 
-import org.apache.commons.io.IOUtils;
 import org.apache.ofbiz.base.util.Debug;
 import org.apache.ofbiz.base.util.GeneralException;
 import org.apache.ofbiz.base.util.UtilHttp;
@@ -54,6 +54,19 @@ public class DataEvents {
 
     private static final String MODULE = DataEvents.class.getName();
     private static final String ERR_RESOURCE = "ContentErrorUiLabels";
+
+    /**
+     * The MIME types a browser will EXECUTE if it renders them as a document in this origin.
+     *
+     * <p>Content of these types is served as an attachment rather than inline, so that a file a user
+     * uploaded cannot run script with the authority of the authenticated session that fetched it. Every
+     * other type - images, PDFs, plain text - is served inline, exactly as before, because that is how
+     * the screens embed it. Matched as a PREFIX, because a recorded MIME type carries parameters
+     * ({@code text/html;charset=UTF-8}).
+     */
+    private static final List<String> ACTIVE_CONTENT_TYPES = List.of(
+            "text/html", "application/xhtml+xml", "image/svg+xml", "application/xml", "text/xml",
+            "application/xslt+xml", "text/javascript", "application/javascript", "application/ecmascript");
 
     public static String uploadImage(HttpServletRequest request, HttpServletResponse response) {
         return DataResourceWorker.uploadAndStoreImage(request, "dataResourceId", "imageData");
@@ -269,8 +282,17 @@ public class DataEvents {
             return "error";
         }
 
+        // Held outside the resolution block, because the response is written only after the whole of it
+        // has succeeded - see the comment on the transfer below.
+        GenericValue dataResource;
+        String mimeType;
+        InputStream stream;
+        Long length;
         try {
-            GenericValue dataResource = EntityQuery.use(delegator).from("DataResource").where("dataResourceId", dataResourceId).cache().queryOne();
+            dataResource = EntityQuery.use(delegator).from("DataResource").where("dataResourceId", dataResourceId).cache().queryOne();
+            if (dataResource == null) {
+                throw new GeneralException("No Data Resource found with ID [" + dataResourceId + "]");
+            }
             if (!"Y".equals(dataResource.getString("isPublic"))) {
                 // now require login...
                 GenericValue userLogin = (GenericValue) session.getAttribute("userLogin");
@@ -296,7 +318,7 @@ public class DataEvents {
                 }
             }
 
-            String mimeType = DataResourceWorker.getMimeType(dataResource);
+            mimeType = DataResourceWorker.getMimeType(dataResource);
 
             // hack for IE and mime types
             String userAgent = request.getHeader("User-Agent");
@@ -305,14 +327,24 @@ public class DataEvents {
                 mimeType = "application/octet-stream";
             }
 
-            if (mimeType != null) {
-                response.setContentType(mimeType);
-            }
-            OutputStream os = response.getOutputStream();
+            // RESOLVED BEFORE THE RESPONSE IS TOUCHED, deliberately. This used to call
+            // response.getOutputStream() first and only then resolve the content, which had two
+            // consequences. A resource whose content could not be resolved at all - a row created by the
+            // content screens whose file has not been uploaded yet, so it records no location, or a
+            // location whose object the store no longer holds - failed AFTER the response had been
+            // claimed as a binary stream, so the framework could not render its error view into it
+            // ("ERROR in error page ... IllegalStateException") and the container answered a bare 500
+            // over a response that had already begun. And the whole object was collapsed into a byte
+            // array (see below), so nothing was streamed at all. Resolving first means the ordinary
+            // failures are ordinary errors again, handled by this method's own error response.
             Map<String, Object> resourceData = DataResourceWorker.getDataResourceStream(dataResource, "",
                     application.getInitParameter("webSiteId"), UtilHttp.getLocale(request), application.getRealPath("/"), false);
-            os.write(IOUtils.toByteArray((InputStream) resourceData.get("stream")));
-            os.flush();
+            stream = (InputStream) resourceData.get("stream");
+            length = resourceData.get("length") instanceof Long ? (Long) resourceData.get("length") : null;
+            if (stream == null) {
+                throw new GeneralException("The content of the Data Resource with ID [" + dataResourceId
+                        + "] could not be opened");
+            }
         } catch (GeneralException | IOException e) {
             String errMsg = "Error downloading digital product content: " + e.toString();
             Debug.logError(e, errMsg, MODULE);
@@ -320,7 +352,140 @@ public class DataEvents {
             return "error";
         }
 
+        // STREAMED THROUGH A FIXED BUFFER, never collected into one. This was
+        // os.write(IOUtils.toByteArray(stream)), which held the WHOLE object in the heap - and with a
+        // content store configured an object may be as large as ContentStore.MAX_OBJECT_BYTES, so a
+        // handful of concurrent reads of allowed-size content was enough to exhaust the shipped
+        // -Xmx1024M and answer HTTP 500 with java.lang.OutOfMemoryError. InputStream.transferTo uses a
+        // fixed internal buffer, so the memory a read costs no longer depends on the size of the
+        // content or on how many reads are in flight. The source is closed either way, which the
+        // previous code never did: with a store configured it is a remote response stream, and leaking
+        // it holds a pooled connection open for the life of the instance.
+        try (InputStream source = stream) {
+            applyUserContentHeaders(response, dataResource, mimeType);
+            if (mimeType != null) {
+                response.setContentType(mimeType);
+            }
+            if (length != null && length >= 0L) {
+                response.setContentLengthLong(length);
+            }
+            OutputStream os = response.getOutputStream();
+            source.transferTo(os);
+            os.flush();
+        } catch (IOException e) {
+            Debug.logError(e, "Unable to write the content of the Data Resource with ID [" + dataResourceId
+                    + "] to the client", MODULE);
+            // Nothing may be rendered into a response that has already begun - the reason
+            // serveObjectData answers a response of type "none" in the same situation. When the
+            // response has NOT been committed the buffer and the headers are dropped and a status is
+            // sent, so the caller sees a failure rather than a short body; once it HAS been committed
+            // the transfer is abandoned, and the caller sees fewer bytes than the Content-Length it was
+            // promised, which is what tells it the content is incomplete. Either way no error view is
+            // attempted, because attempting one is what turned a storage timeout into a container error
+            // page written over a partial payload.
+            if (!response.isCommitted()) {
+                response.reset();
+                response.setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+            }
+            return "success";
+        }
+
         return "success";
+    }
+
+    /**
+     * Applies the defence-in-depth headers a response carrying USER-SUPPLIED content needs.
+     *
+     * <p>The payload responses of this route carried no security headers at all, while every screen
+     * response OFBiz renders carries the standard set. The content is uploaded by users and served from
+     * the application's own origin, so the headers below are what keep a file that is not what its
+     * recorded MIME type claims, or is an active format, from acting inside that origin:
+     *
+     * <ul>
+     *   <li>{@code X-Content-Type-Options: nosniff} - the recorded MIME type is honoured as given
+     *       rather than re-guessed from the bytes, which is how a file uploaded as text comes to be
+     *       executed as script.</li>
+     *   <li>{@code Content-Security-Policy} - for a payload NAVIGATED to as a document, nothing may
+     *       load or execute; it does not affect an image loaded as a sub-resource of a screen, because
+     *       a policy on a sub-resource response is not applied to the embedding document.</li>
+     *   <li>{@code Content-Disposition} - {@code attachment} for the formats a browser will execute in
+     *       this origin (HTML, XHTML, XML and SVG), {@code inline} for everything else, so that the
+     *       images and documents the screens embed keep rendering exactly as they did.</li>
+     *   <li>{@code X-Frame-Options} and {@code Referrer-Policy} - the payload may not be framed by
+     *       another site, and navigating away from it does not disclose the URL, which carries the
+     *       identifier of the content.</li>
+     *   <li>{@code Cache-Control: private, no-store} for content that is NOT public, so an
+     *       intermediary or a shared browser cache does not keep a copy of a resource whose delivery
+     *       required a permission check. Public content is left cacheable, as it was.</li>
+     * </ul>
+     *
+     * <p>{@code Strict-Transport-Security} is applied through the same switch every other OFBiz response
+     * uses - {@code requestHandler.strict-transport-security}, on by default - rather than being decided
+     * here. It is a HOST-wide directive with a lifetime, so a deployment that turns it off must have it
+     * off everywhere, and a payload response that quietly kept sending it would defeat that.
+     *
+     * @param response the response to apply the headers to
+     * @param dataResource the resource being served, whose {@code isPublic} and {@code mimeTypeId}
+     *     decide the cache policy and the disposition
+     * @param mimeType the MIME type the response will declare
+     */
+    private static void applyUserContentHeaders(HttpServletResponse response, GenericValue dataResource, String mimeType) {
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        if (UtilProperties.getPropertyAsBoolean("requestHandler", "strict-transport-security", true)) {
+            response.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+        }
+        response.setHeader("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox");
+        response.setHeader("X-Frame-Options", "SAMEORIGIN");
+        response.setHeader("Referrer-Policy", "same-origin");
+        if (!"Y".equals(dataResource.getString("isPublic"))) {
+            response.setHeader("Cache-Control", "private, no-store");
+        }
+        response.setHeader("Content-Disposition",
+                contentDisposition(mimeType, dataResource.getString("dataResourceName")));
+    }
+
+    /**
+     * Returns the {@code Content-Disposition} header value for a payload of the given type and name.
+     *
+     * <p>{@code attachment} for the formats a browser executes when it renders them as a document in
+     * this origin, {@code inline} for everything else - the images and documents the screens embed keep
+     * being displayed rather than downloaded. Package-private so the decision can be tested on its own.
+     *
+     * @param mimeType the MIME type the response declares, which may be null or carry parameters
+     * @param dataResourceName the recorded name of the content, which may be null or unusable
+     * @return the header value
+     */
+    static String contentDisposition(String mimeType, String dataResourceName) {
+        String type = mimeType == null ? "" : mimeType.toLowerCase(Locale.ROOT).trim();
+        boolean active = ACTIVE_CONTENT_TYPES.stream().anyMatch(type::startsWith);
+        String name = safeDownloadName(dataResourceName);
+        return (active ? "attachment" : "inline") + (name == null ? "" : "; filename=\"" + name + "\"");
+    }
+
+    /**
+     * Returns a file name safe to put in a {@code Content-Disposition} header, or null when none is.
+     *
+     * <p>A recorded {@code dataResourceName} is user input: a quotation mark in it would end the
+     * quoted-string early and let the rest of the name be read as further header parameters, and a
+     * control character has no place in a header value at all. Only the characters a file name needs
+     * are kept, and a name left with nothing is answered as null so the header carries no file name
+     * rather than an empty one.
+     *
+     * @param name the recorded name
+     * @return a safe file name, or null
+     */
+    static String safeDownloadName(String name) {
+        if (UtilValidate.isEmpty(name)) {
+            return null;
+        }
+        StringBuilder safe = new StringBuilder(name.length());
+        for (char c : name.toCharArray()) {
+            if (c >= ' ' && c != '"' && c != '\\' && c != 0x7f) {
+                safe.append(c);
+            }
+        }
+        String answer = safe.toString().trim();
+        return answer.isEmpty() ? null : answer;
     }
 
 

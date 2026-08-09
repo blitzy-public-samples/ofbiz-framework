@@ -704,6 +704,17 @@ public class DataResourceWorker implements org.apache.ofbiz.widget.content.DataR
             throws GeneralException, FileNotFoundException {
         File file = null;
 
+        // A file-backed resource that records NO location names no content. It is a real state, and a
+        // reachable one: the content screens create the DataResource row in one request and upload the
+        // file in the next, so between the two the row exists with an empty objectInfo - as it also does
+        // when that second request carries an empty file field. Composing a path from it produced the
+        // upload DIRECTORY itself, which exists, so the absence was not detected here and the caller was
+        // handed a directory to read - failing later, deeper, and as an opaque server error. Reported as
+        // the absence it is, through the same path as a location whose file is gone.
+        if (UtilValidate.isEmpty(objectInfo)) {
+            throw contentAbsent(dataResourceTypeId, "an empty location on a [" + dataResourceTypeId
+                    + "] resource, which records no content");
+        }
         if ("LOCAL_FILE".equals(dataResourceTypeId) || "LOCAL_FILE_BIN".equals(dataResourceTypeId)) {
             file = FileUtil.getFile(objectInfo);
             if (!fetchFromStore(dataResourceTypeId, file, contextRoot) && !file.exists()) {

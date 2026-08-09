@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -76,6 +77,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -237,6 +239,119 @@ public final class ContentStoreFactoryTest {
         ContentStore second = ContentStoreFactory.getContentStore();
 
         assertSame(first, second, "the resolved provider must be reused rather than rebuilt per call");
+    }
+
+    @Test
+    public void contentIsSentToTheBucketFromTheFileRatherThanFromTheHeap() throws GeneralException, IOException {
+        S3Client client = mock(S3Client.class);
+        ContentStore store = new S3ContentStore(client, BUCKET);
+        Path file = workspace.resolve("streamed.txt");
+        Files.writeString(file, "sent from the file", StandardCharsets.UTF_8);
+        when(client.putObject(any(PutObjectRequest.class), any(RequestBody.class)))
+                .thenReturn(PutObjectResponse.builder().build());
+
+        store.put(KEY, file);
+
+        ArgumentCaptor<PutObjectRequest> put = ArgumentCaptor.forClass(PutObjectRequest.class);
+        ArgumentCaptor<RequestBody> body = ArgumentCaptor.forClass(RequestBody.class);
+        verify(client).putObject(put.capture(), body.capture());
+        assertEquals(BUCKET, put.getValue().bucket(), "the file-based put must address the configured bucket");
+        assertEquals(KEY, put.getValue().key(), "and the key exactly as given");
+        // The point of the overload: the request declares the file's length and streams it, so a write at
+        // the size ceiling costs no heap. A chunked body - no content length - would mean it was buffered.
+        assertEquals(Optional.of((long) "sent from the file".length()), body.getValue().optionalContentLength(),
+                "the request must carry the file's length, which is what says it is streamed from the file");
+    }
+
+    @Test
+    public void readinessSaysNothingAboutAStoreWhileContentIsKeptInTheDatabase() {
+        select("database");
+
+        // The three-state contract the readiness probe reads. null is "not applicable": a deployment storing
+        // content in the database has no store to be ready, and the probe must add no key for one - which is
+        // what keeps the readiness body of every database-mode deployment byte for byte what it was.
+        assertNull(ContentStoreFactory.readinessFailure(),
+                "database mode must report no content-store readiness at all");
+    }
+
+    @Test
+    public void readinessIsUsableWhenTheFilesystemStoreHasSomewhereToWrite() {
+        UtilProperties.setPropertyValueInMemory(RESOURCE, UPLOAD_PREFIX_KEY, "runtime/uploads");
+        select("filesystem");
+
+        // The empty string is "configured and usable". An instance that has stored nothing yet has no storage
+        // root, and must still be reported ready: demanding the root itself would hold every newly started
+        // instance out of a load balancer's rotation until its first upload.
+        assertEquals("", ContentStoreFactory.readinessFailure(),
+                "a filesystem store whose root can be created must be reported usable");
+    }
+
+    @Test
+    public void readinessNamesTheReasonWhenTheFilesystemStoreHasNowhereToWrite()
+            throws GeneralException, IOException {
+        Path occupied = workspace.resolve("not-a-directory");
+        Files.writeString(occupied, "a file where the storage root should be", StandardCharsets.UTF_8);
+        ContentStore store = new FileSystemContentStore(occupied.toString());
+
+        IOException refused = assertThrows(IOException.class, store::requireReachable,
+                "a storage root that is a file cannot be written into and must not be reported usable");
+        assertTrue(refused.getMessage().contains("not a directory"),
+                "the reason must say what is wrong: " + refused.getMessage());
+    }
+
+    @Test
+    public void readinessAsksTheObjectStoreAboutItsBucketAndNothingElse() throws GeneralException, IOException {
+        S3Client client = mock(S3Client.class);
+        ContentStore store = new S3ContentStore(client, BUCKET);
+        when(client.headBucket(any(HeadBucketRequest.class))).thenReturn(HeadBucketResponse.builder().build());
+
+        store.requireReachable();
+
+        ArgumentCaptor<HeadBucketRequest> asked = ArgumentCaptor.forClass(HeadBucketRequest.class);
+        verify(client).headBucket(asked.capture());
+        assertEquals(BUCKET, asked.getValue().bucket(), "the probe must ask about the configured bucket");
+        // One request, and no object named: a probe runs every few seconds on every instance forever, so it
+        // may not read, write or depend on any particular object existing.
+        verify(client, never()).headObject(any(HeadObjectRequest.class));
+        verify(client, never()).getObject(any(GetObjectRequest.class));
+        verify(client, never()).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+    }
+
+    @Test
+    public void anObjectStoreThatCannotConfirmItsBucketIsNotReady() {
+        S3Client gone = mock(S3Client.class);
+        when(gone.headBucket(any(HeadBucketRequest.class))).thenThrow(NoSuchBucketException.builder()
+                .statusCode(404).awsErrorDetails(AwsErrorDetails.builder().errorCode("NoSuchBucket").build()).build());
+        ContentStore missingBucket = new S3ContentStore(gone, BUCKET);
+
+        IOException refused = assertThrows(IOException.class, missingBucket::requireReachable,
+                "a bucket the store does not confirm means this instance cannot serve content");
+        assertTrue(refused.getMessage().contains(BUCKET), "the reason must name the bucket: " + refused.getMessage());
+
+        S3Client unreachable = mock(S3Client.class);
+        when(unreachable.headBucket(any(HeadBucketRequest.class)))
+                .thenThrow(SdkClientException.create("connection refused"));
+        ContentStore down = new S3ContentStore(unreachable, BUCKET);
+
+        // A transport failure and a bucket failure are both "not ready": the probe's job is to keep this
+        // instance out of rotation, not to diagnose which of the two it is.
+        assertThrows(IOException.class, down::requireReachable,
+                "a store that cannot be reached at all must not be reported usable");
+    }
+
+    @Test
+    public void aFileTooLargeForOneObjectIsRefusedByBothProviders() throws GeneralException, IOException {
+        Path file = workspace.resolve("enormous.bin");
+        // Sparse: the bound is the file's LENGTH, so the test needs the length without the bytes.
+        try (java.io.RandomAccessFile sparse = new java.io.RandomAccessFile(file.toFile(), "rw")) {
+            sparse.setLength(ContentStore.MAX_OBJECT_BYTES + 1);
+        }
+        ContentStore filesystem = new FileSystemContentStore(workspace.resolve("object-store").toString());
+        assertThrows(IOException.class, () -> filesystem.put(KEY, file),
+                "the filesystem provider must refuse a file past the object size bound");
+        ContentStore s3 = new S3ContentStore(mock(S3Client.class), BUCKET);
+        assertThrows(IOException.class, () -> s3.put(KEY, file),
+                "and so must the object-store provider, before it sends anything");
     }
 
     @Test
@@ -481,6 +596,33 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
+    public void aStorageKeyLeavesOutTheTransactionDirectoryThatCarriesNoContentIdentity() throws GeneralException {
+        Path home = localHome();
+        String transaction = "txn-" + "0123456789abcdef0123456789abcdef";
+        String other = "txn-" + "fedcba9876543210fedcba9876543210";
+
+        // The point of the omission: the upload service composes the same file name for every update of one
+        // DataResource, so the transaction directory is the ONLY part of the location that changes between
+        // one update and the next. If it were part of the key, each update would name a new object and leave
+        // the one it superseded in the bucket for ever.
+        assertEquals("ofbiz/runtime/uploads/1786/10166.txt",
+                ContentStorePublisher.storeKey(home.resolve("runtime/uploads/1786/" + transaction + "/10166.txt")
+                        .toFile()),
+                "a transaction-owned upload directory must not be part of the key");
+        assertEquals(
+                ContentStorePublisher.storeKey(home.resolve("runtime/uploads/1786/" + transaction + "/10166.txt")
+                        .toFile()),
+                ContentStorePublisher.storeKey(home.resolve("runtime/uploads/1786/" + other + "/10166.txt")
+                        .toFile()),
+                "two updates of one content item must name ONE object, so the second replaces the first");
+        assertEquals("ofbiz/runtime/uploads/txn-not-one-of-ours/2.png",
+                ContentStorePublisher.storeKey(home.resolve("runtime/uploads/txn-not-one-of-ours/2.png").toFile()),
+                "a directory this class did not create keeps its place in the key, however it is named");
+        assertNull(ContentStorePublisher.storeKey(home.resolve(transaction).toFile()),
+                "a location that is nothing but a transaction directory names no content, so it has no key");
+    }
+
+    @Test
     public void anAbsentObjectLeavesThisInstanceCompletelyUntouched() throws GeneralException, IOException {
         Path home = localHome();
         CountingStore store = objectStore();
@@ -547,6 +689,59 @@ public final class ContentStoreFactoryTest {
         assertTrue(ContentStorePublisher.fetch(store, target), "the second read must still report it readable");
         assertEquals(1, store.opens, "a second read must be one metadata request and no transfer");
         assertEquals(2, store.describes, "each read costs exactly one metadata request");
+        // User content, materialised for this instance's own use, must be no more readable than the upload
+        // that produced it. Files.copy(InputStream, Path, REPLACE_EXISTING) re-creates the staging file
+        // under the process umask, which made these 0644 while the upload path's own files were 0600.
+        assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(target.toPath())),
+                "a materialised copy of user content must be owner-only");
+    }
+
+    @Test
+    public void aCachedCopyOfAnObjectThatIsGoneIsNotServedWhilePeersReportItAbsent()
+            throws GeneralException, IOException {
+        Path home = localHome();
+        CountingStore store = objectStore();
+        File target = home.resolve("runtime/uploads/shard/1.txt").toFile();
+        write(target, "stale", 1000L);
+        hold(store, "ofbiz/runtime/uploads/shard/1.txt", "fresh", 5000L);
+        assertTrue(ContentStorePublisher.fetch(store, target), "the precondition is a materialised copy");
+
+        store.delete("ofbiz/runtime/uploads/shard/1.txt");
+
+        // One row, one answer: the instance holding the cache must report the content absent exactly as
+        // every other instance does, rather than serving bytes nothing else can produce.
+        assertFalse(ContentStorePublisher.fetch(store, target), "an object that is gone must be reported absent");
+        assertFalse(target.exists(), "and the cached copy of it must be discarded");
+    }
+
+    @Test
+    public void aCachedCopyInATransactionDirectoryIsDiscardedEvenAfterARestart()
+            throws GeneralException, IOException {
+        Path home = localHome();
+        CountingStore store = objectStore();
+        // What a restart leaves behind: a file this JVM did NOT materialise, in the directory the upload
+        // that produced the object was written into. The in-memory index of materialised copies does not
+        // survive a restart, so the directory - which only this seam creates, and only with a store
+        // configured - is what says the file is a copy of an object rather than content in its own right.
+        File target = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef0123456789abcdef/1.txt")
+                .toFile();
+        write(target, "cached before the restart", 1000L);
+
+        assertFalse(ContentStorePublisher.fetch(store, target), "an object that is gone must be reported absent");
+        assertFalse(target.exists(), "a copy left in a transaction-owned upload directory must be discarded");
+    }
+
+    @Test
+    public void contentOutsideATransactionDirectoryIsNeverDiscarded() throws GeneralException, IOException {
+        Path home = localHome();
+        CountingStore store = objectStore();
+        File target = home.resolve("runtime/uploads/shard/legacy.txt").toFile();
+        write(target, "written before the store existed", 1000L);
+
+        // The migration boundary: content this seam never published is still served from the instance that
+        // holds it, and a read that finds no object must not delete it.
+        assertFalse(ContentStorePublisher.fetch(store, target), "the store holds no object for it");
+        assertTrue(target.exists(), "content that was never published must not be deleted by a read");
     }
 
     @Test
@@ -574,7 +769,7 @@ public final class ContentStoreFactoryTest {
     public void aTransactionThatDoesNotCommitLeavesNoUploadDirectoryBehind() throws GeneralException, IOException {
         Path home = localHome();
         CountingStore store = objectStore();
-        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef").toFile();
+        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef0123456789abcdef").toFile();
         File upload = new File(owned, "10020.txt");
         write(upload, "rolled back", 1000L);
 
@@ -592,10 +787,10 @@ public final class ContentStoreFactoryTest {
     public void aTransactionThatDoesNotCommitLeavesNoObjectBehindEither() throws GeneralException, IOException {
         Path home = localHome();
         CountingStore store = objectStore();
-        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef").toFile();
+        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef0123456789abcdef").toFile();
         File upload = new File(owned, "10020.txt");
         write(upload, "published then rolled back", 1000L);
-        String key = "ofbiz/runtime/uploads/1700000000000/txn-0123456789abcdef/10020.txt";
+        String key = "ofbiz/runtime/uploads/1700000000000/10020.txt";
 
         ContentStorePublisher.ContentPublication publication =
                 new ContentStorePublisher.ContentPublication(store, owned, null, owned.getAbsolutePath());
@@ -612,17 +807,88 @@ public final class ContentStoreFactoryTest {
     }
 
     @Test
-    public void aTransactionThatCommitsKeepsItsUploadDirectory() throws GeneralException, IOException {
+    public void aCommittedUploadKeepsTheObjectAndDiscardsItsLocalGeneration()
+            throws GeneralException, IOException {
         Path home = localHome();
         CountingStore store = objectStore();
-        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef").toFile();
+        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef0123456789abcdef").toFile();
         File upload = new File(owned, "10020.txt");
         write(upload, "committed", 1000L);
+        String key = "ofbiz/runtime/uploads/1700000000000/10020.txt";
 
-        new ContentStorePublisher.ContentPublication(store, owned, null, owned.getAbsolutePath())
-                .afterCompletion(Status.STATUS_COMMITTED);
+        ContentStorePublisher.ContentPublication publication =
+                new ContentStorePublisher.ContentPublication(store, owned, null, owned.getAbsolutePath());
+        publication.beforeCompletion();
+        publication.afterCompletion(Status.STATUS_COMMITTED);
 
-        assertTrue(upload.exists(), "a committed upload's local copy is what this instance serves and must stay");
+        assertTrue(store.exists(key), "the object is the content once a store is configured, and it must stay");
+        // Both halves of what left an instance holding durable state of its own: the local copy that let a
+        // writer answer 200 from its own disk for content the store no longer held, and the generation per
+        // update that accumulated on whichever instance happened to take each write.
+        assertFalse(upload.exists(), "a published upload's local copy is a CACHE of the object and must not be"
+                + " kept as the authoritative copy on the instance that happened to write it");
+        assertFalse(owned.exists(), "and the transaction's own upload directory goes with the last file in it");
+    }
+
+    @Test
+    public void anUploadThatCarriedNoBytesLeavesNoDirectoryBehindEither() throws GeneralException, IOException {
+        Path home = localHome();
+        CountingStore store = objectStore();
+        File owned = home.resolve("runtime/uploads/1700000000000/txn-0123456789abcdef0123456789abcdef").toFile();
+        assertTrue(owned.mkdirs(), "the precondition is a prepared upload directory nothing was written into");
+
+        // A submitted upload form with an empty file field: the directory was prepared, the row committed,
+        // and no content was ever written. Nothing will write into it again, so it is local state.
+        ContentStorePublisher.ContentPublication publication =
+                new ContentStorePublisher.ContentPublication(store, owned, null, owned.getAbsolutePath());
+        publication.beforeCompletion();
+        publication.afterCompletion(Status.STATUS_COMMITTED);
+
+        assertEquals(0, store.puts, "an upload that carried no bytes must publish nothing");
+        assertFalse(owned.exists(), "an empty upload directory must not be left on the instance");
+    }
+
+    @Test
+    public void aCommittedUploadLeavesADirectoryItDoesNotOwnAlone() throws GeneralException, IOException {
+        Path home = localHome();
+        CountingStore store = objectStore();
+        // Named after a transaction directory, but not in the form this class composes, so it belongs to
+        // whatever created it and this seam neither empties nor removes it.
+        File foreign = home.resolve("runtime/uploads/txn-not-one-of-ours").toFile();
+        File upload = new File(foreign, "10020.txt");
+        write(upload, "someone else's", 1000L);
+
+        ContentStorePublisher.ContentPublication publication =
+                new ContentStorePublisher.ContentPublication(store, foreign, null, foreign.getAbsolutePath());
+        publication.beforeCompletion();
+        publication.afterCompletion(Status.STATUS_COMMITTED);
+
+        assertTrue(upload.exists(), "content in a directory this class did not create must never be deleted");
+        assertTrue(foreign.exists(), "nor may the directory itself be removed");
+    }
+
+    @Test
+    public void anUploadDirectoryIsShardedWithoutAStoreAndUnshardedWithOne() throws GeneralException, IOException {
+        Path home = localHome();
+        UtilProperties.setPropertyValueInMemory(RESOURCE, UPLOAD_PREFIX_KEY, "runtime/uploads");
+
+        // Without a store the sharding rule OFBiz has always applied is unchanged: a sub-directory of the
+        // prefix, named after the millisecond it was created in.
+        select("database");
+        String sharded = FileSystemContentStore.getUploadPath("runtime/uploads", 250, false);
+        assertTrue(sharded.matches("/runtime/uploads/\\d+"),
+                "without a store the upload directory must still be a millisecond-named shard. Was: " + sharded);
+
+        // With one, the prefix itself: the shard is chosen by reading the LOCAL filesystem, and an instance
+        // that keeps no durable local state would choose a different one after every replacement, so every
+        // update of one content item would name a new object and orphan the one before it.
+        configureS3();
+        select("s3");
+        assertEquals("/runtime/uploads", FileSystemContentStore.getUploadPath("runtime/uploads", 250, false),
+                "with an external store the upload directory must not depend on local filesystem state");
+        assertEquals(home.resolve("runtime/uploads").toString(),
+                FileSystemContentStore.getUploadPath("runtime/uploads", 250, true),
+                "and the absolute form must name the same directory");
     }
 
     @Test
@@ -821,6 +1087,7 @@ public final class ContentStoreFactoryTest {
         private final ContentStore delegate;
         private int describes;
         private int opens;
+        private int puts;
 
         CountingStore(ContentStore delegate) {
             this.delegate = delegate;
@@ -828,7 +1095,14 @@ public final class ContentStoreFactoryTest {
 
         @Override
         public void put(String key, byte[] data) throws GeneralException, IOException {
+            puts++;
             delegate.put(key, data);
+        }
+
+        @Override
+        public void put(String key, Path file) throws GeneralException, IOException {
+            puts++;
+            delegate.put(key, file);
         }
 
         @Override
@@ -857,6 +1131,11 @@ public final class ContentStoreFactoryTest {
         @Override
         public void delete(String key) throws GeneralException, IOException {
             delegate.delete(key);
+        }
+
+        @Override
+        public void requireReachable() throws GeneralException, IOException {
+            delegate.requireReachable();
         }
     }
 
@@ -895,6 +1174,11 @@ public final class ContentStoreFactoryTest {
 
         @Override
         public void delete(String key) throws IOException {
+            throw new IOException("unreachable");
+        }
+
+        @Override
+        public void requireReachable() throws IOException {
             throw new IOException("unreachable");
         }
     }

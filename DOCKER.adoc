@@ -1,4 +1,44 @@
-== Building and running OFBiz using Docker
+= Building and running OFBiz using Docker
+:lang: en
+:description: How to build, configure and operate Apache OFBiz in a container, \
+including the deployed PostgreSQL datasource, externalised secrets, object \
+storage for content, gated schema initialisation, and the cache-coherence and \
+load-balancer options used behind a load balancer.
+:toc: macro
+:toclevels: 3
+:sectanchors:
+// No remote webfont: an operator reading this in an air-gapped deployment should
+// not need egress to read it, and this page has no business disclosing that it
+// was opened. The admonition icon font is a separate matter - `icons` is set to
+// `font` as a locked attribute by build.gradle, so it cannot be switched off
+// from this document and the rendered page still links one remote icon
+// stylesheet.
+:webfonts!:
+
+// The rendered HTML is read on a phone as often as on a desktop, and the
+// variable-reference tables below carry tokens that cannot be broken between
+// lines - JNDI factory class names, JDBC URIs, S3 endpoints, long OFBIZ_*
+// variable names. Their intrinsic minimum width, not the page, is what used to
+// force the whole document to 1084px against a 390px viewport and push the
+// Description column off screen; allowing a break inside those tokens lets each
+// table shrink to its container so the document itself never scrolls sideways.
+// The skip link lets a keyboard user step over the table of contents in one
+// keystroke. Both are HTML-only concerns, so neither reaches the PDF backend.
+ifdef::backend-html5[]
+++++
+<style>
+table.tableblock caption.title,
+table.tableblock th.tableblock,
+table.tableblock td.tableblock,
+table.tableblock td.tableblock kbd { overflow-wrap: anywhere; white-space: normal; }
+a#ofbiz-doc-skip-link { position: absolute; width: 1px; height: 1px; margin: -1px;
+  padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+a#ofbiz-doc-skip-link:focus { position: static; width: auto; height: auto; margin: 0;
+  padding: .25em .5em; overflow: visible; clip: auto; white-space: normal; }
+</style>
+<a id="ofbiz-doc-skip-link" href="#quickstart">Skip the table of contents</a>
+++++
+endif::[]
 
 OFBiz includes a Dockerfile which can be used to build a container image
 for running OFBiz. The container image is built based on the sources
@@ -7,21 +47,39 @@ you have already downloaded.
 
 If you want to include any plugins in your container image, you must
 download those plugins before running the build. (See the plugin
-documentation in README.adoc).
+documentation in README.md).
 
-=== Quickstart
+// The table of contents is placed explicitly so that it can be wrapped in a
+// navigation landmark; a screen reader can then reach it, or skip past it, as a
+// named region rather than as an unlabelled list of links.
+ifdef::backend-html5[]
+++++
+<nav aria-label="Table of contents">
+++++
+endif::[]
+
+toc::[]
+
+ifdef::backend-html5[]
+++++
+</nav>
+++++
+endif::[]
+
+[#quickstart]
+== Quickstart
 
 Follow these instructions to qet started building and running OFBiz
 using Docker.
 
-==== Build the OFBiz container image
+=== Build the OFBiz container image
 
-From the sources directory (i.e. the directory containing DOCKER.md),
+From the sources directory (i.e. the directory containing DOCKER.adoc),
 run 
 [source,shell script]
 docker build --tag ofbiz-docker .
 
-==== Run the OFBiz container
+=== Run the OFBiz container
 
 Run the following command:
 [source,shell script]
@@ -34,7 +92,7 @@ server.
 Once start up completes, you can access OFBIZ at
 https://localhost:8443/partymgr
 
-=== Other container building options
+== Other container building options
 
 The OFBiz `+Dockerfile+` defines a multi-stage build. The default
 container image produced by the build is named `+runtime+` and consists
@@ -61,7 +119,7 @@ To build a container image pre-loaded with demo data, run:
 [source,shell script]
 docker build --target demo --tag ofbiz-docker .
 
-=== Container runtime options
+== Container runtime options
 
 The container’s behaviour at runtime is controlled via environment
 variables, '`hook`' scripts and XML entity import files.
@@ -92,11 +150,12 @@ genuinely shared filesystem. With the `+s3+` provider nothing in
 `+/ofbiz/runtime+` needs sharing at all - which is the point of configuring it.
 ====
 
-==== Environment variables
+=== Environment variables
 
 Environment variables are used in `+docker-entrypoint.sh+` to control
 configuration options for the OFBiz container.
 
+.General container environment variables
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default value |Description
@@ -206,7 +265,7 @@ should set, and it is unset before the serving command is executed. So are
 `+OFBIZ_POSTGRES_HOST+` and `+OFBIZ_DISABLE_COMPONENTS+`, which are not secrets
 but are of no use to the JVM.
 
-===== Deployment profile and secrets
+==== Deployment profile and secrets
 
 Nothing sensitive is baked into the image. The admin shared secret and the two
 signing keys are blank in the source tree and are supplied at container start
@@ -219,6 +278,7 @@ profile a missing secret is tolerated, so an unconfigured container still
 boots. In the `+prod+` profile a missing secret is a fatal error: the
 container refuses to start and names every variable that was not supplied.
 
+.Deployment profile and secret environment variables
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default value |Description
@@ -261,8 +321,9 @@ image is never written to.
 come into it.* `+docker stop+` sends SIGTERM to PID 1. Which process that is
 depends on how far start-up got:
 
-* *Once the entry point has `+exec+`ed the serving command* - the normal case for
-a running container - *the JVM is PID 1* and receives SIGTERM itself. OFBiz
+* *Once the entry point has replaced itself with the serving command* - which it
+does with `+exec+`, and which is the normal case for a running container - *the
+JVM is PID 1* and receives SIGTERM itself. OFBiz
 handles it through its own JVM shutdown hook (`+ofbiz.enable.hook+` in
 `+start.properties+`, true by default). *No admin request and no admin key are
 involved*, so a container with no key still stops gracefully.
@@ -295,7 +356,19 @@ must not look like one that did, to an operator or to an orchestrator reading an
 exit status. The helper is POSIX shell, so `+sh /ofbiz/send_ofbiz_stop_signal.sh+`
 works as well as running it directly.
 
-WARNING: Two Gradle tasks write live signing keys into the *tracked* source file
+*The verdict is printed before the target can take the helper down with it.* Run
+through `+docker exec+`, the helper reads the server's answer as soon as it arrives
+and prints `+Response: OK+` (or `+IN-PROGRESS+`) and `+Done+` immediately, rather
+than waiting for the connection to close - which, when the shutdown it just
+requested ends PID 1, never happens before Docker kills the exec. Without that, an
+accepted shutdown returned exit `+137+` with no output at all and looked to a caller
+exactly like a failure. Measured: `+docker exec <container>
+/ofbiz/send_ofbiz_stop_signal.sh+` prints the response and exits `+0+`, and the
+container then exits `+0+` on its own.
+
+[WARNING]
+====
+Two Gradle tasks write live signing keys into the *tracked* source file
 `+framework/security/config/security.properties+`. `+gradlew generateSecretKeys+`
 does it by design, and `+gradlew loadAll+` *depends on that task*, so the
 documented development sequence `+./gradlew cleanAll loadAll testIntegration+`
@@ -308,13 +381,13 @@ is restored they can be committed, and a `+docker build+` from that working tree
 would copy them into the build context and seal them into an image layer that no
 run-time override can remove. After running either task check the file and
 restore it:
-+
+
 [source,bash]
 ----
 git diff --stat framework/security/config/security.properties   # expect no output
 git checkout -- framework/security/config/security.properties   # if it is dirty
 ----
-+
+
 The image build will not let a slip through: the builder stage refuses to package
 a non-blank anchor and fails with the command above in its message. To keep real
 keys for a local run without touching the tracked file, put them in an untracked
@@ -324,7 +397,7 @@ ahead of `+ofbiz.jar+` on the class path, which is the mechanism the container
 uses. A plain `+gradlew ofbiz+` run does *not* read that directory: its class path
 is assembled from the active components, so a root `+config+` directory is not on
 it.
-+
+
 The other side of a blank anchor is worth knowing before it is mistaken for a
 regression: on a *bare checkout* run with `+gradlew ofbiz+` and no keys supplied,
 `+security.token.key+` is blank, and `+JWTManager+` refuses a key shorter than 64
@@ -337,16 +410,21 @@ container never has this problem, because the entry point generates a key for th
 either export the two key variables and run the container, or run
 `+gradlew generateSecretKeys+` once and restore the tracked file with the command
 above before packaging or committing.
+====
 
 *Changing a secret or any other setting needs no manual step.* The
 configuration overrides - the secrets, the host and URL prefix, the AJP
 connector, the load-balancer settings and the content-store settings - are
-*rendered on every start*, unconditionally. Supplying a new value, or removing
+*rendered on every start* unless `+OFBIZ_SKIP_INIT+` is set, which is the one
+switch that suppresses them; see its row above. Supplying a new value, or removing
 one, therefore takes effect on the next start with nothing else to do. Nothing
 is skipped because a previous container had already done it: a recreated
 container arrives with a pristine component tree while its `+config+` volume
 persists, so anything remembered rather than redone would be a "production"
-instance booting without its load-balancer route or its injected secrets.
+instance booting without its load-balancer route or its injected secrets. That is
+also why `+OFBIZ_SKIP_INIT+` and a changed setting do not combine: with it set the
+new value is validated and then ignored, and the container serves with whatever
+its `+config+` volume already holds.
 
 Two markers remain, in `+/ofbiz/runtime/container_state+`, and both are about
 the DATABASE rather than the configuration:
@@ -434,7 +512,7 @@ directly; and if the volume is backed up, treat the backup as holding
 credentials.
 ====
 
-===== Object storage for content and uploads
+==== Object storage for content and uploads
 
 File-backed `+DataResource+` content - the `+LOCAL_FILE+`, `+OFBIZ_FILE+` and
 `+CONTEXT_FILE+` types and their `+_BIN+` variants - has always been read from
@@ -447,13 +525,19 @@ default: with `+OFBIZ_CONTENT_STORE_PROVIDER+` unset or set to `+database+`
 no provider is resolved, no object-store code runs, and behaviour is exactly
 what it was before.
 
+.Object-storage environment variables
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default value |Description
 |OFBIZ_CONTENT_STORE_PROVIDER |database |Where file-backed content is stored:
 `+database+` (unchanged behaviour), `+filesystem+` (OFBiz's own upload
 directory, `+/ofbiz/runtime/uploads+`, named by
-`+content.upload.path.prefix+`) or `+s3+`.
+`+content.upload.path.prefix+`) or `+s3+`. The value is trimmed and compared
+without regard to case, so `+S3+` and `+" s3 "+` select the same provider and
+mean exactly what `+s3+` means. Any other value is *refused at container start*
+- the container exits before the JVM is launched and names the variable - rather
+than being quietly treated as `+database+`, because a typo that fell back to the
+database would store new content somewhere the rest of the fleet does not look.
 
 |OFBIZ_S3_BUCKET |_empty_ |The bucket that holds the content. Required when
 the provider is `+s3+`. Not validated against Amazon's naming rules here - see
@@ -464,7 +548,12 @@ provider is `+s3+`.
 
 |OFBIZ_S3_ENDPOINT |_empty_ |An absolute `+http+` or `+https+` URI to address
 instead of the AWS endpoint. Leave empty for Amazon S3; set it for any other
-S3-compatible store.
+S3-compatible store. Validated at start up, not on first use: a value that is not
+an absolute `+http+`/`+https+` URI with a host, or that carries user information, a
+query or a fragment, is refused there. In the `+prod+` profile a plain `+http+`
+endpoint is *refused* as well, because the credential and the content would cross
+the network in clear; use `+https+`, or `+OFBIZ_PROFILE=dev+` for a store reached
+over a network you control end to end.
 
 |OFBIZ_S3_ACCESS_KEY_ID |_empty_ |Static access key id. Supply it together
 with the secret access key, or supply neither.
@@ -564,7 +653,7 @@ another. A larger file fails the transaction rather than being silently skipped.
 when content is published or read in one piece, which is after the request body
 has already been received and written. Bound the body where bodies are bounded -
 at the load balancer, at the connector, and with `+http.upload.max.size+` in
-`+framework/base/config/general.properties+`, which ships as `+-1+`, meaning no
+`+framework/common/config/general.properties+`, which ships as `+-1+`, meaning no
 limit (`+http.upload.max.sizethreshold+`, `+1024000+`, only decides when a part is
 spooled to disk rather than held in memory). A refusal by this bound reports the
 ceiling to the operator log with an opaque reference and tells the caller only
@@ -669,6 +758,21 @@ store adds none, so an object's lifecycle after its row is removed belongs to
 whatever manages the bucket. Deleting the object alone would also not be enough
 on its own if the row still existed - the local copy on the instance that wrote
 it would keep answering reads.
++
+The key to delete is derived from the row, deterministically, so an erasure request
+needs no guesswork. Take the `+object_info+` the `+data_resource+` row held, remove
+the `+/txn-<32 hex digits>/+` segment the upload wrote it under, and prefix
+`+ofbiz+`: `+/runtime/uploads/txn-cd82…b638/10001.txt+` is the object
+`+ofbiz/runtime/uploads/10001.txt+`. That segment is deliberately absent from the
+key - it is what makes an update REPLACE an object instead of accumulating one per
+edit - so every generation of one `+DataResource+` is that single object, and
+deleting it erases all of them:
++
+[source,shell script]
+----
+# object_info was /runtime/uploads/txn-<32 hex>/10001.txt
+aws s3 rm s3://<bucket>/ofbiz/runtime/uploads/10001.txt
+----
 * *Accumulation*, for content whose rows are gone already. Storage keys are OFBiz
 paths built from the `+dataResourceId+`, so a periodic job can list the bucket
 under `+ofbiz/runtime/uploads/+` and delete objects whose `+dataResourceId+` no
@@ -720,10 +824,27 @@ the same bound covers transferring an object as large as the 64 MiB the contract
 allows, and cutting it to a few seconds would refuse legitimate transfers. If a
 deployment would rather fail faster than transfer large objects, put a shorter
 timeout in front of the store at the network layer, and size the connector thread
-pool for the outage you are willing to absorb. Note that a store outage does *not*
-make an instance report itself not ready: readiness has one dimension, this
-instance's own datasource (see _Load balancing and health checks_), so a shared
-store that is down does not take the whole fleet out of rotation.
+pool for the outage you are willing to absorb.
+
+*The bound covers the whole transfer, not just the exchange that starts it.* The
+SDK's own call timeout ends when the response - and its still-unread body stream -
+is handed back, so a store that accepts a request and then trickles the body was
+not bounded by it at all; a shaped-bandwidth measurement held a request for over
+three minutes against a nominal 45-second bound. The stream a read hands to the
+caller therefore carries a deadline of its own: the total time spent reading one
+object's body is bounded at the same 45 seconds, and a body still arriving after
+that is abandoned - the request is aborted, the connection released, and the
+failure logged with the key and an opaque reference. Measured under a 400 kbit
+shaper, a read of a 64 MiB object now ends at 45.1 seconds instead of running on.
+
+*A store outage does take an instance out of rotation.* With a store configured,
+`+/webtools/health/ready+` reports on it: an instance that cannot reach the bucket
+answers `+503+` with `+"contentStore":"DOWN"+` within one two-second verdict
+window, and answers `+200+` again on the first probe after the store returns. The
+check is one bucket-level request, bounded at one second, so the probe stays cheap
+- see _Load balancing and health checks_. A shared store that is down therefore
+does take the fleet out of rotation, which is the intended behaviour: an instance
+that cannot serve or durably accept content should not be sent that request.
 
 Every store failure and refusal is reported by OFBiz's own `+ERROR+` line in
 `+/ofbiz/runtime/logs/ofbiz.log+`, naming the operation, the key, the bucket and
@@ -901,12 +1022,107 @@ the deployment tree. Move the file under `+/ofbiz+` and update the row - or
 convert it to `+OFBIZ_FILE+` - before switching the provider; until then that
 row's content stays on the one instance that holds it.
 
-===== Load balancing and health checks
+==== Serving content, memory, and temporary files
+
+*Content is served to browsers, so it is served defensively.* A read of a
+file-backed `+DataResource+` through `+/content/control/img+` carries
+`+X-Content-Type-Options: nosniff+`, a `+Content-Security-Policy+` of
+`+default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox+`,
+`+X-Frame-Options: SAMEORIGIN+`, `+Referrer-Policy: same-origin+`, and
+`+Strict-Transport-Security+` when `+requestHandler.strict-transport-security+` is
+on (the switch every other response uses). A resource that is not public also
+carries `+Cache-Control: private, no-store+`, so a shared cache cannot keep it;
+public content is left cacheable, as it was.
+
+The `+Content-Disposition+` is what stops stored content from becoming stored
+script: an *active* format - `+text/html+`, `+application/xhtml+xml+`,
+`+image/svg+xml+`, `+application/xml+`, `+text/xml+`, `+application/xslt+xml+` and
+the JavaScript media types - is sent `+attachment+`, so a browser downloads it
+instead of executing it in this deployment's origin; everything else stays
+`+inline+`, so screens embed images and text as before. Measured in Chrome: an HTML
+`+DataResource+` whose script sets `+document.title+` downloads and does *not*
+execute, while an image or a text resource still renders in place.
+
+*This is a defence, not an isolation boundary.* Anything a browser can be
+persuaded to execute in an origin can read that origin's cookies, so a deployment
+that lets untrusted parties upload content should serve content from a *separate
+origin* - a different host name, ideally a different registrable domain - and put
+the load balancer's content route there. Where that is not possible, the header set
+above is what a same-origin deployment gets.
+
+*Memory.* Neither a read nor a write of one object costs the object's size in heap:
+a read streams the store's body to the response through a fixed buffer, and a
+publication sends the file rather than a byte array. Measured on the shipped
+`+-Xmx1024M+`: eight concurrent reads of a 64 MiB object - 512 MiB if they were
+buffered - completed byte-exactly with no full collection and 161 MB of heap in use.
+The one place a whole object is still held is the bounded byte-array form of the
+storage contract, used when content is published or read in one piece, and
+`+ContentStore.MAX_OBJECT_BYTES+` (64 MiB) is what bounds it: size the heap for the
+number of *concurrent publications* a deployment expects, not for the number of
+concurrent reads.
+
+*Temporary files.* A multipart request is spooled to
+`+/ofbiz/runtime/tmp+` while it is parsed. That directory is created
+`+rwx------+`, its staging files are deleted when the request that created them
+finishes, and any left behind by a process that was killed mid-request are removed
+at the next start, which the log reports (`+Removed n abandoned multipart upload
+staging file(s)…+`). Sizing it is still worth doing, because the files exist for
+the duration of a request: allow for the largest upload multiplied by the number of
+concurrent uploads the deployment accepts, and bound the request body at the load
+balancer and with `+http.upload.max.size+` if that product is unacceptable. A
+`+runtime+` volume is not required for correctness - the sweep makes a fresh
+container self-cleaning - but it is where the files land when one is mounted.
+
+==== Production caveats worth reading once
+
+These are properties of the product rather than of anything the container renders,
+and each one has surprised an operator:
+
+* *An authenticated HTTP session belongs to one instance.* `+OFBIZ_JVM_ROUTE+` gives
+the load balancer *affinity*, not failover: when the instance holding a session goes
+away, the next request lands on a peer that has never seen it and the caller is sent
+to the login page. There is no session replication and no external session store, so
+plan for re-authentication on instance replacement, and prefer bearer-token REST
+traffic where a flow must survive it. The *first hop between webapps* is affected by
+the same locality: the `+externalLoginKey+` that carries an authenticated identity
+from one webapp to another is held in the issuing JVM's memory, so a link built on
+instance A and followed on instance B is not recognised and answers the login page.
+Sticky sessions hide it; a rolling replacement does not.
+* *With distributed cache clear on, the message bus is on the write path.* An entity
+write publishes an invalidation inside the caller's transaction, so while the broker
+is unreachable ordinary writes *roll back*. Readiness reports it - `+503+` with
+`+"messaging":"DOWN"+` - so a load balancer removes the instance, but a request
+already in flight ends in a rolled-back transaction whose error view is still
+rendered with `+200+`; check the log, not the status, when a write silently did not
+happen. Recovery needs no restart: the listener reconnects on its own within about
+ten seconds of the broker returning, readiness turns `+200+` again, and the write
+can simply be repeated. If a deployment would rather serve stale caches than fail
+writes, turn `+OFBIZ_DISTRIBUTED_CACHE_CLEAR+` off and accept per-instance caches.
+* *The cache-invalidation services are exported.* `+clearAllEntityCaches+` and the
+four `+clearCacheLine*+` services are declared `+export="true"+` with
+authentication as their only requirement, so *any* authenticated principal can
+invoke them over REST, and one call with `+distribute=true+` invalidates every
+instance in the fleet. This is long-standing OFBiz behaviour, not something the
+container changes. Keep the REST surface off untrusted networks, or place an
+authorization layer in front of it.
+* *The default theme fetches web fonts from the public internet* and sends the full
+document URL as its `+Referer+` when it does. In an air-gapped deployment those
+requests fail and slow first paint; in any deployment they disclose the URLs of
+administrative pages to a third party. Select a theme that carries its own fonts, or
+block outbound HTTP from the instances and accept the fallback font.
+* *The API documentation surface is served.* `+/docs/redoc.html+` and the OpenAPI
+document it renders are part of the REST component and are reachable on a serving
+instance. Neither is needed to serve traffic: block those paths at the load balancer
+for a production deployment, and treat the bundled viewer as an asset to keep
+current if you leave them reachable.
+
+==== Load balancing and health checks
 
 These variables cover what several instances of OFBiz behind one load balancer
 need: coherent entity caches, sticky sessions, and correct handling of requests
 that a proxy has already terminated TLS for.
 
+.Load-balancer and cache-coherence environment variables
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default value |Description
@@ -991,6 +1207,7 @@ descriptors for you - a live `+jms-service+` named `+serviceMessenger+` into
 `+/ofbiz/config/serviceengine.xml+` and the JNDI server it names into
 `+/ofbiz/config/jndiservers.xml+`, both readable by the `+ofbiz+` user alone.
 
+.JMS transport environment variables
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default value |Description
@@ -1006,9 +1223,9 @@ the provider URL is set.
 the topic connection factory.
 
 |OFBIZ_JMS_TOPIC |OFBTopic |The JNDI name of the topic invalidations are
-published to and subscribed from. Every instance of one deployment must use the
-same topic - and a *different* topic from any other deployment sharing the
-broker.
+published to and subscribed from - a *JNDI* name, which is not always the topic's
+own name; see below. Every instance of one deployment must use the same topic, and
+a *different* topic from any other deployment sharing the broker.
 
 |OFBIZ_JMS_USERNAME |_empty_ |Broker username. Supply it together with the
 password, or supply neither and let the broker accept an anonymous connection.
@@ -1018,12 +1235,72 @@ without the other is *refused* at start up rather than silently dropped, because
 the rendered descriptor carries both attributes or neither.
 |===
 
+*The topic name is a JNDI name, and every provider spells it its own way.* OFBiz
+reaches the topic by looking it up in the broker's JNDI context, so what
+`+OFBIZ_JMS_TOPIC+` has to hold is whatever *that provider's* context resolves -
+not the topic's plain name. The shipped default, `+OFBTopic+`, is a placeholder
+inherited from the commented example; it resolves on a broker whose JNDI context
+has an entry of that name, and on ActiveMQ, which has none by default, it does not.
+Consult the client library's own JNDI documentation for the convention, and *check
+the result* rather than trusting the value: an unresolvable name is not fatal, so
+the instance starts, becomes live, and simply carries no invalidations.
+
+With Apache ActiveMQ Classic, a topic that is not declared in `+jndi.properties+`
+is addressed through its dynamic-destination prefix, `+dynamicTopics/+`:
+
+[source,shell script]
+----
+docker run -d \
+  -e OFBIZ_DISTRIBUTED_CACHE_CLEAR=true \
+  -e OFBIZ_JMS_PROVIDER_URL=tcp://broker.internal:61616 \
+  -e OFBIZ_JMS_INITIAL_CONTEXT_FACTORY=org.apache.activemq.jndi.ActiveMQInitialContextFactory \
+  -e OFBIZ_JMS_TOPIC_CONNECTION_FACTORY=TopicConnectionFactory \
+  -e OFBIZ_JMS_TOPIC=dynamicTopics/OFBizEntityCacheClear \
+  -e OFBIZ_JMS_USERNAME=ofbiz -e OFBIZ_JMS_PASSWORD=... \
+  -v /srv/ofbiz/lib-extra:/ofbiz/lib-extra:ro \
+  -e OFBIZ_POSTGRES_HOST=db.example.com ofbiz-docker
+----
+
+*Then verify the listener actually bound*, in the two places that say so:
+
+* The instance logs `+Listening to topic [<name>] on [ofbizjms]…+` once the
+subscription is live. A name the JNDI context cannot resolve logs
+`+JNDI lookup problems; listener not running. (<name>)+` instead, which is the
+symptom of a wrong spelling.
+* The broker shows one consumer *per instance* on that topic. On ActiveMQ:
+`+curl -u <user>:<password> -H 'Origin: http://localhost'
+"http://<broker>:8161/api/jolokia/read/org.apache.activemq:type=Broker,brokerName=localhost,destinationType=Topic,destinationName=<topic>/ConsumerCount"+`.
+Two instances must show two - no more, no fewer. Its `+EnqueueCount+` and
+`+DequeueCount+` on the same MBean are the other useful pair: one publication is
+delivered once to each instance, so dequeues advance by the number of instances
+for every enqueue.
+
+Readiness reports this too. With the cache-clear flag on, an instance whose
+listener is not connected answers `+/webtools/health/ready+` with `+503+` and
+`+"messaging":"DOWN"+`, so a load balancer takes it out of rotation rather than
+sending it writes that will roll back.
+
 *You still have to supply the broker's client library* in the `+/ofbiz/lib-extra+`
 volume - none is bundled, because which one is right depends on the broker. The
 entry point checks that the volume is not empty and refuses to start when it is,
-naming what is missing. The rendered service subscribes as well as publishes
-(`+listen="true"+`), which is what makes an instance act on the invalidations the
-others send; without it a fleet would send invalidations and ignore them.
+naming what is missing.
+
+[IMPORTANT]
+====
+Supply a library that brings its *own* JMS API, or add that API alongside it. The
+image carries the JMS *1.1* specification jar only
+(`+geronimo-jms_1.1_spec+`), and a modern client compiled against JMS 2.0 fails
+to load against it: an ActiveMQ 5.18 `+activemq-client+` jar on its own raises
+`+NoClassDefFoundError: javax/jms/JMSContext+` the first time an invalidation is
+published, and - because the invalidation is dispatched inside the caller's
+transaction - *the entity write that triggered it rolls back*. For ActiveMQ
+Classic use the distribution's `+activemq-all-<version>.jar+`, which bundles the
+API, rather than `+activemq-client-<version>.jar+`.
+====
+
+The rendered service subscribes as well as publishes (`+listen="true"+`), which is
+what makes an instance act on the invalidations the others send; without it a fleet
+would send invalidations and ignore them.
 
 *The second way is to mount your own descriptors*, for a broker whose
 configuration needs more than the above:
@@ -1046,9 +1323,36 @@ without OFBiz being able to verify that it was. *That port must be reachable
 only through the TLS-terminating proxy* - restrict it in the network layer - or
 a client that reaches it directly is treated as if it had used TLS.
 
+[WARNING]
+====
+*The accelerator port does not change the scheme OFBiz puts into absolute URLs.*
+It marks the request secure, which is what OFBiz's own secure-cookie and
+secure-redirect decisions read, but the servlet container still reports the
+scheme of the connector that accepted the request. Any response that embeds an
+absolute URL derived from the request therefore advertises `+http+` behind an
+`+https+` proxy - the REST root document's links and the `+servers+` entry of the
+OpenAPI description are the two an integrator notices, because a client that
+follows them leaves TLS. This is a known limitation of this release; three ways
+to avoid it, in order of preference:
+
+. *Terminate TLS on OFBiz's own https connector* (`+8443+`) instead of using the
+accelerator port. The scheme is then genuinely `+https+` and every URL OFBiz
+builds is correct. This is what the two-instance example earlier in this section
+does.
+. *Have the proxy rewrite those URLs* in the responses it passes through, if it
+must terminate TLS and speak plain HTTP to the instances.
+. *Configure clients with the proxy's own base URL* and treat the URLs in the
+REST root and OpenAPI documents as paths only.
+
+Do not try to fix this by putting the proxy's scheme in
+`+OFBIZ_CONTENT_URL_PREFIX+`: that prefix is used for content URLs, not for the
+REST or OpenAPI documents.
+====
+
 *Health checks.* Two unauthenticated endpoints are served by the webtools
 webapp:
 
+.Health-check endpoints and what each answers
 [width="100%",cols="34%,66%",options="header",]
 |===
 |Endpoint |Behaviour
@@ -1056,47 +1360,72 @@ webapp:
 `+{"status":"UP"}+` whenever the JVM can serve a request at all. Use it for a
 container or task health check, so a hung instance is restarted.
 
-|`+/webtools/health/ready+` |Readiness. Answers `+200+` with
-`+{"status":"UP","database":"UP"}+` when this instance's datasource answers and
-its schema is initialised, and `+503+` with
-`+{"status":"DOWN","database":"DOWN"}+` when it does not. Use it for the load
-balancer's target-group check, so an instance that cannot reach its database is
-taken out of rotation instead of answering errors.
+|`+/webtools/health/ready+` |Readiness. Answers `+200+` when this instance can
+serve a request and `+503+` when it cannot. Use it for the load balancer's
+target-group check, so an instance that cannot reach something it needs is taken
+out of rotation instead of answering errors. The body names each dependency it
+asked about - see below.
 |===
 
-Readiness has exactly one dimension: this instance's own datasource. It is the
-same check the `+ping+` service performs - a count of the rows in the
-`+sequence_value_item+` table, which the `+SequenceValueItem+` entity maps to -
-and a count of zero is reported as not ready. Nothing else is measured: cache
-coherence, object-store reachability and the health of other instances are not
-part of the verdict. The delegator is resolved from the servlet context on every
-request, and a verdict is reused for at most two seconds (see _What a probe
-costs_ below), so a probe always reports what the instance can do now.
+*Readiness reports on the database always, and on each dependency this deployment
+is CONFIGURED with.* The body carries one key per dependency asked, so its shape
+tells you what was measured:
 
-A database holds no such row until an id has been allocated from the sequencer, so a
-schema that has just been created reports *not ready* - exactly as `+ping+` reports
-it - until the first sequenced id is allocated. *A data load is not enough*, and this
-is worth knowing before it is mistaken for a broken instance: seed and demo data
-carry their own explicit ids, so a freshly initialised database with the whole seed
-tier loaded and its admin user created still holds *zero* `+sequence_value_item+`
-rows, and every readiness probe answers `+503+`. The first *ordinary* request the
-instance serves allocates one - it takes a `+Visit+` and a `+Visitor+` id - and
-readiness turns `+200+` within the two-second verdict cache.
+.Readiness body by configured dependency
+[width="100%",cols="40%,60%",options="header",]
+|===
+|Deployment |Readiness body when everything answers
+|Content in the database, no message bus - the zero-configuration local run and
+any deployment that has not enabled the two |`+{"status":"UP","database":"UP"}+`
 
-A probe does not do it, by design: probes are answered ahead of the filter chain
-precisely so that they create no session and no visit. So against a brand-new
-database the very first instance has to be reached once by ordinary traffic before a
-target group will ever mark it healthy. Do that once, directly or with the target
-temporarily forced in:
+|`+OFBIZ_CONTENT_STORE_PROVIDER+` set to `+s3+` or `+filesystem+`
+|`+{"status":"UP","database":"UP","contentStore":"UP"}+`
 
-[source,bash]
-----
-curl -sk -o /dev/null https://<instance>:8443/webtools/control/main
-curl -sk https://<instance>:8443/webtools/health/ready   # now {"status":"UP","database":"UP"}
-----
+|`+OFBIZ_DISTRIBUTED_CACHE_CLEAR=true+` with a message bus declared
+|`+{"status":"UP","database":"UP","messaging":"UP"}+`
 
-Every later instance is unaffected, because from then on the row is in the shared
-database.
+|Both |`+{"status":"UP","database":"UP","contentStore":"UP","messaging":"UP"}+`
+|===
+
+A dependency that is not configured is not a dependency: it adds no key and casts
+no vote, which is why a database-only deployment answers exactly the two-key body
+it always has. Any key reading `+DOWN+` makes `+status+` `+DOWN+` and the response
+`+503+`, and the body says which one - for example
+`+{"status":"DOWN","database":"UP","contentStore":"DOWN","messaging":"UP"}+`.
+
+*The reason is in the log, never in the body.* This endpoint is unauthenticated -
+a target group presents no credential - and a reason names buckets, endpoints,
+mount points and broker addresses, so the body carries a verdict alone. The reason
+is logged at most once a minute per dependency, prefixed
+`+Readiness probe reports …+`; `+grep+` for it when a target reports unhealthy.
+
+What each dimension asks:
+
+* *`+database+`* - the query the `+ping+` service uses, a count over the
+`+SequenceValueItem+` entity. What is asserted is that the query *runs*: that
+exercises the connection pool, the driver, the datasource credentials and the
+schema, and on a database whose schema has not been created it fails, because the
+entity's own table is absent. A schema that exists but has sequenced nothing yet -
+a freshly initialised database carrying only seed data, whose rows all have
+explicit ids - is *ready*, and the empty sequencer is noted in the log. Requiring a
+row on top of a successful query is what a load balancer cannot survive: nothing
+writes to that entity until a request causes an id to be allocated, so the target
+group would wait for a row while the row waited for traffic the target group was
+not sending.
+* *`+contentStore+`* - one bucket-level request for an object store
+(`+HeadBucket+`: it reaches the endpoint, presents the credential and names the
+exact bucket, and transfers nothing), or, for `+filesystem+`, that the storage root
+or the nearest existing directory above it is a writable directory. It needs no
+object to exist, so an instance that has stored nothing is still ready.
+* *`+messaging+`* - that every JMS listener the service engine declares is
+connected. Asked only while `+OFBIZ_DISTRIBUTED_CACHE_CLEAR+` is `+true+`, because
+that is the configuration under which an entity write publishes an invalidation and
+a broker that has gone makes the write roll back. With the flag off a broker is
+nobody's dependency and nothing is reported.
+
+The delegator is resolved from the servlet context on every request, and each
+verdict is reused for at most two seconds (see _What a probe costs_ below), so a
+probe always reports what the instance can do now.
 
 Both endpoints accept `+GET+` and `+HEAD+`, and answer *`+405 Method Not
 Allowed+` with `+Allow: GET, HEAD+`* for every other method - `+POST+`,
@@ -1115,6 +1444,7 @@ the routing it has always had, which for a browser-shaped path means a redirect 
 the webapp's login flow - a `+302+`, which a target group configured to accept
 `+2xx+` or to follow redirects can mistake for health:
 
+.How every other spelling under /health is answered
 [width="100%",cols="45%,55%",options="header",]
 |===
 |Request |Answer
@@ -1146,8 +1476,9 @@ misconfigured probe fails visibly instead of reporting health nothing establishe
 webapp-scoped; there is no root-level endpoint.
 |===
 
-Assert on the status *and* the JSON body, never on "not `+5xx+`": every row above
-that is not a probe answers with a status a naive check can accept.
+Assert on the status *and* the JSON body, never on the mere absence of a `+5xx+`
+status: every row above that is not a probe answers with a status a naive check
+can accept.
 
 *Set the target group's timeout above the instance's own deadline.* A readiness
 probe gives up after two seconds and answers `+503+`; a probe timeout at or below
@@ -1178,12 +1509,24 @@ certificate identity is not what a self-probe tests. Give `+start_period+` room 
 a cold start - OFBiz needs well over a minute before it serves - and start a
 one-shot init or data-load container with `+--no-healthcheck+`.
 
-A readiness verdict is *reused for up to two seconds*, per delegator, so a
-target group probing every instance every few seconds does not put one database
-round trip on the database per probe. The deadline on the query is two seconds as
-well: a database that has stopped answering makes the probe report *not ready*
-rather than hang, because a hung probe is indistinguishable from a lost one and
-would leave a broken instance in service.
+A readiness verdict is *reused for up to two seconds*, per delegator and per
+dependency, so a target group probing every instance every few seconds does not put
+one round trip per probe on the database or on the store. Each question also carries
+a deadline - two seconds for the database, one second for each configured dependency
+- because a dependency that has stopped answering must make the probe report *not
+ready* rather than hang: a hung probe is indistinguishable from a lost one and would
+leave a broken instance in service. No client bounds a probe usefully by itself; the
+datasource's socket timeout is 60 seconds and the object store's call timeout 45.
+
+Those deadlines are what a target group's own timeout has to accommodate. With
+everything configured and everything down at once, a probe answers in a little over
+two seconds - measured 2.14 s on the first probe of an outage and 1.3 ms on the
+cached ones - so three seconds is enough and five is comfortable. At most one
+question of each kind is ever outstanding: a dependency check that passes its
+deadline is left running rather than abandoned and re-asked, so an outage cannot
+accumulate probe work or a thread per probe interval. Measured while healthy: 200
+sequential probes averaged 6.8 ms each and a 40-way concurrent burst answered in
+20 ms.
 
 *A probe does not create an HTTP session.* The health servlet is registered as a
 servlet *and* as a filter on those two exact paths, declared ahead of the other
@@ -1236,7 +1579,7 @@ instance that is replaced or restarted loses its sessions and the users holding
 them sign in again. What the changes here make replaceable is *durable* state -
 the database and the content store - not sessions.
 
-==== Hooks
+=== Hooks
 
 At various steps of initialisation, the `+docker-entrypoint.sh+` script
 will check for '`hook`' scripts in various directories.
@@ -1255,6 +1598,7 @@ Only script files with filename extension `+.sh+` will be processed. If
 the file is executable, it will be executed, otherwise it will be
 sourced.
 
+.Container initialisation hook directories
 [width="100%",cols="50%,50%",options="header",]
 |===
 |Directory |Step
@@ -1273,21 +1617,29 @@ data files.
 data loading is executed.
 |===
 
-==== Data files
+=== Data files
 
 During the data loading step - but after either seed or demo data has
 been loaded - directory `+/docker-entrypoint-hooks/additional-data.d+`
 will be checked to see if any files are present.
 
 If files are present then the load-data functionality in OFBiz will be
-executed, specifying the `+/docker-entrypoint-additional-data.d+`
+executed, specifying that same `+/docker-entrypoint-hooks/additional-data.d+`
 directory as a data source. Any `+.xml+` files in this directory will be
 treated as a data source and will be imported by the entity engine.
+
+Mount the directory at exactly that path. A directory mounted anywhere
+else is neither read nor reported: the container starts, becomes healthy
+and serves without the records, because nothing in the start sequence
+knows a data source was intended. After the first start, confirm the data
+arrived rather than assuming it did - query one row you know the files
+create, for example through
+`+/webtools/control/entitymaint+`.
 
 This functionality can be used to pre-load OFBiz with user-specific
 data, such as a chart of accounts.
 
-==== Database
+=== Database
 
 By default the OFBiz container will use an internal H2 database,
 storing database related files in the /ofbiz/runtime volume.
@@ -1295,23 +1647,26 @@ storing database related files in the /ofbiz/runtime volume.
 Use of an external database can be configured through environment
 variables.
 
-===== H2
+==== H2
 
 To use the embedded H2 database, ensure all database related
 environment variables are unset.
 
-===== PostgreSQL
+==== PostgreSQL
 
 To use a Postgres database set the `+OFBIZ_POSTGRES_HOST+` environment
 variable.
 
+.PostgreSQL connection and pool environment variables
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default |Description
 |OFBIZ_POSTGRES_HOST |_unset_ |Hostname of the PostgreSQL database
 server.
 
-|OFBIZ_POSTGRES_PORT |5432 |Port the PostgreSQL server listens on.
+|OFBIZ_POSTGRES_PORT |5432 |Port the PostgreSQL server listens on. A whole number
+between 1 and 65535; anything else - including a number above the TCP range - is
+refused at start up rather than rendered into the JDBC URI.
 
 |OFBIZ_POSTGRES_OFBIZ_DB |ofbiz |Name of the _ofbiz_ database.
 
@@ -1375,6 +1730,7 @@ SELECT pid, state, backend_xmin IS NOT NULL AS holds_xmin, xact_start
 No pooled connection should ever be reported `+idle in transaction+`, and none
 should hold `+backend_xmin+`.
 
+.PostgreSQL transport-security environment variables
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default value |Description
@@ -1482,12 +1838,21 @@ asked for them, together describing the deployment's schema and naming the engin
 to aim at. It matters more with a managed RDBMS than it did with the embedded
 database, because that database is reachable independently of the instance.
 Quote the reference when reporting a problem and `+grep+` it in
-`+runtime/logs/ofbiz.log+` to find the one entry holding the detail. The
-schema-check and DDL messages produced by `+DatabaseUtil+` are deliberately
-unchanged: they are produced by schema initialisation and by the authenticated
-administrative check in webtools, never by serving a visitor's request.
+`+runtime/logs/ofbiz.log+` to find the one entry holding the detail. The log entry
+names the entity and its *primary key* and the statement - which row and which
+statement - and deliberately not the field values the operation was writing, so the
+log does not become a copy of the data it was protecting.
 
-===== Schema initialisation
+Two exceptions are worth knowing before a scan reports them as leaks. The
+`+ENTITY_MAINT+`-gated *Entity Data Maintenance* screen in webtools reports a failed
+create, update or delete by naming the row's fields, which is the same information
+that screen already renders as a form and is its purpose; it is reachable only by a
+principal holding that permission. And a business service that wraps an entity
+failure in its own message - "Data source error occurred while adding party group",
+say - renders the exception's *class name* along with the safe message. Neither
+carries a statement, a schema or a value from another row.
+
+==== Schema initialisation
 
 The schema is created from the entity model by the Entity Engine itself. No
 migration framework and no hand-written DDL is involved.
@@ -1528,6 +1893,7 @@ nothing to clean up by hand, and a half-finished initialisation cannot leave a
 serving instance issuing DDL. Because the DDL is additive, re-running the
 initialisation after a failure is safe.
 
+.Schema-initialisation environment variable
 [width="100%",cols="34%,33%,33%",options="header",]
 |===
 |Environment variable |Default value |Description
@@ -1536,13 +1902,124 @@ entity model and exit without serving traffic. Requires
 `+OFBIZ_POSTGRES_HOST+`.
 |===
 
+==== Two database roles: one that may create the schema, one that serves
+
+Because a serving instance issues no DDL, it does not need a role that may. Give
+the schema an *owner* that runs the initialisation and a *serving role* with data
+privileges only, so that a compromised instance cannot alter or drop the schema
+it reads. PostgreSQL does not grant the serving role anything automatically -
+privileges follow the objects the owner creates - so the transition has to be
+made explicitly, and it is easiest to make *before* the schema exists.
+
+Do this once per database, for *all three* entity groups: the `+ofbiz+` database
+and, unless they are pointed at the same one, `+ofbizolap+` and `+ofbiztenant+`.
+Each has its own user and password variable
+(`+OFBIZ_POSTGRES_OFBIZ_USER+`/`+_PASSWORD+`, `+OFBIZ_POSTGRES_OLAP_*+`,
+`+OFBIZ_POSTGRES_TENANT_*+`), so the three may share one serving role or use
+three - the grants are per database either way.
+
+As a superuser, create the roles and the databases:
+
+[source,sql]
+----
+CREATE ROLE ofbizowner LOGIN PASSWORD '<owner password>';
+CREATE ROLE ofbizapp   LOGIN PASSWORD '<serving password>';
+
+CREATE DATABASE ofbiz       OWNER ofbizowner;
+CREATE DATABASE ofbizolap   OWNER ofbizowner;
+CREATE DATABASE ofbiztenant OWNER ofbizowner;
+
+REVOKE ALL     ON DATABASE ofbiz, ofbizolap, ofbiztenant FROM PUBLIC;
+GRANT  CONNECT ON DATABASE ofbiz, ofbizolap, ofbiztenant TO   ofbizapp;
+----
+
+Then, *in each of the three databases* and *as its owner*, close the public
+schema and declare what the owner's future objects grant. `+psql+` connects to
+one database at a time, so run this three times, once per `+--dbname+`:
+
+[source,sql]
+----
+REVOKE ALL   ON SCHEMA public FROM PUBLIC;
+GRANT  USAGE ON SCHEMA public TO   ofbizapp;
+
+ALTER DEFAULT PRIVILEGES FOR ROLE ofbizowner IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ofbizapp;
+ALTER DEFAULT PRIVILEGES FOR ROLE ofbizowner IN SCHEMA public
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ofbizapp;
+----
+
+`+ALTER DEFAULT PRIVILEGES+` is the part that is easy to miss and the part that
+matters: it applies to objects created *afterwards*, which is why it is run
+before the initialisation and why it needs no repeating when a later upgrade adds
+entities. It is scoped `+FOR ROLE ofbizowner+` because default privileges belong
+to the creating role, not to the database. The sequence grant includes
+`+UPDATE+`, without which the Entity Engine's own identifier sequencer cannot
+allocate.
+
+Now run the schema initialisation *as the owner*, then serve as the serving role:
+
+[source,shell script]
+----
+# once, as the owner
+docker run --rm -e OFBIZ_SCHEMA_INIT=true -e OFBIZ_POSTGRES_HOST=db.example.com \
+  -e OFBIZ_POSTGRES_OFBIZ_USER=ofbizowner  -e OFBIZ_POSTGRES_OFBIZ_PASSWORD=...  \
+  -e OFBIZ_POSTGRES_OLAP_USER=ofbizowner   -e OFBIZ_POSTGRES_OLAP_PASSWORD=...   \
+  -e OFBIZ_POSTGRES_TENANT_USER=ofbizowner -e OFBIZ_POSTGRES_TENANT_PASSWORD=... \
+  ofbiz-docker
+
+# every serving instance, with the serving role only
+docker run -d -e OFBIZ_POSTGRES_HOST=db.example.com \
+  -e OFBIZ_POSTGRES_OFBIZ_USER=ofbizapp  -e OFBIZ_POSTGRES_OFBIZ_PASSWORD=...  \
+  -e OFBIZ_POSTGRES_OLAP_USER=ofbizapp   -e OFBIZ_POSTGRES_OLAP_PASSWORD=...   \
+  -e OFBIZ_POSTGRES_TENANT_USER=ofbizapp -e OFBIZ_POSTGRES_TENANT_PASSWORD=... \
+  -e OFBIZ_DATA_LOAD=none ofbiz-docker
+----
+
+*If the schema already exists* - an upgrade, or an initialisation run before the
+default privileges were set - the future-object grants above reach nothing that is
+already there. Add the current objects once, in each database, as the owner:
+
+[source,sql]
+----
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO ofbizapp;
+GRANT USAGE, SELECT, UPDATE          ON ALL SEQUENCES IN SCHEMA public TO ofbizapp;
+----
+
+*Verify it, rather than assuming it.* In each database, the serving role should
+hold data privileges on every table and hold no right to create one:
+
+[source,sql]
+----
+-- One row per table, ~865 of them once the schema is initialised.
+SELECT count(*) FROM information_schema.table_privileges
+ WHERE grantee = 'ofbizapp' AND privilege_type = 'SELECT';
+
+-- Must be false. The serving role may read and write rows, and nothing else.
+SELECT has_schema_privilege('ofbizapp', 'public', 'CREATE') AS may_create_objects;
+----
+
+Then confirm it from the outside: `+CREATE TABLE+` as the serving role must be
+refused with `+permission denied for schema public+`, while
+`+GET /webtools/health/ready+` on a serving instance answers `+200+`.
+
+*Rotating a serving password* touches the database and the instances only, never
+the schema: `+ALTER ROLE ofbizapp PASSWORD '<new>'+`, then restart the instances
+with the new value. The rendered configuration is written on every start, so
+there is nothing to clean up between the two. Privileges survive a password
+change, because they belong to the role. *Withdrawing* a role is the reverse of
+the grants - `+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ofbizapp+`, the same
+for sequences, `+ALTER DEFAULT PRIVILEGES … REVOKE ALL … FROM ofbizapp+`, then
+`+REVOKE CONNECT ON DATABASE … FROM ofbizapp+` and `+DROP ROLE ofbizapp+` - and
+`+DROP ROLE+` is refused while any privilege or owned object still references it,
+which is the check that the withdrawal was complete.
+
 The initialisation run loads no data - it exits before the data-loading step,
 so `+OFBIZ_DATA_LOAD+` is not consulted. Load data once, from a single
 container with `+OFBIZ_DATA_LOAD=seed+` (or `+demo+`), and give every serving
 instance `+OFBIZ_DATA_LOAD=none+`, so that instances sharing one database do
 not each repeat the load.
 
-=== Examples of running the OFBiz container
+== Examples of running the OFBiz container
 
 [source,shell script]
 docker run -it -p 8443:8443 ofbiz-docker
@@ -1577,7 +2054,7 @@ user with name `+localadmin+` and password `+TTTTT+`, listen on port
 8443 for connections to `+localhost+`.
 
 [source,shell script]
-docker run -it -v 'C:\ofbiz-framework\add-data':/docker-entrypoint-additional-data.d -p 8443:8443 ofbiz-docker
+docker run -it -v 'C:\ofbiz-framework\add-data':/docker-entrypoint-hooks/additional-data.d -p 8443:8443 ofbiz-docker
 
 
 Example of running on Windows.

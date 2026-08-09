@@ -30,6 +30,8 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -44,6 +46,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 import javax.transaction.Status;
 import javax.transaction.Synchronization;
@@ -150,6 +153,16 @@ public final class ContentStorePublisher {
     private static final int DIGEST_BUFFER = 8192;
 
     /**
+     * A transaction-owned upload directory's name, exactly as {@code uploadDirectoryName} composes it.
+     *
+     * <p>Matched strictly rather than by prefix, because matching decides what a storage key does NOT
+     * contain: a directory a deployment happens to have named {@code txn-something} keeps its place in
+     * the key, and only the directories this class creates are left out of one.
+     */
+    private static final Pattern TRANSACTION_DIRECTORY =
+            Pattern.compile(TRANSACTION_DIRECTORY_PREFIX + "[0-9a-f]{32}");
+
+    /**
      * The transaction scope of the calling thread: the private upload directory the transaction was
      * given, and the publications already bound to it.
      */
@@ -157,6 +170,23 @@ public final class ContentStorePublisher {
 
     /** Keys whose local retention has already been reported, so the warning is one per key per JVM. */
     private static final Set<String> RETENTION_REPORTED =
+            Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    /**
+     * The local files this JVM wrote as a CACHE of a store object, by absolute path.
+     *
+     * <p>What it is for: telling a cached copy apart from a local WRITE. When the store reports that it
+     * holds no object for a key, a local file at that location is one of two very different things - a
+     * write this seam has not published yet, which must be served, or the leftovers of an earlier read of
+     * an object that has since been removed, which must NOT be, because every other instance answers that
+     * the content is gone. Only this class can tell them apart, and only for copies it made itself, so it
+     * records them.
+     *
+     * <p>Per JVM and in memory, deliberately: it is a cache index, it is only ever consulted for a file
+     * that still exists, and being empty after a restart is safe - a restarted instance simply materialises
+     * again, exactly as a fresh instance does. Entries are removed when the file they name is discarded.
+     */
+    private static final Set<String> MATERIALISED =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     private ContentStorePublisher() { }
@@ -186,6 +216,29 @@ public final class ContentStorePublisher {
     /**
      * Returns the storage key naming the given content, or null when it cannot have one.
      *
+     * <p>The key is the content's location relative to {@code ofbiz.home}, under {@link #KEY_NAMESPACE},
+     * with one deliberate omission: the transaction-owned upload directory
+     * ({@value #TRANSACTION_DIRECTORY_PREFIX}<em>uuid</em>) named by
+     * {@link #publishedUploadPath} is NOT part of the key.
+     *
+     * <p><strong>Why that directory is left out of the key.</strong> That directory exists to tell one
+     * transaction's writes apart from another's while the transaction runs - see
+     * {@link #publishedUploadPath} - and for nothing else. If it were part of the key, every update of a
+     * file-backed {@code DataResource} would name a NEW object: the upload service composes the same file
+     * name each time ({@code <dataResourceId>.<extension>}), so the only part of the location that
+     * changes between one update and the next is the transaction directory. The row would move to the new
+     * object and the previous object would stay in the bucket, named by nothing - a durable generation
+     * per update, growing without bound, and, because it is content, one that an erasure request would
+     * have to find. Omitting the directory makes the key what the CONTENT is rather than which
+     * transaction happened to write it, so an update REPLACES the object it supersedes and the store
+     * holds exactly the current one. Reads are unaffected: this method is the only thing that maps a
+     * location to a key, so a read of a location that carries a transaction directory - which every
+     * {@code objectInfo} recorded by an upload does - computes the same key the write used.
+     *
+     * <p>Two uploads for one {@code DataResource} in flight at once therefore write one key, last writer
+     * wins - exactly what two such uploads do to the local file when no store is configured, so the
+     * behaviour is the one OFBiz has always had rather than a new one.
+     *
      * @param file the content's location on this instance
      * @return the storage key, or null when the location is not inside {@code ofbiz.home}
      */
@@ -199,7 +252,16 @@ public final class ContentStorePublisher {
         if (!target.startsWith(root) || target.equals(root)) {
             return null;
         }
-        return KEY_NAMESPACE + "/" + root.relativize(target).toString().replace(File.separatorChar, '/');
+        StringBuilder key = new StringBuilder(KEY_NAMESPACE);
+        for (Path segment : root.relativize(target)) {
+            String name = segment.toString();
+            if (TRANSACTION_DIRECTORY.matcher(name).matches()) {
+                continue;
+            }
+            key.append('/').append(name);
+        }
+        // A location that is nothing BUT a transaction directory names no content, so it has no key.
+        return key.length() == KEY_NAMESPACE.length() ? null : key.toString();
     }
 
     /**
@@ -246,6 +308,7 @@ public final class ContentStorePublisher {
         }
         Description held = describe(store, key);
         if (held == null) {
+            discardStaleCache(key, file.toPath().toAbsolutePath());
             return false;
         }
         Path target = file.toPath().toAbsolutePath();
@@ -303,6 +366,7 @@ public final class ContentStorePublisher {
         }
         Description held = describe(store, key);
         if (held == null) {
+            discardStaleCache(key, file.toPath().toAbsolutePath());
             return Optional.empty();
         }
         FileFacts local = facts(file.toPath().toAbsolutePath());
@@ -583,6 +647,13 @@ public final class ContentStorePublisher {
             try (InputStream content = store.openStream(key)) {
                 Files.copy(content, staged, StandardCopyOption.REPLACE_EXISTING);
             }
+            // OWNER-ONLY, RE-APPLIED AFTER THE COPY. createTempFile above makes the staging file 0600, but
+            // Files.copy(InputStream, Path, REPLACE_EXISTING) DELETES it and creates it again through
+            // newOutputStream, which uses the process umask - 0644 in this image - and the atomic move then
+            // carries that mode onto the target. The result was user-uploaded content, materialised from the
+            // object store, readable by every account on the instance, while the files the upload path wrote
+            // in the same directory were 0600.
+            restrictToOwner(staged);
             if (sameContent(staged, target)) {
                 // The store holds exactly what is already here; only the recorded time differed. The local
                 // file is left in place - keeping its inode, its permissions and any hard link to it - and
@@ -591,6 +662,10 @@ public final class ContentStorePublisher {
                 return true;
             }
             Files.move(staged, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            restrictToOwner(target);
+            // Recorded as a CACHE of the object, which is what lets a later read tell it apart from a local
+            // write when the store no longer holds the object. See discardStaleCache.
+            MATERIALISED.add(target.toString());
             stamp(target, held.modifiedAt());
             if (Debug.verboseOn()) {
                 Debug.logVerbose("Content [" + key + "] was read from the content store onto this instance",
@@ -604,6 +679,30 @@ public final class ContentStorePublisher {
                     "The content store could not be read for [" + key + "]", failure);
         } finally {
             removeQuietly(staged);
+        }
+    }
+
+    /**
+     * Restricts a file to its owner, where the platform has POSIX permissions.
+     *
+     * <p>Applied to user content this instance writes for itself, so a materialised object is no more
+     * readable than the upload that produced it. A platform without POSIX permissions, and a filesystem
+     * that refuses the change, are logged at verbose and otherwise tolerated: the alternative would be to
+     * fail a read over a permission bit, and the read itself is what the caller asked for.
+     *
+     * @param file the file to restrict
+     */
+    private static void restrictToOwner(Path file) {
+        try {
+            if (Files.getFileAttributeView(file, PosixFileAttributeView.class) == null) {
+                return;
+            }
+            Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"));
+        } catch (IOException | UnsupportedOperationException refused) {
+            if (Debug.verboseOn()) {
+                Debug.logVerbose("The permissions of [" + file + "] could not be restricted to its owner: "
+                        + refused.getMessage(), MODULE);
+            }
         }
     }
 
@@ -632,6 +731,76 @@ public final class ContentStorePublisher {
                         + refused.getMessage(), MODULE);
             }
         }
+    }
+
+    /**
+     * Discards a cached copy of an object the store no longer holds, so that every instance answers the
+     * same way.
+     *
+     * <p><strong>The defect this closes.</strong> A read that finds no object falls back to the local file,
+     * which is right for content that was never published - a deployment migrating into the store, or a
+     * write this seam has not seen - and wrong for a copy this class MADE from an object that has since
+     * been removed. In the second case the instance that happens to hold the cache serves HTTP 200 while
+     * every other instance answers that the content is gone: one database row with two different answers,
+     * and the missing object hidden from exactly the instance an operator is most likely to test.
+     *
+     * <p><strong>What counts as a cache, and why nothing else does.</strong> Two things mark a local file
+     * as this class's own copy of an object rather than content in its own right:
+     * <ul>
+     *   <li>This JVM materialised it - see {@link #MATERIALISED}.</li>
+     *   <li>It sits inside a TRANSACTION-OWNED upload directory. Only {@link #publishedUploadPath} creates
+     *       those, only with a store configured, and everything written into one is published and then
+     *       discarded locally, so a file found in one afterwards can only be a copy read back from the
+     *       store. This second test is what makes the behaviour survive a RESTART: the in-memory index does
+     *       not, and an instance that restarted holding a materialised copy would otherwise go back to
+     *       serving it as though it were a local write.</li>
+     * </ul>
+     *
+     * <p>Anything else is left exactly where it is: content written by a path this seam never saw - a
+     * deployment migrating into the store, or a create-file call that composed its own location - lives
+     * outside a transaction-owned directory, is not in the index, and stays readable, which is the
+     * migration boundary DOCKER.adoc records. Removing a cache also means the next read on this instance
+     * asks the store again rather than answering from bytes nothing else can produce.
+     *
+     * @param key the storage key the store holds nothing for
+     * @param target the local location that names it
+     */
+    private static void discardStaleCache(String key, Path target) {
+        if (!MATERIALISED.contains(target.toString()) && !insideTransactionDirectory(target)) {
+            return;
+        }
+        try {
+            if (Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS) && Files.deleteIfExists(target)) {
+                Debug.logWarning("The content store holds no object for [" + key + "] any more, so the copy this"
+                        + " instance had cached at [" + target + "] was discarded: the store is what every"
+                        + " instance reads, and serving a cached copy here would answer differently from every"
+                        + " other instance. The content is now reported absent, as it is elsewhere.", MODULE);
+            }
+        } catch (IOException failure) {
+            Debug.logWarning(failure, "The cached copy [" + target + "] of content the store no longer holds"
+                    + " could not be discarded, so this instance may still answer with it while its peers"
+                    + " report the content absent", MODULE);
+        } finally {
+            MATERIALISED.remove(target.toString());
+        }
+    }
+
+    /**
+     * Reports whether a location sits inside a transaction-owned upload directory.
+     *
+     * <p>Only {@link #publishedUploadPath} creates such a directory, and only with a content store
+     * configured, so a location inside one was composed by this class for one transaction's upload.
+     *
+     * @param target the location to test
+     * @return true when one of its parent directories is a transaction-owned upload directory
+     */
+    private static boolean insideTransactionDirectory(Path target) {
+        for (Path segment : target) {
+            if (TRANSACTION_DIRECTORY.matcher(segment.toString()).matches()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -855,6 +1024,10 @@ public final class ContentStorePublisher {
         private final Map<String, FileFacts> before;
         private final long registeredAt;
         private final List<String> created = new LinkedList<>();
+        /** Keys this transaction wrote OVER an object an earlier committed row already named. */
+        private final List<String> replaced = new LinkedList<>();
+        /** The local files this transaction published, which a commit no longer needs on this instance. */
+        private final List<File> published = new LinkedList<>();
 
         ContentPublication(ContentStore store, File directory, Set<String> names, String identity) {
             this.store = store;
@@ -881,13 +1054,14 @@ public final class ContentStorePublisher {
                 scope.completed(identity);
             }
             if (status == Status.STATUS_COMMITTED) {
+                discardPublishedUpload();
                 return;
             }
             // The transaction did not commit, so the objects it CREATED are named by no committed row and
             // are removed again, on a best-effort basis, rather than left as orphans. A key that REPLACED
             // an object an earlier committed row still names is deliberately not in this list: this
             // publication holds no copy of the previous object, so deleting the key would destroy that
-            // content instead of restoring it.
+            // content instead of restoring it - it is REPORTED instead, below.
             for (String key : created) {
                 try {
                     store.delete(key);
@@ -899,7 +1073,121 @@ public final class ContentStorePublisher {
                             + " store", MODULE);
                 }
             }
+            reportReplacedAfterNonCommit();
             reapOwnedDirectory();
+        }
+
+        /**
+         * Reports content this transaction wrote over before failing to commit.
+         *
+         * <p>An update publishes over the object its row names - the key is what the content IS, not which
+         * transaction wrote it - so a transaction that fails AFTER its content was published leaves the
+         * newer bytes under that key while the row goes back to naming the previous generation. This is
+         * exactly what an update does to the local file when no store is configured, so the behaviour is
+         * the one OFBiz has always had rather than a new one, and it cannot be undone here: this
+         * publication holds no copy of the bytes it replaced. It is reported so that the operator can see
+         * it happened, with the key, instead of it being silent.
+         */
+        private void reportReplacedAfterNonCommit() {
+            for (String key : replaced) {
+                Debug.logWarning("The transaction that wrote content [" + key + "] did not commit, and the"
+                        + " object it wrote OVER cannot be restored - this publication holds no copy of it. The"
+                        + " content store therefore holds the bytes of the upload that failed, under the key the"
+                        + " previous generation of that content is named by. Re-upload the content to settle it."
+                        + " An update without a content store writes over the local file the same way.", MODULE);
+            }
+        }
+
+        /**
+         * Removes the local copy of an upload this transaction published, after it COMMITTED.
+         *
+         * <p><strong>Why a committed upload's local file is deleted.</strong> With an external store
+         * configured the object IS the content: it is what every instance reads, and it is what an
+         * erasure or a retention rule acts on. The local file the upload service wrote is, from the
+         * moment the publication succeeds, a CACHE of that object - and leaving it behind caused two
+         * distinct defects.
+         *
+         * <ul>
+         *   <li>It made instances disagree. When the object was removed from the bucket, the instance
+         *       that had written it went on serving HTTP 200 from its own disk while every other
+         *       instance answered 500 for the same database row - one row, two answers, and the missing
+         *       object invisible from the instance most likely to be looked at.</li>
+         *   <li>It accumulated. Every update of one {@code DataResource} writes into a NEW
+         *       transaction-owned directory, so a file-backed content item that was updated four times
+         *       left four local generations, of which at most one was current, on whichever instances
+         *       happened to take those writes.</li>
+         * </ul>
+         *
+         * <p>A read materialises the object again when it needs a local file ({@link #fetch}), so nothing
+         * is lost but the local copy, and the instance is left holding no durable state a peer cannot
+         * reconstruct - which is the point of the object store.
+         *
+         * <p><strong>Deliberately narrow, because it deletes files.</strong> Only a TRANSACTION-OWNED
+         * upload directory qualifies: {@link #publishedUploadPath} created it for this transaction alone,
+         * its name matches EXACTLY the {@code txn-}uuid form {@code uploadDirectoryName} composes - a
+         * directory a deployment happens to have named {@code txn-something} is not one of ours and is
+         * left alone - and every file in it was written by this transaction. A NAMED publication is never touched - it watches a file some
+         * caller composed the path of, which may be a file that existed in the deployment before this
+         * transaction rewrote it, and deleting that would remove content the store was never asked to own.
+         * Only regular files are removed, symbolic links are not followed, and every failure is logged and
+         * tolerated: the object is safe, so a local copy that survives is at worst a stale cache.
+         *
+         * <p>It runs even when the transaction published NOTHING, because an upload that carried no bytes
+         * - a submitted form with an empty file field - still had a directory prepared for it, and an
+         * empty directory nothing will ever write into again is local state the fleet is not supposed to
+         * accumulate. Only the emptiness is acted on: {@link #pruneOwnedDirectory} removes the directory
+         * only when nothing is left in it, so an upload whose file was written but not published - the
+         * same bytes already in the store - keeps both its file and its directory.
+         */
+        private void discardPublishedUpload() {
+            if (names != null || !TRANSACTION_DIRECTORY.matcher(directory.getName()).matches()) {
+                return;
+            }
+            for (File copy : published) {
+                Path path = copy.toPath();
+                try {
+                    if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                        Files.deleteIfExists(path);
+                        if (Debug.verboseOn()) {
+                            Debug.logVerbose("The local copy of published content [" + storeKey(copy) + "] was"
+                                    + " removed from this instance: the content store holds it, and a read"
+                                    + " materialises it again when a local file is needed", MODULE);
+                        }
+                    }
+                } catch (IOException failure) {
+                    Debug.logWarning(failure, "The local copy [" + copy.getAbsolutePath() + "] of content that"
+                            + " was published to the content store could not be removed from this instance, so"
+                            + " this instance keeps a cached copy of it", MODULE);
+                } finally {
+                    // Whatever the outcome, this location is no longer a cache of an object this JVM read:
+                    // either it is gone, or it holds a local write. Leaving the entry would let a later read
+                    // of a removed object delete a file this class did not materialise.
+                    MATERIALISED.remove(path.toString());
+                }
+            }
+            pruneOwnedDirectory("its content was published to the content store");
+        }
+
+        /**
+         * Removes the transaction-owned upload directory once nothing is left in it.
+         *
+         * @param because what to say in the log about why it was emptied
+         */
+        private void pruneOwnedDirectory(String because) {
+            File[] remaining = directory.listFiles();
+            if (remaining == null || remaining.length > 0) {
+                return;
+            }
+            try {
+                Files.deleteIfExists(directory.toPath());
+                if (Debug.verboseOn()) {
+                    Debug.logVerbose("The upload directory [" + directory.getAbsolutePath() + "] was removed from"
+                            + " this instance, because " + because, MODULE);
+                }
+            } catch (IOException failure) {
+                Debug.logWarning(failure, "The empty upload directory [" + directory.getAbsolutePath() + "] could"
+                        + " not be removed from this instance", MODULE);
+            }
         }
 
         /**
@@ -914,14 +1202,15 @@ public final class ContentStorePublisher {
          * local state the fleet is not supposed to have.
          *
          * <p>Deliberately narrow, because it deletes files. It runs only for a directory publication -
-         * where the directory belongs to this transaction alone - only when that directory carries the
-         * {@code txn-} name this class gives such a directory, and only on the regular files inside it,
+         * where the directory belongs to this transaction alone - only when that directory's name matches
+         * EXACTLY the {@code txn-}uuid form this class gives such a directory, and only on the regular
+         * files inside it,
          * never following a symbolic link and never descending. Anything else it finds, it leaves and
          * reports, keeping the directory too: an unexpected entry is a sign something outside this class
          * is writing there, and that is not something to delete on a best-effort path.
          */
         private void reapOwnedDirectory() {
-            if (names != null || !directory.getName().startsWith(TRANSACTION_DIRECTORY_PREFIX)) {
+            if (names != null || !TRANSACTION_DIRECTORY.matcher(directory.getName()).matches()) {
                 // A NAMED publication watches files it does not own: they belong to whatever wrote them,
                 // and a non-commit is no licence to delete them.
                 return;
@@ -1064,10 +1353,17 @@ public final class ContentStorePublisher {
                         + key + "], so it is left in place if this transaction does not commit", MODULE);
             }
             try {
-                store.put(key, Files.readAllBytes(file.toPath()));
-                if (!replacement) {
+                // Streamed from the file rather than read into memory: an upload at the size ceiling
+                // would otherwise cost MAX_OBJECT_BYTES of heap for every concurrent publication, which
+                // is the same defect on the write path that collapsing a read into a byte array was on
+                // the read path.
+                store.put(key, file.toPath());
+                if (replacement) {
+                    replaced.add(key);
+                } else {
                     created.add(key);
                 }
+                published.add(file);
                 // The local copy and the object are the same content from here on, and the object's
                 // recorded time is the moment of the write, so the local time is left where it is: a read
                 // compares content, finds it identical, and aligns the time without transferring again.

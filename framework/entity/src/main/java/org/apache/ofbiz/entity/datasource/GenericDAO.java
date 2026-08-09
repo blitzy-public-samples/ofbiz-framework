@@ -241,7 +241,18 @@ public class GenericDAO {
             entity.synchronizedWithDatasource();
             return retVal;
         } catch (GenericEntityException e) {
-            throw new GenericEntityException("Error while inserting: " + entity.toString(), e);
+            // The ROW, not its contents. entity.toString() renders every field being written - a password, a
+            // credit-card number, a personal detail - and this message travels out to whatever called the
+            // delegator, which on the storefront is a page an anonymous visitor is looking at. What the caller
+            // gets is a reference; what the log gets is the statement, the entity and its primary key, which is
+            // what an operator needs to find the row without the log becoming a copy of the data. Same contract
+            // as the batch insert above and as SQLProcessor.datasourceFault() one frame down.
+            String reference = UUID.randomUUID().toString();
+            Debug.logError(e, "Error while inserting into " + entity.getEntityName() + " " + entity.getPrimaryKey()
+                    + " with statement: " + sql + " Reference [" + reference + "], which is the only detail the"
+                    + " caller is shown.", MODULE);
+            throw new GenericEntityException("A database error prevented the record from being inserted. The"
+                    + " server log records the statement and the reason. Reference [" + reference + "]");
         }
     }
 
@@ -353,11 +364,21 @@ public class GenericDAO {
             retVal = sqlP.executeUpdate();
             entity.synchronizedWithDatasource();
         } catch (GenericEntityException e) {
-            throw new GenericEntityException("Error while updating: " + entity.toString(), e);
+            // As in singleInsert: the caller is given a reference, the log is given the statement, the entity
+            // and its primary key. entity.toString() here holds every value the update was attempting to write.
+            String reference = UUID.randomUUID().toString();
+            Debug.logError(e, "Error while updating " + entity.getEntityName() + " " + entity.getPrimaryKey()
+                    + " with statement: " + sql + " Reference [" + reference + "], which is the only detail the"
+                    + " caller is shown.", MODULE);
+            throw new GenericEntityException("A database error prevented the record from being updated. The"
+                    + " server log records the statement and the reason. Reference [" + reference + "]");
         }
 
         if (retVal == 0) {
-            throw new GenericEntityNotFoundException("Tried to update an entity that does not exist, entity: " + entity.toString());
+            // The entity and its primary key, not the values: this says WHICH row was not there, which is the
+            // whole information content of the failure, without repeating the payload back to the caller.
+            throw new GenericEntityNotFoundException("Tried to update an entity that does not exist: "
+                    + entity.getEntityName() + " " + entity.getPrimaryKey());
         }
         return retVal;
     }
@@ -640,8 +661,11 @@ public class GenericDAO {
 
             entity.synchronizedWithDatasource();
         } else {
-            // Debug.logWarning("[GenericDAO.select]: select failed, result set was empty for entity: " + entity.toString(), MODULE);
-            throw new GenericEntityNotFoundException("Result set was empty for entity: " + entity.toString());
+            // The entity and its primary key, not entity.toString(): the [GenericEntity:Name][field,value(type)]
+            // rendering names the framework's own classes and dumps field values, and this message reaches
+            // whatever called the delegator. Which row was not found is the whole information content.
+            throw new GenericEntityNotFoundException("No " + entity.getEntityName() + " record was found for "
+                    + entity.getPrimaryKey());
         }
     }
 
@@ -699,7 +723,9 @@ public class GenericDAO {
 
                 entity.synchronizedWithDatasource();
             } else {
-                throw new GenericEntityNotFoundException("Result set was empty for entity: " + entity.toString());
+                // As in select() above: which row, not what was in it.
+                throw new GenericEntityNotFoundException("No " + entity.getEntityName() + " record was found for "
+                        + entity.getPrimaryKey());
             }
         }
     }
@@ -1361,7 +1387,15 @@ public class GenericDAO {
                 return delete(entity, sqlP);
             } catch (GenericDataSourceException e) {
                 sqlP.rollback();
-                throw new GenericDataSourceException("Exception while deleting the following entity: " + entity.toString(), e);
+                // Rolled back first, then reported. The caller is given a reference; the log is given the entity
+                // and its primary key. A delete that fails on a foreign-key constraint is the common case here,
+                // and its message used to carry every field of the row being removed.
+                String reference = UUID.randomUUID().toString();
+                Debug.logError(e, "Exception while deleting " + entity.getEntityName() + " "
+                        + entity.getPrimaryKey() + " Reference [" + reference + "], which is the only detail the"
+                        + " caller is shown.", MODULE);
+                throw new GenericDataSourceException("A database error prevented the record from being deleted."
+                        + " The server log records the reason. Reference [" + reference + "]");
             }
         }
     }

@@ -40,6 +40,9 @@ import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -59,6 +62,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.StringTokenizer;
 import java.util.TimeZone;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -71,6 +75,7 @@ import org.apache.commons.fileupload2.core.DiskFileItemFactory;
 import org.apache.commons.fileupload2.core.FileItem;
 import org.apache.commons.fileupload2.core.FileUploadException;
 import org.apache.commons.fileupload2.jakarta.JakartaServletFileUpload;
+import org.apache.commons.io.FileCleaningTracker;
 import org.apache.commons.lang.RandomStringUtils;
 import org.apache.http.NameValuePair;
 import org.apache.http.client.utils.URLEncodedUtils;
@@ -100,6 +105,21 @@ import jakarta.servlet.http.HttpSession;
 public final class UtilHttp {
 
     private static final String MODULE = UtilHttp.class.getName();
+
+    /**
+     * Deletes a multipart staging file once nothing refers to its {@link FileItem} any more.
+     *
+     * <p>A SAFETY NET behind the deterministic cleanup in {@code ControlServlet}, restoring the
+     * behaviour commons-fileupload 1.x had by default: a staged request body whose item is collected
+     * without anyone having deleted it is deleted then, rather than surviving for the life of the
+     * deployment. Without it, and without the deterministic cleanup, every large upload left its whole
+     * body in the temporary directory - 42 files and 220 MB after one test run, unchanged by a restart -
+     * which is durable local state on an instance that is supposed to hold none.
+     */
+    private static final FileCleaningTracker UPLOAD_STAGING_TRACKER = new FileCleaningTracker();
+
+    /** Whether an already-existing, group- or world-readable staging directory has been reported. */
+    private static final AtomicBoolean STAGING_PERMISSIONS_REPORTED = new AtomicBoolean();
 
     private static final String MULTI_ROW_DELIMITER = "_o_";
     private static final String ROW_SUBMIT_PREFIX = "_rowSubmit_o_";
@@ -216,6 +236,9 @@ public final class UtilHttp {
         DiskFileItemFactory factory = DiskFileItemFactory.builder()
                 .setBufferSizeMax(sizeThreshold)
                 .setPath(tmpUploadRepository.getPath())
+                // See UPLOAD_STAGING_TRACKER: without a tracker nothing ever deletes a staged body that
+                // its consumer did not delete itself.
+                .setFileCleaningTracker(UPLOAD_STAGING_TRACKER)
                 .get();
         JakartaServletFileUpload<DiskFileItem, DiskFileItemFactory> upload = new JakartaServletFileUpload<>(factory);
         upload.setSizeMax(maxUploadSize);
@@ -246,7 +269,17 @@ public final class UtilHttp {
                 Debug.logError("File upload error" + e, MODULE);
             }
             if (uploadedItems != null) {
-                request.setAttribute("fileItems", uploadedItems);
+                // NEVER overwritten with NOTHING. A request body can only be read once, so a second parse
+                // of the same request - and there is one, because getParameterMap re-parses whenever the
+                // servlet container reports no ordinary parameters - answers an EMPTY list rather than
+                // failing. Storing that emptiness replaced the real items with nothing: the staging files
+                // they name were then unreachable, so no consumer could find them (LayoutWorker asks this
+                // attribute for the uploaded file) and nothing could delete them, which is how a completed
+                // upload came to leave its whole body behind in the temporary directory. An empty answer
+                // from a re-parse is an artefact of the body already having been read, not information.
+                if (!uploadedItems.isEmpty() || request.getAttribute("fileItems") == null) {
+                    request.setAttribute("fileItems", uploadedItems);
+                }
                 for (FileItem<DiskFileItem> item : uploadedItems) {
                     String fieldName = item.getFieldName();
                     //byte[] itemBytes = item.get();
@@ -352,7 +385,101 @@ public final class UtilHttp {
         // directory used to temporarily store files that are larger than the configured size threshold
         String tmpUploadRepository = EntityUtilProperties.getPropertyValue("general", "http.upload.tmprepository",
                 "runtime/tmp", delegator);
-        return new File(tmpUploadRepository);
+        File repository = new File(tmpUploadRepository);
+        // OWNER-ONLY, and created here rather than left to the upload library, because what is staged in
+        // it is the whole body of a request: an upload in progress is user content, and until it has been
+        // stored it must be no more readable than the content it becomes. The permissions of a directory
+        // that ALREADY exists are left alone - a deployment may have placed a volume there deliberately -
+        // and reported once so the operator can see it.
+        if (!repository.isDirectory()) {
+            createOwnerOnlyDirectory(repository);
+        } else {
+            reportOpenStagingDirectory(repository);
+        }
+        return repository;
+    }
+
+    /**
+     * Creates a directory readable by its owner alone, on a best-effort basis.
+     *
+     * @param directory the directory to create
+     */
+    private static void createOwnerOnlyDirectory(File directory) {
+        try {
+            Files.createDirectories(directory.toPath());
+            if (Files.getFileAttributeView(directory.toPath(), PosixFileAttributeView.class) != null) {
+                Files.setPosixFilePermissions(directory.toPath(), PosixFilePermissions.fromString("rwx------"));
+            }
+        } catch (IOException | UnsupportedOperationException | SecurityException failure) {
+            // Not fatal: the upload library creates the directory too, and a failure here only means the
+            // permissions are whatever the platform's default gives it.
+            Debug.logWarning(failure, "The upload staging directory [" + directory.getPath() + "] could not be"
+                    + " created with owner-only permissions", MODULE);
+        }
+    }
+
+    /**
+     * Reports, once per JVM, a staging directory that other accounts on the host can read.
+     *
+     * @param directory the existing staging directory
+     */
+    private static void reportOpenStagingDirectory(File directory) {
+        if (!STAGING_PERMISSIONS_REPORTED.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            if (Files.getFileAttributeView(directory.toPath(), PosixFileAttributeView.class) == null) {
+                return;
+            }
+            String mode = PosixFilePermissions.toString(Files.getPosixFilePermissions(directory.toPath()));
+            if (!"rwx------".equals(mode)) {
+                Debug.logWarning("The upload staging directory [" + directory.getAbsolutePath() + "] is [" + mode
+                        + "], so the bodies of uploads in progress are readable by other accounts on this host."
+                        + " It is left as it is, because it already exists and may be a deliberately placed"
+                        + " volume. Set it to rwx------ (0700) unless something else has to read it.", MODULE);
+            }
+        } catch (IOException | UnsupportedOperationException | SecurityException unreadable) {
+            Debug.logVerbose("The permissions of the upload staging directory [" + directory.getPath() + "] could"
+                    + " not be inspected: " + unreadable.getMessage(), MODULE);
+        }
+    }
+
+    /**
+     * Deletes the multipart staging files of a finished request.
+     *
+     * <p><strong>Why this exists.</strong> A multipart request is parsed into {@link DiskFileItem}s, and
+     * every body larger than the configured threshold is staged in a file. Nothing deleted those files:
+     * they accumulated in the temporary directory for the life of the deployment, one per upload, each
+     * holding a complete copy of the uploaded content, and a restart did not remove them. On an instance
+     * that is meant to be freely replaceable that is durable local state, it is business content sitting
+     * outside the content store, and it turns ordinary upload traffic into an unbounded disk requirement.
+     *
+     * <p>Called at the END of the request, after every consumer of the parsed items has run - the items
+     * are handed to callers through the {@code fileItems} request attribute and through the
+     * {@code _<field>_fileItem} parameters, so deleting them any earlier would take the content away
+     * from the code that is about to store it. Failures are logged and tolerated: the request is already
+     * finished, and the tracker behind {@link #UPLOAD_STAGING_TRACKER} is the second line of defence.
+     *
+     * @param request the finished request
+     */
+    public static void releaseMultiPartStaging(HttpServletRequest request) {
+        Object staged = request.getAttribute("fileItems");
+        if (!(staged instanceof List<?>)) {
+            return;
+        }
+        request.removeAttribute("fileItems");
+        for (Object item : (List<?>) staged) {
+            if (!(item instanceof FileItem)) {
+                continue;
+            }
+            FileItem<?> staging = (FileItem<?>) item;
+            try {
+                staging.delete();
+            } catch (IOException | RuntimeException failure) {
+                Debug.logWarning(failure, "The staging file of an uploaded item could not be deleted at the end"
+                        + " of the request, so it is left for the collection-time cleanup", MODULE);
+            }
+        }
     }
 
     public static Map<String, Object> getQueryStringOnlyParameterMap(String queryString) {

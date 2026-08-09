@@ -319,6 +319,83 @@ public final class SchemaInitGatingTests {
     }
 
     /**
+     * An initialisation whose LOADER EXITED 0 while a datasource failed is a FAILURE, and says so.
+     *
+     * <p>This is the one that mattered in production. The data loader returns 0 whenever the JVM completed,
+     * and the Entity Engine's start-up schema check is deliberately non-fatal - it logs "Unable to establish
+     * a connection with the database" and carries on - so an initialisation given a wrong password for one
+     * of the three groups exited 0 and printed its success banner while that group's schema was never
+     * created. An orchestrator reads that as a completed migration and rolls a fleet out onto an incomplete
+     * schema, which is why the outcome is aggregated from the engine's own output rather than inferred from
+     * the exit status.
+     *
+     * @throws Exception if the entry point cannot be run or its output cannot be parsed
+     */
+    @Test
+    public void anInitWhoseDatasourceFailedIsAFailureEvenWhenTheLoaderExitsZero() throws Exception {
+        requireShellAvailable();
+        stubExitStatus(0);
+        stubFailureLine("Unable to establish a connection with the database for helperName"
+                + " [localpostgrestenant]... Error was: FATAL: password authentication failed");
+
+        int status = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST, "OFBIZ_SCHEMA_INIT", "true"),
+                "ofbiz_setup_env", "create_ofbiz_runtime_directories", "run_schema_init",
+                "echo REACHED-THE-SERVING-COMMAND");
+
+        assertNotEquals(0, status, "an initialisation that could not reach a datasource must fail the job");
+        assertFalse(output().contains("Schema initialisation is complete"),
+                "a failed initialisation must print no success banner: " + output());
+        assertTrue(output().contains("schema initialisation FAILED"),
+                "the failure must be reported so an orchestrator and an operator both see it: " + output());
+        assertFalse(output().contains("REACHED-THE-SERVING-COMMAND"),
+                "a failed initialisation must not go on to serve traffic");
+        assertManagedDdl("false");
+    }
+
+    /**
+     * An initialisation that never checked one of its entity groups is a FAILURE.
+     *
+     * <p>The complement of the test above: a group whose datasource is missing from the run at all - the
+     * shape a DML-only role produced, where nothing was created in any of the three databases - leaves no
+     * failure line of its own to match, so the run is also required to show that EVERY group the rendered
+     * configuration points at PostgreSQL was actually checked.
+     *
+     * @throws Exception if the entry point cannot be run or its output cannot be parsed
+     */
+    @Test
+    public void anInitThatSkippedAnEntityGroupIsAFailure() throws Exception {
+        requireShellAvailable();
+        stubExitStatus(0);
+        stubGroupChecks(ENTITY_GROUPS.size() - 1);
+
+        int status = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST, "OFBIZ_SCHEMA_INIT", "true"),
+                "ofbiz_setup_env", "create_ofbiz_runtime_directories", "run_schema_init");
+
+        assertNotEquals(0, status, "an initialisation that skipped a group must fail the job");
+        assertFalse(output().contains("Schema initialisation is complete"),
+                "a failed initialisation must print no success banner: " + output());
+        assertManagedDdl("false");
+    }
+
+    /**
+     * A COMPLETED initialisation reports the group count it verified, so the success banner says what was
+     * actually checked rather than merely that the process ended.
+     *
+     * @throws Exception if the entry point cannot be run or its output cannot be parsed
+     */
+    @Test
+    public void aCompletedInitReportsEveryGroupItChecked() throws Exception {
+        requireShellAvailable();
+
+        int status = runEntryPoint(Map.of("OFBIZ_POSTGRES_HOST", MANAGED_HOST, "OFBIZ_SCHEMA_INIT", "true"),
+                "ofbiz_setup_env", "create_ofbiz_runtime_directories", "run_schema_init");
+
+        assertEquals(0, status, "a completed initialisation must exit successfully");
+        assertTrue(output().contains("all " + ENTITY_GROUPS.size() + " configured entity group(s) were checked"),
+                "the banner must state how many groups were verified: " + output());
+    }
+
+    /**
      * An INTERRUPTED initialisation - killed after the DDL-enabled render and before anything could put the
      * run mode back - is repaired by the next serving start, because the marker records the mode that was
      * rendered rather than merely that something was.
@@ -1154,15 +1231,38 @@ public final class SchemaInitGatingTests {
         Files.createDirectories(containerRoot.resolve("config"));
         Files.createDirectories(containerRoot.resolve("bin"));
         Path stub = containerRoot.resolve("bin/ofbiz");
+        // The stub STANDS IN FOR THE ENGINE'S OUTPUT as well as for its exit status, because the schema
+        // initialisation is judged on what the engine LOGGED and not only on how it exited: the data
+        // loader returns 0 whether or not a datasource could be reached, so the entry point counts the
+        // per-group checks the Entity Engine reports and scans for the failure lines DatabaseUtil emits.
+        // STUB_OFBIZ_CHECKS says how many groups reported a check - three is a complete run - and
+        // STUB_OFBIZ_FAILURE injects one of those failure lines, which is what a wrong credential or a
+        // DML-only role produces in a real run.
         Files.writeString(stub, "#!/bin/sh\n"
                 + "echo \"$*\" >> \"$(dirname \"$0\")/../invocations\"\n"
+                + "checks=${STUB_OFBIZ_CHECKS:-0}\n"
+                + "while [ \"$checks\" -gt 0 ]; do\n"
+                + "  echo 'Doing database check as requested in entityengine.xml with addMissing=true'\n"
+                + "  checks=$((checks - 1))\n"
+                + "done\n"
+                + "if [ -n \"${STUB_OFBIZ_FAILURE:-}\" ]; then echo \"$STUB_OFBIZ_FAILURE\"; fi\n"
                 + "exit \"${STUB_OFBIZ_EXIT:-0}\"\n", StandardCharsets.UTF_8);
         assertTrue(stub.toFile().setExecutable(true), "the stub launcher must be executable");
         stubExitStatus(0);
+        stubGroupChecks(ENTITY_GROUPS.size());
+        stubFailureLine("");
     }
 
     private void stubExitStatus(int status) throws IOException {
         Files.writeString(containerRoot.resolve("stub-exit"), Integer.toString(status), StandardCharsets.UTF_8);
+    }
+
+    private void stubGroupChecks(int groups) throws IOException {
+        Files.writeString(containerRoot.resolve("stub-checks"), Integer.toString(groups), StandardCharsets.UTF_8);
+    }
+
+    private void stubFailureLine(String line) throws IOException {
+        Files.writeString(containerRoot.resolve("stub-failure"), line, StandardCharsets.UTF_8);
     }
 
     /**
@@ -1188,6 +1288,10 @@ public final class SchemaInitGatingTests {
         builder.environment().put("OFBIZ_CONTAINER_ROOT", containerRoot.toString());
         builder.environment().put("STUB_OFBIZ_EXIT",
                 Files.readString(containerRoot.resolve("stub-exit"), StandardCharsets.UTF_8).trim());
+        builder.environment().put("STUB_OFBIZ_CHECKS",
+                Files.readString(containerRoot.resolve("stub-checks"), StandardCharsets.UTF_8).trim());
+        builder.environment().put("STUB_OFBIZ_FAILURE",
+                Files.readString(containerRoot.resolve("stub-failure"), StandardCharsets.UTF_8));
         builder.environment().putAll(environment);
         builder.redirectErrorStream(true);
         builder.redirectOutput(containerRoot.resolve("output").toFile());
